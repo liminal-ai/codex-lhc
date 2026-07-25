@@ -1,0 +1,15 @@
+[package]
+name = "codex-lhc-host"
+version = "0.1.0"
+edition = "2024"
+description = "LHC host adapter for Codex — raw-item capture, compact bridge via replace_compacted_history, ModelCall over public ModelClient (fork-only crate)"
+publish = false
+
+[dependencies]
+lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Standalone workspace on purpose: zero core files are modified by Chunk 0.
+# The root codex-rs/Cargo.toml members entry is patch 0001 when the first
+# hook lands (Chunk 1). See FORK.md "Touchpoint inventory".
+[workspace]
