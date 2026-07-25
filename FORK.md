@@ -101,6 +101,31 @@ sign-off.
 | ModelOutput vs HostContext vs InterAgent tag fidelity | **Unverifiable by behaviour today** — mapping collapses them for every variant (only `UserPrompt` vs rest is observable on user-role). Stream/compact tags are present in code; Chunk 3 live cert or a future payload field if the distinction must be durable. |
 | Compaction `OutputItemDone` provenance path | Same collapse as above; not separately e2e-driven (same mapper). |
 
+### Correction to the Chunk 1 record (2026-07-25)
+
+Chunk 1's commit body (`86e9873220`) describes its dual-verify rounds as
+having produced *independent* confirmation. **That claim is too strong.** Both
+lanes were launched concurrently with cwd `/srv/work/codex` — one working tree
+— across both verify rounds and the confirmation round, which the onboarding
+doc's §"Verifier isolation — MANDATORY" forbids precisely because verifier
+mandates include mutation testing. It demonstrably interfered here: a
+confirmer found a cached certification binary carrying the *other* lane's
+probe symbol (`confirmation_probe_extra_reaches_stored_row`), present in no
+source file.
+
+Per that rule, those rounds are **"corroborated", not "independently
+confirmed"**. The substance stands: findings were traced to source, and the
+orchestrator independently re-derived the decisive ones (envelope `extra`
+rejection against `intake_stream/internal/validate.rs:359-372`; hook-body
+deletion failing both core e2e tests; `codex_lhc_host::install` removal
+failing the registry test; the provenance call sites in
+`stream_events_utils.rs` / `compact.rs`). Those are orchestrator
+measurements, not lane measurements.
+
+Not amended in place: rewriting `lhc` history is reserved for the
+history-reset drill with Lee's sign-off. Corrected forward here instead.
+From Chunk 2 on, lanes are isolated via `scripts/verify-isolated.sh`.
+
 ## Laws (binding)
 
 1. Write-back is the architecture (`replace_compacted_history`).
