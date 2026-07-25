@@ -1,14 +1,21 @@
-//! LHC host adapter for Codex — Chunk 1 capture.
+//! LHC host adapter for Codex — Chunk 1 capture + Chunk 2a band-shape helpers.
 //!
-//! Chunk 1 delivers capture only — no compaction, no user-facing benefit.
-//! Chunks 2–3 remain (rebuild/compact bridge + live cert).
+//! Chunk 1: capture only. Chunk 2a: band-shaped history construction for the
+//! pre-bridge model-tolerance harness (no compact bridge yet). Chunks 2b–3
+//! remain (bridge + live cert).
 
+mod band_shape;
 mod capture;
 mod gating;
 mod idempotency;
 mod install;
 mod mapping;
 mod session;
+
+pub use band_shape::{
+    BandShapeItem, BandShapeReport, DEFAULT_FULL_BAND_USER_TURNS, band_shaped_history_from_events,
+    synthetic_minimal_band_history,
+};
 
 pub use capture::CAPTURE_QUEUE_CAP;
 pub use capture::CaptureHandle;

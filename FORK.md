@@ -88,10 +88,11 @@ sign-off.
 | Item | Checkpoint |
 |------|-----------|
 | Mapping goldens (byte-eq + LhcSession round-trip) | Chunk 1 — DONE (rule zero) |
-| Capture→rebuild diff | Chunk 2 |
+| Capture→rebuild diff | Chunk 2b (bridge) |
 | Real-session item-shape vs hand fixtures | Chunk 3 live cert |
-| Band-shape tolerance eval | Chunk 2, BEFORE the bridge |
-| Auth-lane ruling | Chunk 2 start, with Lee |
+| Band-shape tolerance eval harness | Chunk 2a — **built, not live-run** (`lhc_band_shape_eval_*`); live needs Lee auth-lane |
+| Conversation-consumer census (law 3) | Chunk 2a — `codex-rs/lhc/CHUNK2-CENSUS.md` |
+| Auth-lane ruling | **Open with Lee** — ChatGPT plan is the only available lane; live band-eval spends quota |
 | Upstream-PR candidacy of `RawItemContributor` | after Chunk 3 |
 | Full data-URL policy (URLs live in `payload.text` / `__hostRaw`; TextPayload is closed) | Chunk 2 if size issues |
 | `model_change` / `thinking_level_change` free-seam wiring (`ConfigContributor`) | Chunk 1 — DONE offline |

@@ -4257,3 +4257,9 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "lhc_capture_e2e_tests.rs"]
 mod lhc_capture_e2e_tests;
+
+// Chunk 2a: band-shape eval harness (dry-run always; live behind env flag).
+// Test-only — does not register a production hook site.
+#[cfg(test)]
+#[path = "lhc_band_shape_eval_tests.rs"]
+mod lhc_band_shape_eval_tests;
