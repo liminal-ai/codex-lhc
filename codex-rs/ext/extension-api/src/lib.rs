@@ -42,6 +42,9 @@ pub use contributors::McpServerContributor;
 pub use contributors::PreviousWorldStateSection;
 pub use contributors::PromptFragment;
 pub use contributors::PromptSlot;
+pub use contributors::RawItemContributor; // LHC-HOOK
+pub use contributors::RawItemInput; // LHC-HOOK
+pub use contributors::RawItemProvenance; // LHC-HOOK
 pub use contributors::RenderedWorldStateFragment;
 pub use contributors::SkillInvocationContributor;
 pub use contributors::SkillInvocationInput;

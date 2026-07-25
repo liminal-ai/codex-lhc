@@ -2979,6 +2979,25 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
+        // Default provenance for generic call sites: HostContext (fail toward
+        // synthetic, never invent user_prompt). Typed paths pass explicitly.
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            items,
+            codex_extension_api::RawItemProvenance::HostContext,
+        )
+        .await;
+    }
+
+    /// Record conversation items with typed raw-item provenance for extensions.
+    // LHC-HOOK: provenance-carrying record path (law 6 — typed origin, not content).
+    #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
+    pub(crate) async fn record_conversation_items_with_provenance(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        provenance: codex_extension_api::RawItemProvenance,
+    ) {
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         {
@@ -2990,7 +3009,8 @@ impl Session {
             );
         }
         self.persist_rollout_response_items(items).await;
-        self.send_raw_response_items(turn_context, items).await;
+        self.send_raw_response_items(turn_context, items, provenance)
+            .await;
     }
 
     pub(crate) async fn record_step_world_state_if_changed(
@@ -3112,7 +3132,13 @@ impl Session {
             RolloutItem::ResponseItem(response_item),
         ])
         .await;
-        self.send_raw_response_items(turn_context, items).await;
+        // LHC-HOOK: inter-agent provenance for raw-item capture.
+        self.send_raw_response_items(
+            turn_context,
+            items,
+            codex_extension_api::RawItemProvenance::InterAgent,
+        )
+        .await;
     }
 
     async fn maybe_warn_on_server_model_mismatch(
@@ -3281,7 +3307,42 @@ impl Session {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
-    async fn send_raw_response_items(&self, turn_context: &TurnContext, items: &[ResponseItem]) {
+    async fn send_raw_response_items(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+        provenance: codex_extension_api::RawItemProvenance,
+    ) {
+        // LHC-HOOK: fan raw ResponseItems into RawItemContributor adapters.
+        // Contained: catch_unwind so a panicking contributor cannot take down
+        // the session path (F16). Timeout is not applied here — contributors
+        // must be non-blocking (try_send only).
+        for contributor in self.services.extensions.raw_item_contributors() {
+            let fut = contributor.on_raw_items(codex_extension_api::RawItemInput {
+                items,
+                provenance,
+                session_store: &self.services.session_extension_data,
+                thread_store: &self.services.thread_extension_data,
+                turn_store: Some(turn_context.extension_data.as_ref()),
+            });
+            // AssertUnwindSafe: extension futures are not required to be UnwindSafe;
+            // a panic is logged and recording continues.
+            if let Err(payload) =
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(fut)).await
+            {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    (*s).to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "non-string panic payload".to_string()
+                };
+                tracing::error!(
+                    error = %msg,
+                    "raw item contributor panicked; continuing session recording"
+                );
+            }
+        }
         for item in items {
             self.send_event(
                 turn_context,
@@ -3916,9 +3977,13 @@ impl Session {
         turn_context: &TurnContext,
         response_item: ResponseItem,
     ) {
-        // Add to conversation history and persist response item to rollout.
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        // LHC-HOOK: model-output provenance for raw-item capture.
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            std::slice::from_ref(&response_item),
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
 
         // Derive a turn item and emit lifecycle events if applicable.
         if let Some(item) = parse_turn_item(&response_item) {
@@ -3937,8 +4002,13 @@ impl Session {
         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         let response_item = self.response_item_from_user_input(input.to_vec());
-        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-            .await;
+        // LHC-HOOK: user-prompt provenance — the only real human-input path.
+        self.record_conversation_items_with_provenance(
+            turn_context,
+            std::slice::from_ref(&response_item),
+            codex_extension_api::RawItemProvenance::UserPrompt,
+        )
+        .await;
         let mut user_message_item = UserMessageItem::new(input);
         user_message_item.client_id = client_id;
         let turn_item = TurnItem::UserMessage(user_message_item);
@@ -4182,3 +4252,8 @@ mod elicitation_holders_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+// LHC-HOOK: e2e suite for the raw-item capture seam (F11).
+#[cfg(test)]
+#[path = "lhc_capture_e2e_tests.rs"]
+mod lhc_capture_e2e_tests;

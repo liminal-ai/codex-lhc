@@ -1,0 +1,17 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ctc_1",
+      "toolName": "custom",
+      "arguments": {
+        "x": 1,
+        "__hostRaw": "{\"x\":1}"
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:ctc_1:e716b8dceeb2e5f0bb6d85e2f64fe6f8fb512ecf748b282b7622f59b459cf576:tool_call:ctc_1"
+  }
+]

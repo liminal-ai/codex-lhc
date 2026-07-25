@@ -1,15 +1,39 @@
 [package]
 name = "codex-lhc-host"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
 description = "LHC host adapter for Codex — raw-item capture, compact bridge via replace_compacted_history, ModelCall over public ModelClient (fork-only crate)"
 publish = false
 
-[dependencies]
-lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
-serde_json = { version = "1", features = ["preserve_order"] }
+[lib]
+name = "codex_lhc_host"
+path = "src/lib.rs"
+doctest = false
 
-# Standalone workspace on purpose: zero core files are modified by Chunk 0.
-# The root codex-rs/Cargo.toml members entry is patch 0001 when the first
-# hook lands (Chunk 1). See FORK.md "Touchpoint inventory".
-[workspace]
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables crash-injection and blocking test helpers for certification.
+test-util = []
+
+[[test]]
+name = "certification"
+required-features = ["test-util"]
+
+[dependencies]
+codex-extension-api = { workspace = true }
+codex-protocol = { workspace = true }
+lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }

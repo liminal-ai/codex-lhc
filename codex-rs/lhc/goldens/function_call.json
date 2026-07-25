@@ -1,0 +1,17 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "fc_1",
+      "toolName": "read_file",
+      "arguments": {
+        "path": "src/main.rs",
+        "__hostRaw": "{\"path\":\"src/main.rs\"}"
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:fc_1:b96232920950cbc938ace3d7c49daadb10e3170dd79bb5d02710b0f4c5dd4d35:tool_call:fc_1"
+  }
+]

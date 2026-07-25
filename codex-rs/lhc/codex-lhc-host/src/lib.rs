@@ -1,31 +1,68 @@
-//! LHC host adapter for Codex — Chunk 0 skeleton.
+//! LHC host adapter for Codex — Chunk 1 capture.
 //!
-//! Fork-only crate; carries no host hooks itself. The host-side touchpoints
-//! that call into this crate are enumerated in FORK.md and marked with
-//! `LHC-HOOK` sentinels. Laws binding this adapter (Phase 3 scar tissue,
-//! recorded in the Phase 4 brief):
-//! - write-back is the architecture: after an LHC compact, host state IS
-//!   the LHC body (via `Session::replace_compacted_history`);
-//! - bands may compress to text; the live tail conserves host-native kinds;
-//! - classify on the typed session view (source linkage, variants, ids) —
-//!   never reconstruct structure from rendered text;
-//! - per-entry classification fails toward synthetic; whole-index
-//!   construction failure fails the operation;
-//! - fixtures must be shapes the host can actually produce, and a test
-//!   that cannot fail is not a test.
+//! Chunk 1 delivers capture only — no compaction, no user-facing benefit.
+//! Chunks 2–3 remain (rebuild/compact bridge + live cert).
 
-/// Linkage proof through a real, behavior-bearing port export: the
-/// JS-parity serializer (the port's most load-bearing shared surface).
+mod capture;
+mod gating;
+mod idempotency;
+mod install;
+mod mapping;
+mod session;
+
+pub use capture::CAPTURE_QUEUE_CAP;
+pub use capture::CaptureHandle;
+pub use capture::spawn_capture;
+pub use gating::lhc_root;
+pub use idempotency::OccurrenceTracker;
+pub use idempotency::encode_thread_id;
+pub use idempotency::item_digest;
+pub use idempotency::item_event_key;
+pub use idempotency::item_stable_id;
+pub use idempotency::model_change_key;
+pub use idempotency::seed_occurrence_from_keys;
+pub use idempotency::thinking_level_change_key;
+pub use idempotency::turn_end_key;
+pub use install::LhcCaptureSlot;
+pub use install::LhcTurnId;
+pub use install::install;
+pub use mapping::ACTOR_ASSISTANT;
+pub use mapping::ACTOR_SYSTEM;
+pub use mapping::ACTOR_TOOL;
+pub use mapping::ACTOR_USER;
+pub use mapping::HARNESS;
+pub use mapping::MappedEvent;
+pub use mapping::map_item;
+pub use mapping::map_model_or_thinking_change;
+pub use mapping::map_runtime_note;
+pub use mapping::map_turn_end;
+pub use session::encode_thread_id_for_path;
+pub use session::thread_file_path;
+
+/// Linkage proof through a real, behavior-bearing port export.
 pub fn lhc_port_linked() -> String {
     lhc::shared_tech::js_json::js_json_stringify(&serde_json::json!({"linked": 1e21}))
 }
+
+/// Re-export event records for host-side certification assertions.
+pub use lhc::intake_stream::EventRecord;
+pub use lhc::sdk::init_lhc;
+
+#[cfg(any(test, feature = "test-util"))]
+pub use gating::env_lock;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::install_with_root;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::install_with_root_and_labels;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::wait_for_handle;
+#[cfg(any(test, feature = "test-util"))]
+pub use session::LhcSession;
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn vendored_port_links_with_js_number_parity() {
-        // 1e21 is the JS exponent-spelling boundary — the exact divergence
-        // class the port's serializer exists to pin.
         assert_eq!(super::lhc_port_linked(), r#"{"linked":1e+21}"#);
     }
 }

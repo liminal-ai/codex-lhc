@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "assistant_thinking",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "text": "OPAQUE_ENCRYPTED_BYTES_verbatim"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:rs_enc:3d3064f0f96db57199a9647ea7390ad32d5486736747c9dc85ddd1ddbf1de5bf:assistant_thinking"
+  }
+]

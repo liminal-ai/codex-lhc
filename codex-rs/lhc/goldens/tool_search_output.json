@@ -1,0 +1,14 @@
+[
+  {
+    "event_kind": "tool_result",
+    "actor": "tool",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ts_1",
+      "content": "[{\"name\":\"web_search\"}]",
+      "isError": false
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:862d926785d83f1cbf268481e4e5a2679d3938ff67aefb50242871738011c7f6:0:tool_result:ts_1"
+  }
+]

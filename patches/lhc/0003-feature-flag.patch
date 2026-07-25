@@ -1,0 +1,28 @@
+diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
+index 000f2c4bf4..0b689b5e48 100644
+--- a/codex-rs/features/src/lib.rs
++++ b/codex-rs/features/src/lib.rs
+@@ -254,6 +254,9 @@ pub enum Feature {
+     PreventIdleSleep,
+     /// Enable remote compaction v2 over the normal Responses API.
+     RemoteCompactionV2,
++    /// Enable LHC long-horizon capture (parallel SQLite record; default off).
++    // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
++    LhcCapture,
+     /// Use Agent Identity for ChatGPT-authenticated sessions.
+     UseAgentIdentity,
+     /// Enable workspace dependency support.
+@@ -1427,6 +1430,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+         stage: Stage::Stable,
+         default_enabled: true,
+     },
++    // LHC-HOOK 3/8: FeatureSpec for LhcCapture (default OFF).
++    FeatureSpec {
++        id: Feature::LhcCapture,
++        key: "lhc_capture",
++        stage: Stage::UnderDevelopment,
++        default_enabled: false,
++    },
+     FeatureSpec {
+         id: Feature::UseAgentIdentity,
+         key: "use_agent_identity",

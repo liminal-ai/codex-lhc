@@ -714,8 +714,13 @@ async fn drain_to_completed(
         };
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                    .await;
+                // LHC-HOOK: compaction model output is ModelOutput (not HostContext default).
+                sess.record_conversation_items_with_provenance(
+                    turn_context,
+                    std::slice::from_ref(&item),
+                    codex_extension_api::RawItemProvenance::ModelOutput,
+                )
+                .await;
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;

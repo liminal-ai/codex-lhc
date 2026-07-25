@@ -1,0 +1,17 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ws_1",
+      "toolName": "web_search",
+      "arguments": {
+        "type": "search",
+        "query": "rust async"
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:ws_1:77f22c8fba30edee6b79f8d50fa218b44fa97b7ffebd90d88880b0241185dfac:tool_call:ws_1"
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "shell-1",
+      "toolName": "local_shell",
+      "arguments": {
+        "command": [
+          "echo",
+          "hi"
+        ],
+        "timeout_ms": null,
+        "working_directory": null,
+        "env": null,
+        "user": null
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:586831bffd34319c7fcea3f7953e6ac9e1c6e682b5d77674a3cabb878341e3ac:0:tool_call:shell-1"
+  }
+]

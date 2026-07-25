@@ -138,6 +138,8 @@ codex-shell-escalation = { workspace = true }
 [dev-dependencies]
 assert_cmd = { workspace = true }
 assert_matches = { workspace = true }
+# LHC-HOOK: e2e capture suite exercises the real Session raw-item seam.
+codex-lhc-host = { workspace = true, features = ["test-util"] }
 codex-exec-server-test-support = { workspace = true }
 codex-image-generation-extension = { workspace = true }
 codex-home = { workspace = true }

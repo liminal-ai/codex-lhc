@@ -1,0 +1,28 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ig_1",
+      "toolName": "image_generation",
+      "arguments": {
+        "revisedPrompt": "a cat"
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:ig_1:d296b9a912af17baa2e53542b4fb709122a20dca1c9650cd209b81cf87f692de:tool_call:ig_1"
+  },
+  {
+    "event_kind": "tool_result",
+    "actor": "tool",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ig_1",
+      "content": "{\"status\":\"completed\",\"result\":\"base64…\",\"revisedPrompt\":\"a cat\"}",
+      "isError": false
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:ig_1:d296b9a912af17baa2e53542b4fb709122a20dca1c9650cd209b81cf87f692de:tool_result:ig_1"
+  }
+]

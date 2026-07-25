@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "user_prompt",
+    "actor": "user",
+    "harness": "codex",
+    "payload": {
+      "text": "hello from user"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:msg_hellofromuser:994a445dd02e40473d2f294f51914f5fb0890ddc232d817d6e80b936cb531eda:user_prompt"
+  }
+]

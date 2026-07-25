@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "assistant_thinking",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "text": "thinking aloud"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:rs_1:9b72b2893fad2f0ccc98c4c7b893a93fac109657d6cbe4abbda36616231b5800:assistant_thinking"
+  }
+]

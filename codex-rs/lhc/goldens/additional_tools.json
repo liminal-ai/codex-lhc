@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "runtime_note",
+    "actor": "system",
+    "harness": "codex",
+    "payload": {
+      "text": "additional_tools [{\"name\":\"extra\"}]"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:71c3c8d356f924307423d8591178e1fbe27fe50e18379b06b53fb9cb1f7e405c:0:runtime_note"
+  }
+]

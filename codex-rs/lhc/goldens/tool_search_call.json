@@ -1,0 +1,17 @@
+[
+  {
+    "event_kind": "tool_call",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "ts_1",
+      "toolName": "tool_search",
+      "arguments": {
+        "query": "web",
+        "__hostRaw": "{\"query\":\"web\"}"
+      }
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:195f4284cc0edf037853608dcbe3b410d9b30ae29afc08a8a425033e4233586d:0:tool_call:ts_1"
+  }
+]

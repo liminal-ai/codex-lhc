@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "runtime_note",
+    "actor": "system",
+    "harness": "codex",
+    "payload": {
+      "text": "agent_message author=agent-a recipient=agent-b parts=[{\"type\":\"input_text\",\"text\":\"handoff\"}]\nhandoff"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:23b7c2ab905d8aeab46599e2c825592648cee5cae51dd7f6fd4f86b42065a1c3:0:runtime_note"
+  }
+]

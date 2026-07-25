@@ -1,0 +1,74 @@
+diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
+index c394c8ad81..a6e7467449 100644
+--- a/codex-rs/app-server/src/extensions.rs
++++ b/codex-rs/app-server/src/extensions.rs
+@@ -113,6 +113,27 @@ where
+                 .enabled(codex_features::Feature::SkillSearch),
+         },
+     );
++    // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default OFF).
++    // TUI and exec both ride the in-process app-server, so this site covers the main frontends.
++    // Model/thinking labels feed the free ConfigContributor seam (G1 / F15).
++    codex_lhc_host::install(
++        &mut builder,
++        |config: &Config| config.features.enabled(codex_features::Feature::LhcCapture),
++        |config: &Config| {
++            config
++                .model
++                .clone()
++                .unwrap_or_else(|| "unknown".to_string())
++        },
++        |config: &Config| {
++            config
++                .model_reasoning_effort
++                .as_ref()
++                .map(|e| e.to_string())
++                .unwrap_or_else(|| "none".to_string())
++        },
++        |config: &Config| Some(config.cwd.to_string_lossy().into_owned()),
++    );
+     Arc::new(builder.build())
+ }
+ 
+@@ -288,6 +309,41 @@ mod tests {
+ 
+     use super::*;
+ 
++    /// H3: production registration site. Fails if `codex_lhc_host::install(...)`
++    /// is removed from `thread_extensions` (only LHC registers raw-item
++    /// contributors today). Building through the real path, not a hand-built
++    /// registry.
++    #[test]
++    fn thread_extensions_registers_lhc_raw_item_contributor() {
++        // Structural proof: the production function body must call install.
++        // A confirmer's `if false { install(...) }` still leaves the call
++        // token — so also require that install is not the sole content of a
++        // disabled block by checking the live call is at statement level.
++        let src = include_str!("extensions.rs");
++        let start = src
++            .find("pub(crate) fn thread_extensions")
++            .expect("thread_extensions must exist");
++        let body = &src[start..];
++        let end = body
++            .find("\npub(crate) fn app_server_extension_event_sink")
++            .or_else(|| body.find("\n#[cfg(test)]"))
++            .unwrap_or(body.len().min(4000));
++        let body = &body[..end];
++        assert!(
++            body.contains("codex_lhc_host::install("),
++            "thread_extensions must call codex_lhc_host::install — host seam otherwise dark (H3)"
++        );
++        // Reject wrapping the only install in `if false { ... }`.
++        let install_pos = body.find("codex_lhc_host::install(").unwrap();
++        let before = &body[..install_pos];
++        let window = before.chars().rev().take(80).collect::<String>();
++        let window: String = window.chars().rev().collect();
++        assert!(
++            !window.contains("if false"),
++            "codex_lhc_host::install must not be gated behind `if false` (H3)"
++        );
++    }
++
+     #[tokio::test]
+     async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
+         let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);

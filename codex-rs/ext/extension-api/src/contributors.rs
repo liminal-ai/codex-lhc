@@ -14,6 +14,7 @@ use crate::ExtensionData;
 mod context;
 mod mcp;
 mod prompt;
+mod raw_item; // LHC-HOOK 2/8: additive RawItemContributor module
 mod skill_invocation;
 mod thread_lifecycle;
 mod tool_lifecycle;
@@ -26,6 +27,9 @@ pub use mcp::McpServerContribution;
 pub use mcp::McpServerContributionContext;
 pub use prompt::PromptFragment;
 pub use prompt::PromptSlot;
+pub use raw_item::RawItemContributor; // LHC-HOOK
+pub use raw_item::RawItemInput; // LHC-HOOK
+pub use raw_item::RawItemProvenance; // LHC-HOOK
 pub use skill_invocation::SkillInvocationInput;
 pub use skill_invocation::SkillInvocationKind;
 pub use thread_lifecycle::ThreadIdleInput;

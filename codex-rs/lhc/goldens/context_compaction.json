@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "runtime_note",
+    "actor": "system",
+    "harness": "codex",
+    "payload": {
+      "text": "ctx-compact-blob"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:b8529a1f8398c6317dc54193883b835d43edb69f8073d0a1b9316bec1dfffbc9:0:runtime_note:context_compaction"
+  }
+]

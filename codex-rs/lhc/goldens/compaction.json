@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "runtime_note",
+    "actor": "system",
+    "harness": "codex",
+    "payload": {
+      "text": "compaction-ciphertext"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:75c2351db1b155615876c4e850c192fc86e481386e8b4238d01a60cf18519cb7:0:runtime_note:compaction"
+  }
+]

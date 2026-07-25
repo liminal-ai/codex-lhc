@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "assistant_text",
+    "actor": "assistant",
+    "harness": "codex",
+    "payload": {
+      "text": "hello from assistant"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:msg_asst:7930adca1220f2ab897845b9f23a9077cade8c6d1d9920bd92594fc46e396b64:assistant_text"
+  }
+]

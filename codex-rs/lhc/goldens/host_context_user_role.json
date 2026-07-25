@@ -1,0 +1,12 @@
+[
+  {
+    "event_kind": "runtime_note",
+    "actor": "system",
+    "harness": "codex",
+    "payload": {
+      "text": "RolloutBudgetContext"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:id:msg_ctx:929293c4ac9a76883e6093eec17ca18a2e79fc8dd002a46465f2c8ea927884bf:runtime_note"
+  }
+]

@@ -9,6 +9,7 @@ use crate::ExtensionData;
 use crate::ExtensionEventSink;
 use crate::McpServerContributor;
 use crate::NoopExtensionEventSink;
+use crate::RawItemContributor;
 use crate::SkillInvocationContributor;
 use crate::ThreadLifecycleContributor;
 use crate::TokenUsageContributor;
@@ -32,6 +33,8 @@ pub struct ExtensionRegistryBuilder<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
+    // LHC-HOOK 2/8: additive raw-item contributor list (upstreamable).
+    raw_item_contributors: Vec<Arc<dyn RawItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
@@ -51,6 +54,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
             tool_contributors: Vec::new(),
             tool_lifecycle_contributors: Vec::new(),
             turn_item_contributors: Vec::new(),
+            raw_item_contributors: Vec::new(), // LHC-HOOK 2/8
         }
     }
 }
@@ -140,6 +144,12 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
         self.turn_item_contributors.push(contributor);
     }
 
+    /// Registers one raw-item contributor.
+    // LHC-HOOK 2/8: builder method for RawItemContributor (additive).
+    pub fn raw_item_contributor(&mut self, contributor: Arc<dyn RawItemContributor>) {
+        self.raw_item_contributors.push(contributor);
+    }
+
     /// Finishes construction and returns the immutable registry.
     pub fn build(self) -> ExtensionRegistry<C> {
         ExtensionRegistry {
@@ -156,6 +166,7 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
             tool_contributors: self.tool_contributors,
             tool_lifecycle_contributors: self.tool_lifecycle_contributors,
             turn_item_contributors: self.turn_item_contributors,
+            raw_item_contributors: self.raw_item_contributors, // LHC-HOOK 2/8
         }
     }
 }
@@ -174,6 +185,8 @@ pub struct ExtensionRegistry<C: Sync> {
     tool_contributors: Vec<Arc<dyn ToolContributor>>,
     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
+    // LHC-HOOK 2/8: additive raw-item contributor list (upstreamable).
+    raw_item_contributors: Vec<Arc<dyn RawItemContributor>>,
     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
 }
 
@@ -256,6 +269,12 @@ impl<C: Sync> ExtensionRegistry<C> {
     /// Returns the registered ordered turn-item contributors.
     pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
         &self.turn_item_contributors
+    }
+
+    /// Returns the registered raw-item contributors.
+    // LHC-HOOK 2/8: accessor for RawItemContributor list.
+    pub fn raw_item_contributors(&self) -> &[Arc<dyn RawItemContributor>] {
+        &self.raw_item_contributors
     }
 }
 

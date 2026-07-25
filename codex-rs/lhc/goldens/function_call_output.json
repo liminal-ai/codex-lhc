@@ -1,0 +1,13 @@
+[
+  {
+    "event_kind": "tool_result",
+    "actor": "tool",
+    "harness": "codex",
+    "payload": {
+      "toolCallId": "fc_1",
+      "content": "fn main() {}"
+    },
+    "extra": {},
+    "idempotency_key": "codex:golden-thread:anon:f6842629cbe912b1f2a5a7687c53d00ea2d37cd7707831196265064076199b39:0:tool_result:fc_1"
+  }
+]
