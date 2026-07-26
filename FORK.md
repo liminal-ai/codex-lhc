@@ -62,7 +62,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
 | 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget | (with 0007) |
-| 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated) | (with 0007) |
+| 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
 | 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot before the `on_thread_idle` fan-out (background drain pump) | (with 0007) |
@@ -78,7 +78,7 @@ and a test module, not seams). They were missing from every patch until Chunk 3
 round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing is
 a legitimate combination; fork-owned and *not in any patch* is not.
 
-Expected markers: **38** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **39** (`EXPECTED_HOOKS` in the tripwire script).
 
 Rule: any commit that adds/changes an `LHC-HOOK` line updates, in the
 SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.

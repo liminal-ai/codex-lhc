@@ -9,9 +9,11 @@ is in §7 (not exercised) or §8 (ceilings), named plainly. Where a measurement
 contradicted an expectation — including one of mine — the measurement is what
 is written down.
 
-**Chunk 3 was split.** Phase A (this document) is everything that costs no
-model quota. Phase B — every run that calls `gpt-5.6-luna` for real — was
-**not run**; it is costed in §6 and awaits Lee's budget ruling.
+**Chunk 3 was split.** Phase A is everything that costs no model quota. Of
+Phase B, **only run B3 was authorised and only B3 was run** — the real per-call
+latency measurement that settles carried gap 2. Actual spend **63,838 tokens**
+against a 69k authorisation and a 100k hard stop. B1, B2, B4, B5 and B6 remain
+unrun and still costed in §6.
 
 Phase A ran in two rounds. Round 8 certified and found defects; **round 9 fixed
 three of them under instruction** — the patch series (N1), tripwire layer 13
@@ -23,9 +25,9 @@ that the after is not vacuous.
 
 ## 1. Headline
 
-Phase A ran in two rounds. Round 8 found the defects; **round 9 fixed two of
-them under instruction** (N1/N2: the patch series and tripwire layer 13; N3:
-turn cancellation). This section reflects the state *after* round 9.
+Four rounds: 8 certified and found defects, 9 fixed three of them under
+instruction, **B3** spent the one authorised live run, and 10 acted on what B3
+found. This reflects the state after all four.
 
 | | |
 |---|---|
@@ -34,22 +36,29 @@ turn cancellation). This section reflects the state *after* round 9.
 | Upstream sync drill, hooks live | **Ran, clean.** Zero conflicts — but the window was 3 commits / 9 h. §4.3 |
 | Turn abort stops derivation | **FIXED (N3).** Was 3 calls at abort → 12 by 500 ms, history rewritten, marker committed. Now 1 → 1, nothing installed. §4.4 |
 | Carried gap 1 (M1 core-level measurement) | **SETTLED**, with numbers. §3.1 |
-| Carried gap 2 (real per-call latency) | **Half settled offline** — per-call *input size* now measured; latency still needs Phase B. §3.2, §6 |
+| Carried gap 2 (real per-call latency) | **SETTLED — and the bounds do NOT hold.** Measured 1,660 ms/call on `gpt-5.6-luna`; a first compact at H=40k needs ~103 s against a **75 s** drain budget. §3.5 |
 | KV / prefix-cache impact | **MEASURED**: a compact invalidates **100%** of the prefix. §3.4 |
 | Resume / fork / abort | **Exercised offline**, all three. §3.3 |
-| Real compacts on `gpt-5.6-luna` (≥3), live auth lane | **NOT RUN** — Phase B, blocked on budget ruling. §6, §7 |
+| Phase B | **B3 run** (63,838 tokens actual vs 69k authorised). B1/B2/B4/B5/B6 **not run**. §6 |
+| Per-call token cost | **Was 4.7x underestimated; now FIXED (P1).** Derivation shipped Codex's full 20,903-char agent prompt on every call. Removed — projected **7.2x** cheaper per call. §3.6 |
 
-Would I use it for real work? §9. Round 9 removed both of the two things I said
-I would fix or watch most closely; what remains is the idle-tick-rate question
-and an unrehearsed conflicting sync.
+Would I use it for real work? §9 — **answer changed by B3.** Rounds 8-9 left me
+saying yes with three things to watch. B3 measured one of them and it is worse
+than assumed: the compact-time derivation budget is insufficient at realistic
+history sizes, so first compacts above ~29k tokens of history fail open to
+native compaction. That is not a crash and not data loss, but it means the
+feature does not do its job on exactly the threads it exists for, until someone
+rules on it. §5.5 escalates; per instruction I did not redesign the timeout or
+the pump.
 
 ---
 
 ## 2. What changed in this working tree
 
 Round 8 was certification only — six tests, no production change. Round 9
-changed production behaviour once, under instruction: N3, propagating turn
-cancellation into the compact arm. Sentinels 36 → **38**.
+changed production behaviour once under instruction (N3, turn cancellation into
+the compact arm); round 10 once more (P1, dropping the agent prompt from
+derivation requests). Sentinels 36 → 38 → **39**.
 
 | File | Change |
 |---|---|
@@ -60,7 +69,8 @@ cancellation into the compact arm. Sentinels 36 → **38**.
 | `codex-rs/core/src/tasks/compact.rs` | **N3**: binds `cancellation_token` (was `_cancellation_token`) and passes it |
 | `codex-rs/core/src/session/turn.rs` | **N3**: `run_auto_compact` gains a `cancellation_token` parameter; 4 call sites |
 | `codex-rs/core/src/session/lhc_band_shape_eval_tests.rs` | call-site update for the new arm signature |
-| `scripts/check-lhc-hooks.sh` | **N2**: layer 13 rewritten; `EXPECTED_HOOKS` 36 → 38 |
+| `codex-rs/core/src/lhc_inference_bridge.rs` | **P1**: `derivation_prompt()` sets every `Prompt` field explicitly; `base_instructions` empty, never defaulted. Two offline tests |
+| `scripts/check-lhc-hooks.sh` | **N2**: layer 13 rewritten; `EXPECTED_HOOKS` 36 → 38 → 39 |
 | `patches/lhc/0001..0007`, `patches/lhc/BASE`, `patches/lhc/README.md` | **N1**: whole series regenerated from one base |
 | `FORK.md` | inventory rows 18-23; sync record; history-reset section rewritten |
 
@@ -127,7 +137,14 @@ remembering:** at 8 items/tick the pump needs roughly **one idle tick per 1.5
 conversation turns** to keep up. Below that rate the compact still pays the
 balance, and M1's protection is partial rather than absent.
 
-### 3.2 Carried gap 2 — per-call cost. Input measured; latency still open.
+### 3.2 Per-call cost, offline. **Superseded on the token axis by §3.5.**
+
+> Read with §3.5. The offline profile below is correct about *content* size and
+> call count, and it was **optimistic by 6.8x on total tokens**, because stub
+> callbacks send no prompt and so could not see the ~4.4k base-instruction
+> overhead every real call carries. The call-count and excerpt-size findings
+> survive; the "total derivation input ≈ 1x history" finding does not.
+
 
 Chunk 2's timeout arithmetic multiplied an assumed latency by a call count.
 The *other* factor is input tokens per call, and that is measurable offline
@@ -161,9 +178,8 @@ calls, so `summarize_tool_result` shows zero; a real session with tool use adds
 that kind entirely. Both are reasons C1 asks for *real tool use*, and both are
 priced conservatively in §6.
 
-Latency per call remains **unmeasured**. It cannot be obtained offline, and it
-is the factor that decides whether the 120 s bound holds. It is the primary
-purpose of Phase B run B3.
+Latency per call cannot be obtained offline. It was the primary purpose of run
+B3 and is now measured — **§3.5**. The answer is that the bounds do not hold.
 
 ### 3.3 Resume, fork, abort
 
@@ -248,6 +264,201 @@ written so that if LHC ever gains a cache-preserving prefix, the test tells the
 reader this document is now wrong.
 
 ---
+
+### 3.5 Carried gap 2 — real per-call latency. SETTLED. **The bounds do not hold.**
+
+Run B3, the only authorised Phase B run. Real production path
+(`try_run_lhc_compact_arm`), feature on, real `ModelClient`, ChatGPT auth
+(`auth_mode=Chatgpt`), pinned model **`gpt-5.6-luna`**, resolved effort
+**`low`** — luna advertises `low|medium|high|xhigh|max`, so
+`resolve_lhc_derivation_effort` correctly takes the minimum supported rather
+than `None`.
+
+**Bounded by input size, verified before spending:** history grown turn by turn
+and measured, `H = 40,568` tokens over 32 turns (target 40,000 ± 4,000). The
+run refuses to start otherwise.
+
+#### What it measured
+
+| Kind | n | min | median | max |
+|---|---|---|---|---|
+| `compress_detailed_turn` | 6 | 1,534 ms | **2,132 ms** | 2,483 ms |
+| `smooth_prompt` | 4 | 996 ms | **1,174 ms** | 1,329 ms |
+| `summarize_chunk_brief` | 0 | — | — | — |
+| `summarize_tool_result` | 0 | — | — | — |
+| **all** | **10** | | **1,660 ms mean** | |
+
+* **`max_inflight` = 1**, confirmed against the real client — question 4
+  answered. Serial call time 16,597 ms against an arm wall clock of 17,468 ms:
+  **95% of the arm's elapsed time is serialised inference.** Serialisation is
+  what makes the deadline arithmetic bite, and it does.
+* Tokens: input 59,019 (of which **cached 44,800 — 76%**), output 416.
+
+#### Do the bounds hold? No.
+
+Phase A measured 1 derivation call per 650 tokens of history, so `H = 40,568`
+needs **~62 calls**. Serialised at the measured mean:
+
+```
+62 calls x 1.660 s = 102.9 s
+```
+
+* against `DRAIN_TIME_BUDGET` = **75 s** → **exceeded by 37%**;
+* against `COMPACT_THREAD_TIMEOUT` = 120 s → under, but the drain budget bites
+  first and fails open before the timeout is reached.
+
+The conclusion is robust across the whole plausible range, which matters
+because only two of four call kinds were sampled:
+
+| Assumption for the ~52 unsampled calls | Total | vs 75 s |
+|---|---|---|
+| all at `smooth_prompt` median (1,174 ms) — optimistic | 77.6 s | still over |
+| at the measured mean (1,660 ms) | 102.9 s | over by 37% |
+| all at `compress_detailed_turn` median (2,132 ms) — pessimistic | 127.5 s | over 120 s too |
+
+**Even the optimistic bound exceeds the 75 s drain budget.** Solving for the
+largest history whose first compact fits: `75 s / 1.660 s = 45 calls`, i.e.
+**H ≈ 29,000 tokens**. Above that, a first compact fails open to the native
+ladder. Threads big enough to need LHC compaction are precisely the ones where
+it declines — the exact failure the M1 idle pump was built to prevent.
+
+Escalated in §5.5. Per instruction I did not touch the timeout or the pump.
+
+#### Does the idle pump change the answer? Partly, and it costs more than assumed.
+
+Phase A's "~1 idle tick per 1.5 turns" was a *count* derived with stub latency.
+With real latency the binding constraint becomes wall clock. Of 294 work items
+on a 60-turn thread, 117 were inference-bearing (40%), so a full 8-item tick is
+~3.2 real calls ≈ **5.3 s of background inference per idle tick**.
+
+The pump runs detached, so it never blocks a turn — but it is single-flight, so
+a tick that is still running when the next idle fires is simply skipped. The
+count stays right; the requirement it implies is new: **the user must be idle
+for ~5 s at a time, roughly once per 1.5 turns.** In unhurried use that holds.
+In fast interactive bursts it does not, derivation falls back to compact time,
+and compact time is where the 75 s budget is already insufficient above
+H ≈ 29k. The two findings compound rather than cancel.
+
+#### The cost model in §6 was wrong by 4.7x — **cause removed in §3.6**
+
+The pre-flight — one call, 55 characters of content — cost **4,392 input
+tokens**. The bridge builds `Prompt { input, ..Default::default() }` and
+`BaseInstructions::default()` is Codex's full base prompt: **20,903 characters,
+~5.2k tokens, on every derivation call**, for a task that needs none of it.
+
+§6 modelled derivation input as ~1x H (content only), which is what Phase A's
+offline harness could see — the stubs never sent a prompt. Recomputed from
+measurement, a *complete* H=40k run needs 62 calls x ~5,943 tokens ≈ **368k
+tokens: 5.3x the 69k estimate and 3.7x the 100k hard stop.**
+
+That is why this run is **truncated by design**. The budget guard refused
+further calls at 59,435 tokens and LHC failed derivation
+(`chunk_summary_brief: B3 budget guard`), the arm failed open, and what landed
+is a real partial measurement inside budget. Latency per call does not depend on
+H, so a truncated run still settles gap 2 — and the truncation itself produced
+the token finding, which is arguably the more consequential of the two.
+
+**76% of input was cached** (44,800 of 59,019), so the *billed* cost was far
+below the raw token count — the base instructions prefix-cached after the first
+call. The token ceiling was still what it was. Both numbers are reported because
+they answer different questions.
+
+Round 10 removed the cause (§3.6): the agent prompt is no longer sent, projected
+**7.2x** cheaper per call. That also retires most of the caching benefit, since
+the cached prefix *was* the agent prompt — a smaller uncached request is still
+far cheaper than a large mostly-cached one, but the two effects should not be
+added together.
+
+#### Limits of this measurement
+
+* 10 samples, two of four kinds. `summarize_chunk_brief` and
+  `summarize_tool_result` were never sampled — the guard fired on the first
+  chunk-brief item. The bounds conclusion is stated across the full range above
+  precisely because of this.
+* One run, one time of day, one network path. No variance across sessions.
+* The extrapolation to 62 calls uses Phase A's calls-per-token ratio, measured
+  offline; the live ratio was not independently confirmed.
+* Measurement scaffolding (timing/token/concurrency instrumentation in
+  `lhc_inference_bridge.rs`, plus a real-`AuthManager` session builder) was
+  **removed after the run**. A stale budget guard left in the production
+  derivation path could silently refuse calls, which is a worse defect than the
+  one it measured. Re-running B3 means re-adding it; the method is described
+  above in enough detail to reconstruct.
+
+### 3.6 P1 — derivation no longer ships Codex's agent prompt
+
+B3's most consequential finding was incidental to its purpose: a 55-character
+derivation prompt cost **4,392 input tokens**. The bridge built
+`Prompt { input, ..Default::default() }`, and `Prompt::default()` sets
+`base_instructions: BaseInstructions::default()` =
+`BASE_INSTRUCTIONS_DEFAULT` — **20,903 characters** of Codex's coding-agent
+prompt: apply_patch conventions, sandbox and approval rules, tool protocol.
+All of it, on every call, to ask a pinned model to compress a conversation turn.
+
+**Fixed.** `derivation_prompt()` now sets every field explicitly and never
+defaults `base_instructions`.
+
+Audit of the other `Prompt::default()` fields, since the same route could have
+carried more agent surface — three were already correct, one changed:
+
+| Field | Default | For derivation | Action |
+|---|---|---|---|
+| `base_instructions` | `BASE_INSTRUCTIONS_DEFAULT` (20,903 ch) | wrong — agent prompt | **set empty** |
+| `tools` | `Vec::new()` | correct — no tool surface | pinned explicitly |
+| `parallel_tool_calls` | `false` | correct | pinned explicitly |
+| `output_schema` | `None` | correct | pinned explicitly |
+| `output_schema_strict` | **`true`** | inert with no schema, but "strict" defaulted on is not a default to inherit silently | set `false` |
+
+**Empty rather than a short instruction string**, and this is provable rather
+than hopeful: `gpt-5.6-luna` is a `use_responses_lite` model, and on that path
+(`client.rs`) the request's `instructions` field is `String::new()` regardless,
+while `base_instructions` rides as a *prepended developer message only when
+non-empty*. Empty therefore deletes the message and adds nothing. Recorded in
+the code: if derivation ever moves to a non-lite model, `instructions: ""`
+would reach the wire directly and needs re-checking against the provider.
+
+One residue remains and is not the fork's to remove: on the lite path
+`client.rs` prepends an `AdditionalTools` developer item **unconditionally**,
+even with an empty tool list. It is a few tokens; it is upstream's shape.
+
+Verified offline, from the payload the bridge actually builds
+(`derivation_prompt`), not a fixture: instruction text under 1,000 chars, free
+of three distinctive `BASE_INSTRUCTIONS_DEFAULT` markers, no tools, and input
+exactly equal to the content being derived. A second test asserts those markers
+still occur in the real agent prompt, so the first cannot pass vacuously.
+Mutation: restoring `..Default::default()` fails with
+`got 20903 chars`.
+
+#### Projected cost model — **arithmetic, not measurement**
+
+No live call was made this round. Per-call input, using B3's measured 4,392
+fixed overhead, Phase A's measured 649-token mean content, and a generous
+50-token allowance for the residual lite-path envelope:
+
+| | before | after | factor |
+|---|---|---|---|
+| input tokens per derivation call | 5,041 | **699** | **7.2x cheaper** |
+
+Applied to §6's runs at their specified sizes:
+
+| Run | before | after |
+|---|---|---|
+| B1 — 3 compacts, H=40k | 982,026 | **174,414** |
+| B2 — auth lane, H=12k | 95,178 | **17,022** |
+| B3 — latency, H=40k (complete) | 327,342 | **58,138** |
+| B4 — KV billing, H=25k | 200,808 | **35,812** |
+| B5 — band eval, H=30k | 242,986 | **43,254** |
+| B6 — `model_change`, no derivation | 2,960 | 2,960 |
+| **all six** | **1,851,300** | **331,600** |
+
+Two things follow. **B2, B4 and B5 come back inside a ~50k envelope**, and B3
+as originally specified would now fit its 69k estimate — the estimate was
+right about everything except the prompt nobody had measured. B1 remains large
+because it is three compacts of a 40k history; halving it to 2 compacts at
+H=25k lands near 87k.
+
+These are projections from two measured constants. The first live call after
+this change replaces them with a number.
 
 ## 4. C2 — sync drill, recovery drill, and the abort fix
 
@@ -461,6 +672,47 @@ paying it for ~2 calls per turn. Fixed under N3 — see §4.4.
 
 No live run was made. §6.
 
+### 5.5 The compact-time derivation budget is insufficient — **open with Lee**
+
+Stated in three registers, kept separate on purpose.
+
+**Measured (run B3, 10 real calls on `gpt-5.6-luna` at effort `low`):**
+
+* 1,660 ms mean per derivation call; `compress_detailed_turn` median 2,132 ms,
+  `smooth_prompt` median 1,174 ms.
+* **`max_inflight` = 1** against the real client — derivation is serialised.
+* **95%** of the arm's elapsed time was serialised inference (16,597 ms of
+  16,597/17,468 ms wall).
+* Therefore, at Phase A's measured 1 call per 650 tokens of history:
+  **62 calls x 1.660 s = 102.9 s** for H = 40,568, against a **75 s**
+  `DRAIN_TIME_BUDGET` — over by 37%. Even the optimistic bound (all remaining
+  calls at `smooth_prompt` speed) is 77.6 s, still over. The pessimistic bound,
+  127.5 s, also exceeds the 120 s `COMPACT_THREAD_TIMEOUT`.
+* Ceiling: **H ≈ 29,000 tokens.** Above that a first compact fails open to the
+  native ladder.
+
+**An upper bound on latency, not a clean measurement.** Every one of those 10
+calls carried the 4,392-token agent prompt that P1 has since removed (§3.6).
+A request whose input is ~7x smaller may well complete faster. So the 1,660 ms
+figure bounds derivation latency from above; it does not isolate it.
+
+**Unknown.** Whether P1 moves the bound is **unmeasured**. It would need a
+second live run, which is not authorised, and I did not run one. It is
+plausible that lower latency narrows or closes the 102.9 s vs 75 s gap; it is
+equally possible that latency is dominated by model time-to-first-token and
+reasoning rather than input size, in which case P1 changes cost and not
+schedule. **Nothing here should be read as "P1 fixes the bounds."**
+
+Compounding, and unaffected by P1: an idle-pump tick costs ~5.3 s of real
+inference and is single-flight, so the pump only keeps up if the user is idle
+in ~5 s stretches roughly once per 1.5 turns.
+
+Three levers exist and all three are rulings, not fixes for me to invent:
+raise or rework the drain budget, make derivation concurrent (`max_inflight`
+is 1), or re-measure after P1 and see where the number actually lands. **Per
+instruction I did not redesign the timeout or the pump.** Reporting and
+stopping.
+
 ### 5.4 Carried, not escalated
 
 Two Chunk 2 gaps remain live-only and are not in the Phase B plan because they
@@ -497,11 +749,46 @@ model, not measurements — B3 replaces them with measurements.
 |---|---|---|---|---|---|---|---|---|
 | **B1** | ≥3 real compacts, one session, real tool use; per-compact source events / body items / tokens before-after / band composition | 40 k, 40 k, 40 k | 3 | ~95 | ~230 | 162 k | 44 k | **206 k** |
 | **B2** | Auth-lane confirmation in a live session: derivation rides `gpt-5.6-luna`, not the turn model | 12 k | 1 | ~10 | ~23 | 16 k | 4 k | **20 k** |
-| **B3** | **Real per-call latency (gap 2)** — wall-clock per call by kind, and whether 117 calls fit under 120 s / 75 s | 40 k | 1 | ~32 | ~77 | 54 k | 15 k | **69 k** |
+| ~~**B3**~~ | **DONE** — real per-call latency (gap 2). Truncated by its own guard; see §3.5 | 40.5 k | 1 | 32 | **10** | **59,019** (44,800 cached) | **416** | **59,435** |
 | **B4** | KV/prefix-cache billing: `cached_input_tokens` on the two turns after a compact | 25 k | 1 | ~20 | ~48 | 34 k | 9 k | **43 k** |
 | **B5** | Live band-shape eval (`lhc_band_shape_eval_*`, built in Chunk 2a, never run) | 30 k | 1 | ~24 | ~58 | 40 k | 11 k | **51 k** |
 | **B6** | `model_change` on a real mid-thread `/model` switch (FORK.md checkpoint) | 8 k | 0 | ~6 | 0 | 8 k | 2 k | **10 k** |
 | | | | | | **~436** | **314 k** | **85 k** | **~399 k** |
+
+**B3 actual: 59,435 tokens for the run + 4,403 for a one-call pre-flight =
+63,838 total**, against a 69k authorisation and a 100k hard stop. Under both.
+
+But the estimate was right only by accident of truncation. §3.5 shows a
+*complete* B3 would have cost ~368k — **5.3x its estimate**. The whole §6 table
+below is built on the same broken assumption (derivation input ≈ 1x H) and is
+therefore **low by roughly 5x across every remaining run**. Corrected rough
+totals, using the measured ~5,943 tokens/call:
+
+| Run | old estimate | corrected |
+|---|---|---|
+| B1 (3 compacts, H=40k each) | 206 k | **~1.1 M** |
+| B2 (auth lane, H=12 k) | 20 k | **~110 k** |
+| B4 (KV billing, H=25 k) | 43 k | **~230 k** |
+| B5 (band-shape eval, H=30 k) | 51 k | **~275 k** |
+| B6 (`model_change`, no compacts) | 10 k | ~10 k (unchanged — no derivation) |
+
+**As of round 8 none of B1/B2/B4/B5 was affordable as specified.**
+
+**Round 10 removed the cause.** P1 (§3.6) drops the agent prompt from every
+derivation request, projected 7.2x cheaper per call. Recomputed — arithmetic on
+two measured constants, not a new measurement:
+
+| Run | round-8 corrected | **post-P1 projection** |
+|---|---|---|
+| B1 (3 compacts, H=40k) | ~1.1 M | **174 k** |
+| B2 (auth lane, H=12k) | ~110 k | **17 k** |
+| B4 (KV billing, H=25k) | ~230 k | **36 k** |
+| B5 (band-shape eval, H=30k) | ~275 k | **43 k** |
+| B6 (`model_change`) | ~10 k | ~3 k |
+
+**B2, B4 and B5 are back inside a ~50k envelope.** B1 stays large because it is
+three compacts of a 40k history; 2 compacts at H=25k lands near 87k. The first
+live call after P1 replaces these projections with a number.
 
 **Every run except B2 and B6 exceeds the ~50 k stop-and-ask bound, and the
 chunk total is ~8× it. I am therefore not running any of them, and this table
@@ -532,13 +819,24 @@ Notes for whoever rules on this:
 An honest gap list is worth more than a claim of completeness, and every prior
 round of this project that concealed a gap cost a round to undo.
 
-1. **No live model call was made.** Zero. All C1 results above are on
-   deterministic offline callbacks through production entry points. The ≥3 real
-   compacts, the live auth-lane confirmation, and the real latency measurement
-   are Phase B and were not run.
-2. **Real per-call latency (carried gap 2) remains unmeasured.** §3.2 measured
-   the input-size factor; the latency factor is unobtainable offline. The 120 s
-   bound and 75 s drain budget remain justified by arithmetic.
+1. **Only run B3 was live.** 10 real calls, 63,838 tokens. Everything else in
+   §3 is deterministic offline callbacks through production entry points. The
+   ≥3 real compacts (B1), the live auth-lane confirmation in a real session
+   (B2), KV billing (B4), band-shape eval (B5) and `model_change` (B6) were
+   **not run** — and §6 now shows four of them are unaffordable as specified.
+2. **B3 itself is partial.** 10 samples, two of four call kinds; no
+   `summarize_chunk_brief` or `summarize_tool_result` latency. One run, one
+   network path, no variance data. §3.5 states the bounds conclusion across the
+   full plausible range for exactly this reason.
+3. **No compact was ever observed to complete on the live lane.** B3 was
+   truncated by budget, so the end-to-end "real compact installs a real body
+   derived by gpt-5.6-luna" event has still never been witnessed. That is B1.
+4. **P1 is unverified on the wire.** §3.6 asserts the `Prompt` the bridge
+   builds, offline. That the resulting HTTP request is correspondingly smaller,
+   that `gpt-5.6-luna` accepts a request with no base instructions, and that
+   derivation output quality is unchanged without them, are all **unmeasured** —
+   no live call was authorised this round. The lite-path reasoning in §3.6 is
+   read from `client.rs`, not observed.
 3. **The sync drill did not exercise conflict resolution.** 3 commits, 9 hours,
    zero hook files touched. §4.3's churn table is exposure measurement, not a
    substitute. A sync after a real gap — a week or more — has still never been
@@ -611,46 +909,54 @@ should be read as "this is as good as it gets without a different architecture".
 
 ## 9. Would I use this for real work?
 
-**Yes, with the feature on** — and I would watch three things.
+**Rounds 8-9: yes, with three things to watch. B3 changes that to: yes for
+short threads, no for the long ones the feature exists for — until §5.5 is
+ruled on.**
 
-What earns that: the compact arm is not a summariser wearing LHC's name. The
-body comes from `lhc.compact()` through the typed view; law 1 holds as
-structural equality under mutation; law 2 holds as a next-turn property through
-the production token-status path; both ladders are entered by tests that fail
-when their hooks are removed; and every path that cannot complete honestly —
-partial archive, zero reduction, derivation failure, timeout, cancel — fails
-open to the native ladder rather than installing something plausible. That
-last property is the one I would actually rely on day to day, and it is the one
-this unit found the most evidence for: every C1 path I drove that *could not*
-succeed (fork with nothing left to compact, resume with no history, abort
-mid-flight) declined cleanly instead of installing a partial result.
+That is a real change of answer and it comes from one measurement, so it is
+worth being precise about what did and did not change.
 
-Round 9 closed two of the three concerns round 8 raised — the recovery drill
-(§4.2) and post-abort spend (§4.4) are both fixed and mutation-proven. What
-remains to watch:
+What still earns confidence, unchanged: the compact arm is not a summariser
+wearing LHC's name. The body comes from `lhc.compact()` through the typed view;
+law 1 holds as structural equality under mutation; law 2 holds as a next-turn
+property through the production token-status path; both ladders are entered by
+tests that fail when their hooks are removed. And every path that cannot
+complete honestly fails open rather than installing something plausible — B3
+is itself another instance of that: the run blew its budget, derivation failed,
+and the arm declined cleanly instead of installing a half-derived body.
 
-1. **Idle-tick rate against turn rate.** §3.1's finding is the practical one:
-   the pump needs roughly one idle tick per 1.5 turns to keep up. A user who
-   works in fast bursts with no idle gaps gets the Chunk-2 behaviour — the whole
-   derivation backlog lands on the first compact, against a 120 s deadline whose
-   sufficiency is still arithmetic (§7.2). The failure mode is a fail-open, not
-   corruption, so it degrades to native compaction rather than breaking; but it
-   degrades silently.
-2. **The first upstream sync that actually conflicts.** §4.3 measured the
-   exposure as low (3 of 26 hook sites saw churn in 30 days), but the drill has
-   never resolved a conflict, and `session/mod.rs` takes 66 commits a month.
-   That sync is also the first test of the regenerate-and-move-`BASE` step the
-   series now depends on.
-3. **The unmeasured latency (§3.2).** Every claim that the 120 s bound holds is
-   still arithmetic. Phase B run B3 is the only thing that changes that, and it
-   is the run I would authorise first.
+What changed: I assumed the fail-open was a rare path. **It is the common path
+for any thread over ~29k tokens of history.** A 40.5k-token history needs ~103 s
+of serialised derivation against a 75 s budget (§3.5). So on a long thread, LHC
+captures everything faithfully, then declines to compact and hands over to
+native compaction — which is exactly the outcome the fork exists to replace.
+Nothing breaks, nothing is lost, and the archive stays complete and rebuildable;
+the feature just does not deliver its main benefit where it matters most.
 
-Nothing on this list now needs fixing before use. Round 8's one
-fix-before-relying-on-it — a recovery procedure that produced a non-compiling
-tree carrying a forbidden test — is closed, verified by running it rather than
-by reading the patches.
+For a thread under ~29k tokens it works as designed, and the capture and
+recovery machinery underneath is sound (§4.2).
 
----
+What I would watch, revised:
+
+1. **Whether a compact actually installs.** The arm logs
+   `NoReduction` / `DerivationFailed` / `timed out` on fail-open. On a long
+   thread, expect it. That log line is now the single most informative signal
+   about whether the feature is doing anything.
+2. **Idle-tick rate against turn rate**, now with wall clock attached: a tick
+   costs ~5.3 s of real inference and is single-flight. Fast bursts starve the
+   pump and push everything onto the insufficient compact-time budget.
+3. **The first upstream sync that actually conflicts** — also the first test of
+   the regenerate-and-move-`BASE` step the series now depends on.
+
+The one thing I would fix before relying on it for long threads: **§5.5.**
+
+Round 10 took the cheapest of its three levers under instruction — derivation no
+longer ships Codex's agent prompt (§3.6), projected 7.2x cheaper per call, and
+three of the five unrun Phase B runs come back inside budget. **That is a cost
+fix, and I am not claiming it is a schedule fix.** Whether smaller requests also
+run faster — and therefore whether the 102.9 s vs 75 s gap narrows at all — is
+unmeasured and needs a second live run. The other two levers, reworking the
+budget and making derivation concurrent, remain untouched and are Lee's call.
 
 ## 10. Mutation log — every new invariant, broken and restored
 
@@ -666,6 +972,8 @@ Per law 3: assertion of sensitivity is not evidence of sensitivity.
 | 5 | N3: arm passes `&CancellationToken::new()` instead of the turn's token (pre-N3 behaviour) | `c1_abort_mid_compact_…` FAILED: "derivation must stop within one drain batch of the abort — fired 156 more calls"; history 160 → 31, marker committed | ✓ |
 | 6 | N2/R3: drop `lhc_band_shape_eval_tests.rs` from `0007` | layer 13 FAILED: "fork-owned file(s) in NO patch — the drill would reconstruct upstream's version of these: codex-rs/core/src/session/lhc_band_shape_eval_tests.rs" | ✓ |
 | 7 | N1: edit `tasks/lifecycle.rs` without regenerating the series | layer 13 FAILED: "codex-rs/core/src/tasks/lifecycle.rs differs after the drill" + unified diff | ✓ |
+
+| 8 | P1: restore `..Default::default()` on the derivation `Prompt` | `p1_derivation_prompt_carries_no_agent_instructions` FAILED: "derivation instructions must stay tiny, got 20903 chars — `Prompt::default()` puts BASE_INSTRUCTIONS_DEFAULT (20903 chars) here" | ✓ |
 
 Mutations 6 and 7 are the two ways the recovery drill can rot — a fork-owned
 file falling out of the series, and the tree drifting from it. Both were live
@@ -692,7 +1000,12 @@ Verification sweep on this working tree, after round 9:
 | `cargo test -p codex-core --lib compact_lhc` | **25 passed**, 0 failed |
 | `cargo test -p codex-core --lib lhc_capture_e2e` | **8 passed**, 0 failed |
 | `cargo test -p codex-core --lib lhc_band_shape` | **2 passed**, 0 failed, 1 ignored (live band eval — Phase B) |
+| `cargo test -p codex-core --lib lhc_inference_bridge` | **8 passed**, 0 failed (incl. 2 new P1 tests) |
 | `cargo test -p codex-lhc-host --lib` | **45 passed**, 0 failed |
+
+B3's scaffolding was removed after the run (§3.5), so
+`lhc_inference_bridge.rs` and `session/tests.rs` are byte-identical to `HEAD`
+and the tripwire above is the round-9 tree, unchanged by Phase B.
 
 Nothing committed, nothing pushed. Drill worktrees left in place as evidence and
 are disposable: `/tmp/lhc-reset-v2` (§4.2, includes the compiled reconstruction)

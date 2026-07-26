@@ -2857,10 +2857,10 @@ index 0000000000..d9cee8bdbc
 +}
 diff --git a/codex-rs/core/src/lhc_inference_bridge.rs b/codex-rs/core/src/lhc_inference_bridge.rs
 new file mode 100644
-index 0000000000..269d2de116
+index 0000000000..9f14761d61
 --- /dev/null
 +++ b/codex-rs/core/src/lhc_inference_bridge.rs
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,617 @@
 +//! ModelClient → LHC [`InferenceCallbacks`] bridge (R2 / J1–J2).
 +//!
 +//! Production derivation always uses this bridge: pinned model
@@ -3057,9 +3057,37 @@ index 0000000000..269d2de116
 +    }
 +}
 +
-+async fn model_complete_text(ctx: &LiveInferCtx, text: &str) -> InferenceResult {
-+    let mut session = ctx.client.new_session();
-+    let prompt = Prompt {
++/// P1: the exact request payload a derivation call sends.
++///
++/// Split out so the payload can be asserted offline, from what the bridge
++/// actually builds, without spending a live call.
++///
++/// **`base_instructions` is set explicitly and must stay that way.**
++/// `Prompt::default()` fills it with `BASE_INSTRUCTIONS_DEFAULT` — Codex's
++/// coding-agent prompt: apply_patch conventions, sandbox and approval rules,
++/// tool protocol, 20,903 characters of it. Run B3 measured what that costs:
++/// **4,392 input tokens for a 55-character summarisation prompt**, ~6.8x the
++/// content being summarised, on every one of ~62 calls per compact. Derivation
++/// asks a pinned model to compress a conversation turn. It is not agent work
++/// and must not carry agent instructions.
++///
++/// Empty is the right value here rather than a short instruction string,
++/// because the pinned lane makes it provably a no-op: `gpt-5.6-luna` is a
++/// `use_responses_lite` model, and on that path (`client.rs`) the request's
++/// `instructions` field is `String::new()` regardless, while
++/// `base_instructions` rides as a prepended developer message *only when
++/// non-empty*. Empty therefore removes the message and sends nothing extra.
++///
++/// If the derivation model ever moves to a non-lite model, `instructions: ""`
++/// would reach the wire directly — re-check that the provider accepts it before
++/// making that change.
++///
++/// The other `Prompt::default()` fields were audited with it and are already
++/// correct for derivation: `tools` empty (no agent tool surface),
++/// `parallel_tool_calls` false, `output_schema` none. `output_schema_strict`
++/// defaults true but is inert with no schema.
++pub(crate) fn derivation_prompt(text: &str) -> Prompt {
++    Prompt {
 +        input: vec![ResponseItem::Message {
 +            id: None,
 +            role: "user".into(),
@@ -3069,8 +3097,20 @@ index 0000000000..269d2de116
 +            phase: None,
 +            internal_chat_message_metadata_passthrough: None,
 +        }],
-+        ..Default::default()
-+    };
++        // LHC-HOOK: never `..Default::default()` for this field — see above.
++        base_instructions: codex_protocol::models::BaseInstructions {
++            text: String::new(),
++        },
++        tools: Vec::new(),
++        parallel_tool_calls: false,
++        output_schema: None,
++        output_schema_strict: false,
++    }
++}
++
++async fn model_complete_text(ctx: &LiveInferCtx, text: &str) -> InferenceResult {
++    let mut session = ctx.client.new_session();
++    let prompt = derivation_prompt(text);
 +    let meta = CodexResponsesMetadata::new(
 +        ctx.installation_id.clone(),
 +        ctx.session_id.clone(),
@@ -3145,6 +3185,93 @@ index 0000000000..269d2de116
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
++
++    /// P1: a derivation request must not carry Codex's coding-agent prompt.
++    ///
++    /// Counted from the payload the bridge actually builds
++    /// ([`derivation_prompt`]), not a hand-made fixture. Restoring
++    /// `..Default::default()` for `base_instructions` fails this.
++    ///
++    /// Run B3 measured the cost of getting this wrong: 4,392 input tokens for
++    /// a 55-character prompt, ~62 calls per compact.
++    #[test]
++    fn p1_derivation_prompt_carries_no_agent_instructions() {
++        let content = "summarise this turn";
++        let prompt = derivation_prompt(content);
++        let instructions = &prompt.base_instructions.text;
++
++        assert!(
++            instructions.len() < 1_000,
++            "derivation instructions must stay tiny, got {} chars — \
++             `Prompt::default()` puts BASE_INSTRUCTIONS_DEFAULT ({} chars) here",
++            instructions.len(),
++            codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT.len()
++        );
++
++        // Distinctive opening line of BASE_INSTRUCTIONS_DEFAULT. If the agent
++        // prompt is reinstated by any route, this catches it.
++        for marker in [
++            "You are a coding agent running in the Codex CLI",
++            "apply_patch",
++            "Sandbox and approvals",
++        ] {
++            assert!(
++                !instructions.contains(marker),
++                "derivation instructions contain agent-prompt marker {marker:?}"
++            );
++        }
++
++        // Nothing else from the agent turn surface leaks in either.
++        assert!(prompt.tools.is_empty(), "derivation must advertise no tools");
++        assert!(!prompt.parallel_tool_calls);
++        assert!(prompt.output_schema.is_none());
++
++        // The request is the content, plus a negligible envelope.
++        let input_chars: usize = prompt
++            .input
++            .iter()
++            .map(|item| match item {
++                ResponseItem::Message { content, .. } => content
++                    .iter()
++                    .map(|c| match c {
++                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
++                            text.len()
++                        }
++                        _ => 0,
++                    })
++                    .sum(),
++                _ => 0,
++            })
++            .sum();
++        assert_eq!(
++            input_chars,
++            content.len(),
++            "derivation input must be exactly the text to derive"
++        );
++        assert!(
++            instructions.len() + input_chars < content.len() + 1_000,
++            "total derivation payload must be dominated by the content itself"
++        );
++    }
++
++    /// The marker strings above must actually occur in the real agent prompt,
++    /// otherwise the test above passes vacuously.
++    #[test]
++    fn p1_markers_are_present_in_the_real_agent_prompt() {
++        let base = codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
++        for marker in [
++            "You are a coding agent running in the Codex CLI",
++            "apply_patch",
++            "Sandbox and approvals",
++        ] {
++            assert!(
++                base.contains(marker),
++                "marker {marker:?} no longer appears in BASE_INSTRUCTIONS_DEFAULT — \
++                 p1_derivation_prompt_carries_no_agent_instructions is now vacuous"
++            );
++        }
++    }
++
 +    use codex_lhc_host::lhc_inference_callbacks;
 +    use codex_models_manager::ModelsManagerConfig;
 +    use codex_models_manager::test_support::construct_model_info_offline_for_tests;
