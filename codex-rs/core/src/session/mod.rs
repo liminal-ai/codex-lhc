@@ -3268,6 +3268,36 @@ impl Session {
         }
     }
 
+    /// In-memory half of compaction install without appending to the rollout.
+    ///
+    /// LHC slice C rewrites the rollout file (materialize + atomic swap); the
+    /// Compacted boundary record lives inside that rewritten sequence. Native
+    /// compact arms still use [`Self::replace_compacted_history`] (append).
+    // LHC-HOOK: in-memory compact install without append (slice C rewrite path)
+    pub(crate) async fn install_compacted_history_memory(
+        &self,
+        items: Vec<ResponseItem>,
+        reference_context_item: Option<TurnContextItem>,
+        world_state_baseline: Option<Arc<WorldState>>,
+        durable_message: Option<String>,
+    ) {
+        let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+        {
+            let mut state = self.state.lock().await;
+            state.replace_history(items, reference_context_item);
+            if let Some(world_state) = world_state_baseline {
+                let snapshot = world_state.snapshot();
+                state.history.set_world_state_baseline(snapshot);
+            }
+            if let Some(msg) = durable_message
+                && codex_lhc_host::CompactMarker::is_durable_writeback_record(&msg)
+            {
+                state.set_last_lhc_durable_derived(Some(msg));
+            }
+            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
+        }
+    }
+
     /// I2: remember durable LHC derived record from CompactedItem messages in rollout.
     pub(crate) async fn seed_last_lhc_durable_from_rollout(&self, rollout_items: &[RolloutItem]) {
         let last = rollout_items.iter().rev().find_map(|item| match item {

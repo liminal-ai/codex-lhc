@@ -4,6 +4,14 @@
 //! archive is missing, degraded, or compact fails.
 //!
 //! Marker is committed only after durable write-back. Body is never re-ingested.
+//!
+//! # Slice C — rollout rewrite
+//!
+//! On install the arm materializes a full rollout projection and atomically
+//! rewrites the session file (temp → fsync → rename → reopen). There is no
+//! append of a `Compacted` record: the boundary lives inside the rewritten
+//! sequence. In-memory history is bands (`replacement_history`) + native tail
+//! — equal to what resume rebuilds from the rewritten file.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,29 +20,38 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_features::Feature;
+use codex_lhc_host::CompactBoundaryMeta;
 use codex_lhc_host::CompactMarker;
 use codex_lhc_host::DerivedProvenance;
 use codex_lhc_host::InferenceCallbacks;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::LhcCompactResult;
+use codex_lhc_host::MaterializeInput;
+use codex_lhc_host::atomic_rewrite_rollout;
 use codex_lhc_host::commit_compact_marker;
 use codex_lhc_host::content_identity_digest;
 use codex_lhc_host::estimate_response_items_tokens;
+use codex_lhc_host::history_from_materialized_items;
 use codex_lhc_host::item_stable_id;
+use codex_lhc_host::materialize_rollout;
+use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
+use codex_lhc_host::read_materialize_surfaces;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::SessionMeta;
+use codex_protocol::protocol::SessionMetaLine;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
-use crate::compact::CompactedHistoryMetadata;
 use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
-use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::session::context_window::context_window_token_status;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -197,7 +214,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     }
 
     let thread_id = handle.thread_id().to_string();
-    let root = handle.root().map(|p| p.to_path_buf());
+    let root = handle.root().map(std::path::Path::to_path_buf);
     let host_items = sess.clone_history().await.raw_items().to_vec();
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -230,34 +247,31 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         }
     };
 
-    let mut new_history = produced.body.clone();
-    if new_history.is_empty() {
+    let produce_body = produced.body.clone();
+    if produce_body.is_empty() {
         return Ok(LhcCompactAttempt::Unavailable {
             reason: "LHC compact produced empty body".into(),
         });
     }
 
     // F3: zero-reduction is not an install — fall through to native ladder.
-    let body_token_estimate = estimate_response_items_tokens(&new_history);
+    // Measured against the LLM-request body (what the model would see).
+    let body_token_estimate = estimate_response_items_tokens(&produce_body);
     if body_token_estimate >= host_token_estimate {
         let reason = format!(
             "NoReduction: body_tokens={body_token_estimate} host_tokens={host_token_estimate} \
              items_body={} (LHC pass-through or non-reducing compact)",
-            new_history.len()
+            produce_body.len()
         );
         warn!(%reason, manual, "LHC compact did not reduce; failing open to native arms");
         return Ok(LhcCompactAttempt::Unavailable { reason });
     }
 
-    let (initial_context, world_state_baseline) =
+    let (_initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
-    if !initial_context.is_empty() {
-        new_history =
-            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
-    }
 
-    // Token bound against context window (after injection). R8.
-    if let Some(reason) = body_exceeds_window(turn_context, &new_history) {
+    // Token bound against the produce body (window check for served view). R8.
+    if let Some(reason) = body_exceeds_window(turn_context, &produce_body) {
         warn!(%reason, "LHC compact body over window; fail open");
         return Ok(LhcCompactAttempt::Unavailable { reason });
     }
@@ -269,43 +283,208 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         }
     };
 
-    // Pre-assign host ids so the durable CompactedItem record includes them in
-    // the same write as the body (I2). replace_compacted_history will not reassign.
-    let mut body_with_ids = new_history;
-    for item in &mut body_with_ids {
-        if item_stable_id(item).is_none() {
-            // Mirror Session::assign_missing_response_item_id prefix path.
-            if let Some(prefix) = item.id_prefix() {
-                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
-            }
+    // LHC-HOOK: rollout rewrite at LHC compact install (slice C)
+    // Box the rewrite future so the parent arm body stays under rustc's
+    // query-depth limit when nested under run_turn.
+    Box::pin(install_lhc_compact_rewrite(
+        sess,
+        turn_context,
+        &slot,
+        thread_id,
+        root,
+        produced.marker,
+        world_state_baseline,
+        reference_context_item,
+        manual,
+        cancellation_token,
+    ))
+    .await
+}
+
+/// Materialize → atomic rewrite → in-memory bands+tail install.
+///
+/// Extracted from the arm entry so the main future stays under the rustc
+/// query-depth limit (large async bodies nested under `run_turn` overflow it).
+#[allow(clippy::too_many_arguments)]
+async fn install_lhc_compact_rewrite(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    slot: &LhcCaptureSlot,
+    thread_id: String,
+    root: Option<PathBuf>,
+    mut marker: CompactMarker,
+    world_state_baseline: Option<std::sync::Arc<crate::context::world_state::WorldState>>,
+    reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
+    manual: bool,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<LhcCompactAttempt> {
+    // LHC SDK futures are !Send — hop to a dedicated thread like produce does.
+    let surfaces = match read_materialize_surfaces_on_thread(
+        thread_id.clone(),
+        root.clone(),
+        cancellation_token,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(%err, manual, "LHC materialize surfaces unavailable; failing open");
+            return Ok(LhcCompactAttempt::Unavailable {
+                reason: format!("materialize surfaces: {err}"),
+            });
         }
+    };
+
+    let rollout_path = match sess.current_rollout_path().await {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(%err, "current_rollout_path failed; continuing without rewrite");
+            None
+        }
+    };
+
+    let prior_generation = match rollout_path.as_ref() {
+        Some(path) if path.exists() => parse_rollout_items(path).unwrap_or_else(|err| {
+            warn!(%err, path = %path.display(), "failed to parse prior rollout; carry-forwards empty");
+            Vec::new()
+        }),
+        _ => Vec::new(),
+    };
+
+    let session_meta = prior_generation
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => Some(meta.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| SessionMetaLine {
+            meta: SessionMeta {
+                session_id: sess.session_id(),
+                id: sess.thread_id,
+                ..SessionMeta::default()
+            },
+            git: None,
+        });
+
+    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+
+    let world_state_value = world_state_baseline
+        .as_ref()
+        .map(|ws| ws.snapshot().into_value());
+
+    // Provisional boundary message (host ids filled after history extract).
+    let provisional_message = marker.to_durable_writeback_record();
+    let mut materialize_result = materialize_rollout(&MaterializeInput {
+        session_meta,
+        thread_view: &surfaces.thread_view,
+        messages: &surfaces.messages,
+        turns: &surfaces.turns,
+        prior_generation: &prior_generation,
+        boundary: CompactBoundaryMeta {
+            message: provisional_message,
+            window_number,
+            first_window_id: window_ids.first_window_id.to_string(),
+            previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
+            window_id: window_ids.window_id.to_string(),
+        },
+        world_state: world_state_value,
+        turn_context: reference_context_item.clone(),
+    });
+
+    for note in &materialize_result.gap_notes {
+        error!(%note, manual, "LHC materialize gap_note");
     }
-    let assigned_ids: Vec<String> = body_with_ids.iter().filter_map(item_stable_id).collect();
-    if assigned_ids.is_empty() {
+
+    // In-memory history = bands (replacement_history) + native tail — same as
+    // resume-from-rewritten-file rebuilds.
+    let mut install_history = history_from_materialized_items(&materialize_result.items);
+    if install_history.is_empty() {
         return Ok(LhcCompactAttempt::Unavailable {
-            reason: "derived provenance: no stable ids for write-back body".into(),
+            reason: "materialize produced empty install history (bands+tail)".into(),
         });
     }
-    let digests: Vec<String> = body_with_ids.iter().map(content_identity_digest).collect();
-
-    let mut marker = produced.marker;
+    for item in &mut install_history {
+        if item_stable_id(item).is_none()
+            && let Some(prefix) = item.id_prefix() {
+                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
+            }
+    }
+    let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
+    if assigned_ids.is_empty() {
+        return Ok(LhcCompactAttempt::Unavailable {
+            reason: "derived provenance: no stable ids for install history".into(),
+        });
+    }
+    let digests: Vec<String> = install_history
+        .iter()
+        .map(content_identity_digest)
+        .collect();
     marker.derived_host_ids = assigned_ids.clone();
     marker.derived_content_digests = digests.clone();
-
-    // I1: model-visible LHC note is small/constant. I2: durable full record rides
-    // CompactedItem.message (same durable write as the body).
+    marker.body_item_count = install_history.len();
+    // Final durable record (with host ids) must ride the Compacted.message in
+    // the rewritten file — patch the provisional boundary before the swap.
+    // Also stamp assigned ids into the file's replacement_history + tail so
+    // resume rebuilds the same items the live session holds.
     let durable_message = marker.to_durable_writeback_record();
-    let expected_body = body_with_ids.clone();
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-    sess.replace_compacted_history(
-        body_with_ids,
+    patch_materialized_history_ids(&mut materialize_result.items, &install_history);
+    for item in &mut materialize_result.items {
+        if let RolloutItem::Compacted(compacted) = item {
+            compacted.message = durable_message.clone();
+        }
+    }
+
+    // Rewrite the rollout file (replaces append of Compacted). Failure leaves
+    // the old file authoritative; session continues; next compact retries.
+    // NO append fallback path.
+    if let Some(path) = rollout_path.as_ref() {
+        if let Err(err) = sess.flush_rollout().await {
+            error!(
+                %err,
+                path = %path.display(),
+                "LHC rollout flush before rewrite failed; continuing with rewrite attempt"
+            );
+        }
+        match atomic_rewrite_rollout(path, &materialize_result.items) {
+            Ok(()) => {
+                // Reopen the append handle onto the new inode.
+                if let Some(live_thread) = sess.live_thread()
+                    && let Err(err) = live_thread.reopen_rollout_after_rewrite().await
+                {
+                    error!(
+                        %err,
+                        path = %path.display(),
+                        "LHC recorder reopen after rewrite failed; subsequent \
+                         appends may target the orphaned prior generation"
+                    );
+                }
+                info!(
+                    path = %path.display(),
+                    items = materialize_result.items.len(),
+                    "LHC rollout rewrite installed (atomic swap)"
+                );
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    path = %path.display(),
+                    "LHC rollout rewrite failed; old file remains authoritative; \
+                     next compact will retry (no append fallback)"
+                );
+            }
+        }
+    } else {
+        debug!("LHC compact: no live rollout path; skip rewrite (in-memory install only)");
+    }
+
+    // In-memory install — must equal history_from_materialized_items (law 1 /
+    // resume equivalence). Does NOT append Compacted to the file.
+    let expected_body = install_history.clone();
+    sess.install_compacted_history_memory(
+        install_history,
         reference_context_item,
         world_state_baseline,
-        CompactedHistoryMetadata {
-            message: durable_message,
-            window_number,
-            window_ids,
-        },
+        Some(durable_message),
     )
     .await;
     sess.recompute_token_usage(turn_context).await;
@@ -314,13 +493,14 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     let installed_items = installed.raw_items();
     if !response_items_structurally_equal(installed_items, &expected_body) {
         return Err(CodexErr::UnsupportedOperation(format!(
-            "LHC compact law-1 violation: host history drifted from LHC body (host={}, body={})",
+            "LHC compact law-1 violation: host history drifted from materialized \
+             bands+tail (host={}, body={})",
             installed_items.len(),
             expected_body.len()
         )));
     }
 
-    // Process-local slot (fast path); durable already on CompactedItem.
+    // Process-local slot (fast path); durable already on CompactedItem in rewritten file.
     if let Err(err) =
         slot.mark_derived_after_writeback(assigned_ids.iter().cloned(), digests.iter().cloned())
     {
@@ -351,7 +531,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         total_tokens = marker.total_tokens,
         derived_ids = marker.derived_host_ids.len(),
         runtime_note_chars = marker.to_runtime_note_text().len(),
-        "LHC compact arm installed write-back from real CompactReceipt"
+        "LHC compact arm installed write-back from real CompactReceipt (rewrite path)"
     );
 
     Ok(LhcCompactAttempt::Installed {
@@ -408,11 +588,10 @@ async fn select_production_inference_callbacks(
 ) -> Result<InferenceCallbacks, String> {
     #[cfg(test)]
     {
-        if let Ok(guard) = sess.services.lhc_test_inference.lock() {
-            if let Some(cbs) = guard.as_ref() {
+        if let Ok(guard) = sess.services.lhc_test_inference.lock()
+            && let Some(cbs) = guard.as_ref() {
                 return Ok(cbs.clone());
             }
-        }
     }
     crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
 }
@@ -430,6 +609,38 @@ async fn reseed_slot_from_durable_session(sess: &Session, slot: &LhcCaptureSlot)
         marker.derived_host_ids.iter().cloned(),
         marker.derived_content_digests.iter().cloned(),
     );
+}
+
+/// Stamp host-assigned ids from `install_history` (bands + tail) onto the
+/// materialized rollout sequence so the rewritten file and live memory match.
+fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[ResponseItem]) {
+    let band_len = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(c) => c.replacement_history.as_ref().map(Vec::len),
+            _ => None,
+        })
+        .unwrap_or(0);
+    let band_len = band_len.min(install_history.len());
+    let (bands, tail) = install_history.split_at(band_len);
+
+    let mut past_boundary = false;
+    let mut tail_idx = 0usize;
+    for item in items.iter_mut() {
+        match item {
+            RolloutItem::Compacted(c) => {
+                c.replacement_history = Some(bands.to_vec());
+                past_boundary = true;
+            }
+            RolloutItem::ResponseItem(response_item) if past_boundary => {
+                if let Some(src) = tail.get(tail_idx) {
+                    *response_item = src.clone();
+                    tail_idx += 1;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
@@ -464,6 +675,50 @@ fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Opt
     } else {
         None
     }
+}
+
+/// Read materialize surfaces on a dedicated thread (LHC SDK futures are !Send).
+async fn read_materialize_surfaces_on_thread(
+    thread_id: String,
+    root: Option<PathBuf>,
+    turn_cancel: &CancellationToken,
+) -> Result<codex_lhc_host::MaterializeSurfaces, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let join = std::thread::Builder::new()
+        .name(format!("lhc-materialize-{thread_id}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("runtime: {e}"))?;
+                rt.block_on(
+                    async move { read_materialize_surfaces(&thread_id, root.as_deref()).await },
+                )
+            }))
+            .unwrap_or_else(|payload| {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "panic in materialize surfaces thread".into());
+                Err(msg)
+            });
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("spawn materialize surfaces thread: {e}"))?;
+
+    let result = tokio::select! {
+        biased;
+        () = turn_cancel.cancelled() => {
+            // Detach: join will finish; we fail open.
+            return Err("turn cancelled while reading materialize surfaces".into());
+        }
+        r = rx => r.map_err(|_| "materialize surfaces thread dropped".to_string())?,
+    };
+    // Best-effort join so we don't leak threads on the happy path.
+    let _ = join.join();
+    result
 }
 
 /// Structural equality for law 1: role + each content variant (incl. media URLs).

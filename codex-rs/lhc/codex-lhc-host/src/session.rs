@@ -233,9 +233,36 @@ impl LhcSession {
         }
     }
 
-    #[cfg(any(test, feature = "test-util"))]
     pub async fn list_turns(&self) -> Result<Vec<lhc::turns::TurnRecord>, String> {
         match self.lhc.turns.list_turns(self.thread_ref.clone()).await {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Read-surface for the rollout materializer (slice C).
+    pub async fn list_messages(&self) -> Result<Vec<lhc::messages::MessageRecord>, String> {
+        match self
+            .lhc
+            .messages
+            .list(self.thread_ref.clone(), /*filter*/ None)
+            .await
+        {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
+    /// Session-thread view (bands + full-fidelity tail) for materialize.
+    pub async fn get_session_thread_view(
+        &self,
+    ) -> Result<lhc::shared_tech::view::SessionThreadView, String> {
+        match self
+            .lhc
+            .thread_view
+            .get_session_thread_view(self.thread_ref.clone())
+            .await
+        {
             OpResult::Ok { value } => Ok(value),
             OpResult::Err { error } => Err(error.reason),
         }

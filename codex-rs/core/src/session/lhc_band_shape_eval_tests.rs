@@ -303,7 +303,7 @@ async fn produce_real_lhc_body() -> (Vec<ResponseItem>, usize, String, serde_jso
     );
 
     let thread_id = handle.thread_id().to_string();
-    let root_path = handle.root().map(|p| p.to_path_buf());
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
     let source_events = archive_source_event_count(&thread_id, root_path.as_deref()).await;
 
     // Test-only deterministic override so CI/dry-run can produce a real
@@ -630,11 +630,10 @@ async fn lhc_band_shape_eval_live() {
                 Ok(ResponseEvent::OutputItemDone(item)) => {
                     if let ResponseItem::Message { content, .. } = &item {
                         for part in content {
-                            if let ContentItem::OutputText { text } = part {
-                                if out.is_empty() {
+                            if let ContentItem::OutputText { text } = part
+                                && out.is_empty() {
                                     out = text.clone();
                                 }
-                            }
                         }
                     }
                     conversation.push(item);

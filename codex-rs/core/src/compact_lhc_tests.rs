@@ -417,7 +417,7 @@ async fn production_three_compacts_do_not_reingest_body() {
     handle.flush().await;
 
     let thread_id = handle.thread_id().to_string();
-    let root_path = handle.root().map(|p| p.to_path_buf());
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
     let events_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
     assert!(events_before >= 100, "seed must leave large archive");
 
@@ -583,7 +583,7 @@ async fn crash_between_install_and_marker_no_reingest() {
     handle.flush().await;
 
     let thread_id = handle.thread_id().to_string();
-    let root_path = handle.root().map(|p| p.to_path_buf());
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
     let source_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
 
     let sess = Arc::new(session);
@@ -670,7 +670,7 @@ async fn production_manual_ladder_invokes_lhc_arm() {
     // would otherwise require live ModelClient. Not a silent production default.
     install_deterministic_test_override(&session);
 
-    let root_for_marker = handle.root().map(|p| p.to_path_buf());
+    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
     let thread_id = handle.thread_id().to_string();
     let sess = Arc::new(session);
 
@@ -719,7 +719,7 @@ async fn production_auto_ladder_invokes_lhc_arm() {
     handle.flush().await;
     install_deterministic_test_override(&session);
 
-    let root_for_marker = handle.root().map(|p| p.to_path_buf());
+    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
     let thread_id = handle.thread_id().to_string();
     let tokens_before = context_window_token_status(&session, &tc)
         .await
@@ -827,7 +827,7 @@ fn band_body_replacement_history_byte_equal() {
         window_id: Some("b".into()),
     };
     let mut history = ContextManager::new();
-    history.replace(compacted.replacement_history.clone().unwrap());
+    history.replace(compacted.replacement_history.unwrap());
     assert!(response_items_structurally_equal(
         history.raw_items(),
         &body
@@ -891,7 +891,7 @@ fn shape_risk_consumers_see_band_replacement() {
     resume.replace(
         compacted
             .replacement_history
-            .clone()
+            
             .expect("replacement_history present"),
     );
     assert!(response_items_structurally_equal(resume.raw_items(), &band));
@@ -1943,7 +1943,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     // Deliberately NOT settled — derivation is still running.
 
     let thread_id = handle.thread_id().to_string();
-    let root_for_marker = handle.root().map(|p| p.to_path_buf());
+    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
     let sess = Arc::new(session);
     let history_before = sess.clone_history().await.raw_items().to_vec();
 
@@ -2015,8 +2015,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     assert!(
         returned_in < Duration::from_secs(10),
         "N3: the arm must abandon its settle-wait promptly on abort, not sit \
-         out SETTLE_WAIT ({}s); took {returned_in:?}",
-        SETTLE_WAIT_SECS
+         out SETTLE_WAIT ({SETTLE_WAIT_SECS}s); took {returned_in:?}"
     );
     assert!(
         after_grace >= at_cancel,
@@ -2032,5 +2031,314 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
         !marker,
         "abort must not commit a compact marker — the archive would claim a \
          compact that was never served to the model"
+    );
+}
+
+// ── Slice C: rollout rewrite ──────────────────────────────────────────────
+
+/// Open live thread persistence so compact can rewrite a real rollout path.
+async fn attach_rollout_for_slice_c(session: &mut Session) -> std::path::PathBuf {
+    use codex_protocol::models::BaseInstructions;
+    use codex_protocol::protocol::ThreadMemoryMode;
+    use codex_thread_store::CreateThreadParams;
+    use codex_thread_store::LiveThread;
+    use codex_thread_store::ThreadPersistenceMetadata;
+    use uuid::Uuid;
+
+    let config = session.get_config().await;
+    let live_thread = LiveThread::create(
+        Arc::clone(&session.services.thread_store),
+        CreateThreadParams {
+            session_id: session.session_id(),
+            thread_id: session.thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            originator: "slice-c-test".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: Default::default(),
+            subagent_history_start_ordinal: None,
+            history_base: None,
+            initial_window_id: Uuid::now_v7().to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(config.cwd.to_path_buf()),
+                model_provider: config.model_provider_id.clone(),
+                memory_mode: if config.memories.generate_memories {
+                    ThreadMemoryMode::Enabled
+                } else {
+                    ThreadMemoryMode::Disabled
+                },
+            },
+        },
+    )
+    .await
+    .expect("create thread persistence");
+    session.services.live_thread = Some(live_thread);
+    session.ensure_rollout_materialized().await;
+    session.flush_rollout().await.expect("flush rollout");
+    session
+        .current_rollout_path()
+        .await
+        .expect("path")
+        .expect("rollout path present")
+}
+
+/// Recorder-reopen pin: after swap, an append must land in the NEW file
+/// (not the orphaned `.prev` inode).
+#[tokio::test]
+async fn slice_c_reopen_pin_append_lands_in_new_file() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { .. } = attempt else {
+        panic!("expected Installed: {attempt:?}");
+    };
+
+    // Post-swap marker text unique to the new generation append.
+    let pin = "slice-c-reopen-pin-unique-marker-text";
+    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::EventMsg(
+        codex_protocol::protocol::EventMsg::AgentMessage(
+            codex_protocol::protocol::AgentMessageEvent {
+                message: pin.to_string(),
+                phase: None,
+                memory_citation: None,
+            },
+        ),
+    )])
+    .await;
+    sess.flush_rollout().await.expect("flush pin append");
+
+    let new_contents = tokio::fs::read_to_string(&rollout_path)
+        .await
+        .expect("read new rollout");
+    assert!(
+        new_contents.contains(pin),
+        "append after swap must land in the NEW active file"
+    );
+
+    let prev = codex_lhc_host::SwapPaths::for_rollout(&rollout_path).prev;
+    if prev.exists() {
+        let prev_contents = tokio::fs::read_to_string(&prev).await.expect("read prev");
+        assert!(
+            !prev_contents.contains(pin),
+            "append after swap must NOT land in the orphaned .prev generation \
+             (reopen pin mutation target)"
+        );
+    }
+}
+
+/// In-memory history installed at compact must equal what resume rebuilds
+/// from the rewritten file (item-for-item structural equality).
+#[tokio::test]
+async fn slice_c_in_memory_equals_resume_from_rewritten_file() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body, .. } = attempt else {
+        panic!("expected Installed: {attempt:?}");
+    };
+
+    let host = sess.clone_history().await;
+    assert!(
+        response_items_structurally_equal(host.raw_items(), &body),
+        "installed body must equal live host history"
+    );
+
+    // Reconstruct from the rewritten file the same way resume does.
+    let file_items = codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse rewritten");
+    assert!(
+        file_items
+            .iter()
+            .any(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_))),
+        "rewritten file must contain exactly the boundary Compacted"
+    );
+    let compacted_count = file_items
+        .iter()
+        .filter(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_)))
+        .count();
+    assert_eq!(compacted_count, 1, "exactly one Compacted boundary");
+
+    let reconstructed = codex_lhc_host::history_from_materialized_items(&file_items);
+    assert!(
+        response_items_structurally_equal(&reconstructed, host.raw_items()),
+        "resume-from-rewritten-file must equal installed history item-for-item\n\
+         reconstructed={} host={}",
+        reconstructed.len(),
+        host.raw_items().len()
+    );
+}
+
+/// Window numbers stay monotonic across two consecutive rewrites.
+#[tokio::test]
+async fn slice_c_window_continuity_across_two_rewrites() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let a1 = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    assert!(
+        matches!(a1, LhcCompactAttempt::Installed { .. }),
+        "first install: {a1:?}"
+    );
+
+    // Grow again so a second compact reduces.
+    seed_conversation_bandable(sess.as_ref(), &tc, 40).await;
+    handle.flush().await;
+    let a2 = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    assert!(
+        matches!(a2, LhcCompactAttempt::Installed { .. }),
+        "second install: {a2:?}"
+    );
+
+    let file_items = codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse");
+    let windows: Vec<u64> = file_items
+        .iter()
+        .filter_map(|i| match i {
+            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(windows.len(), 1, "rewritten file has one boundary");
+    assert!(
+        windows[0] >= 2,
+        "second rewrite must advance window_number (got {})",
+        windows[0]
+    );
+
+    // Prior generation retained.
+    let prev = codex_lhc_host::SwapPaths::for_rollout(&rollout_path).prev;
+    assert!(prev.exists(), "exactly one prior generation retained");
+    let prev_items = codex_lhc_host::parse_rollout_items(&prev).expect("parse prev");
+    let prev_windows: Vec<u64> = prev_items
+        .iter()
+        .filter_map(|i| match i {
+            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !prev_windows.is_empty() && prev_windows[0] < windows[0],
+        "prior generation window {} must be < active {}",
+        prev_windows.first().copied().unwrap_or(0),
+        windows[0]
+    );
+}
+
+/// Mutation demo: if reopen is skipped after swap, appends land in .prev.
+/// This test documents the pin — the production path reopens; breaking
+/// reopen (by writing via an unreopened fd) is what this would catch.
+#[tokio::test]
+async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
+    use std::io::Write;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    // Seed + rewrite with the pure swap helper (no recorder).
+    let seed = vec![codex_protocol::protocol::RolloutItem::SessionMeta(
+        codex_protocol::protocol::SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                timestamp: "t".into(),
+                ..codex_protocol::protocol::SessionMeta::default()
+            },
+            git: None,
+        },
+    )];
+    codex_lhc_host::atomic_rewrite_rollout(&path, &seed).ok();
+    // Open an append fd, then swap underneath it — the classic unreopened bug.
+    let mut orphan_fd = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open");
+    let gen2 = vec![
+        codex_protocol::protocol::RolloutItem::SessionMeta(
+            codex_protocol::protocol::SessionMetaLine {
+                meta: codex_protocol::protocol::SessionMeta {
+                    timestamp: "t2".into(),
+                    ..codex_protocol::protocol::SessionMeta::default()
+                },
+                git: None,
+            },
+        ),
+        codex_protocol::protocol::RolloutItem::EventMsg(
+            codex_protocol::protocol::EventMsg::AgentMessage(
+                codex_protocol::protocol::AgentMessageEvent {
+                    message: "gen2-body".into(),
+                    phase: None,
+                    memory_citation: None,
+                },
+            ),
+        ),
+    ];
+    codex_lhc_host::atomic_rewrite_rollout(&path, &gen2).expect("swap under open fd");
+    // Write via the old fd — lands in .prev (orphaned inode).
+    writeln!(orphan_fd, r#"{{"timestamp":"x","type":"event_msg","payload":{{"type":"agent_message","message":"orphaned-append"}}}}"#)
+        .expect("write orphan");
+    orphan_fd.flush().unwrap();
+
+    let prev = codex_lhc_host::SwapPaths::for_rollout(&path).prev;
+    let prev_text = std::fs::read_to_string(&prev).expect("prev");
+    let new_text = std::fs::read_to_string(&path).expect("new");
+    assert!(
+        prev_text.contains("orphaned-append"),
+        "unreopened fd writes to .prev — this is the bug reopen prevents"
+    );
+    assert!(
+        !new_text.contains("orphaned-append"),
+        "new generation must stay clean without reopen"
+    );
+    assert!(
+        new_text.contains("gen2-body"),
+        "new generation holds the rewritten content"
     );
 }

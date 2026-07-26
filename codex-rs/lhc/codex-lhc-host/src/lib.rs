@@ -13,6 +13,7 @@ mod inference;
 mod install;
 mod mapping;
 mod materialize;
+mod rollout_swap;
 mod session;
 
 pub use band_shape::BandShapeItem;
@@ -24,6 +25,7 @@ pub use compact_bridge::CompactMarker;
 pub use compact_bridge::DerivedProvenance;
 pub use compact_bridge::LhcCompactResult;
 pub use compact_bridge::LhcCompactUnavailable;
+pub use compact_bridge::MaterializeSurfaces;
 pub use compact_bridge::VIEW_MAP_SEAM_ID;
 pub use compact_bridge::archive_tip_identity;
 pub use compact_bridge::commit_compact_marker;
@@ -42,6 +44,7 @@ pub use compact_bridge::produce_lhc_compact;
 pub use compact_bridge::produce_lhc_compact_deterministic;
 pub use compact_bridge::produce_lhc_compact_with_derived;
 pub use compact_bridge::produce_lhc_compact_with_provenance;
+pub use compact_bridge::read_materialize_surfaces;
 pub use inference::LateBoundCallbacks;
 pub use inference::LhcInferenceError;
 pub use inference::lhc_inference_callbacks;
@@ -96,8 +99,20 @@ pub use materialize::boundary_completeness_error;
 pub use materialize::iso_to_unix_secs;
 pub use materialize::materialize_rollout;
 pub use materialize::model_stream_response_item_count;
+pub use rollout_swap::SwapFailpoint;
+pub use rollout_swap::SwapPaths;
+pub use rollout_swap::atomic_rewrite_rollout;
+pub use rollout_swap::history_from_materialized_items;
+pub use rollout_swap::parse_rollout_items;
 pub use session::encode_thread_id_for_path;
 pub use session::thread_file_path;
+
+#[cfg(any(test, feature = "test-util"))]
+pub use rollout_swap::SwapFailpointGuard;
+#[cfg(any(test, feature = "test-util"))]
+pub use rollout_swap::clear_swap_failpoint;
+#[cfg(any(test, feature = "test-util"))]
+pub use rollout_swap::set_swap_failpoint;
 
 /// Linkage proof through a real, behavior-bearing port export.
 pub fn lhc_port_linked() -> String {

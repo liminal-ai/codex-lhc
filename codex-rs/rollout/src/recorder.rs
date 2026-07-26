@@ -122,6 +122,14 @@ enum RolloutCmd {
     Flush {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
+    /// Drop the open append handle and reopen at `rollout_path`.
+    ///
+    /// Required after an external atomic rewrite of the rollout file: the
+    /// previous fd follows the renamed inode, so without reopen post-swap
+    /// appends would silently land in the orphaned prior generation.
+    ReopenAfterRewrite {
+        ack: oneshot::Sender<std::io::Result<()>>,
+    },
     Shutdown {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -979,6 +987,28 @@ impl RolloutRecorder {
         })?
     }
 
+    /// Reopen the append-mode file handle after an external rewrite of `rollout_path`.
+    ///
+    /// Slice C atomic swap renames the live path onto a new inode. An unreopened
+    /// handle keeps writing to the orphaned prior generation — silently.
+    // LHC-HOOK: RolloutRecorder::reopen_after_rewrite (slice C)
+    pub async fn reopen_after_rewrite(&self) -> std::io::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(RolloutCmd::ReopenAfterRewrite { ack: tx })
+            .await
+            .map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to queue rollout reopen: {e}"))
+                })
+            })?;
+        rx.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout reopen: {e}"))
+            })
+        })?
+    }
+
     pub async fn load_rollout_items(
         path: &Path,
     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
@@ -1641,6 +1671,30 @@ impl RolloutWriterState {
         self.write_pending_with_recovery("flush").await
     }
 
+    /// Drop any open handle and reopen at `rollout_path`, recomputing ordinals.
+    async fn reopen_after_rewrite(&mut self) -> std::io::Result<()> {
+        // Drain anything still queued against the old inode first.
+        if !self.pending_items.is_empty() {
+            self.write_pending_with_recovery("reopen-preflush").await?;
+        }
+        self.writer = None;
+        let path = self.rollout_path.clone();
+        let (file, ordinal_state) = tokio::task::spawn_blocking(move || {
+            let mut file = open_log_file(path.as_path())?;
+            let ordinal_state = ordinal_state_for_rollout(&mut file, path.as_path())?;
+            Ok::<_, IoError>((file, ordinal_state))
+        })
+        .await
+        .map_err(|e| IoError::other(format!("reopen join: {e}")))??;
+        self.writer = Some(JsonlWriter {
+            file: tokio::fs::File::from_std(file),
+        });
+        self.ordinal_state = ordinal_state;
+        self.deferred_log_file_info = None;
+        self.last_logged_error = None;
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
@@ -1787,6 +1841,9 @@ async fn rollout_writer(
             }
             RolloutCmd::Flush { ack } => {
                 let _ = ack.send(state.flush().await);
+            }
+            RolloutCmd::ReopenAfterRewrite { ack } => {
+                let _ = ack.send(state.reopen_after_rewrite().await);
             }
             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                 Ok(()) => {

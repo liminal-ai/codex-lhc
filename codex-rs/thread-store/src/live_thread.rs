@@ -338,6 +338,23 @@ impl LiveThread {
             .map(Some)
     }
 
+    /// Reopen the local rollout append handle after an external atomic rewrite.
+    ///
+    /// No-op for non-local stores. See `RolloutRecorder::reopen_after_rewrite`.
+    // LHC-HOOK: LiveThread::reopen_rollout_after_rewrite (slice C)
+    pub async fn reopen_rollout_after_rewrite(&self) -> ThreadStoreResult<()> {
+        let Some(local_store) = self
+            .thread_store
+            .as_any()
+            .downcast_ref::<LocalThreadStore>()
+        else {
+            return Ok(());
+        };
+        local_store
+            .reopen_rollout_after_rewrite(self.thread_id)
+            .await
+    }
+
     async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
         let update = self.metadata_sync.lock().await.take_pending_update();
         self.apply_pending_metadata_update(update).await

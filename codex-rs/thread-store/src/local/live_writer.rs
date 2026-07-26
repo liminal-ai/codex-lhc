@@ -210,6 +210,36 @@ pub(super) async fn rollout_path(
         .to_path_buf())
 }
 
+/// Reopen the live recorder after an external atomic rewrite of its path.
+///
+/// LHC compact (slice C) renames a new generation onto the same path; the
+/// append-mode handle must be reopened so subsequent appends land in the new
+/// inode rather than the orphaned prior generation.
+pub(super) async fn reopen_after_rewrite(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+) -> ThreadStoreResult<()> {
+    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
+    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
+    recorder
+        .reopen_after_rewrite()
+        .await
+        .map_err(thread_store_io_error)?;
+    if matches!(history_mode, ThreadHistoryMode::Paginated) {
+        let rollout_path = recorder.rollout_path().to_path_buf();
+        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
+            store,
+            thread_id,
+            rollout_path.as_path(),
+        )
+        .await
+        {
+            warn!("failed to re-project rollout after rewrite for {thread_id}: {err}");
+        }
+    }
+    Ok(())
+}
+
 async fn sync_materialized_rollout_path(
     store: &LocalThreadStore,
     thread_id: ThreadId,

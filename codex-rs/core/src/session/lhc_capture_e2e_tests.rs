@@ -157,7 +157,7 @@ async fn e2e_item_order_preserved_across_records() {
         texts.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
         "prompts must appear in original order by identity (no pre-sort)"
     );
-    let orders: Vec<i64> = events.iter().map(|e| e.event_order()).collect();
+    let orders: Vec<i64> = events.iter().map(codex_lhc_host::EventRecord::event_order).collect();
     assert!(
         orders.windows(2).all(|w| w[0] <= w[1]),
         "raw list_events order must be non-decreasing: {orders:?}"
@@ -495,11 +495,11 @@ async fn e2e_model_output_path_does_not_tag_user_role_as_user_prompt() {
     let events = handle.list_events().await.expect("list");
     let kinds: Vec<_> = events.iter().map(|e| e.event_kind().as_str()).collect();
     assert!(
-        kinds.iter().any(|k| *k == "runtime_note"),
+        kinds.contains(&"runtime_note"),
         "model-output path must not classify user-role as user_prompt; got {kinds:?}"
     );
     assert!(
-        !kinds.iter().any(|k| *k == "user_prompt"),
+        !kinds.contains(&"user_prompt"),
         "user-role item via record_completed_response_item must not be user_prompt (would mean UserPrompt tag); got {kinds:?}"
     );
     handle.shutdown().await;

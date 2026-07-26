@@ -608,10 +608,10 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
 
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() {
-                if let Some(handle) = slot.get() {
-                    shutdown_capture_send(handle).await;
-                }
+            if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>()
+                && let Some(handle) = slot.get()
+            {
+                shutdown_capture_send(handle).await;
             }
         })
     }

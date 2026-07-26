@@ -2097,7 +2097,7 @@ fn m9_optional_turn_context_emitted_when_provided() {
         "summary": "auto",
     }))
     .expect("minimal TurnContextItem");
-    let items = materialize_with_ctx(view, &[], &[], &[], None, Some(ctx.clone()));
+    let items = materialize_with_ctx(view, &[], &[], &[], None, Some(ctx));
     assert!(items.iter().any(|i| matches!(
         i,
         RolloutItem::TurnContext(c) if c.model == "gpt-test"

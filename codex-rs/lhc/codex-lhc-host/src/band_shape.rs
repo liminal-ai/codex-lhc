@@ -333,7 +333,7 @@ mod tests {
         assert!(bands.contains(&"brief"));
         assert!(bands.contains(&"detailed"));
         assert!(bands.contains(&"smooth"));
-        assert!(bands.iter().any(|b| *b == "full"));
+        assert!(bands.contains(&"full"));
         assert!(
             report.items.iter().any(|i| i.role == "user"),
             "full band must retain a user turn"

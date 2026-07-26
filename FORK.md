@@ -64,7 +64,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
-| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) | `0007-lhc-compact-arm` |
+| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
 | 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
@@ -77,13 +77,20 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 21 | `core/src/session/session.rs` | initialises `lhc_test_inference` | (with 0007) |
 | 22 | `core/src/session/tests.rs` | initialises `lhc_test_inference` (x2) | (with 0007) |
 | 23 | `core/src/session/lhc_band_shape_eval_tests.rs` | band-shape eval harness (Chunk 2a); `session/mod.rs` declares the module | (with 0007) |
+| 24 | `rollout/src/recorder.rs` | `RolloutRecorder::reopen_after_rewrite` after atomic swap (slice C) | `0007-lhc-compact-arm` |
+| 25 | `thread-store/src/live_thread.rs` | `LiveThread::reopen_rollout_after_rewrite` escape hatch (slice C) | `0007-lhc-compact-arm` |
+| 26 | `thread-store/src/local/{mod,live_writer}.rs` | local-store reopen implementation (slice C; no sentinel on impl) | `0007-lhc-compact-arm` |
+| 27 | `core/src/session/mod.rs` | `install_compacted_history_memory` — in-memory install without append (slice C) | (with 0004) |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
 round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing is
-a legitimate combination; fork-owned and *not in any patch* is not.
+a legitimate combination; fork-owned and *not in any patch* is not. Row 26 is
+the same pattern (impl details under a sentinel-bearing LiveThread API).
 
-Expected markers: **47** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **51** (`EXPECTED_HOOKS` in the tripwire script).
+Was 47 before slice C (rollout rewrite); +4 for recorder reopen, LiveThread
+reopen, compact-arm rewrite install, and in-memory-only compact install.
 Was 39 before slice A (schema v5 field capture); +8 for turn timing fields on
 `TurnStart`/`TurnStop`/`TurnAbort` inputs and the three lifecycle emit sites that
 thread host `started_at`/`completed_at` (no new raw-item hook sites — provider
@@ -94,6 +101,33 @@ SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.
 
 Chunk 2b compact arm: **done** (offline, deterministic inference). Chunk 3
 remains: live cert with real model (auth lane).
+
+### Rollout rewrite generation scheme (slice C)
+
+On LHC compact install the rollout is **rewritten**, not appended. For a live
+path `P` (e.g. `…/sessions/YYYY/MM/DD/rollout-….jsonl`):
+
+| Role | Path |
+|------|------|
+| Active generation | `P` |
+| Prior generation (exactly one) | `P.prev` |
+| In-progress rewrite | `P.rewrite-tmp` |
+
+Steps: write full materialized sequence to `P.rewrite-tmp` → fsync file →
+fsync directory → remove old `P.prev` if present → `rename(P → P.prev)` →
+`rename(P.rewrite-tmp → P)` → **reopen** the append-mode recorder handle so
+it points at the new inode. An unreopened fd silently follows the orphaned
+prior generation.
+
+Failure before the final rename leaves `P` untouched and authoritative —
+loud `tracing::error`, session continues, next compact retries. **No append
+fallback path.** In-memory history installed at compact equals
+`Compacted.replacement_history` (bands) + post-boundary native
+`ResponseItem`s — the same split resume rebuilds from the rewritten file.
+
+Implementation: pure swap in `codex-lhc-host::rollout_swap`; materializer
+wiring in `core/src/compact_lhc.rs`; reopen on `RolloutRecorder` +
+`LiveThread`.
 
 ### The drain correction (Chunk 3, round 11)
 
@@ -313,7 +347,9 @@ From Chunk 2 on, lanes are isolated via `scripts/verify-isolated.sh`.
 
 ## Laws (binding)
 
-1. Write-back is the architecture (`replace_compacted_history`).
+1. Write-back is the architecture. Native arms still append via
+   `replace_compacted_history`; the LHC arm (slice C) rewrites the rollout
+   and installs bands+tail in memory so live history equals resume-from-file.
 2. LHC compact arm feeds native accounting (threshold-untrips).
 3. Census fail-open / full-conversation consumers at Chunk 2 start.
 4. Capture idempotent under write-back; also under resume/replay/retry via

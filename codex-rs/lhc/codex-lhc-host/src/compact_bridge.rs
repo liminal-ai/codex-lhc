@@ -465,10 +465,10 @@ pub fn host_items_missing_from_archive_with_provenance(
     let mut anon_digest_counts: HashMap<String, usize> = HashMap::new();
     for e in events {
         let key = e.idempotency_key();
-        if let Some(rest) = key.split(":anon:").nth(1) {
-            if let Some(digest) = rest.split(':').next() {
-                *anon_digest_counts.entry(digest.to_string()).or_insert(0) += 1;
-            }
+        if let Some(rest) = key.split(":anon:").nth(1)
+            && let Some(digest) = rest.split(':').next()
+        {
+            *anon_digest_counts.entry(digest.to_string()).or_insert(0) += 1;
         }
     }
     let mut missing = Vec::new();
@@ -912,6 +912,37 @@ pub async fn produce_lhc_compact_deterministic(
     produce_lhc_compact(thread_id, root, host_items, import_missing, callbacks, None).await
 }
 
+/// Read surfaces the rollout materializer needs (slice C).
+///
+/// Opens a short-lived Manual session — no derivation, no capture worker.
+/// Call after compact has settled so the view reflects the new bands.
+#[derive(Debug, Clone)]
+pub struct MaterializeSurfaces {
+    pub thread_view: lhc::shared_tech::view::SessionThreadView,
+    pub messages: Vec<lhc::messages::MessageRecord>,
+    pub turns: Vec<lhc::turns::TurnRecord>,
+}
+
+pub async fn read_materialize_surfaces(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Result<MaterializeSurfaces, String> {
+    // Reads never call inference; deterministic callbacks are a safe inert plug.
+    let callbacks = lhc_inference_callbacks(false).map_err(|e| e.to_string())?;
+    let (session, _) = LhcSession::open_with_inference(thread_id, None, root, callbacks)
+        .await
+        .ok_or_else(|| "LhcSession::open returned None for materialize surfaces".to_string())?;
+    let thread_view = session.get_session_thread_view().await?;
+    let messages = session.list_messages().await?;
+    let turns = session.list_turns().await?;
+    session.close().await;
+    Ok(MaterializeSurfaces {
+        thread_view,
+        messages,
+        turns,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,9 +1239,9 @@ mod tests {
             // Simulate replace_compacted_history: assign stable ids to body.
             let mut body = result.body.clone();
             for (i, item) in body.iter_mut().enumerate() {
-                item.set_id(Some(ResponseItemId::from_server(
-                    format!("installed-r{round}-{i}").into(),
-                )));
+                item.set_id(Some(ResponseItemId::from_server(format!(
+                    "installed-r{round}-{i}"
+                ))));
             }
             let assigned: Vec<String> = body.iter().filter_map(item_stable_id).collect();
             assert!(
@@ -1299,7 +1330,7 @@ mod tests {
         // Assign ids as replace_compacted_history would; skip marker commit.
         let mut body_host = r1.body.clone();
         for (i, item) in body_host.iter_mut().enumerate() {
-            item.set_id(Some(ResponseItemId::from_server(format!("wb-{i}").into())));
+            item.set_id(Some(ResponseItemId::from_server(format!("wb-{i}"))));
         }
         let provenance = DerivedProvenance {
             ids: body_host.iter().filter_map(item_stable_id).collect(),

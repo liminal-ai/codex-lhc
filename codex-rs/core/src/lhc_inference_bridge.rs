@@ -78,7 +78,7 @@ pub(crate) fn resolve_lhc_derivation_effort(model_info: &ModelInfo) -> Reasoning
 
     let min = supported
         .into_iter()
-        .min_by_key(|e| effort_rank(e))
+        .min_by_key(effort_rank)
         .unwrap_or(ReasoningEffort::Low);
     warn!(
         model = %model_info.slug,
@@ -287,11 +287,10 @@ async fn model_complete_text(ctx: &LiveInferCtx, text: &str) -> InferenceResult 
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 if let ResponseItem::Message { content, .. } = item {
                     for part in content {
-                        if let ContentItem::OutputText { text } = part {
-                            if out.is_empty() {
+                        if let ContentItem::OutputText { text } = part
+                            && out.is_empty() {
                                 out = text;
                             }
-                        }
                     }
                 }
             }

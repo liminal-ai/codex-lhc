@@ -22,16 +22,24 @@ index 3eac8f03e6..85c83fe4ea 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..ee4646666c
+index 0000000000..acc271eb3d
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,672 @@
+@@ -0,0 +1,927 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
 +//! archive is missing, degraded, or compact fails.
 +//!
 +//! Marker is committed only after durable write-back. Body is never re-ingested.
++//!
++//! # Slice C — rollout rewrite
++//!
++//! On install the arm materializes a full rollout projection and atomically
++//! rewrites the session file (temp → fsync → rename → reopen). There is no
++//! append of a `Compacted` record: the boundary lives inside the rewritten
++//! sequence. In-memory history is bands (`replacement_history`) + native tail
++//! — equal to what resume rebuilds from the rewritten file.
 +
 +use std::path::PathBuf;
 +use std::sync::Arc;
@@ -40,29 +48,38 @@ index 0000000000..ee4646666c
 +use std::time::Duration;
 +
 +use codex_features::Feature;
++use codex_lhc_host::CompactBoundaryMeta;
 +use codex_lhc_host::CompactMarker;
 +use codex_lhc_host::DerivedProvenance;
 +use codex_lhc_host::InferenceCallbacks;
 +use codex_lhc_host::LhcCaptureSlot;
 +use codex_lhc_host::LhcCompactResult;
++use codex_lhc_host::MaterializeInput;
++use codex_lhc_host::atomic_rewrite_rollout;
 +use codex_lhc_host::commit_compact_marker;
 +use codex_lhc_host::content_identity_digest;
 +use codex_lhc_host::estimate_response_items_tokens;
++use codex_lhc_host::history_from_materialized_items;
 +use codex_lhc_host::item_stable_id;
++use codex_lhc_host::materialize_rollout;
++use codex_lhc_host::parse_rollout_items;
 +use codex_lhc_host::produce_lhc_compact_with_provenance;
++use codex_lhc_host::read_materialize_surfaces;
 +use codex_protocol::error::CodexErr;
 +use codex_protocol::error::Result as CodexResult;
 +use codex_protocol::models::ContentItem;
 +use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::RolloutItem;
++use codex_protocol::protocol::SessionMeta;
++use codex_protocol::protocol::SessionMetaLine;
 +use tokio_util::sync::CancellationToken;
 +use tracing::debug;
++use tracing::error;
 +use tracing::info;
 +use tracing::warn;
 +
-+use crate::compact::CompactedHistoryMetadata;
 +use crate::compact::InitialContextInjection;
 +use crate::compact::build_compaction_initial_context;
-+use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 +use crate::session::context_window::context_window_token_status;
 +use crate::session::session::Session;
 +use crate::session::turn_context::TurnContext;
@@ -225,7 +242,7 @@ index 0000000000..ee4646666c
 +    }
 +
 +    let thread_id = handle.thread_id().to_string();
-+    let root = handle.root().map(|p| p.to_path_buf());
++    let root = handle.root().map(std::path::Path::to_path_buf);
 +    let host_items = sess.clone_history().await.raw_items().to_vec();
 +
 +    let cancel = Arc::new(AtomicBool::new(false));
@@ -258,34 +275,31 @@ index 0000000000..ee4646666c
 +        }
 +    };
 +
-+    let mut new_history = produced.body.clone();
-+    if new_history.is_empty() {
++    let produce_body = produced.body.clone();
++    if produce_body.is_empty() {
 +        return Ok(LhcCompactAttempt::Unavailable {
 +            reason: "LHC compact produced empty body".into(),
 +        });
 +    }
 +
 +    // F3: zero-reduction is not an install — fall through to native ladder.
-+    let body_token_estimate = estimate_response_items_tokens(&new_history);
++    // Measured against the LLM-request body (what the model would see).
++    let body_token_estimate = estimate_response_items_tokens(&produce_body);
 +    if body_token_estimate >= host_token_estimate {
 +        let reason = format!(
 +            "NoReduction: body_tokens={body_token_estimate} host_tokens={host_token_estimate} \
 +             items_body={} (LHC pass-through or non-reducing compact)",
-+            new_history.len()
++            produce_body.len()
 +        );
 +        warn!(%reason, manual, "LHC compact did not reduce; failing open to native arms");
 +        return Ok(LhcCompactAttempt::Unavailable { reason });
 +    }
 +
-+    let (initial_context, world_state_baseline) =
++    let (_initial_context, world_state_baseline) =
 +        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
-+    if !initial_context.is_empty() {
-+        new_history =
-+            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
-+    }
 +
-+    // Token bound against context window (after injection). R8.
-+    if let Some(reason) = body_exceeds_window(turn_context, &new_history) {
++    // Token bound against the produce body (window check for served view). R8.
++    if let Some(reason) = body_exceeds_window(turn_context, &produce_body) {
 +        warn!(%reason, "LHC compact body over window; fail open");
 +        return Ok(LhcCompactAttempt::Unavailable { reason });
 +    }
@@ -297,43 +311,208 @@ index 0000000000..ee4646666c
 +        }
 +    };
 +
-+    // Pre-assign host ids so the durable CompactedItem record includes them in
-+    // the same write as the body (I2). replace_compacted_history will not reassign.
-+    let mut body_with_ids = new_history;
-+    for item in &mut body_with_ids {
-+        if item_stable_id(item).is_none() {
-+            // Mirror Session::assign_missing_response_item_id prefix path.
-+            if let Some(prefix) = item.id_prefix() {
-+                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
-+            }
++    // LHC-HOOK: rollout rewrite at LHC compact install (slice C)
++    // Box the rewrite future so the parent arm body stays under rustc's
++    // query-depth limit when nested under run_turn.
++    Box::pin(install_lhc_compact_rewrite(
++        sess,
++        turn_context,
++        &slot,
++        thread_id,
++        root,
++        produced.marker,
++        world_state_baseline,
++        reference_context_item,
++        manual,
++        cancellation_token,
++    ))
++    .await
++}
++
++/// Materialize → atomic rewrite → in-memory bands+tail install.
++///
++/// Extracted from the arm entry so the main future stays under the rustc
++/// query-depth limit (large async bodies nested under `run_turn` overflow it).
++#[allow(clippy::too_many_arguments)]
++async fn install_lhc_compact_rewrite(
++    sess: &Arc<Session>,
++    turn_context: &TurnContext,
++    slot: &LhcCaptureSlot,
++    thread_id: String,
++    root: Option<PathBuf>,
++    mut marker: CompactMarker,
++    world_state_baseline: Option<std::sync::Arc<crate::context::world_state::WorldState>>,
++    reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
++    manual: bool,
++    cancellation_token: &CancellationToken,
++) -> CodexResult<LhcCompactAttempt> {
++    // LHC SDK futures are !Send — hop to a dedicated thread like produce does.
++    let surfaces = match read_materialize_surfaces_on_thread(
++        thread_id.clone(),
++        root.clone(),
++        cancellation_token,
++    )
++    .await
++    {
++        Ok(s) => s,
++        Err(err) => {
++            warn!(%err, manual, "LHC materialize surfaces unavailable; failing open");
++            return Ok(LhcCompactAttempt::Unavailable {
++                reason: format!("materialize surfaces: {err}"),
++            });
 +        }
++    };
++
++    let rollout_path = match sess.current_rollout_path().await {
++        Ok(p) => p,
++        Err(err) => {
++            warn!(%err, "current_rollout_path failed; continuing without rewrite");
++            None
++        }
++    };
++
++    let prior_generation = match rollout_path.as_ref() {
++        Some(path) if path.exists() => parse_rollout_items(path).unwrap_or_else(|err| {
++            warn!(%err, path = %path.display(), "failed to parse prior rollout; carry-forwards empty");
++            Vec::new()
++        }),
++        _ => Vec::new(),
++    };
++
++    let session_meta = prior_generation
++        .iter()
++        .find_map(|item| match item {
++            RolloutItem::SessionMeta(meta) => Some(meta.clone()),
++            _ => None,
++        })
++        .unwrap_or_else(|| SessionMetaLine {
++            meta: SessionMeta {
++                session_id: sess.session_id(),
++                id: sess.thread_id,
++                ..SessionMeta::default()
++            },
++            git: None,
++        });
++
++    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
++
++    let world_state_value = world_state_baseline
++        .as_ref()
++        .map(|ws| ws.snapshot().into_value());
++
++    // Provisional boundary message (host ids filled after history extract).
++    let provisional_message = marker.to_durable_writeback_record();
++    let mut materialize_result = materialize_rollout(&MaterializeInput {
++        session_meta,
++        thread_view: &surfaces.thread_view,
++        messages: &surfaces.messages,
++        turns: &surfaces.turns,
++        prior_generation: &prior_generation,
++        boundary: CompactBoundaryMeta {
++            message: provisional_message,
++            window_number,
++            first_window_id: window_ids.first_window_id.to_string(),
++            previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
++            window_id: window_ids.window_id.to_string(),
++        },
++        world_state: world_state_value,
++        turn_context: reference_context_item.clone(),
++    });
++
++    for note in &materialize_result.gap_notes {
++        error!(%note, manual, "LHC materialize gap_note");
 +    }
-+    let assigned_ids: Vec<String> = body_with_ids.iter().filter_map(item_stable_id).collect();
-+    if assigned_ids.is_empty() {
++
++    // In-memory history = bands (replacement_history) + native tail — same as
++    // resume-from-rewritten-file rebuilds.
++    let mut install_history = history_from_materialized_items(&materialize_result.items);
++    if install_history.is_empty() {
 +        return Ok(LhcCompactAttempt::Unavailable {
-+            reason: "derived provenance: no stable ids for write-back body".into(),
++            reason: "materialize produced empty install history (bands+tail)".into(),
 +        });
 +    }
-+    let digests: Vec<String> = body_with_ids.iter().map(content_identity_digest).collect();
-+
-+    let mut marker = produced.marker;
++    for item in &mut install_history {
++        if item_stable_id(item).is_none()
++            && let Some(prefix) = item.id_prefix() {
++                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
++            }
++    }
++    let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
++    if assigned_ids.is_empty() {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "derived provenance: no stable ids for install history".into(),
++        });
++    }
++    let digests: Vec<String> = install_history
++        .iter()
++        .map(content_identity_digest)
++        .collect();
 +    marker.derived_host_ids = assigned_ids.clone();
 +    marker.derived_content_digests = digests.clone();
-+
-+    // I1: model-visible LHC note is small/constant. I2: durable full record rides
-+    // CompactedItem.message (same durable write as the body).
++    marker.body_item_count = install_history.len();
++    // Final durable record (with host ids) must ride the Compacted.message in
++    // the rewritten file — patch the provisional boundary before the swap.
++    // Also stamp assigned ids into the file's replacement_history + tail so
++    // resume rebuilds the same items the live session holds.
 +    let durable_message = marker.to_durable_writeback_record();
-+    let expected_body = body_with_ids.clone();
-+    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-+    sess.replace_compacted_history(
-+        body_with_ids,
++    patch_materialized_history_ids(&mut materialize_result.items, &install_history);
++    for item in &mut materialize_result.items {
++        if let RolloutItem::Compacted(compacted) = item {
++            compacted.message = durable_message.clone();
++        }
++    }
++
++    // Rewrite the rollout file (replaces append of Compacted). Failure leaves
++    // the old file authoritative; session continues; next compact retries.
++    // NO append fallback path.
++    if let Some(path) = rollout_path.as_ref() {
++        if let Err(err) = sess.flush_rollout().await {
++            error!(
++                %err,
++                path = %path.display(),
++                "LHC rollout flush before rewrite failed; continuing with rewrite attempt"
++            );
++        }
++        match atomic_rewrite_rollout(path, &materialize_result.items) {
++            Ok(()) => {
++                // Reopen the append handle onto the new inode.
++                if let Some(live_thread) = sess.live_thread()
++                    && let Err(err) = live_thread.reopen_rollout_after_rewrite().await
++                {
++                    error!(
++                        %err,
++                        path = %path.display(),
++                        "LHC recorder reopen after rewrite failed; subsequent \
++                         appends may target the orphaned prior generation"
++                    );
++                }
++                info!(
++                    path = %path.display(),
++                    items = materialize_result.items.len(),
++                    "LHC rollout rewrite installed (atomic swap)"
++                );
++            }
++            Err(err) => {
++                error!(
++                    %err,
++                    path = %path.display(),
++                    "LHC rollout rewrite failed; old file remains authoritative; \
++                     next compact will retry (no append fallback)"
++                );
++            }
++        }
++    } else {
++        debug!("LHC compact: no live rollout path; skip rewrite (in-memory install only)");
++    }
++
++    // In-memory install — must equal history_from_materialized_items (law 1 /
++    // resume equivalence). Does NOT append Compacted to the file.
++    let expected_body = install_history.clone();
++    sess.install_compacted_history_memory(
++        install_history,
 +        reference_context_item,
 +        world_state_baseline,
-+        CompactedHistoryMetadata {
-+            message: durable_message,
-+            window_number,
-+            window_ids,
-+        },
++        Some(durable_message),
 +    )
 +    .await;
 +    sess.recompute_token_usage(turn_context).await;
@@ -342,13 +521,14 @@ index 0000000000..ee4646666c
 +    let installed_items = installed.raw_items();
 +    if !response_items_structurally_equal(installed_items, &expected_body) {
 +        return Err(CodexErr::UnsupportedOperation(format!(
-+            "LHC compact law-1 violation: host history drifted from LHC body (host={}, body={})",
++            "LHC compact law-1 violation: host history drifted from materialized \
++             bands+tail (host={}, body={})",
 +            installed_items.len(),
 +            expected_body.len()
 +        )));
 +    }
 +
-+    // Process-local slot (fast path); durable already on CompactedItem.
++    // Process-local slot (fast path); durable already on CompactedItem in rewritten file.
 +    if let Err(err) =
 +        slot.mark_derived_after_writeback(assigned_ids.iter().cloned(), digests.iter().cloned())
 +    {
@@ -379,7 +559,7 @@ index 0000000000..ee4646666c
 +        total_tokens = marker.total_tokens,
 +        derived_ids = marker.derived_host_ids.len(),
 +        runtime_note_chars = marker.to_runtime_note_text().len(),
-+        "LHC compact arm installed write-back from real CompactReceipt"
++        "LHC compact arm installed write-back from real CompactReceipt (rewrite path)"
 +    );
 +
 +    Ok(LhcCompactAttempt::Installed {
@@ -436,11 +616,10 @@ index 0000000000..ee4646666c
 +) -> Result<InferenceCallbacks, String> {
 +    #[cfg(test)]
 +    {
-+        if let Ok(guard) = sess.services.lhc_test_inference.lock() {
-+            if let Some(cbs) = guard.as_ref() {
++        if let Ok(guard) = sess.services.lhc_test_inference.lock()
++            && let Some(cbs) = guard.as_ref() {
 +                return Ok(cbs.clone());
 +            }
-+        }
 +    }
 +    crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
 +}
@@ -458,6 +637,38 @@ index 0000000000..ee4646666c
 +        marker.derived_host_ids.iter().cloned(),
 +        marker.derived_content_digests.iter().cloned(),
 +    );
++}
++
++/// Stamp host-assigned ids from `install_history` (bands + tail) onto the
++/// materialized rollout sequence so the rewritten file and live memory match.
++fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[ResponseItem]) {
++    let band_len = items
++        .iter()
++        .find_map(|item| match item {
++            RolloutItem::Compacted(c) => c.replacement_history.as_ref().map(Vec::len),
++            _ => None,
++        })
++        .unwrap_or(0);
++    let band_len = band_len.min(install_history.len());
++    let (bands, tail) = install_history.split_at(band_len);
++
++    let mut past_boundary = false;
++    let mut tail_idx = 0usize;
++    for item in items.iter_mut() {
++        match item {
++            RolloutItem::Compacted(c) => {
++                c.replacement_history = Some(bands.to_vec());
++                past_boundary = true;
++            }
++            RolloutItem::ResponseItem(response_item) if past_boundary => {
++                if let Some(src) = tail.get(tail_idx) {
++                    *response_item = src.clone();
++                    tail_idx += 1;
++                }
++            }
++            _ => {}
++        }
++    }
 +}
 +
 +fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
@@ -492,6 +703,50 @@ index 0000000000..ee4646666c
 +    } else {
 +        None
 +    }
++}
++
++/// Read materialize surfaces on a dedicated thread (LHC SDK futures are !Send).
++async fn read_materialize_surfaces_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    turn_cancel: &CancellationToken,
++) -> Result<codex_lhc_host::MaterializeSurfaces, String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let join = std::thread::Builder::new()
++        .name(format!("lhc-materialize-{thread_id}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| format!("runtime: {e}"))?;
++                rt.block_on(
++                    async move { read_materialize_surfaces(&thread_id, root.as_deref()).await },
++                )
++            }))
++            .unwrap_or_else(|payload| {
++                let msg = payload
++                    .downcast_ref::<&str>()
++                    .map(|s| (*s).to_string())
++                    .or_else(|| payload.downcast_ref::<String>().cloned())
++                    .unwrap_or_else(|| "panic in materialize surfaces thread".into());
++                Err(msg)
++            });
++            let _ = tx.send(result);
++        })
++        .map_err(|e| format!("spawn materialize surfaces thread: {e}"))?;
++
++    let result = tokio::select! {
++        biased;
++        () = turn_cancel.cancelled() => {
++            // Detach: join will finish; we fail open.
++            return Err("turn cancelled while reading materialize surfaces".into());
++        }
++        r = rx => r.map_err(|_| "materialize surfaces thread dropped".to_string())?,
++    };
++    // Best-effort join so we don't leak threads on the happy path.
++    let _ = join.join();
++    result
 +}
 +
 +/// Structural equality for law 1: role + each content variant (incl. media URLs).
@@ -700,10 +955,10 @@ index 0000000000..ee4646666c
 +mod tests;
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..d4e6eb800c
+index 0000000000..9b3de5c9e6
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2036 @@
+@@ -0,0 +1,2344 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -1123,7 +1378,7 @@ index 0000000000..d4e6eb800c
 +    handle.flush().await;
 +
 +    let thread_id = handle.thread_id().to_string();
-+    let root_path = handle.root().map(|p| p.to_path_buf());
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
 +    let events_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
 +    assert!(events_before >= 100, "seed must leave large archive");
 +
@@ -1289,7 +1544,7 @@ index 0000000000..d4e6eb800c
 +    handle.flush().await;
 +
 +    let thread_id = handle.thread_id().to_string();
-+    let root_path = handle.root().map(|p| p.to_path_buf());
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
 +    let source_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
 +
 +    let sess = Arc::new(session);
@@ -1376,7 +1631,7 @@ index 0000000000..d4e6eb800c
 +    // would otherwise require live ModelClient. Not a silent production default.
 +    install_deterministic_test_override(&session);
 +
-+    let root_for_marker = handle.root().map(|p| p.to_path_buf());
++    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
 +    let thread_id = handle.thread_id().to_string();
 +    let sess = Arc::new(session);
 +
@@ -1425,7 +1680,7 @@ index 0000000000..d4e6eb800c
 +    handle.flush().await;
 +    install_deterministic_test_override(&session);
 +
-+    let root_for_marker = handle.root().map(|p| p.to_path_buf());
++    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
 +    let thread_id = handle.thread_id().to_string();
 +    let tokens_before = context_window_token_status(&session, &tc)
 +        .await
@@ -1533,7 +1788,7 @@ index 0000000000..d4e6eb800c
 +        window_id: Some("b".into()),
 +    };
 +    let mut history = ContextManager::new();
-+    history.replace(compacted.replacement_history.clone().unwrap());
++    history.replace(compacted.replacement_history.unwrap());
 +    assert!(response_items_structurally_equal(
 +        history.raw_items(),
 +        &body
@@ -1597,7 +1852,7 @@ index 0000000000..d4e6eb800c
 +    resume.replace(
 +        compacted
 +            .replacement_history
-+            .clone()
++            
 +            .expect("replacement_history present"),
 +    );
 +    assert!(response_items_structurally_equal(resume.raw_items(), &band));
@@ -2649,7 +2904,7 @@ index 0000000000..d4e6eb800c
 +    // Deliberately NOT settled — derivation is still running.
 +
 +    let thread_id = handle.thread_id().to_string();
-+    let root_for_marker = handle.root().map(|p| p.to_path_buf());
++    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
 +    let sess = Arc::new(session);
 +    let history_before = sess.clone_history().await.raw_items().to_vec();
 +
@@ -2721,8 +2976,7 @@ index 0000000000..d4e6eb800c
 +    assert!(
 +        returned_in < Duration::from_secs(10),
 +        "N3: the arm must abandon its settle-wait promptly on abort, not sit \
-+         out SETTLE_WAIT ({}s); took {returned_in:?}",
-+        SETTLE_WAIT_SECS
++         out SETTLE_WAIT ({SETTLE_WAIT_SECS}s); took {returned_in:?}"
 +    );
 +    assert!(
 +        after_grace >= at_cancel,
@@ -2740,12 +2994,321 @@ index 0000000000..d4e6eb800c
 +         compact that was never served to the model"
 +    );
 +}
++
++// ── Slice C: rollout rewrite ──────────────────────────────────────────────
++
++/// Open live thread persistence so compact can rewrite a real rollout path.
++async fn attach_rollout_for_slice_c(session: &mut Session) -> std::path::PathBuf {
++    use codex_protocol::models::BaseInstructions;
++    use codex_protocol::protocol::ThreadMemoryMode;
++    use codex_thread_store::CreateThreadParams;
++    use codex_thread_store::LiveThread;
++    use codex_thread_store::ThreadPersistenceMetadata;
++    use uuid::Uuid;
++
++    let config = session.get_config().await;
++    let live_thread = LiveThread::create(
++        Arc::clone(&session.services.thread_store),
++        CreateThreadParams {
++            session_id: session.session_id(),
++            thread_id: session.thread_id,
++            extra_config: None,
++            forked_from_id: None,
++            parent_thread_id: None,
++            source: SessionSource::Exec,
++            thread_source: None,
++            originator: "slice-c-test".to_string(),
++            base_instructions: BaseInstructions::default(),
++            dynamic_tools: Vec::new(),
++            selected_capability_roots: Vec::new(),
++            multi_agent_version: None,
++            history_mode: Default::default(),
++            subagent_history_start_ordinal: None,
++            history_base: None,
++            initial_window_id: Uuid::now_v7().to_string(),
++            metadata: ThreadPersistenceMetadata {
++                cwd: Some(config.cwd.to_path_buf()),
++                model_provider: config.model_provider_id.clone(),
++                memory_mode: if config.memories.generate_memories {
++                    ThreadMemoryMode::Enabled
++                } else {
++                    ThreadMemoryMode::Disabled
++                },
++            },
++        },
++    )
++    .await
++    .expect("create thread persistence");
++    session.services.live_thread = Some(live_thread);
++    session.ensure_rollout_materialized().await;
++    session.flush_rollout().await.expect("flush rollout");
++    session
++        .current_rollout_path()
++        .await
++        .expect("path")
++        .expect("rollout path present")
++}
++
++/// Recorder-reopen pin: after swap, an append must land in the NEW file
++/// (not the orphaned `.prev` inode).
++#[tokio::test]
++async fn slice_c_reopen_pin_append_lands_in_new_file() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::Installed { .. } = attempt else {
++        panic!("expected Installed: {attempt:?}");
++    };
++
++    // Post-swap marker text unique to the new generation append.
++    let pin = "slice-c-reopen-pin-unique-marker-text";
++    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::EventMsg(
++        codex_protocol::protocol::EventMsg::AgentMessage(
++            codex_protocol::protocol::AgentMessageEvent {
++                message: pin.to_string(),
++                phase: None,
++                memory_citation: None,
++            },
++        ),
++    )])
++    .await;
++    sess.flush_rollout().await.expect("flush pin append");
++
++    let new_contents = tokio::fs::read_to_string(&rollout_path)
++        .await
++        .expect("read new rollout");
++    assert!(
++        new_contents.contains(pin),
++        "append after swap must land in the NEW active file"
++    );
++
++    let prev = codex_lhc_host::SwapPaths::for_rollout(&rollout_path).prev;
++    if prev.exists() {
++        let prev_contents = tokio::fs::read_to_string(&prev).await.expect("read prev");
++        assert!(
++            !prev_contents.contains(pin),
++            "append after swap must NOT land in the orphaned .prev generation \
++             (reopen pin mutation target)"
++        );
++    }
++}
++
++/// In-memory history installed at compact must equal what resume rebuilds
++/// from the rewritten file (item-for-item structural equality).
++#[tokio::test]
++async fn slice_c_in_memory_equals_resume_from_rewritten_file() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::Installed { body, .. } = attempt else {
++        panic!("expected Installed: {attempt:?}");
++    };
++
++    let host = sess.clone_history().await;
++    assert!(
++        response_items_structurally_equal(host.raw_items(), &body),
++        "installed body must equal live host history"
++    );
++
++    // Reconstruct from the rewritten file the same way resume does.
++    let file_items = codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse rewritten");
++    assert!(
++        file_items
++            .iter()
++            .any(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_))),
++        "rewritten file must contain exactly the boundary Compacted"
++    );
++    let compacted_count = file_items
++        .iter()
++        .filter(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_)))
++        .count();
++    assert_eq!(compacted_count, 1, "exactly one Compacted boundary");
++
++    let reconstructed = codex_lhc_host::history_from_materialized_items(&file_items);
++    assert!(
++        response_items_structurally_equal(&reconstructed, host.raw_items()),
++        "resume-from-rewritten-file must equal installed history item-for-item\n\
++         reconstructed={} host={}",
++        reconstructed.len(),
++        host.raw_items().len()
++    );
++}
++
++/// Window numbers stay monotonic across two consecutive rewrites.
++#[tokio::test]
++async fn slice_c_window_continuity_across_two_rewrites() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let a1 = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    assert!(
++        matches!(a1, LhcCompactAttempt::Installed { .. }),
++        "first install: {a1:?}"
++    );
++
++    // Grow again so a second compact reduces.
++    seed_conversation_bandable(sess.as_ref(), &tc, 40).await;
++    handle.flush().await;
++    let a2 = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    assert!(
++        matches!(a2, LhcCompactAttempt::Installed { .. }),
++        "second install: {a2:?}"
++    );
++
++    let file_items = codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse");
++    let windows: Vec<u64> = file_items
++        .iter()
++        .filter_map(|i| match i {
++            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
++            _ => None,
++        })
++        .collect();
++    assert_eq!(windows.len(), 1, "rewritten file has one boundary");
++    assert!(
++        windows[0] >= 2,
++        "second rewrite must advance window_number (got {})",
++        windows[0]
++    );
++
++    // Prior generation retained.
++    let prev = codex_lhc_host::SwapPaths::for_rollout(&rollout_path).prev;
++    assert!(prev.exists(), "exactly one prior generation retained");
++    let prev_items = codex_lhc_host::parse_rollout_items(&prev).expect("parse prev");
++    let prev_windows: Vec<u64> = prev_items
++        .iter()
++        .filter_map(|i| match i {
++            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
++            _ => None,
++        })
++        .collect();
++    assert!(
++        !prev_windows.is_empty() && prev_windows[0] < windows[0],
++        "prior generation window {} must be < active {}",
++        prev_windows.first().copied().unwrap_or(0),
++        windows[0]
++    );
++}
++
++/// Mutation demo: if reopen is skipped after swap, appends land in .prev.
++/// This test documents the pin — the production path reopens; breaking
++/// reopen (by writing via an unreopened fd) is what this would catch.
++#[tokio::test]
++async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
++    use std::io::Write;
++
++    let dir = tempdir().unwrap();
++    let path = dir.path().join("rollout.jsonl");
++    // Seed + rewrite with the pure swap helper (no recorder).
++    let seed = vec![codex_protocol::protocol::RolloutItem::SessionMeta(
++        codex_protocol::protocol::SessionMetaLine {
++            meta: codex_protocol::protocol::SessionMeta {
++                timestamp: "t".into(),
++                ..codex_protocol::protocol::SessionMeta::default()
++            },
++            git: None,
++        },
++    )];
++    codex_lhc_host::atomic_rewrite_rollout(&path, &seed).ok();
++    // Open an append fd, then swap underneath it — the classic unreopened bug.
++    let mut orphan_fd = std::fs::OpenOptions::new()
++        .append(true)
++        .open(&path)
++        .expect("open");
++    let gen2 = vec![
++        codex_protocol::protocol::RolloutItem::SessionMeta(
++            codex_protocol::protocol::SessionMetaLine {
++                meta: codex_protocol::protocol::SessionMeta {
++                    timestamp: "t2".into(),
++                    ..codex_protocol::protocol::SessionMeta::default()
++                },
++                git: None,
++            },
++        ),
++        codex_protocol::protocol::RolloutItem::EventMsg(
++            codex_protocol::protocol::EventMsg::AgentMessage(
++                codex_protocol::protocol::AgentMessageEvent {
++                    message: "gen2-body".into(),
++                    phase: None,
++                    memory_citation: None,
++                },
++            ),
++        ),
++    ];
++    codex_lhc_host::atomic_rewrite_rollout(&path, &gen2).expect("swap under open fd");
++    // Write via the old fd — lands in .prev (orphaned inode).
++    writeln!(orphan_fd, r#"{{"timestamp":"x","type":"event_msg","payload":{{"type":"agent_message","message":"orphaned-append"}}}}"#)
++        .expect("write orphan");
++    orphan_fd.flush().unwrap();
++
++    let prev = codex_lhc_host::SwapPaths::for_rollout(&path).prev;
++    let prev_text = std::fs::read_to_string(&prev).expect("prev");
++    let new_text = std::fs::read_to_string(&path).expect("new");
++    assert!(
++        prev_text.contains("orphaned-append"),
++        "unreopened fd writes to .prev — this is the bug reopen prevents"
++    );
++    assert!(
++        !new_text.contains("orphaned-append"),
++        "new generation must stay clean without reopen"
++    );
++    assert!(
++        new_text.contains("gen2-body"),
++        "new generation holds the rewritten content"
++    );
++}
 diff --git a/codex-rs/core/src/lhc_inference_bridge.rs b/codex-rs/core/src/lhc_inference_bridge.rs
 new file mode 100644
-index 0000000000..af201fd6db
+index 0000000000..643590ba6e
 --- /dev/null
 +++ b/codex-rs/core/src/lhc_inference_bridge.rs
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,619 @@
 +//! ModelClient → LHC [`InferenceCallbacks`] bridge (R2 / J1–J2).
 +//!
 +//! Production derivation always uses this bridge: pinned model
@@ -2826,7 +3389,7 @@ index 0000000000..af201fd6db
 +
 +    let min = supported
 +        .into_iter()
-+        .min_by_key(|e| effort_rank(e))
++        .min_by_key(effort_rank)
 +        .unwrap_or(ReasoningEffort::Low);
 +    warn!(
 +        model = %model_info.slug,
@@ -3035,11 +3598,10 @@ index 0000000000..af201fd6db
 +            Ok(ResponseEvent::OutputItemDone(item)) => {
 +                if let ResponseItem::Message { content, .. } = item {
 +                    for part in content {
-+                        if let ContentItem::OutputText { text } = part {
-+                            if out.is_empty() {
++                        if let ContentItem::OutputText { text } = part
++                            && out.is_empty() {
 +                                out = text;
 +                            }
-+                        }
 +                    }
 +                }
 +            }
@@ -3386,10 +3948,10 @@ index e37c17ca5d..dee828af95 100644
  pub use codex_thread::CodexThreadSettingsOverrides;
 diff --git a/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
 new file mode 100644
-index 0000000000..9540bb44e7
+index 0000000000..fdc3d93bc2
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
-@@ -0,0 +1,753 @@
+@@ -0,0 +1,752 @@
 +//! Band-shape model-tolerance harness (Chunk 2a/2b → round 6 / K2).
 +//!
 +//! **Dry-run:** install a real `lhc.compact`-produced body (via the production
@@ -3695,7 +4257,7 @@ index 0000000000..9540bb44e7
 +    );
 +
 +    let thread_id = handle.thread_id().to_string();
-+    let root_path = handle.root().map(|p| p.to_path_buf());
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
 +    let source_events = archive_source_event_count(&thread_id, root_path.as_deref()).await;
 +
 +    // Test-only deterministic override so CI/dry-run can produce a real
@@ -4022,11 +4584,10 @@ index 0000000000..9540bb44e7
 +                Ok(ResponseEvent::OutputItemDone(item)) => {
 +                    if let ResponseItem::Message { content, .. } = &item {
 +                        for part in content {
-+                            if let ContentItem::OutputText { text } = part {
-+                                if out.is_empty() {
++                            if let ContentItem::OutputText { text } = part
++                                && out.is_empty() {
 +                                    out = text.clone();
 +                                }
-+                            }
 +                        }
 +                    }
 +                    conversation.push(item);
@@ -4546,3 +5107,177 @@ index 54e561de4f..3076ee4c8f 100644
      }
  }
  
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index 43be695398..d38277f688 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -122,6 +122,14 @@ enum RolloutCmd {
+     Flush {
+         ack: oneshot::Sender<std::io::Result<()>>,
+     },
++    /// Drop the open append handle and reopen at `rollout_path`.
++    ///
++    /// Required after an external atomic rewrite of the rollout file: the
++    /// previous fd follows the renamed inode, so without reopen post-swap
++    /// appends would silently land in the orphaned prior generation.
++    ReopenAfterRewrite {
++        ack: oneshot::Sender<std::io::Result<()>>,
++    },
+     Shutdown {
+         ack: oneshot::Sender<std::io::Result<()>>,
+     },
+@@ -979,6 +987,28 @@ impl RolloutRecorder {
+         })?
+     }
+ 
++    /// Reopen the append-mode file handle after an external rewrite of `rollout_path`.
++    ///
++    /// Slice C atomic swap renames the live path onto a new inode. An unreopened
++    /// handle keeps writing to the orphaned prior generation — silently.
++    // LHC-HOOK: RolloutRecorder::reopen_after_rewrite (slice C)
++    pub async fn reopen_after_rewrite(&self) -> std::io::Result<()> {
++        let (tx, rx) = oneshot::channel();
++        self.tx
++            .send(RolloutCmd::ReopenAfterRewrite { ack: tx })
++            .await
++            .map_err(|e| {
++                self.writer_task.terminal_failure().unwrap_or_else(|| {
++                    IoError::other(format!("failed to queue rollout reopen: {e}"))
++                })
++            })?;
++        rx.await.map_err(|e| {
++            self.writer_task.terminal_failure().unwrap_or_else(|| {
++                IoError::other(format!("failed waiting for rollout reopen: {e}"))
++            })
++        })?
++    }
++
+     pub async fn load_rollout_items(
+         path: &Path,
+     ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
+@@ -1641,6 +1671,30 @@ impl RolloutWriterState {
+         self.write_pending_with_recovery("flush").await
+     }
+ 
++    /// Drop any open handle and reopen at `rollout_path`, recomputing ordinals.
++    async fn reopen_after_rewrite(&mut self) -> std::io::Result<()> {
++        // Drain anything still queued against the old inode first.
++        if !self.pending_items.is_empty() {
++            self.write_pending_with_recovery("reopen-preflush").await?;
++        }
++        self.writer = None;
++        let path = self.rollout_path.clone();
++        let (file, ordinal_state) = tokio::task::spawn_blocking(move || {
++            let mut file = open_log_file(path.as_path())?;
++            let ordinal_state = ordinal_state_for_rollout(&mut file, path.as_path())?;
++            Ok::<_, IoError>((file, ordinal_state))
++        })
++        .await
++        .map_err(|e| IoError::other(format!("reopen join: {e}")))??;
++        self.writer = Some(JsonlWriter {
++            file: tokio::fs::File::from_std(file),
++        });
++        self.ordinal_state = ordinal_state;
++        self.deferred_log_file_info = None;
++        self.last_logged_error = None;
++        Ok(())
++    }
++
+     async fn shutdown(&mut self) -> std::io::Result<()> {
+         if self.is_deferred() && self.pending_items.is_empty() {
+             return Ok(());
+@@ -1788,6 +1842,9 @@ async fn rollout_writer(
+             RolloutCmd::Flush { ack } => {
+                 let _ = ack.send(state.flush().await);
+             }
++            RolloutCmd::ReopenAfterRewrite { ack } => {
++                let _ = ack.send(state.reopen_after_rewrite().await);
++            }
+             RolloutCmd::Shutdown { ack } => match state.shutdown().await {
+                 Ok(()) => {
+                     let _ = ack.send(Ok(()));
+diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
+index f2dc3cfeb0..f6c0a42034 100644
+--- a/codex-rs/thread-store/src/live_thread.rs
++++ b/codex-rs/thread-store/src/live_thread.rs
+@@ -338,6 +338,23 @@ impl LiveThread {
+             .map(Some)
+     }
+ 
++    /// Reopen the local rollout append handle after an external atomic rewrite.
++    ///
++    /// No-op for non-local stores. See `RolloutRecorder::reopen_after_rewrite`.
++    // LHC-HOOK: LiveThread::reopen_rollout_after_rewrite (slice C)
++    pub async fn reopen_rollout_after_rewrite(&self) -> ThreadStoreResult<()> {
++        let Some(local_store) = self
++            .thread_store
++            .as_any()
++            .downcast_ref::<LocalThreadStore>()
++        else {
++            return Ok(());
++        };
++        local_store
++            .reopen_rollout_after_rewrite(self.thread_id)
++            .await
++    }
++
+     async fn flush_pending_metadata_update(&self) -> ThreadStoreResult<()> {
+         let update = self.metadata_sync.lock().await.take_pending_update();
+         self.apply_pending_metadata_update(update).await
+diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
+index 1457cc9e55..f48e6d5c70 100644
+--- a/codex-rs/thread-store/src/local/live_writer.rs
++++ b/codex-rs/thread-store/src/local/live_writer.rs
+@@ -210,6 +210,36 @@ pub(super) async fn rollout_path(
+         .to_path_buf())
+ }
+ 
++/// Reopen the live recorder after an external atomic rewrite of its path.
++///
++/// LHC compact (slice C) renames a new generation onto the same path; the
++/// append-mode handle must be reopened so subsequent appends land in the new
++/// inode rather than the orphaned prior generation.
++pub(super) async fn reopen_after_rewrite(
++    store: &LocalThreadStore,
++    thread_id: ThreadId,
++) -> ThreadStoreResult<()> {
++    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
++    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
++    recorder
++        .reopen_after_rewrite()
++        .await
++        .map_err(thread_store_io_error)?;
++    if matches!(history_mode, ThreadHistoryMode::Paginated) {
++        let rollout_path = recorder.rollout_path().to_path_buf();
++        if let Err(err) = super::thread_history_materialization::materialize_to_sqlite(
++            store,
++            thread_id,
++            rollout_path.as_path(),
++        )
++        .await
++        {
++            warn!("failed to re-project rollout after rewrite for {thread_id}: {err}");
++        }
++    }
++    Ok(())
++}
++
+ async fn sync_materialized_rollout_path(
+     store: &LocalThreadStore,
+     thread_id: ThreadId,
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+index 6f25492e9a..3df438abd3 100644
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -238,6 +238,11 @@ impl LocalThreadStore {
+         live_writer::rollout_path(self, thread_id).await
+     }
+ 
++    /// Reopen the live append handle after an external atomic rewrite of the rollout file.
++    pub async fn reopen_rollout_after_rewrite(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
++        live_writer::reopen_after_rewrite(self, thread_id).await
++    }
++
+     pub(super) async fn ensure_live_recorder_absent(
+         &self,
+         thread_id: ThreadId,

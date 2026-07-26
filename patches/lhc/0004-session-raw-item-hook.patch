@@ -30,7 +30,7 @@ index 71abe5acc3..06ab2bb299 100644
                  sess.set_server_reasoning_included(included).await;
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..fcc29e4f25
+index 0000000000..e1971383f8
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 @@ -0,0 +1,935 @@
@@ -193,7 +193,7 @@ index 0000000000..fcc29e4f25
 +        texts.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
 +        "prompts must appear in original order by identity (no pre-sort)"
 +    );
-+    let orders: Vec<i64> = events.iter().map(|e| e.event_order()).collect();
++    let orders: Vec<i64> = events.iter().map(codex_lhc_host::EventRecord::event_order).collect();
 +    assert!(
 +        orders.windows(2).all(|w| w[0] <= w[1]),
 +        "raw list_events order must be non-decreasing: {orders:?}"
@@ -531,11 +531,11 @@ index 0000000000..fcc29e4f25
 +    let events = handle.list_events().await.expect("list");
 +    let kinds: Vec<_> = events.iter().map(|e| e.event_kind().as_str()).collect();
 +    assert!(
-+        kinds.iter().any(|k| *k == "runtime_note"),
++        kinds.contains(&"runtime_note"),
 +        "model-output path must not classify user-role as user_prompt; got {kinds:?}"
 +    );
 +    assert!(
-+        !kinds.iter().any(|k| *k == "user_prompt"),
++        !kinds.contains(&"user_prompt"),
 +        "user-role item via record_completed_response_item must not be user_prompt (would mean UserPrompt tag); got {kinds:?}"
 +    );
 +    handle.shutdown().await;
@@ -970,7 +970,7 @@ index 0000000000..fcc29e4f25
 +    handle.shutdown().await;
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index e06dfb569f..87ad6b9ced 100644
+index e06dfb569f..79b9f7cb44 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -1316,6 +1316,9 @@ impl Session {
@@ -1063,10 +1063,40 @@ index e06dfb569f..87ad6b9ced 100644
          }
  
          self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3233,6 +3268,27 @@ impl Session {
+@@ -3233,6 +3268,57 @@ impl Session {
          }
      }
  
++    /// In-memory half of compaction install without appending to the rollout.
++    ///
++    /// LHC slice C rewrites the rollout file (materialize + atomic swap); the
++    /// Compacted boundary record lives inside that rewritten sequence. Native
++    /// compact arms still use [`Self::replace_compacted_history`] (append).
++    // LHC-HOOK: in-memory compact install without append (slice C rewrite path)
++    pub(crate) async fn install_compacted_history_memory(
++        &self,
++        items: Vec<ResponseItem>,
++        reference_context_item: Option<TurnContextItem>,
++        world_state_baseline: Option<Arc<WorldState>>,
++        durable_message: Option<String>,
++    ) {
++        let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
++        {
++            let mut state = self.state.lock().await;
++            state.replace_history(items, reference_context_item);
++            if let Some(world_state) = world_state_baseline {
++                let snapshot = world_state.snapshot();
++                state.history.set_world_state_baseline(snapshot);
++            }
++            if let Some(msg) = durable_message
++                && codex_lhc_host::CompactMarker::is_durable_writeback_record(&msg)
++            {
++                state.set_last_lhc_durable_derived(Some(msg));
++            }
++            state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
++        }
++    }
++
 +    /// I2: remember durable LHC derived record from CompactedItem messages in rollout.
 +    pub(crate) async fn seed_last_lhc_durable_from_rollout(&self, rollout_items: &[RolloutItem]) {
 +        let last = rollout_items.iter().rev().find_map(|item| match item {
@@ -1091,7 +1121,7 @@ index e06dfb569f..87ad6b9ced 100644
      async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
          let rollout_items: Vec<RolloutItem> = items
              .iter()
-@@ -3246,6 +3302,23 @@ impl Session {
+@@ -3246,6 +3332,23 @@ impl Session {
          self.features.enabled(feature)
      }
  
@@ -1115,7 +1145,7 @@ index e06dfb569f..87ad6b9ced 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3281,7 +3354,42 @@ impl Session {
+@@ -3281,7 +3384,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1159,7 +1189,7 @@ index e06dfb569f..87ad6b9ced 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3916,9 +4024,13 @@ impl Session {
+@@ -3916,9 +4054,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1176,7 +1206,7 @@ index e06dfb569f..87ad6b9ced 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -3937,8 +4049,13 @@ impl Session {
+@@ -3937,8 +4079,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1192,7 +1222,7 @@ index e06dfb569f..87ad6b9ced 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4182,3 +4299,14 @@ mod elicitation_holders_tests;
+@@ -4182,3 +4329,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

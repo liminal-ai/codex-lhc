@@ -79,17 +79,17 @@ pub fn map_item(
     // can prove the worker catch_unwind continues (H9/I3). Content-keyed so
     // parallel tests do not share a static latch.
     #[cfg(any(test, feature = "test-util"))]
-    if thread_id == "__lhc_test_panic_map__" {
-        if let ResponseItem::Message { content, .. } = item {
-            let panics = content.iter().any(|c| {
-                matches!(
-                    c,
-                    ContentItem::InputText { text } if text == "this-map-panics-once"
-                )
-            });
-            if panics {
-                panic!("deliberate map_item panic for worker containment certification");
-            }
+    if thread_id == "__lhc_test_panic_map__"
+        && let ResponseItem::Message { content, .. } = item
+    {
+        let panics = content.iter().any(|c| {
+            matches!(
+                c,
+                ContentItem::InputText { text } if text == "this-map-panics-once"
+            )
+        });
+        if panics {
+            panic!("deliberate map_item panic for worker containment certification");
         }
     }
 

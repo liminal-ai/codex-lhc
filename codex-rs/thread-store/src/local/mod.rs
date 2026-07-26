@@ -238,6 +238,11 @@ impl LocalThreadStore {
         live_writer::rollout_path(self, thread_id).await
     }
 
+    /// Reopen the live append handle after an external atomic rewrite of the rollout file.
+    pub async fn reopen_rollout_after_rewrite(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
+        live_writer::reopen_after_rewrite(self, thread_id).await
+    }
+
     pub(super) async fn ensure_live_recorder_absent(
         &self,
         thread_id: ThreadId,

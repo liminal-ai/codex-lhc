@@ -516,10 +516,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
                 if let Err(err) = persist_item(
                     &mut session,
@@ -533,10 +532,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
             }
             CaptureCmd::ProviderUsage { usage } => {
@@ -552,10 +550,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
             }
             CaptureCmd::TurnEnd {
@@ -574,10 +571,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
                 let event = map_turn_end(&thread_id, &turn_id, &reason, &facts);
                 if let Err(err) = submit_mapped(&mut session, &[event]).await {
@@ -601,10 +597,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
                 let events = map_model_or_thinking_change(
                     &thread_id,
@@ -643,10 +638,9 @@ async fn worker_loop(
                     &mut crash_after,
                 )
                 .await
+                    && err == "crash"
                 {
-                    if err == "crash" {
-                        return;
-                    }
+                    return;
                 }
                 let _ = ack.send(());
             }
