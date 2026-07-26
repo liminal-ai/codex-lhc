@@ -50,6 +50,12 @@ enum CaptureCmd {
         new_level: String,
     },
     Flush(oneshot::Sender<()>),
+    /// Wait, bounded, for the background scheduler to finish draining this
+    /// thread. Replies `true` if it settled within the bound.
+    DrainSettled {
+        timeout: std::time::Duration,
+        ack: oneshot::Sender<bool>,
+    },
     #[cfg(any(test, feature = "test-util"))]
     ListEvents(oneshot::Sender<Result<Vec<lhc::intake_stream::EventRecord>, String>>),
     #[cfg(any(test, feature = "test-util"))]
@@ -254,6 +260,38 @@ impl CaptureHandle {
         let _ = rx.await;
     }
 
+    /// Wait, bounded, for background derivation to settle on this thread.
+    ///
+    /// Returns `false` if it did not settle in time, which the caller treats as
+    /// a fail-open — never as licence to start draining inline. This is the
+    /// short settle-wait the design always called for; it replaces the
+    /// compact-time drain loop that existed only because the SDK was
+    /// misconfigured to `Manual` and its scheduler was inert.
+    ///
+    /// The bound is enforced **on the worker**, not just here: a settle that
+    /// cannot finish (e.g. derivation waiting on callbacks that are never
+    /// seeded) must not wedge the worker loop, or every command queued behind
+    /// it — including `Shutdown` — would never run. The outer timeout below
+    /// only guards a wedged or dead worker; the grace covers queue latency in
+    /// front of the command.
+    pub async fn drain_settled(&self, timeout: std::time::Duration) -> bool {
+        const REPLY_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        let (tx, rx) = oneshot::channel();
+        if self
+            .inner
+            .tx
+            .send(CaptureCmd::DrainSettled { timeout, ack: tx })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        match tokio::time::timeout(timeout.saturating_add(REPLY_GRACE), rx).await {
+            Ok(Ok(settled)) => settled,
+            _ => false,
+        }
+    }
+
     pub fn shutdown_async(&self) {
         let _ = self.inner.tx.try_send(CaptureCmd::Shutdown(None));
     }
@@ -328,8 +366,12 @@ pub async fn spawn_capture(
     thread_id: &str,
     cwd: Option<&str>,
     root: Option<PathBuf>,
+    derivation: crate::inference::LateBoundCallbacks,
 ) -> Option<CaptureHandle> {
-    let (session, tracker) = LhcSession::open(thread_id, cwd, root.as_deref()).await?;
+    // Background mode derives on this session, so its callbacks are what lands
+    // in the durable record — never the deterministic ones (J1).
+    let (session, tracker) =
+        LhcSession::open(thread_id, cwd, root.as_deref(), derivation.callbacks()).await?;
     let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_CAP);
     let dropped = Arc::new(AtomicU64::new(0));
     let degraded = Arc::new(AtomicBool::new(false));
@@ -360,7 +402,15 @@ pub async fn spawn_capture(
             // thread forever without a degradation note (H9).
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 rt.block_on(async move {
-                    worker_loop(session, tracker, rx, thread_id_owned, degraded_worker).await;
+                    worker_loop(
+                        session,
+                        tracker,
+                        rx,
+                        thread_id_owned,
+                        degraded_worker,
+                        derivation,
+                    )
+                    .await;
                 });
             }));
             if let Err(payload) = result {
@@ -388,6 +438,7 @@ async fn worker_loop(
     mut rx: mpsc::Receiver<CaptureCmd>,
     thread_id: String,
     degraded: Arc<AtomicBool>,
+    derivation: crate::inference::LateBoundCallbacks,
 ) {
     #[cfg(any(test, feature = "test-util"))]
     let mut crash_after: Option<usize> = None;
@@ -497,6 +548,19 @@ async fn worker_loop(
             CaptureCmd::Flush(ack) => {
                 let _ = ack.send(());
             }
+            CaptureCmd::DrainSettled { timeout, ack } => {
+                // Runs on the worker, which owns the Background-mode SDK — the
+                // only session with a live scheduler. Bounded HERE, not only at
+                // the handle: this await runs inside the worker loop, so an
+                // unbounded settle-wait on a thread that can never settle would
+                // wedge the loop and starve every command behind it, including
+                // `Shutdown`. Timing out reports unsettled and the caller fails
+                // open; it is never licence to drain inline.
+                let settled = tokio::time::timeout(timeout, session.drain_settled())
+                    .await
+                    .is_ok();
+                let _ = ack.send(settled);
+            }
             #[cfg(any(test, feature = "test-util"))]
             CaptureCmd::ListEvents(ack) => {
                 let _ = ack.send(session.list_events().await);
@@ -516,7 +580,7 @@ async fn worker_loop(
                 let _ = ack.send(session.capture_disabled);
             }
             CaptureCmd::Shutdown(ack) => {
-                session.close().await;
+                close_capture_session(session, &derivation).await;
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
@@ -524,7 +588,24 @@ async fn worker_loop(
             }
         }
     }
-    session.close().await;
+    close_capture_session(session, &derivation).await;
+}
+
+/// Close the worker's Background-mode session.
+///
+/// The settle-wait inside [`LhcSession::close`] is skipped when derivation
+/// callbacks were never seeded: unseeded inference work is parked on
+/// `LateBoundCallbacks::resolve` and can never complete, so waiting on it is
+/// pure delay, not cleanup. Either way nothing is lost — the work queue is
+/// durable and first-touch catch-up re-drains it on the next open.
+async fn close_capture_session(
+    session: LhcSession,
+    derivation: &crate::inference::LateBoundCallbacks,
+) {
+    if derivation.is_seeded() {
+        session.close().await;
+    }
+    // else: drop. The claim lease releases the in-flight item.
 }
 
 async fn submit_mapped(

@@ -6,6 +6,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use lhc::intake_stream::EventRecord;
 use lhc::sdk::Lhc;
@@ -25,7 +26,6 @@ use lhc::shared_tech::InferenceCallbacks;
 use crate::gating::lhc_root;
 use crate::idempotency::OccurrenceTracker;
 use crate::idempotency::seed_occurrence_from_keys;
-use crate::inference::lhc_inference_callbacks;
 
 /// Serialize registry schema init — concurrent `new_thread` races on CREATE TABLE.
 fn registry_lock() -> &'static AsyncMutex<()> {
@@ -52,22 +52,54 @@ pub struct LhcSession {
 }
 
 impl LhcSession {
-    /// Create or reopen with deterministic inference (capture path).
+    /// Create or reopen on the **capture** path, in [`SdkMode::Background`].
+    ///
+    /// Background is what LHC is designed for: the scheduler pokes after each
+    /// intake commit and drains queued derivation itself, plus a first-touch
+    /// catch-up for work left by a previous process
+    /// (`docs/onboard/01-core-concepts.md` §Host mode). The reference host,
+    /// pi-lhc, constructs the SDK "always in background mode, regardless of
+    /// caller config" (`04-host-pi-lhc.md`).
+    ///
+    /// **Only this path gets a scheduler**, and the reason is runtime lifetime.
+    /// The scheduler drains via `tokio::spawn`, so it needs a runtime that
+    /// outlives the work. The capture worker owns exactly that: a
+    /// `new_current_thread` runtime driven by `block_on(worker_loop)` for the
+    /// whole thread lifetime, so spawned drains interleave with the worker's
+    /// awaits and survive until shutdown. Every other `LhcSession` is opened on
+    /// a runtime built for one call and dropped when it returns; a scheduler
+    /// there would spawn drains that are cancelled at runtime drop, leaving
+    /// claimed rows to sit out their lease. Inert is strictly better.
+    ///
+    /// `set_scheduler_poke` / `set_thread_touch` are `thread_local!`
+    /// (`shared_tech/context.rs`), not process globals, so the capture thread's
+    /// hooks cannot clobber another instance's.
     pub async fn open(
         thread_id: &str,
         cwd: Option<&str>,
         root: Option<&Path>,
+        callbacks: InferenceCallbacks,
     ) -> Option<(Self, OccurrenceTracker)> {
-        let callbacks = lhc_inference_callbacks(false).ok()?;
-        Self::open_with_inference(thread_id, cwd, root, callbacks).await
+        Self::open_with_mode(thread_id, cwd, root, callbacks, SdkMode::Background).await
     }
 
-    /// Create or reopen with explicit inference callbacks (compact / live path).
+    /// Create or reopen for a **short-lived** read or compact session, in
+    /// [`SdkMode::Manual`] — see [`Self::open`] for why these do not schedule.
     pub async fn open_with_inference(
         thread_id: &str,
         cwd: Option<&str>,
         root: Option<&Path>,
         inference_callbacks: InferenceCallbacks,
+    ) -> Option<(Self, OccurrenceTracker)> {
+        Self::open_with_mode(thread_id, cwd, root, inference_callbacks, SdkMode::Manual).await
+    }
+
+    async fn open_with_mode(
+        thread_id: &str,
+        cwd: Option<&str>,
+        root: Option<&Path>,
+        inference_callbacks: InferenceCallbacks,
+        mode: SdkMode,
     ) -> Option<(Self, OccurrenceTracker)> {
         let root_buf = root.map(Path::to_path_buf).unwrap_or_else(lhc_root);
         let root = root_buf.as_path();
@@ -82,7 +114,7 @@ impl LhcSession {
         let lhc = init_lhc(SdkConfig {
             inference_callbacks: Some(inference_callbacks),
             inference: None,
-            mode: SdkMode::Manual,
+            mode,
             clock: None,
             guards: None,
             tool_result: None,
@@ -201,8 +233,30 @@ impl LhcSession {
         }
     }
 
-    pub async fn close(self) {
+    /// Wait for this session's scheduler to report the thread quiescent.
+    /// Inert (returns immediately) on a `Manual` session — only the capture
+    /// session has a scheduler.
+    pub async fn drain_settled(&self) {
         self.lhc.drain_settled(self.thread_ref.clone()).await;
+    }
+
+    /// Bound on [`Self::close`]'s settle-wait. Close is cleanup, not a gate:
+    /// give in-flight background derivation a moment to land, then let go.
+    const CLOSE_SETTLE_BOUND: Duration = Duration::from_secs(5);
+
+    pub async fn close(self) {
+        // Best-effort settle before the session (and, on the capture worker,
+        // its runtime) drops. Bounded: a scheduler that cannot settle — a
+        // hung inference call, callbacks that never resolve — must not turn
+        // close into a hang. Whatever is still in flight stays claimed in the
+        // durable work queue; its lease expires and first-touch catch-up
+        // re-drains it on the next open. On a `Manual` session the scheduler
+        // holds no state and this returns immediately.
+        let _ = tokio::time::timeout(
+            Self::CLOSE_SETTLE_BOUND,
+            self.lhc.drain_settled(self.thread_ref.clone()),
+        )
+        .await;
     }
 
     #[cfg(any(test, feature = "test-util"))]

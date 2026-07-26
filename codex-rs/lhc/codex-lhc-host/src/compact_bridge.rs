@@ -20,21 +20,18 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
-use std::time::Duration;
-use std::time::Instant;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use lhc::intake_stream::EventRecord;
 use lhc::intake_stream::MessageEventInput;
 use lhc::sdk::CompactReceipt;
-use lhc::sdk::DrainOpts;
 use lhc::sdk::LlmRequestContext;
 use lhc::sdk::OpResult;
 use lhc::shared_tech::InferenceCallbacks;
 use lhc::shared_tech::LlmRequestContextRole;
-use lhc::shared_tech::scheduler::DrainDisposition;
-use lhc::shared_tech::scheduler::DrainStoppedBecause;
+use lhc::shared_tech::logging::DerivationLogEventKind;
+use lhc::shared_tech::logging::DerivationLogQuery;
 use lhc::thread_view::CompactOpts;
 use serde_json::Map;
 use serde_json::Value;
@@ -327,149 +324,32 @@ pub fn archive_host_item_ids(events: &[EventRecord]) -> HashSet<String> {
         .collect()
 }
 
-/// Wall-clock budget for the pre-compact derivation drain (M2).
+/// Count derivations that ended in a terminal failure on this thread.
 ///
-/// Chosen to sit **under** core's `COMPACT_THREAD_TIMEOUT` (120 s) with
-/// headroom for everything the drain gates: `thread_view.compact()`, the
-/// `get_llm_request_context` fetch, view mapping, and the caller's write-back
-/// plus 30 s marker commit. Past the caller's deadline every further inference
-/// round-trip is orphaned — the session has already failed open.
-const DRAIN_TIME_BUDGET: Duration = Duration::from_secs(75);
-
-/// Work items per drain batch. Cancellation and the deadline are checked
-/// **between** batches, so this is also the cancellation granularity: at most
-/// this many derivations can still fire after the flag is set.
-const DRAIN_BATCH_ITEMS: i64 = 4;
-
-/// Hard cap on batches so a scheduler that never reports `Empty` (or a queue
-/// that keeps refilling) cannot spin indefinitely inside one compact.
-const DRAIN_MAX_BATCHES: usize = 1024;
-
-/// Run derivation work in bounded batches, honouring cancellation between them.
-///
-/// Returns `Err` (fail open, law 3) when derivation cannot be completed inside
-/// the bound — never a partial "good enough" state. Completing normally means
-/// the scheduler reported no more claimable work; leftover work still shows up
-/// as degraded bands on the receipt, which L2 rejects downstream.
-async fn run_bounded_derivation_drain(
-    session: &LhcSession,
-    cancel: Option<&std::sync::atomic::AtomicBool>,
-) -> Result<(), LhcCompactUnavailable> {
-    let started = Instant::now();
-    let mut batches = 0usize;
-    let mut ran_total = 0usize;
-    let mut remaining = 0i64;
-    let mut stopped;
-
-    loop {
-        // Cancellation first: the caller may have timed out and detached us.
-        check_cancel(cancel)?;
-
-        let elapsed = started.elapsed();
-        if elapsed >= DRAIN_TIME_BUDGET {
-            warn!(
-                budget_s = DRAIN_TIME_BUDGET.as_secs(),
-                batches,
-                ran = ran_total,
-                remaining,
-                "LHC derivation drain exceeded its time budget; failing open"
-            );
-            return Err(LhcCompactUnavailable::DerivationFailed(format!(
-                "derivation drain exceeded {}s budget (batches={batches} ran={ran_total} \
-                 remaining={remaining})",
-                DRAIN_TIME_BUDGET.as_secs()
-            )));
-        }
-        if batches >= DRAIN_MAX_BATCHES {
-            warn!(
-                batches,
-                ran = ran_total,
-                remaining,
-                "LHC derivation drain hit its batch cap; failing open"
-            );
-            return Err(LhcCompactUnavailable::DerivationFailed(format!(
-                "derivation drain hit batch cap {DRAIN_MAX_BATCHES} (ran={ran_total} \
-                 remaining={remaining})"
-            )));
-        }
-
-        let report = match session
-            .lhc
-            .work
-            .drain(
-                session.thread_ref.clone(),
-                Some(DrainOpts {
-                    max_items: Some(DRAIN_BATCH_ITEMS),
-                }),
-            )
-            .await
-        {
-            OpResult::Ok { value } => value,
-            OpResult::Err { error } => {
-                return Err(LhcCompactUnavailable::DerivationFailed(format!(
-                    "work.drain failed: {}",
-                    error.reason
-                )));
-            }
-        };
-        batches += 1;
-        ran_total += report.ran.len();
-        remaining = report.remaining;
-        stopped = report.stopped_because;
-
-        let failed_n = report
-            .ran
-            .iter()
-            .filter(|e| e.disposition == DrainDisposition::FailedTerminal)
-            .count();
-        if failed_n > 0 {
-            let sample: Vec<String> = report
-                .ran
-                .iter()
-                .filter(|e| e.disposition == DrainDisposition::FailedTerminal)
-                .take(3)
-                .map(|e| {
-                    format!(
-                        "{}:{}",
-                        e.kind,
-                        e.reason.as_deref().unwrap_or("failed_terminal")
-                    )
-                })
-                .collect();
-            warn!(
-                failed = failed_n,
-                ran = ran_total,
-                remaining,
-                ?sample,
-                "LHC derivation failed during drain; failing open (no degraded install)"
-            );
-            return Err(LhcCompactUnavailable::DerivationFailed(format!(
-                "{failed_n} derivation item(s) failed_terminal (sample={sample:?})"
-            )));
-        }
-
-        // `MaxItems` is the only "there is more claimable work" signal. `Empty`
-        // and `InFlight` both mean this caller cannot make further progress
-        // now; leftover work surfaces as degraded bands, which L2 rejects.
-        if stopped != DrainStoppedBecause::MaxItems {
-            break;
-        }
-        // Defensive: a batch that claims the cap but runs nothing is no
-        // progress — break rather than spin the deadline down.
-        if report.ran.is_empty() {
-            break;
+/// LHC's own typed health surface (`query_derivation_log`), not a parsed
+/// render. A terminal failure means that subject has no derivation and compact
+/// will serve its raw content, which is not a compaction — L2 fails open.
+async fn terminal_derivation_failures(session: &LhcSession) -> usize {
+    match session
+        .lhc
+        .logging
+        .query_derivation_log(
+            session.thread_ref.clone(),
+            DerivationLogQuery {
+                subject_kind: None,
+                subject_id: None,
+                derivation_type: None,
+                event_kind: Some(DerivationLogEventKind::TerminalFailed),
+            },
+        )
+        .await
+    {
+        OpResult::Ok { value } => value.len(),
+        OpResult::Err { error } => {
+            warn!(reason = %error.reason, "LHC: derivation log query failed; treating as healthy");
+            0
         }
     }
-
-    info!(
-        ran = ran_total,
-        batches,
-        remaining,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        stopped = %stopped.as_str(),
-        "LHC derivation work.drain completed before compact (bounded)"
-    );
-    Ok(())
 }
 
 /// Max compact markers whose derived digests/ids we retain (most recent).
@@ -851,25 +731,30 @@ pub async fn produce_lhc_compact_with_provenance(
         return Err(LhcCompactUnavailable::NoEvents);
     }
 
-    check_cancel(cancel.as_deref())?;
-
-    // L1: actually run derivation work. `drain_settled` only waits for idle —
-    // it never schedules or executes work. Without `work.drain`, every band is
-    // the degraded excerpt fallback and inference callbacks are never invoked.
-    //
-    // M2: the drain is **bounded** and **cancellable**. An unbounded
-    // `drain(ref, None)` keeps issuing inference round-trips long after the
-    // caller's `COMPACT_THREAD_TIMEOUT` has elapsed and Codex has already
-    // failed open to the native ladder — orphaned traffic billed to a session
-    // that has stopped listening.
-    if let Err(err) = run_bounded_derivation_drain(&session, cancel.as_deref()).await {
+    // L2 gate, restored on typed signal. The old gate was the compact-time
+    // drain's `FailedTerminal` disposition; with the drain gone, that signal
+    // moved. `receipt.degraded` does **not** cover it — measured: with every
+    // derivation failing, compact returns `degraded: []` while serving raw
+    // prompts marked `[fallback]` in the rendered bands. Reading that marker
+    // would be parsing a render (law 1), so ask LHC's own derivation log
+    // instead.
+    let terminal = terminal_derivation_failures(&session).await;
+    if terminal > 0 {
         session.close().await;
-        return Err(err);
+        return Err(LhcCompactUnavailable::DerivationFailed(format!(
+            "{terminal} derivation(s) failed terminally in background; \
+             refusing to compact raw fallback content"
+        )));
     }
 
-    // Await quiescence after work has been run (not a substitute for drain).
-    session.lhc.drain_settled(session.thread_ref.clone()).await;
-
+    // No drain here. Derivation runs in the background as intake commits, on
+    // the capture session's scheduler (`SdkMode::Background`); the caller waits
+    // for it to settle via `CaptureHandle::drain_settled` before reaching this
+    // point. Draining inline was a host doing LHC's job at the worst possible
+    // moment — see FORK.md §"The drain correction".
+    //
+    // If derivation is genuinely incomplete the bands come back degraded and L2
+    // rejects them below, which is the correct fail-open.
     check_cancel(cancel.as_deref())?;
 
     let archive_tip = archive_tip_identity(&events);
@@ -1030,7 +915,6 @@ pub async fn produce_lhc_compact_deterministic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mapping::map_item;
     use codex_extension_api::RawItemProvenance;
     use codex_protocol::ResponseItemId;
     use tempfile::tempdir;
@@ -1055,12 +939,19 @@ mod tests {
         }
     }
 
+    /// Seed through the **capture path**, the way production does.
+    ///
+    /// This used to open a bare `Manual` session and submit directly, which
+    /// derived nothing — the compact-time drain covered for it. With that drain
+    /// deleted, seeding has to go through the same background-mode capture
+    /// session production uses, or the bands legitimately come back degraded
+    /// and L2 refuses. Driving the real entry point is the point.
     async fn submit_items(root: &Path, tid: &str, items: &[ResponseItem]) {
-        let callbacks = lhc_inference_callbacks(false).unwrap();
-        let (mut session, mut tracker) =
-            LhcSession::open_with_inference(tid, None, Some(root), callbacks)
-                .await
-                .expect("open");
+        let derivation = crate::inference::LateBoundCallbacks::new();
+        derivation.seed(lhc_inference_callbacks(false).unwrap());
+        let handle = crate::capture::spawn_capture(tid, None, Some(root.to_path_buf()), derivation)
+            .await
+            .expect("capture");
         for item in items {
             let prov = match item {
                 ResponseItem::Message { role, .. } if role == "user" => {
@@ -1068,11 +959,46 @@ mod tests {
                 }
                 _ => RawItemProvenance::ModelOutput,
             };
-            let mapped = map_item(tid, item, prov, &mut tracker);
-            let inputs: Vec<_> = mapped.into_iter().map(|m| m.input).collect();
-            session.submit_events(&inputs).await.expect("submit");
+            handle.persist(item, prov);
         }
-        session.close().await;
+        handle.flush().await;
+        assert!(
+            handle
+                .drain_settled(std::time::Duration::from_secs(120))
+                .await,
+            "fixture: background derivation must settle before the test compacts"
+        );
+        handle.shutdown().await;
+    }
+
+    /// Seed through capture with explicit derivation callbacks — the seam where
+    /// derivation now actually happens.
+    async fn submit_items_with_callbacks(
+        root: &Path,
+        tid: &str,
+        items: &[ResponseItem],
+        callbacks: InferenceCallbacks,
+    ) -> bool {
+        let derivation = crate::inference::LateBoundCallbacks::new();
+        derivation.seed(callbacks);
+        let handle = crate::capture::spawn_capture(tid, None, Some(root.to_path_buf()), derivation)
+            .await
+            .expect("capture");
+        for item in items {
+            let prov = match item {
+                ResponseItem::Message { role, .. } if role == "user" => {
+                    RawItemProvenance::UserPrompt
+                }
+                _ => RawItemProvenance::ModelOutput,
+            };
+            handle.persist(item, prov);
+        }
+        handle.flush().await;
+        let settled = handle
+            .drain_settled(std::time::Duration::from_secs(120))
+            .await;
+        handle.shutdown().await;
+        settled
     }
 
     async fn seed_thread(root: &Path, tid: &str) -> Vec<ResponseItem> {
@@ -1091,7 +1017,9 @@ mod tests {
     }
 
     /// Large history so LHC actually bands (lower_bound 120k tokens).
-    async fn seed_bandable_thread(root: &Path, tid: &str, turns: usize) -> Vec<ResponseItem> {
+    /// The bandable fixture items, without seeding — so a test can choose the
+    /// callbacks the capture session derives with.
+    fn bandable_items(turns: usize) -> Vec<ResponseItem> {
         let pad = "x".repeat(2500);
         let mut items = Vec::with_capacity(turns * 2);
         for i in 0..turns {
@@ -1100,10 +1028,16 @@ mod tests {
                 &format!("bu{i}"),
             ));
             items.push(assistant(
-                &format!("assistant reply {i} covering topic {pad}"),
+                &format!("assistant reply {i} for topic series {pad}"),
                 &format!("ba{i}"),
             ));
         }
+        items
+    }
+
+    /// Large history so LHC actually bands (lower_bound 120k tokens).
+    async fn seed_bandable_thread(root: &Path, tid: &str, turns: usize) -> Vec<ResponseItem> {
+        let items = bandable_items(turns);
         submit_items(root, tid, &items).await;
         items
     }
@@ -1589,7 +1523,6 @@ mod tests {
     #[tokio::test]
     async fn l1_derivation_runs_callbacks_and_bands_are_not_degraded() {
         use lhc::shared_tech::CompressDetailedTurnInput;
-        use lhc::shared_tech::InferenceResult;
         use lhc::shared_tech::SmoothPromptInput;
         use lhc::shared_tech::SummarizeChunkBriefInput;
         use lhc::shared_tech::SummarizeToolResultInput;
@@ -1601,89 +1534,16 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let tid = "l1-derive-runs";
-        let host = seed_bandable_thread(root, tid, 80).await;
 
+        // The callbacks now go where derivation happens: the capture session.
         let counter = Arc::new(AtomicUsize::new(0));
         let base = create_deterministic_inference_callbacks();
-        let a = Arc::clone(&counter);
-        let b = Arc::clone(&counter);
-        let c = Arc::clone(&counter);
-        let d = Arc::clone(&counter);
-        let base_a = base.clone();
-        let base_b = base.clone();
-        let base_c = base.clone();
-        let base_d = base;
-        let callbacks = InferenceCallbacks {
-            smooth_prompt: Arc::new(move |input: SmoothPromptInput| {
-                a.fetch_add(1, Ordering::SeqCst);
-                let f = Arc::clone(&base_a.smooth_prompt);
-                Box::pin(async move { f(input).await })
-            }),
-            summarize_tool_result: Arc::new(move |input: SummarizeToolResultInput| {
-                b.fetch_add(1, Ordering::SeqCst);
-                let f = Arc::clone(&base_b.summarize_tool_result);
-                Box::pin(async move { f(input).await })
-            }),
-            compress_detailed_turn: Arc::new(move |input: CompressDetailedTurnInput| {
-                c.fetch_add(1, Ordering::SeqCst);
-                let f = Arc::clone(&base_c.compress_detailed_turn);
-                Box::pin(async move { f(input).await })
-            }),
-            summarize_chunk_brief: Arc::new(move |input: SummarizeChunkBriefInput| {
-                d.fetch_add(1, Ordering::SeqCst);
-                let f = Arc::clone(&base_d.summarize_chunk_brief);
-                Box::pin(async move { f(input).await })
-            }),
-        };
-
-        let result = produce_lhc_compact(tid, Some(root), &host, true, callbacks, None)
-            .await
-            .expect("produce must succeed with derivation");
-        let invoked = counter.load(Ordering::SeqCst);
-        assert!(
-            invoked > 0,
-            "L1: inference callbacks must be invoked by work.drain (got {invoked}); \
-             if this is 0, drain was not run and derivation is still dead"
-        );
-        assert!(
-            result.receipt.degraded.is_empty(),
-            "L1: receipt.degraded must be empty after successful derivation; got {:?}",
-            result.receipt.degraded
-        );
-        assert!(
-            !body_contains_degraded_marker(&result.body),
-            "L1: body must not contain [degraded: …] markers"
-        );
-        // Silence unused import warning path for InferenceResult if needed.
-        let _ = InferenceResult::Err {
-            reason: String::new(),
-            request_messages: None,
-        };
-    }
-
-    /// Counting inference callbacks over the deterministic base.
-    /// `on_call` runs before each derivation and may set a cancel flag.
-    fn counting_callbacks(
-        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-        on_call: std::sync::Arc<dyn Fn(usize) + Send + Sync>,
-    ) -> InferenceCallbacks {
-        use lhc::shared_tech::CompressDetailedTurnInput;
-        use lhc::shared_tech::SmoothPromptInput;
-        use lhc::shared_tech::SummarizeChunkBriefInput;
-        use lhc::shared_tech::SummarizeToolResultInput;
-        use lhc::shared_tech::create_deterministic_inference_callbacks;
-        use std::sync::Arc;
-        use std::sync::atomic::Ordering;
-
-        let base = create_deterministic_inference_callbacks();
-        macro_rules! wrap {
+        macro_rules! counted {
             ($field:ident, $ty:ty) => {{
-                let counter = Arc::clone(&counter);
-                let on_call = Arc::clone(&on_call);
+                let n = Arc::clone(&counter);
                 let inner = Arc::clone(&base.$field);
                 Arc::new(move |input: $ty| {
-                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
-                    on_call(n);
+                    n.fetch_add(1, Ordering::SeqCst);
                     let inner = Arc::clone(&inner);
                     Box::pin(async move { inner(input).await })
                         as lhc::shared_tech::derivation::BoxFuture<
@@ -1692,146 +1552,32 @@ mod tests {
                 })
             }};
         }
-        InferenceCallbacks {
-            smooth_prompt: wrap!(smooth_prompt, SmoothPromptInput),
-            summarize_tool_result: wrap!(summarize_tool_result, SummarizeToolResultInput),
-            compress_detailed_turn: wrap!(compress_detailed_turn, CompressDetailedTurnInput),
-            summarize_chunk_brief: wrap!(summarize_chunk_brief, SummarizeChunkBriefInput),
-        }
-    }
+        let callbacks = InferenceCallbacks {
+            smooth_prompt: counted!(smooth_prompt, SmoothPromptInput),
+            summarize_tool_result: counted!(summarize_tool_result, SummarizeToolResultInput),
+            compress_detailed_turn: counted!(compress_detailed_turn, CompressDetailedTurnInput),
+            summarize_chunk_brief: counted!(summarize_chunk_brief, SummarizeChunkBriefInput),
+        };
 
-    /// M2: the compact-time drain must stop promptly when the caller cancels.
-    ///
-    /// Before M2 the drain was a single unbounded `work.drain(ref, None)` and
-    /// `cancel` was only consulted **after** it returned — so every remaining
-    /// derivation still fired (and still billed) after Codex had already failed
-    /// open to the native ladder.
-    ///
-    /// Cancellation is checked *between batches*, so the bound proven here is
-    /// "at most one batch of further derivations", not zero.
-    #[tokio::test]
-    async fn m2_cancel_mid_drain_stops_further_inference() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
+        let host = bandable_items(80);
+        let settled = submit_items_with_callbacks(root, tid, &host, callbacks).await;
+        assert!(settled, "background derivation must settle");
 
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-
-        // Baseline: how much derivation an uncancelled compact performs.
-        let tid_base = "m2-cancel-baseline";
-        let host_base = seed_bandable_thread(root, tid_base, 80).await;
-        let baseline_counter = Arc::new(AtomicUsize::new(0));
-        produce_lhc_compact(
-            tid_base,
-            Some(root),
-            &host_base,
-            true,
-            counting_callbacks(Arc::clone(&baseline_counter), Arc::new(|_| {})),
-            None,
-        )
-        .await
-        .expect("baseline produce");
-        let baseline = baseline_counter.load(Ordering::SeqCst);
+        let invoked = counter.load(Ordering::SeqCst);
         assert!(
-            baseline > 3 * DRAIN_BATCH_ITEMS as usize,
-            "fixture: baseline derivation ({baseline}) must span several batches \
-             for the cancellation bound to mean anything"
+            invoked > 0,
+            "L1: background derivation must invoke inference (got {invoked}). \
+             0 means the scheduler is inert — the `SdkMode::Manual` defect."
         );
 
-        // Cancel from inside the 5th derivation callback.
-        let tid = "m2-cancel-mid-drain";
-        let host = seed_bandable_thread(root, tid, 80).await;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let counter = Arc::new(AtomicUsize::new(0));
-        let cancel_at = 5usize;
-        let flag = Arc::clone(&cancel);
-        let callbacks = counting_callbacks(
-            Arc::clone(&counter),
-            Arc::new(move |n| {
-                if n >= cancel_at {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            }),
-        );
-
-        let err = produce_lhc_compact(
-            tid,
-            Some(root),
-            &host,
-            true,
-            callbacks,
-            Some(Arc::clone(&cancel)),
-        )
-        .await
-        .expect_err("cancelled drain must not produce a body");
-        assert_eq!(err, LhcCompactUnavailable::Cancelled, "got {err:?}");
-
-        let at_return = counter.load(Ordering::SeqCst);
-        // Bound: the batch in flight when the flag was set may finish, and the
-        // flag is only set part-way through a batch — never a second one.
-        let bound = cancel_at + 2 * DRAIN_BATCH_ITEMS as usize;
-        assert!(
-            at_return <= bound,
-            "M2: cancellation must stop the drain within one batch — fired {at_return} \
-             derivations (bound {bound}, uncancelled baseline {baseline}); \
-             without a per-batch cancel check this reaches the baseline"
-        );
-        assert!(
-            at_return < baseline,
-            "M2: cancelled run ({at_return}) must derive strictly less than the \
-             uncancelled baseline ({baseline})"
-        );
-
-        // Nothing keeps firing after produce returned.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            at_return,
-            "M2: no derivation may fire after the cancelled produce returned"
-        );
-        assert_eq!(
-            marker_count(&list_archive(root, tid).await),
-            0,
-            "M2: cancelled compact writes no marker"
-        );
-    }
-
-    /// M2: the drain is bounded — it issues many small batches, not one
-    /// unbounded call. Proven by `remaining`/batch behaviour being reachable:
-    /// a single `max_items: None` drain would run every item in one batch and
-    /// the per-batch cancel check above could never bite.
-    #[tokio::test]
-    async fn m2_drain_batches_are_bounded_by_max_items() {
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::atomic::Ordering;
-
-        let dir = tempdir().unwrap();
-        let root = dir.path();
-        let tid = "m2-bounded-batches";
-        let host = seed_bandable_thread(root, tid, 80).await;
-
-        // Count derivations observed by the *first* batch only: cancel as soon
-        // as the first batch's items have run.
-        let counter = Arc::new(AtomicUsize::new(0));
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&cancel);
-        let callbacks = counting_callbacks(
-            Arc::clone(&counter),
-            Arc::new(move |_| flag.store(true, Ordering::SeqCst)),
-        );
-        let err = produce_lhc_compact(tid, Some(root), &host, true, callbacks, Some(cancel))
+        // Compact assembles from what background derivation already produced.
+        let result = produce_lhc_compact_deterministic(tid, Some(root), &host, true)
             .await
-            .expect_err("cancel on first derivation");
-        assert_eq!(err, LhcCompactUnavailable::Cancelled);
-        let fired = counter.load(Ordering::SeqCst);
+            .expect("produce must succeed off background-derived material");
         assert!(
-            fired <= DRAIN_BATCH_ITEMS as usize,
-            "M2: cancelling on the very first derivation must not exceed one \
-             batch of {DRAIN_BATCH_ITEMS} items; fired {fired} (unbounded drain \
-             would run the whole backlog)"
+            result.receipt.degraded.is_empty(),
+            "L1: receipt.degraded must be empty after successful derivation; got {:?}",
+            result.receipt.degraded
         );
     }
 
@@ -1848,9 +1594,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let tid = "l2-infer-fail";
-        let host = seed_bandable_thread(root, tid, 80).await;
-        let source_before = list_archive(root, tid).await.len();
 
+        // The failure is injected where derivation runs — at capture. Injecting
+        // it at compact time would prove nothing now: compact never calls
+        // inference.
         let fail = || {
             Box::pin(async {
                 InferenceResult::Err {
@@ -1865,16 +1612,21 @@ mod tests {
             compress_detailed_turn: Arc::new(move |_input: CompressDetailedTurnInput| fail()),
             summarize_chunk_brief: Arc::new(move |_input: SummarizeChunkBriefInput| fail()),
         };
+        let host = bandable_items(80);
+        submit_items_with_callbacks(root, tid, &host, callbacks).await;
+        let source_before = list_archive(root, tid).await.len();
 
-        let outcome = produce_lhc_compact(tid, Some(root), &host, true, callbacks, None).await;
+        let outcome = produce_lhc_compact_deterministic(tid, Some(root), &host, true).await;
         match outcome {
             Err(LhcCompactUnavailable::DerivationFailed(reason)) => {
                 assert!(!reason.is_empty(), "DerivationFailed must carry a reason");
             }
             Ok(r) => panic!(
-                "L2: inference failure must not Install; got body_items={} degraded={}",
+                "L2: inference failure must not Install; got body_items={} degraded={} \
+                 receipt={:?}",
                 r.body.len(),
-                r.receipt.degraded.len()
+                r.receipt.degraded.len(),
+                r.receipt
             ),
             Err(other) => panic!("expected DerivationFailed, got {other:?}"),
         }

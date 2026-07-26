@@ -41,6 +41,7 @@ pub use compact_bridge::produce_lhc_compact;
 pub use compact_bridge::produce_lhc_compact_deterministic;
 pub use compact_bridge::produce_lhc_compact_with_derived;
 pub use compact_bridge::produce_lhc_compact_with_provenance;
+pub use inference::LateBoundCallbacks;
 pub use inference::LhcInferenceError;
 pub use inference::lhc_inference_callbacks;
 /// Re-export so core can pass live ModelClient-backed callbacks without a
@@ -72,10 +73,6 @@ pub use idempotency::turn_end_key;
 pub use install::LhcCaptureSlot;
 pub use install::LhcTurnId;
 pub use install::install;
-#[cfg(any(test, feature = "test-util"))]
-pub use install::reset_session_derived_cap_for_test;
-#[cfg(any(test, feature = "test-util"))]
-pub use install::set_session_derived_cap_for_test;
 pub use mapping::ACTOR_ASSISTANT;
 pub use mapping::ACTOR_SYSTEM;
 pub use mapping::ACTOR_TOOL;

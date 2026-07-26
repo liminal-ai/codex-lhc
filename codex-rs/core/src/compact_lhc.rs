@@ -41,34 +41,6 @@ use crate::session::turn_context::TurnContext;
 
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-// Test-only shrink of COMPACT_THREAD_TIMEOUT so the timeout → cancel →
-// bounded-drain chain can be driven in seconds instead of minutes (M2).
-// `0` means "use the production constant".
-//
-// Thread-local, not a global: the test harness runs each test on its own
-// thread and `#[tokio::test]` awaits the arm inline, so a global would leak a
-// 400 ms compact timeout into every test running concurrently.
-#[cfg(test)]
-thread_local! {
-    static COMPACT_THREAD_TIMEOUT_MS_OVERRIDE: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(crate) fn set_compact_thread_timeout_ms_for_test(ms: u64) {
-    COMPACT_THREAD_TIMEOUT_MS_OVERRIDE.with(|c| c.set(ms));
-}
-
-fn compact_thread_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        let ms = COMPACT_THREAD_TIMEOUT_MS_OVERRIDE.with(std::cell::Cell::get);
-        if ms > 0 {
-            return Duration::from_millis(ms);
-        }
-    }
-    COMPACT_THREAD_TIMEOUT
-}
 
 #[derive(Debug)]
 pub(crate) enum LhcCompactAttempt {
@@ -196,6 +168,34 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     }
 
     handle.flush().await;
+
+    // Derivation runs in the background as intake commits (LHC's own scheduler,
+    // `SdkMode::Background`). All the arm does is wait, bounded, for it to
+    // settle — and fail open if it has not. This replaces the compact-time
+    // drain loop, which existed only because the SDK was misconfigured to
+    // `Manual` and its scheduler was inert; see FORK.md §"The drain correction".
+    let settled = tokio::select! {
+        biased;
+        () = cancellation_token.cancelled() => {
+            return Ok(LhcCompactAttempt::Unavailable {
+                reason: "turn cancelled while waiting for background derivation".into(),
+            });
+        }
+        ok = handle.drain_settled(SETTLE_WAIT) => ok,
+    };
+    if !settled {
+        warn!(
+            manual,
+            wait_s = SETTLE_WAIT.as_secs(),
+            "LHC background derivation did not settle in time; failing open"
+        );
+        return Ok(LhcCompactAttempt::Unavailable {
+            reason: format!(
+                "background derivation not settled within {}s",
+                SETTLE_WAIT.as_secs()
+            ),
+        });
+    }
 
     let thread_id = handle.thread_id().to_string();
     let root = handle.root().map(|p| p.to_path_buf());
@@ -361,16 +361,24 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     })
 }
 
-/// M1: hand the LHC capture slot the **production** derivation callbacks so its
-/// `on_thread_idle` pump can derive in the background.
+/// Bound on waiting for LHC's background scheduler to settle before a compact.
+///
+/// This is a *wait*, not a work loop — the drain is already running and this
+/// only asks when it is done. Kept well under `COMPACT_THREAD_TIMEOUT` so the
+/// arm fails open to the native ladder rather than being killed by the caller.
+const SETTLE_WAIT: Duration = Duration::from_secs(60);
+
+/// Hand the LHC capture slot the **production** derivation callbacks that its
+/// background scheduler derives with.
 ///
 /// Resolved once per thread (the models-manager lookup is not free) and only
 /// through [`select_production_inference_callbacks`] — the same selection the
-/// compact arm uses, so the idle pump can never be the path that quietly
-/// persists deterministic text into the durable record (J1). If the derivation
-/// model is unavailable the pump simply stays off and every derivation falls
-/// back to compact time, exactly as before this hook existed.
-pub(crate) async fn seed_lhc_idle_derivation_callbacks(sess: &Session) {
+/// compact arm uses, so background derivation can never be the path that
+/// quietly persists deterministic text into the durable record (J1). If the
+/// derivation model is unavailable the capture session's `LateBoundCallbacks`
+/// stay unseeded: queued inference work waits rather than failing terminally,
+/// and the arm's bounded settle-wait fails open at compact time.
+pub(crate) async fn seed_lhc_derivation_callbacks(sess: &Session) {
     if !sess.enabled(Feature::LhcCapture) {
         return;
     }
@@ -385,7 +393,7 @@ pub(crate) async fn seed_lhc_idle_derivation_callbacks(sess: &Session) {
         Err(reason) => {
             debug!(
                 %reason,
-                "LHC background derivation callbacks unavailable; idle pump stays off"
+                "LHC background derivation callbacks unavailable; capture stays unseeded"
             );
         }
     }
@@ -559,11 +567,11 @@ async fn produce_lhc_compact_on_thread(
         })
         .map_err(|e| format!("spawn lhc-compact thread: {e}"))?;
 
-    let thread_timeout = compact_thread_timeout();
+    let thread_timeout = COMPACT_THREAD_TIMEOUT;
     // N3: the turn's own cancellation races the worker and the timeout. The
-    // detached worker checks `cancel` between drain batches (M2), so setting it
-    // here stops further inference within one batch instead of letting it run
-    // out the 75 s derivation budget for an abandoned turn.
+    // detached worker checks `cancel` between its compact steps (event import,
+    // compact, context fetch, mapping), so setting it here stops the abandoned
+    // attempt at the next step boundary instead of letting it run to the end.
     let raced = tokio::select! {
         biased;
         () = turn_cancel.cancelled() => {

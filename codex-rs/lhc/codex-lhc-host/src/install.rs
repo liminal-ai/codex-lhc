@@ -44,16 +44,12 @@ use tracing::debug;
 use tracing::error;
 use tracing::warn;
 
-use lhc::sdk::DrainOpts;
-use lhc::sdk::OpResult;
 use lhc::shared_tech::InferenceCallbacks;
-use lhc::shared_tech::scheduler::DrainDisposition;
 
 use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
 use crate::capture::spawn_capture;
 use crate::gating::lhc_root;
-use crate::session::LhcSession;
 
 /// Cap a set to `max` entries by dropping arbitrary extras; **logs** the drop (H3).
 /// Only used on **superseded** provenance — never on the current body (L3).
@@ -77,30 +73,14 @@ fn cap_hashset_with_log(set: &mut HashSet<String>, max: usize, label: &str) {
 
 /// Process-local cap on **superseded** (non-current) derived provenance (H3/L3).
 /// The current body's ids/digests are pinned and never subject to this cap.
+///
+/// There is deliberately no test override. There used to be a mutable global
+/// one, and it was a shared-state smell that duly bit: two `l3_*` tests set it
+/// concurrently and the suite failed only under parallelism, passing in
+/// isolation. The tests now drive the real constant — provenance ids are just
+/// strings in a set, so exercising the true cap costs nothing.
 fn session_derived_cap() -> usize {
-    #[cfg(any(test, feature = "test-util"))]
-    {
-        SESSION_DERIVED_CAP_OVERRIDE.load(Ordering::SeqCst).max(1) as usize
-    }
-    #[cfg(not(any(test, feature = "test-util")))]
-    {
-        SESSION_DERIVED_CAP
-    }
-}
-
-#[cfg(any(test, feature = "test-util"))]
-static SESSION_DERIVED_CAP_OVERRIDE: AtomicU64 = AtomicU64::new(SESSION_DERIVED_CAP as u64);
-
-/// Test-only: shrink the superseded provenance cap (L3 mutation harness).
-#[cfg(any(test, feature = "test-util"))]
-pub fn set_session_derived_cap_for_test(cap: usize) {
-    SESSION_DERIVED_CAP_OVERRIDE.store(cap.max(1) as u64, Ordering::SeqCst);
-}
-
-/// Test-only: restore the production superseded cap.
-#[cfg(any(test, feature = "test-util"))]
-pub fn reset_session_derived_cap_for_test() {
-    SESSION_DERIVED_CAP_OVERRIDE.store(SESSION_DERIVED_CAP as u64, Ordering::SeqCst);
+    SESSION_DERIVED_CAP
 }
 
 /// Bound on the pre-open buffer (same order as the capture queue).
@@ -124,14 +104,6 @@ enum PendingCmd {
 /// write-backs (H3). Current-body ids/digests are **never** capped (L3).
 pub const SESSION_DERIVED_CAP: usize = 512;
 
-/// Derivation work items attempted per idle tick (M1).
-///
-/// Small on purpose: an idle tick must stay short, must not monopolise the
-/// scheduler's claims, and is only an *optimisation* — the compact-time drain
-/// is the correctness backstop, so a tick that under-derives costs nothing but
-/// a slower first compact.
-const IDLE_PUMP_MAX_ITEMS: i64 = 8;
-
 /// Per-thread capture slot: handle is filled asynchronously after start.
 /// Items arriving before open are buffered and flushed when the handle lands.
 pub struct LhcCaptureSlot {
@@ -148,22 +120,14 @@ pub struct LhcCaptureSlot {
     /// Superseded by a later compact — may be capped (H3/L3).
     superseded_ids: Mutex<HashSet<String>>,
     superseded_digests: Mutex<HashSet<String>>,
-    /// Inference callbacks for **background** derivation (M1), seeded by the
-    /// host before the idle fan-out. `None` means the idle pump stays off.
+    /// Late binding for the **capture session's** derivation callbacks.
     ///
-    /// J1 applies here as hard as it does at compact time: whatever these
-    /// callbacks produce is persisted to the archive and later *served* as if
-    /// it were real derivation. The capture worker's own session holds
-    /// deterministic callbacks, so pumping from there would quietly bake
-    /// canned text into the record. Only the host's production callbacks are
-    /// ever installed here.
-    derivation_callbacks: Mutex<Option<InferenceCallbacks>>,
-    /// Single-flight guard: at most one idle pump in flight per thread.
-    pumping: AtomicBool,
-    /// Latched by `on_thread_stop` — no pump is started after shutdown.
-    stopped: AtomicBool,
-    /// Completed idle pump ticks (observability + test synchronisation).
-    pump_runs: AtomicU64,
+    /// Under `SdkMode::Background` LHC's scheduler derives on the capture
+    /// session, so this is what lands in the durable record. J1 applies as hard
+    /// as it does at compact time: only the host's production callbacks are
+    /// ever installed here — never the deterministic ones, which would bake
+    /// canned text into the record and serve it as real derivation.
+    derivation_callbacks: crate::inference::LateBoundCallbacks,
 }
 
 impl LhcCaptureSlot {
@@ -179,44 +143,24 @@ impl LhcCaptureSlot {
             pinned_digests: Mutex::new(HashSet::new()),
             superseded_ids: Mutex::new(HashSet::new()),
             superseded_digests: Mutex::new(HashSet::new()),
-            derivation_callbacks: Mutex::new(None),
-            pumping: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
-            pump_runs: AtomicU64::new(0),
+            derivation_callbacks: crate::inference::LateBoundCallbacks::new(),
         }
     }
 
-    /// Install the production derivation callbacks used by the idle pump (M1).
+    /// Install the production derivation callbacks the capture session's
+    /// background scheduler derives with.
     ///
     /// The host resolves these the same way the compact arm does; passing
     /// deterministic callbacks here in production would silently degrade the
     /// durable record (see the field docs).
     pub fn set_derivation_callbacks(&self, callbacks: InferenceCallbacks) {
-        *self
-            .derivation_callbacks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(callbacks);
+        self.derivation_callbacks.seed(callbacks);
     }
 
     /// Whether background derivation callbacks have been seeded.
     /// Hosts use this to resolve the (non-trivial) callbacks only once.
     pub fn has_derivation_callbacks(&self) -> bool {
-        self.derivation_callbacks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    fn derivation_callbacks(&self) -> Option<InferenceCallbacks> {
-        self.derivation_callbacks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Completed background derivation ticks for this thread.
-    pub fn idle_pump_runs(&self) -> u64 {
-        self.pump_runs.load(Ordering::SeqCst)
+        self.derivation_callbacks.is_seeded()
     }
 
     /// Current capture handle, if the background open has completed.
@@ -541,6 +485,7 @@ fn schedule_open(slot: Arc<LhcCaptureSlot>, thread_id: String, cwd: Option<Strin
     {
         return;
     }
+    let derivation = slot.derivation_callbacks.clone();
     let _ = std::thread::Builder::new()
         .name(format!("lhc-open-{thread_id}"))
         .spawn(move || {
@@ -559,6 +504,7 @@ fn schedule_open(slot: Arc<LhcCaptureSlot>, thread_id: String, cwd: Option<Strin
                 &thread_id,
                 cwd.as_deref(),
                 Some(root),
+                derivation,
             ));
             match handle {
                 Some(h) => {
@@ -571,133 +517,6 @@ fn schedule_open(slot: Arc<LhcCaptureSlot>, thread_id: String, cwd: Option<Strin
                 }
             }
         });
-}
-
-/// M1: bounded background derivation pumped from `on_thread_idle`.
-///
-/// Without this, **all** derivation is deferred to the first `compact()`, where
-/// it runs as one long serial burst of inference round-trips against the
-/// caller's 120 s deadline — so the threads big enough to need compaction are
-/// exactly the ones whose first compact times out and fails open, after
-/// billing for the derivations it did manage.
-///
-/// Best effort by design (law 3 keeps the compact-time drain as the
-/// correctness backstop):
-/// * never blocks the turn loop — detached thread, like the capture open;
-/// * never panics into core — the worker catches unwind;
-/// * never runs without production callbacks (J1);
-/// * never runs after `on_thread_stop`;
-/// * single-flight, so overlapping idle ticks cannot pile up sessions.
-///
-/// Derivations persist to the archive, so this genuinely shrinks the
-/// compact-time backlog rather than duplicating it.
-fn spawn_idle_derivation_pump(slot: Arc<LhcCaptureSlot>, handle: &CaptureHandle) {
-    if slot.stopped.load(Ordering::SeqCst) {
-        return;
-    }
-    if handle.is_degraded() {
-        return;
-    }
-    let Some(callbacks) = slot.derivation_callbacks() else {
-        debug!("LHC: idle derivation pump skipped — no production callbacks seeded");
-        return;
-    };
-    if slot
-        .pumping
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        // A previous tick is still deriving; nothing to queue up behind it.
-        return;
-    }
-
-    let thread_id = handle.thread_id().to_string();
-    let root = handle.root().map(std::path::Path::to_path_buf);
-    let slot_worker = Arc::clone(&slot);
-    let spawned = std::thread::Builder::new()
-        .name(format!("lhc-idle-pump-{thread_id}"))
-        .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| format!("runtime: {err}"))?;
-                rt.block_on(run_idle_derivation_pump(
-                    &thread_id,
-                    root.as_deref(),
-                    callbacks,
-                ))
-            }));
-            match outcome {
-                Ok(Ok((ran, remaining))) => {
-                    debug!(
-                        thread_id = %thread_id,
-                        ran,
-                        remaining,
-                        "LHC: idle derivation pump tick complete"
-                    );
-                }
-                Ok(Err(err)) => {
-                    warn!(thread_id = %thread_id, %err, "LHC: idle derivation pump failed (ignored)");
-                }
-                Err(_) => {
-                    warn!(thread_id = %thread_id, "LHC: idle derivation pump panicked (ignored)");
-                }
-            }
-            slot_worker.pump_runs.fetch_add(1, Ordering::SeqCst);
-            slot_worker.pumping.store(false, Ordering::SeqCst);
-        });
-    if let Err(err) = spawned {
-        slot.pumping.store(false, Ordering::SeqCst);
-        warn!(?err, "LHC: failed to spawn idle derivation pump thread");
-    }
-}
-
-/// One bounded drain tick against the thread's archive.
-/// Returns `(items_run, items_remaining)`.
-async fn run_idle_derivation_pump(
-    thread_id: &str,
-    root: Option<&std::path::Path>,
-    callbacks: InferenceCallbacks,
-) -> Result<(usize, i64), String> {
-    let (session, _tracker) = LhcSession::open_with_inference(thread_id, None, root, callbacks)
-        .await
-        .ok_or_else(|| "idle pump: LhcSession::open returned None".to_string())?;
-    let report = match session
-        .lhc
-        .work
-        .drain(
-            session.thread_ref.clone(),
-            Some(DrainOpts {
-                max_items: Some(IDLE_PUMP_MAX_ITEMS),
-            }),
-        )
-        .await
-    {
-        OpResult::Ok { value } => value,
-        OpResult::Err { error } => {
-            session.close().await;
-            return Err(format!("idle pump: work.drain failed: {}", error.reason));
-        }
-    };
-    let failed = report
-        .ran
-        .iter()
-        .filter(|e| e.disposition == DrainDisposition::FailedTerminal)
-        .count();
-    if failed > 0 {
-        // Not fatal here: the compact-time drain re-runs and fails open if the
-        // failure persists. Surfacing it early is the point.
-        warn!(
-            thread_id = %thread_id,
-            failed,
-            ran = report.ran.len(),
-            "LHC: idle derivation pump saw failed_terminal work items"
-        );
-    }
-    let out = (report.ran.len(), report.remaining);
-    session.close().await;
-    Ok(out)
 }
 
 async fn shutdown_capture_send(handle: CaptureHandle) {
@@ -758,8 +577,6 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 && let Some(handle) = slot.get()
             {
                 handle.flush_async();
-                // M1: idle is the natural background-drain pump.
-                spawn_idle_derivation_pump(slot, &handle);
             }
         })
     }
@@ -767,8 +584,6 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() {
-                // Latch before shutdown so no further idle tick starts a pump.
-                slot.stopped.store(true, Ordering::SeqCst);
                 if let Some(handle) = slot.get() {
                     shutdown_capture_send(handle).await;
                 }
@@ -920,6 +735,9 @@ fn _provenance_link() -> RawItemProvenance {
 mod tests {
     use super::*;
 
+    use crate::session::LhcSession;
+    use lhc::sdk::DrainOpts;
+    use lhc::sdk::OpResult;
     use lhc::shared_tech::CompressDetailedTurnInput;
     use lhc::shared_tech::SmoothPromptInput;
     use lhc::shared_tech::SummarizeChunkBriefInput;
@@ -966,44 +784,15 @@ mod tests {
         }
     }
 
-    /// Real registry + stores, so tests fire the **production** lifecycle
-    /// hooks (`on_thread_idle` / `on_thread_stop`) rather than the pump
-    /// function directly — otherwise deleting the `on_thread_idle` call site
-    /// would leave these tests green.
-    struct IdleHarness {
-        registry: codex_extension_api::ExtensionRegistry<()>,
-        session_store: ExtensionData,
-        thread_store: ExtensionData,
-        slot: Arc<LhcCaptureSlot>,
-    }
-
-    impl IdleHarness {
-        async fn fire_idle(&self) {
-            for contributor in self.registry.thread_lifecycle_contributors() {
-                contributor
-                    .on_thread_idle(ThreadIdleInput {
-                        session_store: &self.session_store,
-                        thread_store: &self.thread_store,
-                    })
-                    .await;
-            }
-        }
-
-        async fn fire_stop(&self) {
-            for contributor in self.registry.thread_lifecycle_contributors() {
-                contributor
-                    .on_thread_stop(ThreadStopInput {
-                        session_store: &self.session_store,
-                        thread_store: &self.thread_store,
-                    })
-                    .await;
-            }
-        }
-    }
-
-    /// Build a real registry + slot and seed a bandable thread through the
-    /// production capture path.
-    async fn seeded_slot(root: &std::path::Path, tid: &str) -> IdleHarness {
+    /// Build a real registry, drive `on_thread_start` through the production
+    /// lifecycle contributors, seed derivation callbacks **before** any capture
+    /// (so background derivation runs with them from the first commit), and
+    /// capture a bandable thread through the production path.
+    async fn seeded_slot_with_callbacks(
+        root: &std::path::Path,
+        tid: &str,
+        callbacks: InferenceCallbacks,
+    ) -> Arc<LhcCaptureSlot> {
         let mut builder = ExtensionRegistryBuilder::<()>::new();
         install_with_root(&mut builder, |_c| true, root.to_path_buf());
         let registry = builder.build();
@@ -1026,6 +815,7 @@ mod tests {
                 .await;
         }
         let slot = store.get::<LhcCaptureSlot>().expect("slot");
+        slot.set_derivation_callbacks(callbacks);
         let handle = wait_for_handle(&slot, std::time::Duration::from_secs(30))
             .await
             .expect("handle");
@@ -1049,98 +839,47 @@ mod tests {
             );
         }
         handle.flush().await;
-        IdleHarness {
-            registry,
-            session_store,
-            thread_store: store,
-            slot,
-        }
+        slot
     }
 
-    /// M1: `on_thread_idle` must pump bounded derivation work in the
-    /// background. Before M1 it only flushed capture, so every derivation was
-    /// deferred to the first compact.
+    /// Background mode: LHC derives on its own as intake commits, with **no**
+    /// host drain call anywhere. This is the behaviour the whole M1 idle pump
+    /// was hand-rolling, and it is why that pump is gone.
     ///
-    /// Driven through the real `ThreadLifecycleContributor::on_thread_idle`.
+    /// Driven through the production capture path; the only host action is
+    /// seeding production callbacks through the same lifecycle seam the compact
+    /// arm uses.
     #[tokio::test]
-    async fn m1_idle_tick_derives_in_background_and_shrinks_backlog() {
+    async fn background_mode_derives_without_any_host_drain() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let tid = "m1-idle-pump";
-        let h = seeded_slot(root, tid).await;
+        let tid = "bg-derives";
 
-        // Gate: no production callbacks seeded → no pump, no inference (J1).
         let counter = Arc::new(AtomicUsize::new(0));
-        h.fire_idle().await;
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(
-            h.slot.idle_pump_runs(),
-            0,
-            "M1: no pump may run without host-seeded production callbacks"
-        );
+        let slot =
+            seeded_slot_with_callbacks(root, tid, counting_callbacks(Arc::clone(&counter))).await;
 
-        h.slot
-            .set_derivation_callbacks(counting_callbacks(Arc::clone(&counter)));
-
-        let backlog_before = drain_backlog(root, tid).await;
-        assert!(
-            backlog_before > (4 * IDLE_PUMP_MAX_ITEMS),
-            "fixture: backlog ({backlog_before}) must exceed several ticks"
-        );
-
-        const TICKS: u64 = 4;
-        for tick in 1..=TICKS {
-            h.fire_idle().await;
-            wait_for_pump_runs(&h.slot, tick, std::time::Duration::from_secs(20)).await;
-        }
-        assert_eq!(h.slot.idle_pump_runs(), TICKS, "each idle tick pumps once");
+        // Nothing below calls `work.drain`. If derivation happens, the
+        // scheduler did it.
+        let handle = slot.get().expect("handle");
+        let settled = handle
+            .drain_settled(std::time::Duration::from_secs(120))
+            .await;
+        assert!(settled, "background drain did not settle within 120s");
 
         let derived = counter.load(Ordering::SeqCst);
         assert!(
             derived > 0,
-            "M1: idle ticks must invoke real derivation inference; got 0 — \
-             on_thread_idle no longer pumps, or it ran with other callbacks"
+            "background mode must derive without a host drain; got 0 calls. \
+             `SdkMode::Manual` leaves the scheduler inert (sdk.rs: poke/touch \
+             are no-op closures), which is the misconfiguration this replaces."
         );
-        let backlog_after = drain_backlog(root, tid).await;
-        assert!(
-            backlog_after < backlog_before,
-            "M1: background pumping must shrink the compact-time backlog: \
-             before={backlog_before} after={backlog_after} derived={derived}"
-        );
-    }
 
-    /// M1: no pump may start after `on_thread_stop`.
-    #[tokio::test]
-    async fn m1_no_pump_after_thread_stop() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let tid = "m1-idle-pump-stop";
-        let h = seeded_slot(root, tid).await;
-        let counter = Arc::new(AtomicUsize::new(0));
-        h.slot
-            .set_derivation_callbacks(counting_callbacks(Arc::clone(&counter)));
-
-        // Positive control first: the pump does run before stop.
-        h.fire_idle().await;
+        let backlog = drain_backlog(root, tid).await;
         assert_eq!(
-            wait_for_pump_runs(&h.slot, 1, std::time::Duration::from_secs(20)).await,
-            1
-        );
-        let calls_before_stop = counter.load(Ordering::SeqCst);
-        assert!(calls_before_stop > 0, "positive control: pump derives");
-
-        h.fire_stop().await;
-        h.fire_idle().await;
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        assert_eq!(
-            h.slot.idle_pump_runs(),
-            1,
-            "M1: no derivation pump may start after on_thread_stop"
-        );
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            calls_before_stop,
-            "M1: no inference after thread stop"
+            backlog, 0,
+            "background mode must leave no claimable work behind: {backlog} \
+             items still queued after {derived} derivations"
         );
     }
 
@@ -1163,107 +902,16 @@ mod tests {
         r
     }
 
-    /// Chunk 3 / gap 1: `DrainReport::remaining` is **not** a progress metric.
-    ///
-    /// Chunk 2's deleted core-level M1 test asserted on `remaining` and saw it
-    /// grow while derivation ran; nobody accounted for it and the test was
-    /// removed. This pins the reason as observed behaviour.
-    ///
-    /// `remaining` is `count_live_items` — `SELECT COUNT(*) FROM work_item
-    /// WHERE status IN ('queued','claimed')` — over a derivation graph that
-    /// **cascades**: settling one item enqueues its successors (detailed-turn
-    /// compression when a turn is applied, chunk summaries when a chunk closes,
-    /// rebuild groups on cascade). So the counter nets settled work against
-    /// newly enqueued successors and systematically under-reports progress: a
-    /// tick can run real inference and leave `remaining` unchanged or higher.
-    ///
-    /// Measured here (8 production idle ticks on an 80-turn thread): `remaining`
-    /// fell 159 → 147 while 32 inference calls ran, and two ticks settled work
-    /// for **zero** net reduction. Read as "work left to do", that says the pump
-    /// did nothing on those ticks. It did.
-    ///
-    /// The M1 claim is therefore measured in compact-time inference calls
-    /// instead — see codex-core
-    /// `m1_core_idle_pump_reduces_compact_time_inference_calls`.
-    #[tokio::test]
-    async fn m1_remaining_is_not_a_monotone_progress_metric() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let tid = "m1-remaining-cascade";
-        let h = seeded_slot(root, tid).await;
-        let counter = Arc::new(AtomicUsize::new(0));
-        h.slot
-            .set_derivation_callbacks(counting_callbacks(Arc::clone(&counter)));
-
-        // Per-tick (remaining_before, ran, remaining_after) through the real
-        // idle seam, exactly as production drives it.
-        let mut ticks: Vec<(i64, usize, i64)> = Vec::new();
-        let mut before = drain_backlog(root, tid).await;
-        for tick in 1..=8u64 {
-            let calls_before = counter.load(Ordering::SeqCst);
-            h.fire_idle().await;
-            wait_for_pump_runs(&h.slot, tick, std::time::Duration::from_secs(30)).await;
-            let ran = counter.load(Ordering::SeqCst) - calls_before;
-            let after = drain_backlog(root, tid).await;
-            ticks.push((before, ran, after));
-            before = after;
-        }
-        eprintln!(
-            "M1 cascade ticks (remaining_before, inference_calls, remaining_after): {ticks:?}"
-        );
-
-        let total_calls = counter.load(Ordering::SeqCst);
-        assert!(
-            total_calls > 0,
-            "fixture: derivation must actually run, else this measures nothing"
-        );
-
-        // Decisive observation: at least one tick ran real inference and ended
-        // with no fewer live rows than it began. Over a flat queue that cannot
-        // happen — settling work can only shrink it. It is explicable only by
-        // successors being enqueued as predecessors settle.
-        let stalled = ticks.iter().any(|(b, ran, a)| *ran > 0 && a >= b);
-        assert!(
-            stalled,
-            "expected at least one tick that ran derivation yet did not reduce \
-             `remaining` — that is the cascade this test documents. Ticks: \
-             {ticks:?}. If this now fails, the work graph stopped cascading and \
-             the Chunk 2 observation needs re-deriving, not this comment."
-        );
-
-        // Weaker but flake-proof companion: total reduction across all ticks is
-        // far below the work actually performed.
-        let net_reduction = ticks[0].0 - ticks[ticks.len() - 1].2;
-        assert!(
-            net_reduction < total_calls as i64,
-            "`remaining` fell by {net_reduction} while {total_calls} inference \
-             calls ran; if these ever match, the queue stopped cascading"
-        );
-    }
-
-    async fn wait_for_pump_runs(
-        slot: &LhcCaptureSlot,
-        target: u64,
-        timeout: std::time::Duration,
-    ) -> u64 {
-        let start = std::time::Instant::now();
-        loop {
-            let runs = slot.idle_pump_runs();
-            if runs >= target || start.elapsed() > timeout {
-                return runs;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
+    /// L3: the **current** body's provenance is pinned and survives eviction,
+    /// driven against the real `SESSION_DERIVED_CAP`.
     #[test]
-    fn l3_current_body_provenance_survives_tiny_cap() {
-        set_session_derived_cap_for_test(2);
+    fn l3_current_body_provenance_survives_cap_pressure() {
         let slot = LhcCaptureSlot::new();
 
-        // Ten write-backs of 5 ids each under cap=2: every *current* body must
+        // Enough write-backs to push far past the cap: every *current* body must
         // remain fully protected; only superseded history may be trimmed.
-        for round in 0..10 {
+        let rounds = (SESSION_DERIVED_CAP / 5) + 20;
+        for round in 0..rounds {
             let ids: Vec<String> = (0..5).map(|i| format!("r{round}-id{i}")).collect();
             let digests: Vec<String> = (0..5).map(|i| format!("r{round}-d{i}")).collect();
             slot.mark_derived_after_writeback(ids.clone(), digests.clone())
@@ -1272,7 +920,9 @@ mod tests {
             for id in &ids {
                 assert!(
                     have.contains(id),
-                    "L3: current body id {id} must not be evicted at round {round} (cap=2); have={have:?}"
+                    "L3: current body id {id} must not be evicted at round {round} \
+                     (cap={SESSION_DERIVED_CAP}); have={} ids",
+                    have.len()
                 );
             }
             let digs = slot.derived_digests();
@@ -1283,7 +933,6 @@ mod tests {
                 );
             }
         }
-        reset_session_derived_cap_for_test();
     }
 
     #[test]
@@ -1310,31 +959,40 @@ mod tests {
         assert!(slot.derived_digests().contains("d-x"));
     }
 
+    /// L3: superseded provenance — and only superseded — is subject to the cap.
     #[test]
     fn l3_superseded_only_is_capped() {
-        set_session_derived_cap_for_test(2);
         let slot = LhcCaptureSlot::new();
-        slot.mark_derived_after_writeback(
-            vec!["old1".into(), "old2".into(), "old3".into()],
-            vec!["od1".into(), "od2".into(), "od3".into()],
-        )
-        .unwrap();
+        // Supersede far more than the cap, then install a small current body.
+        let old: Vec<String> = (0..SESSION_DERIVED_CAP + 50)
+            .map(|i| format!("old{i}"))
+            .collect();
+        let old_digests: Vec<String> = (0..SESSION_DERIVED_CAP + 50)
+            .map(|i| format!("od{i}"))
+            .collect();
+        slot.mark_derived_after_writeback(old.clone(), old_digests)
+            .unwrap();
         slot.mark_derived_after_writeback(
             vec!["new1".into(), "new2".into()],
             vec!["nd1".into(), "nd2".into()],
         )
         .unwrap();
+
         let have = slot.derived_ids();
-        assert!(have.contains("new1") && have.contains("new2"));
-        // At most 2 superseded + 2 current = 4; some old* may be gone.
-        let old_retained = ["old1", "old2", "old3"]
-            .iter()
-            .filter(|id| have.contains(**id))
-            .count();
         assert!(
-            old_retained <= 2,
-            "superseded should be capped to 2, retained {old_retained}"
+            have.contains("new1") && have.contains("new2"),
+            "current body must be pinned"
         );
-        reset_session_derived_cap_for_test();
+        let old_retained = old.iter().filter(|id| have.contains(*id)).count();
+        assert!(
+            old_retained <= SESSION_DERIVED_CAP,
+            "superseded must be capped at {SESSION_DERIVED_CAP}, retained {old_retained}"
+        );
+        assert!(
+            old_retained < old.len(),
+            "fixture: the cap must actually have evicted something \
+             ({old_retained} of {} retained)",
+            old.len()
+        );
     }
 }

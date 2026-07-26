@@ -141,7 +141,7 @@ async fn e2e_item_order_preserved_across_records() {
 
     // Close + reopen the LHC thread (process-restart analogue).
     let thread_id = session.thread_id().to_string();
-    let handle2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root))
+    let handle2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root), Default::default())
         .await
         .expect("reopen");
     let events = handle2.list_events().await.expect("list after reopen");
@@ -223,7 +223,7 @@ async fn e2e_core_id_assignment_is_restart_stable() {
     assert!(!id_str.is_empty(), "minted id must be non-empty");
 
     let thread_id = session.thread_id().to_string();
-    let h2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root))
+    let h2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root), Default::default())
         .await
         .expect("reopen");
     // Re-present the same prepared item twice — must collide.

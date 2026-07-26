@@ -72,7 +72,19 @@ fn text_input(text: &str) -> UserInput {
     }
 }
 
+/// Install LHC for an offline test and seed the capture session's derivation
+/// callbacks, mirroring what `tasks/lifecycle.rs` does in production. Under
+/// `SdkMode::Background` LHC derives as intake commits, so without this the
+/// scheduler's handlers wait forever for callbacks that never arrive.
 async fn install_lhc_and_enable(session: &mut Session, root: std::path::PathBuf) {
+    install_lhc_and_enable_with(session, root, Some(deterministic_callbacks())).await;
+}
+
+async fn install_lhc_and_enable_with(
+    session: &mut Session,
+    root: std::path::PathBuf,
+    derivation: Option<InferenceCallbacks>,
+) {
     session
         .set_feature_for_test(Feature::LhcCapture, true)
         .expect("enable LhcCapture");
@@ -95,6 +107,14 @@ async fn install_lhc_and_enable(session: &mut Session, root: std::path::PathBuf)
                 thread_store: &session.services.thread_extension_data,
             })
             .await;
+    }
+    if let Some(cbs) = derivation
+        && let Some(slot) = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+    {
+        slot.set_derivation_callbacks(cbs);
     }
 }
 
@@ -944,7 +964,9 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
         )
     };
-    install_lhc_and_enable(&mut session, root).await;
+    // Deliberately NO derivation callbacks seeded: J1 asserts production never
+    // serves deterministic text, so seeding any here would defeat the test.
+    install_lhc_and_enable_with(&mut session, root, None).await;
     let slot = session
         .services
         .thread_extension_data
@@ -1291,205 +1313,32 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
     );
 }
 
-// M1's idle-pump wiring is proven in the host crate (codex-lhc-host
-// `install.rs::tests::m1_*`) through the real extension registry. The
-// core-level end-to-end measurement is settled below (Chunk 3, gap 1).
+// Background-scheduler derivation (no host drain anywhere) is proven in the
+// host crate (codex-lhc-host `install.rs::tests::
+// background_mode_derives_without_any_host_drain`) through the real extension
+// registry. The core-level end-to-end measurement is settled below.
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
-/// Chunk 3 / gap 1 — the core-level M1 measurement Chunk 2 could not explain.
+/// Round 11: with `SdkMode::Background`, derivation happens **during the
+/// session** and a compact pays for essentially none of it.
 ///
-/// The deleted Chunk 2 attempt asserted on `DrainReport::remaining` and saw it
-/// *grow* while the core pump ran. That is the queue behaving as designed, not
-/// a pump failure: `remaining` is `count_live_items` — queued + claimed
-/// `work_item` rows — and LHC's derivation graph cascades, so settling an item
-/// enqueues its successors. `remaining` is therefore not monotone under
-/// progress and cannot support the M1 claim in either direction. That is pinned
-/// as observed behaviour by the host-crate companion test
-/// `m1_remaining_is_not_a_monotone_progress_metric`.
+/// This replaces `m1_core_idle_pump_reduces_compact_time_inference_calls`,
+/// which measured a hand-rolled idle pump that existed only to work around the
+/// SDK being misconfigured to `Manual`. Both the pump and the compact-time
+/// drain loop are gone; the arm now waits, bounded, for LHC's own scheduler.
 ///
-/// The quantity M1 exists to reduce — and the one core's 120 s
-/// `COMPACT_THREAD_TIMEOUT` is actually spent on — is **inference calls made at
-/// compact time**. This measures exactly that, driving the background pump
-/// through the production idle seam (`emit_thread_idle_lifecycle_if_idle`, the
-/// same call `codex_thread.rs` makes) against an unpumped control on an
-/// identically seeded thread.
-///
-/// Chunk 2's measurement was not wrong, it was **truncated**. Instrumenting the
-/// pump on this exact fixture (60 turns / 120 events / 294 work items) shows two
-/// phases:
-///
-///   * ticks 1–~12 drain only *non-inference* work (ingest, placement,
-///     projection) at the full 8 items/tick. Each settled item enqueues more
-///     successors than it consumed, so `remaining` climbs ~4/tick (121 → ~137)
-///     while the inference counter stays at **0**. A short experiment sees
-///     exactly the reported symptom: "the pump runs, derives nothing, and the
-///     backlog grows".
-///   * from ~tick 13 the cascade front reaches inference-bearing kinds;
-///     `remaining` falls to 0 by ~tick 40 and all derivation is paid in
-///     background.
-///
-/// Hence `TICKS` below is 80, not a handful: fewer ticks measure the transient.
-/// The operational number that falls out is the one worth remembering — roughly
-/// **one idle tick per 1.5 conversation turns** is needed for the pump to keep
-/// up at 8 items/tick. Below that rate compact time still pays the balance.
+/// The control arm is not a second configuration — it is the *same*
+/// configuration measured before the background scheduler has settled, which is
+/// what the old design paid at every compact.
 #[tokio::test]
-async fn m1_core_idle_pump_reduces_compact_time_inference_calls() {
+async fn background_derivation_leaves_compact_with_no_inference_to_do() {
     const TURNS: usize = 60;
-    const TICKS: u64 = 80;
 
-    // ── Control arm: no idle pump. Every derivation is paid at compact time.
-    let control_dir = tempdir().unwrap();
-    let (mut control, control_tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut control, control_dir.path().to_path_buf()).await;
-    let control_slot = control
-        .services
-        .thread_extension_data
-        .get::<LhcCaptureSlot>()
-        .expect("control slot");
-    let control_handle = wait_for_handle(&control_slot, Duration::from_secs(30))
-        .await
-        .expect("control handle");
-    seed_conversation_bandable(&control, &control_tc, TURNS).await;
-    control_handle.flush().await;
-    assert_eq!(
-        control_slot.idle_pump_runs(),
-        0,
-        "control arm must never pump — it is the baseline"
-    );
-
-    let control_calls = Arc::new(AtomicUsize::new(0));
-    let control_sess = Arc::new(control);
-    let control_attempt = try_run_lhc_compact_arm_with_callbacks(
-        &control_sess,
-        &control_tc,
-        InitialContextInjection::DoNotInject,
-        /*manual*/ true,
-        slow_counting_callbacks(Arc::clone(&control_calls), Duration::ZERO),
-    )
-    .await
-    .expect("control arm");
-    assert!(
-        matches!(control_attempt, LhcCompactAttempt::Installed { .. }),
-        "control compact must install (else the comparison is between two \
-         fail-open paths, not two derivation paths); got {control_attempt:?}"
-    );
-    let control_compact_calls = control_calls.load(AtomicOrdering::SeqCst);
-    assert!(
-        control_compact_calls > 0,
-        "control must actually pay derivation at compact time"
-    );
-
-    // ── Pumped arm: identical seed, derivation pumped from the idle seam.
-    let pumped_dir = tempdir().unwrap();
-    let (mut pumped, pumped_tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut pumped, pumped_dir.path().to_path_buf()).await;
-    let pumped_slot = pumped
-        .services
-        .thread_extension_data
-        .get::<LhcCaptureSlot>()
-        .expect("pumped slot");
-    let pumped_handle = wait_for_handle(&pumped_slot, Duration::from_secs(30))
-        .await
-        .expect("pumped handle");
-    seed_conversation_bandable(&pumped, &pumped_tc, TURNS).await;
-    pumped_handle.flush().await;
-
-    // The idle seam resolves callbacks through the same production selection
-    // the compact arm uses; under cfg(test) that honours this override. One
-    // counter across both phases, so background and compact-time calls are
-    // measured on the same instrument.
-    let pumped_calls = Arc::new(AtomicUsize::new(0));
-    *pumped
-        .services
-        .lhc_test_inference
-        .lock()
-        .expect("lhc_test_inference lock") = Some(slow_counting_callbacks(
-        Arc::clone(&pumped_calls),
-        Duration::ZERO,
-    ));
-
-    for tick in 1..=TICKS {
-        // Production entry — not `spawn_idle_derivation_pump` directly, so
-        // deleting the seam in `tasks/lifecycle.rs` fails this test.
-        pumped.emit_thread_idle_lifecycle_if_idle().await;
-        // Asserted per tick, not once at the end: a mutation that severs the
-        // seam otherwise fails only after every tick has burnt its timeout.
-        let runs = wait_for_core_pump_runs(&pumped_slot, tick, Duration::from_secs(20)).await;
-        assert_eq!(
-            runs, tick,
-            "M1: idle tick {tick} did not pump. Either `on_thread_idle` no longer \
-             pumps, or `seed_lhc_idle_derivation_callbacks` is not reaching the \
-             slot from tasks/lifecycle.rs."
-        );
-    }
-    let background_calls = pumped_calls.load(AtomicOrdering::SeqCst);
-    assert!(
-        background_calls > 0,
-        "M1: idle ticks must run real derivation in the background; got 0"
-    );
-
-    let pumped_sess = Arc::new(pumped);
-    let pumped_attempt = try_run_lhc_compact_arm_with_callbacks(
-        &pumped_sess,
-        &pumped_tc,
-        InitialContextInjection::DoNotInject,
-        /*manual*/ true,
-        slow_counting_callbacks(Arc::clone(&pumped_calls), Duration::ZERO),
-    )
-    .await
-    .expect("pumped arm");
-    assert!(
-        matches!(pumped_attempt, LhcCompactAttempt::Installed { .. }),
-        "pumped compact must install; got {pumped_attempt:?}"
-    );
-    let pumped_compact_calls = pumped_calls.load(AtomicOrdering::SeqCst) - background_calls;
-
-    // Printed so the certification record can quote measured numbers.
-    eprintln!(
-        "M1 core measurement: turns={TURNS} ticks={TICKS} \
-         control_compact_calls={control_compact_calls} \
-         pumped_background_calls={background_calls} \
-         pumped_compact_calls={pumped_compact_calls}"
-    );
-
-    assert!(
-        pumped_compact_calls < control_compact_calls,
-        "M1: the idle pump must move derivation off the compact-time deadline — \
-         control paid {control_compact_calls} calls at compact time, pumped paid \
-         {pumped_compact_calls} after {background_calls} background calls. \
-         Not smaller means the pump derived nothing the compact would have had \
-         to do, i.e. background derivation is not persisting to the archive."
-    );
-}
-
-/// Core-local copy of the host crate's pump-run waiter (that one is private to
-/// `install.rs`'s test module).
-async fn wait_for_core_pump_runs(
-    slot: &LhcCaptureSlot,
-    target: u64,
-    timeout: Duration,
-) -> u64 {
-    let start = std::time::Instant::now();
-    loop {
-        let runs = slot.idle_pump_runs();
-        if runs >= target || start.elapsed() > timeout {
-            return runs;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// M2 through the production chain: when the compact arm's own thread timeout
-/// fires, the detached worker's drain must observe the cancel flag and stop —
-/// not keep billing inference for a session that already failed open.
-#[tokio::test]
-async fn m2_compact_timeout_cancels_in_flight_derivation() {
     let dir = tempdir().unwrap();
-    let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut session, root).await;
+    install_lhc_and_enable(&mut session, dir.path().to_path_buf()).await;
     let slot = session
         .services
         .thread_extension_data
@@ -1498,49 +1347,66 @@ async fn m2_compact_timeout_cancels_in_flight_derivation() {
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("handle");
-    seed_conversation_bandable(&session, &tc, 80).await;
+
+    // Seed production callbacks before capture, as `tasks/lifecycle.rs` does —
+    // background derivation runs with these, so they must never be canned text
+    // in production (J1).
+    let calls = Arc::new(AtomicUsize::new(0));
+    slot.set_derivation_callbacks(slow_counting_callbacks(
+        Arc::clone(&calls),
+        Duration::ZERO,
+    ));
+
+    seed_conversation_bandable(&session, &tc, TURNS).await;
     handle.flush().await;
 
-    let counter = Arc::new(AtomicUsize::new(0));
-    let slow = slow_counting_callbacks(Arc::clone(&counter), Duration::from_millis(20));
-    let sess = Arc::new(session);
+    // No host drain anywhere. Wait for LHC's scheduler.
+    let settled = handle.drain_settled(Duration::from_secs(120)).await;
+    assert!(settled, "background derivation did not settle");
+    let derived_in_session = calls.load(AtomicOrdering::SeqCst);
+    assert!(
+        derived_in_session > 0,
+        "background derivation must run during the session; got 0"
+    );
 
-    super::set_compact_thread_timeout_ms_for_test(400);
+    // Now compact. Anything it derives is work the background scheduler did not
+    // already do.
+    let sess = Arc::new(session);
     let attempt = try_run_lhc_compact_arm_with_callbacks(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
-        slow,
+        slow_counting_callbacks(Arc::clone(&calls), Duration::ZERO),
     )
     .await
     .expect("arm");
-    super::set_compact_thread_timeout_ms_for_test(0);
+    let at_compact = calls.load(AtomicOrdering::SeqCst) - derived_in_session;
 
-    let reason = match attempt {
-        LhcCompactAttempt::Unavailable { reason } => reason,
-        other => panic!("timeout must fail open, got {other:?}"),
-    };
-    assert!(
-        reason.contains("timed out"),
-        "expected timeout fail-open, got: {reason}"
+    eprintln!(
+        "R11 background: turns={TURNS} derived_in_session={derived_in_session} \
+         calls_at_compact={at_compact} attempt={}",
+        match &attempt {
+            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+        }
     );
 
-    // The worker is detached; the cancel flag must stop it within a batch.
-    let at_timeout = counter.load(AtomicOrdering::SeqCst);
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    let after = counter.load(AtomicOrdering::SeqCst);
     assert!(
-        after - at_timeout <= 8,
-        "M2: after the caller timed out and failed open, derivation must stop \
-         within one drain batch — fired {} more calls in 3s (at_timeout={at_timeout}, \
-         after={after}); without the per-batch cancel check this keeps climbing",
-        after - at_timeout
+        matches!(attempt, LhcCompactAttempt::Installed { .. }),
+        "compact must install off background-derived material: {attempt:?}"
+    );
+    assert_eq!(
+        at_compact, 0,
+        "a compact must not derive: background mode already did the work. \
+         {at_compact} calls at compact time means derivation is still being \
+         deferred to the deadline — the defect this round removed."
     );
 }
 
-/// Deterministic callbacks that count and sleep — used to make the compact-time
-/// drain slow enough to time out deterministically.
+/// Deterministic callbacks that count and optionally sleep — the delay makes
+/// background derivation slow enough that an abort deterministically lands
+/// while it is still in flight.
 fn slow_counting_callbacks(counter: Arc<AtomicUsize>, delay: Duration) -> InferenceCallbacks {
     use codex_lhc_host::CompressDetailedTurnInput;
     use codex_lhc_host::SmoothPromptInput;
@@ -1964,7 +1830,8 @@ async fn c1_derivation_call_input_cost_profile_is_measured() {
 
     let dir = tempdir().unwrap();
     let (mut session, tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut session, dir.path().to_path_buf()).await;
+    // Measured at the capture session — the seam where derivation now runs.
+    install_lhc_and_enable_with(&mut session, dir.path().to_path_buf(), Some(callbacks)).await;
     let slot = session
         .services
         .thread_extension_data
@@ -1975,23 +1842,14 @@ async fn c1_derivation_call_input_cost_profile_is_measured() {
         .expect("handle");
     seed_conversation_bandable(&session, &tc, TURNS).await;
     handle.flush().await;
+    assert!(
+        handle.drain_settled(Duration::from_secs(180)).await,
+        "background derivation must settle before profiling it"
+    );
 
     let sess = Arc::new(session);
     let history = sess.clone_history().await.raw_items().to_vec();
     let history_tokens = codex_lhc_host::estimate_response_items_tokens(&history);
-    let attempt = try_run_lhc_compact_arm_with_callbacks(
-        &sess,
-        &tc,
-        InitialContextInjection::DoNotInject,
-        /*manual*/ true,
-        callbacks,
-    )
-    .await
-    .expect("arm");
-    assert!(
-        matches!(attempt, LhcCompactAttempt::Installed { .. }),
-        "fixture: compact must install; got {attempt:?}"
-    );
 
     let calls = log.lock().expect("log").clone();
     assert!(!calls.is_empty(), "no derivation calls were made");
@@ -2050,10 +1908,25 @@ async fn c1_derivation_call_input_cost_profile_is_measured() {
 /// body is installed, no marker is committed (law 3 fail-open).
 #[tokio::test]
 async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
+    /// Mirrors `compact_lhc::SETTLE_WAIT` for the message below.
+    const SETTLE_WAIT_SECS: u64 = 60;
+
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut session, root).await;
+    // Slow background derivation, so the arm is still waiting for it to settle
+    // when the abort lands. That wait is where an aborted turn now blocks, so
+    // it is where cancellation has to bite.
+    let calls = Arc::new(AtomicUsize::new(0));
+    install_lhc_and_enable_with(
+        &mut session,
+        root,
+        Some(slow_counting_callbacks(
+            Arc::clone(&calls),
+            Duration::from_millis(50),
+        )),
+    )
+    .await;
     let slot = session
         .services
         .thread_extension_data
@@ -2064,17 +1937,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
         .expect("handle");
     seed_conversation_bandable(&session, &tc, 80).await;
     handle.flush().await;
-
-    // Slow enough that the abort lands with derivation genuinely in flight.
-    let calls = Arc::new(AtomicUsize::new(0));
-    *session
-        .services
-        .lhc_test_inference
-        .lock()
-        .expect("lhc_test_inference lock") = Some(slow_counting_callbacks(
-        Arc::clone(&calls),
-        Duration::from_millis(30),
-    ));
+    // Deliberately NOT settled — derivation is still running.
 
     let thread_id = handle.thread_id().to_string();
     let root_for_marker = handle.root().map(|p| p.to_path_buf());
@@ -2107,6 +1970,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     );
 
     cancel.cancel();
+    let cancelled_at = std::time::Instant::now();
 
     // The task must return on its own — no hard abort. If it hangs, the token
     // is not reaching the arm.
@@ -2118,6 +1982,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
         result.is_ok(),
         "cancellation is a fail-open, not a turn error: {result:?}"
     );
+    let returned_in = cancelled_at.elapsed();
     let at_return = calls.load(AtomicOrdering::SeqCst);
 
     // Give any surviving worker a generous window to keep spending.
@@ -2134,15 +1999,25 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
         history_after.len()
     );
 
-    // Cancellation is checked between drain batches (DRAIN_BATCH_ITEMS = 4), so
-    // that many derivations can still be in flight. Anything beyond one batch
-    // means the worker never observed the abort.
+    // Background derivation deliberately keeps running. It is the *session's*
+    // work, not the turn's: it was going to happen anyway, its results persist,
+    // and the next compact assembles from them. Round 10 measured the opposite
+    // requirement because derivation then ran as a burst *inside* the turn, so
+    // an abandoned turn was billing for work nobody would use. Under background
+    // mode that is no longer true, and stopping it would only make the next
+    // compact redo it.
+    //
+    // What must stop is the turn: the arm returns instead of waiting out
+    // SETTLE_WAIT.
     assert!(
-        after_grace - at_cancel <= 8,
-        "N3: derivation must stop within one drain batch of the abort — fired \
-         {} more calls (at_cancel={at_cancel}, 2s later={after_grace}). Without \
-         the turn token reaching the arm this keeps climbing to completion.",
-        after_grace - at_cancel
+        returned_in < Duration::from_secs(10),
+        "N3: the arm must abandon its settle-wait promptly on abort, not sit \
+         out SETTLE_WAIT ({}s); took {returned_in:?}",
+        SETTLE_WAIT_SECS
+    );
+    assert!(
+        after_grace >= at_cancel,
+        "sanity: background derivation counter must not go backwards"
     );
     assert!(
         response_items_structurally_equal(&history_before, &history_after),

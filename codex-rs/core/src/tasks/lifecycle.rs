@@ -46,10 +46,10 @@ impl Session {
             return;
         }
 
-        // LHC-HOOK: seed production derivation callbacks before the idle
-        // fan-out so LHC's background drain pump derives with the real model
-        // (never deterministic text). No-op when the feature is off.
-        crate::compact_lhc::seed_lhc_idle_derivation_callbacks(self).await;
+        // LHC-HOOK: seed production derivation callbacks so the capture
+        // session's background scheduler derives with the real model (never
+        // deterministic text). No-op when the feature is off.
+        crate::compact_lhc::seed_lhc_derivation_callbacks(self).await;
 
         for contributor in self.services.extensions.thread_lifecycle_contributors() {
             contributor

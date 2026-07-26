@@ -65,7 +65,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
-| 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot before the `on_thread_idle` fan-out (background drain pump) | (with 0007) |
+| 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot (what the capture session's background scheduler derives with) | (with 0007) |
 | 18 | `core/src/tasks/compact.rs` | manual ladder binds `cancellation_token` (was `_cancellation_token`) and passes it to the arm — N3 | (with 0007) |
 | 19 | `core/src/session/turn.rs` | `run_auto_compact` gains a `cancellation_token` parameter (fork-added; all four callers already had one in scope) — N3 | (with 0007) |
 | 20 | `core/src/state/service.rs` | `lhc_test_inference` slot on `SessionServices` | (with 0007) |
@@ -86,21 +86,69 @@ SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.
 Chunk 2b compact arm: **done** (offline, deterministic inference). Chunk 3
 remains: live cert with real model (auth lane).
 
-### Derivation cadence (Chunk 2b, fix round 8)
+### The drain correction (Chunk 3, round 11)
 
-Derivation is pumped **in the background from `on_thread_idle`** (bounded,
-8 work items per tick) and drained at compact time only for what is left.
-Two invariants hold that cadence honest:
+**LHC drains its own work. We had it in the wrong mode.**
 
-- The idle pump runs **only** on host-seeded production callbacks. The
-  capture worker's own `LhcSession` carries deterministic callbacks, and
-  pumping from it would bake canned text into the durable record and serve it
-  as real derivation — a law-3 violation the compact-time gates cannot see.
-  No callbacks seeded ⇒ no pump ⇒ every derivation falls back to compact time.
-- The compact-time drain is **bounded and cancellable between batches**
-  (`DRAIN_BATCH_ITEMS`, `DRAIN_TIME_BUDGET` = 75 s under the caller's 120 s
-  `COMPACT_THREAD_TIMEOUT`). Past the caller's deadline, further inference is
-  orphaned traffic billed to a session that already failed open.
+`codex-lhc-host/src/session.rs` constructed the SDK with `SdkMode::Manual`.
+In `Manual` the instance seam's `poke` and `touch` are no-op closures
+(`sdk.rs`), so the scheduler is inert and nothing is ever scheduled. The
+onboarding docs are explicit — `01-core-concepts.md` §Host mode,
+`02-domain-design.md` §scheduler — and the reference host, pi-lhc, constructs
+"always in background mode, regardless of caller config" (`04-host-pi-lhc.md`).
+
+One wrong constant produced the whole causal chain the previous rounds chased:
+
+- the original `drain_settled` call was **correct**; it did nothing because the
+  scheduler was inert;
+- diagnosing that as "derivation never runs" was right, but the fix — call
+  `work.drain` at compact time — made the host do LHC's job, serially, at the
+  worst possible moment;
+- hence 62-447 calls in one burst, 102.9 s against a 75 s budget, and the
+  H ≈ 29,000 ceiling. **Those numbers measured our misconfiguration, not LHC.**
+- the M1 idle pump was hand-rolling what background mode does for free.
+
+**Now:** the capture session is `SdkMode::Background`; derivation runs as
+intake commits. The compact-time drain loop, its three constants, and the idle
+pump are all deleted. The arm waits, bounded and cancellably, on
+`CaptureHandle::drain_settled` and fails open if it does not settle.
+
+Two things this required, both load-bearing:
+
+- **Only the capture session is Background.** The scheduler drains via
+  `tokio::spawn`, so it needs a runtime that outlives the work; the capture
+  worker's `block_on(worker_loop)` runtime is exactly that. Every other
+  `LhcSession` is opened on a runtime built for one call, where a scheduler
+  would spawn drains that die at runtime drop. `set_scheduler_poke` /
+  `set_thread_touch` are `thread_local!`, so no cross-instance clobbering.
+- **The capture session must not hold deterministic callbacks.** Background
+  derivation writes to the durable record, so J1 applies there now, not at
+  compact time. The capture session is opened with `LateBoundCallbacks`, which
+  **wait** for the host to seed production callbacks rather than erroring —
+  LHC's `work_item` table has no `attempts` column, so a returned `Err` is
+  terminal, and erroring early would permanently un-derive a thread's first
+  turns.
+
+**Every settle-wait is bounded.** With a live scheduler, "wait for quiescence"
+can genuinely never return (unseeded callbacks park derivation on
+`LateBoundCallbacks::resolve`; a wedged model call hangs a handler). Three
+bounds keep that from becoming a hang: the arm's `SETTLE_WAIT` (fail-open);
+the capture worker bounds its own `DrainSettled` await, because an unbounded
+one wedges the worker loop and starves every queued command including
+`Shutdown`; and `LhcSession::close` waits at most `CLOSE_SETTLE_BOUND`
+(shutdown skips the wait outright when callbacks were never seeded — that work
+provably cannot settle). Abandoned in-flight work stays claimed in the durable
+queue; the lease expires and first-touch catch-up re-drains it on next open.
+Pinned by `unsettleable_drain_neither_hangs_caller_nor_wedges_worker` and
+`shutdown_is_bounded_when_seeded_derivation_hangs` (certification).
+
+**L2's gate moved with it.** It used to be the drain's `FailedTerminal`
+disposition. `receipt.degraded` does *not* cover the same ground — measured:
+with every derivation failing, compact returns `degraded: []` while serving raw
+prompts marked `[fallback]` in the rendered bands. Reading that marker would be
+parsing a render (law 1), so the arm asks LHC's typed derivation log
+(`query_derivation_log`, `TerminalFailed`) instead and fails open on any
+terminal failure.
 
 ## Sync drill (merge-based; weekly minimum — upstream runs ~760 commits/mo)
 

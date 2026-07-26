@@ -3,6 +3,17 @@
 Date: 2026-07-26. Working tree `/srv/work/codex`, branch `lhc`,
 base commit `3aa3a44d22` (Chunk 2). **Nothing here is committed or pushed.**
 
+> **Superseded in part by round 11 (the drain correction — FORK.md §"The
+> drain correction").** The SDK had been constructed in `SdkMode::Manual`;
+> every compact-time drain number here (§3.5's 75 s `DRAIN_TIME_BUDGET`, the
+> 102.9 s serial burst, the H ≈ 29k fail-open ceiling, §5.5's escalation, and
+> the M1 idle-pump machinery in §3.1) measured that misconfiguration, not LHC.
+> Round 11 opens the capture session in `SdkMode::Background`: derivation runs
+> as intake commits, the compact-time drain loop and idle pump are deleted,
+> and the arm only waits (bounded, cancellable) for the scheduler to settle.
+> The per-call latency (§3.5), token-cost (§3.6/P1), KV (§3.4), and
+> capture/recovery findings stand.
+
 This document is meant to be trusted without rerunning anything. Every number
 in it came out of a run on this tree; every claim that is *not* backed by a run
 is in §7 (not exercised) or §8 (ceilings), named plainly. Where a measurement
@@ -25,47 +36,56 @@ that the after is not vacuous.
 
 ## 1. Headline
 
-Four rounds: 8 certified and found defects, 9 fixed three of them under
-instruction, **B3** spent the one authorised live run, and 10 acted on what B3
-found. This reflects the state after all four.
+Five rounds: 8 certified and found defects, 9 fixed three under instruction,
+**B3** spent the one authorised live run, 10 acted on what B3 found, and **11
+deleted most of what rounds 7-10 built** — the drain was ours to begin with.
+This reflects the state after all five.
+
+**Read §3.7 first.** It supersedes §3.1's and §3.5's conclusions.
 
 | | |
 |---|---|
 | Tripwire | **ALL 13 GREEN.** Was 12/13 on arrival — layer 13 had been red since `3aa3a44d22`. §4.1 |
 | History-reset recovery drill | **WORKS.** 26/26 fork-owned core files byte-identical; reconstructed tree compiles. §4.2 |
 | Upstream sync drill, hooks live | **Ran, clean.** Zero conflicts — but the window was 3 commits / 9 h. §4.3 |
-| Turn abort stops derivation | **FIXED (N3).** Was 3 calls at abort → 12 by 500 ms, history rewritten, marker committed. Now 1 → 1, nothing installed. §4.4 |
-| Carried gap 1 (M1 core-level measurement) | **SETTLED**, with numbers. §3.1 |
-| Carried gap 2 (real per-call latency) | **SETTLED — and the bounds do NOT hold.** Measured 1,660 ms/call on `gpt-5.6-luna`; a first compact at H=40k needs ~103 s against a **75 s** drain budget. §3.5 |
+| Turn abort | **Correct, invariant revised (round 11).** No install, no marker, arm returns promptly. Background derivation continues by design — it is session work, not the turn's. §4.4, §3.7 |
+| Carried gap 1 (M1 core-level measurement) | **Moot (round 11).** The idle pump it measured is deleted; LHC's own scheduler does this. §3.7 |
+| Carried gap 2 (real per-call latency) | Measured at 1,660 ms/call (§3.5) — but **under a misconfiguration**, and before P1. An upper bound; no current bound exists. §3.7, §5.5 |
+| Derivation architecture | **CORRECTED (round 11).** `SdkMode::Manual` → `Background`. Compact-time drain and idle pump deleted. Offline: **117 derivations in-session, 0 at compact**. §3.7 |
 | KV / prefix-cache impact | **MEASURED**: a compact invalidates **100%** of the prefix. §3.4 |
 | Resume / fork / abort | **Exercised offline**, all three. §3.3 |
 | Phase B | **B3 run** (63,838 tokens actual vs 69k authorised). B1/B2/B4/B5/B6 **not run**. §6 |
 | Per-call token cost | **Was 4.7x underestimated; now FIXED (P1).** Derivation shipped Codex's full 20,903-char agent prompt on every call. Removed — projected **7.2x** cheaper per call. §3.6 |
 
-Would I use it for real work? §9 — **answer changed by B3.** Rounds 8-9 left me
-saying yes with three things to watch. B3 measured one of them and it is worse
-than assumed: the compact-time derivation budget is insufficient at realistic
-history sizes, so first compacts above ~29k tokens of history fail open to
-native compaction. That is not a crash and not data loss, but it means the
-feature does not do its job on exactly the threads it exists for, until someone
-rules on it. §5.5 escalates; per instruction I did not redesign the timeout or
-the pump.
+Would I use it for real work? §9. Round 8 said yes-with-caveats; B3 downgraded
+that to "no for long threads"; **round 11 removes the cause of that downgrade**
+— the H ≈ 29,000 ceiling was an artefact of the host draining LHC's queue at
+compact time. What replaces it is not a better number but an honest absence of
+one: the corrected configuration has never been measured live. §5.5.
 
 ---
 
 ## 2. What changed in this working tree
 
-Round 8 was certification only — six tests, no production change. Round 9
-changed production behaviour once under instruction (N3, turn cancellation into
-the compact arm); round 10 once more (P1, dropping the agent prompt from
-derivation requests). Sentinels 36 → 38 → **39**.
+Round 8 was certification only. Round 9 changed production behaviour once (N3,
+turn cancellation); round 10 once more (P1, agent prompt); **round 11 changed
+the derivation architecture and deleted more than it added**. Sentinels
+36 → 38 → **39**.
+
+Round 11 net: **~500 lines deleted** — the compact-time drain loop and its three
+constants, the M1 idle pump and its slot state, five tests whose subject no
+longer exists, and the `SESSION_DERIVED_CAP_OVERRIDE` test global.
 
 | File | Change |
 |---|---|
-| `codex-rs/lhc/codex-lhc-host/src/install.rs` | `m1_remaining_is_not_a_monotone_progress_metric` |
-| `codex-rs/core/src/compact_lhc_tests.rs` | `m1_core_idle_pump_…`, `c1_resume_…`, `c1_fork_full_history_…`, `c1_kv_prefix_cache_…`, `c1_derivation_call_input_cost_profile_…`, `c1_abort_mid_compact_…` (N3) |
+| `codex-rs/lhc/codex-lhc-host/src/session.rs` | **R11**: capture path opens in `SdkMode::Background`; `close()` bounded |
+| `codex-rs/lhc/codex-lhc-host/src/inference.rs` | **R11**: `LateBoundCallbacks` — capture-session callbacks that wait for host seeding rather than erroring |
+| `codex-rs/lhc/codex-lhc-host/src/capture.rs` | **R11**: `CaptureHandle::drain_settled(timeout)` |
+| `codex-rs/lhc/codex-lhc-host/src/compact_bridge.rs` | **R11**: drain loop deleted; L2 gate moved to LHC's typed derivation log |
+| `codex-rs/lhc/codex-lhc-host/src/install.rs` | **R11**: idle pump deleted; cap override deleted |
+| `codex-rs/core/src/compact_lhc_tests.rs` | `background_derivation_leaves_compact_with_no_inference_to_do` (R11, replaces the M1 test), `c1_resume_…`, `c1_fork_full_history_…`, `c1_kv_prefix_cache_…`, `c1_derivation_call_input_cost_profile_…`, `c1_abort_mid_compact_…` |
 | `codex-rs/core/src/session/lhc_capture_e2e_tests.rs` | `e2e_rollout_reconstruction_does_not_re_ingest_into_capture` |
-| `codex-rs/core/src/compact_lhc.rs` | **N3**: arm takes the turn's `CancellationToken`; races it against the worker and the timeout |
+| `codex-rs/core/src/compact_lhc.rs` | **N3**: arm takes the turn's `CancellationToken`. **R11**: waits on `drain_settled` (bounded, cancellable) instead of draining |
 | `codex-rs/core/src/tasks/compact.rs` | **N3**: binds `cancellation_token` (was `_cancellation_token`) and passes it |
 | `codex-rs/core/src/session/turn.rs` | **N3**: `run_auto_compact` gains a `cancellation_token` parameter; 4 call sites |
 | `codex-rs/core/src/session/lhc_band_shape_eval_tests.rs` | call-site update for the new arm signature |
@@ -85,7 +105,14 @@ All C1 Phase A work runs on deterministic offline callbacks through production
 entry points. Where the offline harness under-measures something relative to a
 live run, that is stated in place rather than left for the reader to infer.
 
-### 3.1 Carried gap 1 — the M1 core-level measurement. SETTLED.
+### 3.1 Carried gap 1 — the M1 core-level measurement
+
+> **Superseded by §3.7.** The idle pump measured below was deleted in round 11:
+> it was hand-rolling what `SdkMode::Background` does natively. The
+> investigation stands as a record of how the cascade behaves, and the
+> `remaining`-is-not-monotone finding remains true, but nothing in the fork
+> reasons about `remaining` any more and the tests that measured it are gone.
+
 
 Chunk 2 left this: "`remaining` grew under the core pump and fell under the host
 pump; nobody accounted for it." The core test was deleted rather than left
@@ -672,46 +699,57 @@ paying it for ~2 calls per turn. Fixed under N3 — see §4.4.
 
 No live run was made. §6.
 
-### 5.5 The compact-time derivation budget is insufficient — **open with Lee**
+### 5.5 The bound measured a misconfiguration — **withdrawn** (round 11)
 
-Stated in three registers, kept separate on purpose.
+Round 8 escalated "the compact-time derivation budget is insufficient": 62
+calls x 1.660 s = 102.9 s against a 75 s drain budget, ceiling H ≈ 29,000.
+**That escalation is withdrawn. The numbers were real; what they measured was
+our own misconfiguration, not LHC.**
 
-**Measured (run B3, 10 real calls on `gpt-5.6-luna` at effort `low`):**
+`codex-lhc-host/src/session.rs` built the SDK with `SdkMode::Manual`, in which
+the instance seam's `poke` and `touch` are no-op closures (`sdk.rs`) — the
+scheduler never runs. The onboarding docs say so plainly
+(`01-core-concepts.md` §Host mode, `02-domain-design.md` §scheduler), and the
+reference host constructs "always in background mode, regardless of caller
+config" (`04-host-pi-lhc.md`). One wrong constant produced everything
+downstream:
 
-* 1,660 ms mean per derivation call; `compress_detailed_turn` median 2,132 ms,
-  `smooth_prompt` median 1,174 ms.
-* **`max_inflight` = 1** against the real client — derivation is serialised.
-* **95%** of the arm's elapsed time was serialised inference (16,597 ms of
-  16,597/17,468 ms wall).
-* Therefore, at Phase A's measured 1 call per 650 tokens of history:
-  **62 calls x 1.660 s = 102.9 s** for H = 40,568, against a **75 s**
-  `DRAIN_TIME_BUDGET` — over by 37%. Even the optimistic bound (all remaining
-  calls at `smooth_prompt` speed) is 77.6 s, still over. The pessimistic bound,
-  127.5 s, also exceeds the 120 s `COMPACT_THREAD_TIMEOUT`.
-* Ceiling: **H ≈ 29,000 tokens.** Above that a first compact fails open to the
-  native ladder.
+* the original `drain_settled` was correct and did nothing, because the
+  scheduler was inert;
+* "derivation never runs" was the right diagnosis; "call `work.drain` at
+  compact time" was the wrong fix — it made the host do LHC's job, serially,
+  at the one moment a user is waiting;
+* so 62 calls landed in a single burst against a deadline, and the H ≈ 29,000
+  ceiling followed arithmetically;
+* the M1 idle pump was hand-rolling what background mode does for free.
 
-**An upper bound on latency, not a clean measurement.** Every one of those 10
-calls carried the 4,392-token agent prompt that P1 has since removed (§3.6).
-A request whose input is ~7x smaller may well complete faster. So the 1,660 ms
-figure bounds derivation latency from above; it does not isolate it.
+**What is true now (measured offline, round 11).** With the capture session in
+`SdkMode::Background`, on the same 60-turn fixture:
 
-**Unknown.** Whether P1 moves the bound is **unmeasured**. It would need a
-second live run, which is not authorised, and I did not run one. It is
-plausible that lower latency narrows or closes the 102.9 s vs 75 s gap; it is
-equally possible that latency is dominated by model time-to-first-token and
-reasoning rather than input size, in which case P1 changes cost and not
-schedule. **Nothing here should be read as "P1 fixes the bounds."**
+| | round 8 (Manual + compact-time drain) | round 11 (Background) |
+|---|---|---|
+| derivations during the session | 0 | **117** |
+| inference calls **at compact time** | **117** | **0** |
+| what the arm does at compact | drains, serially, against 75 s | waits for `drain_settled`, bounded and cancellable |
 
-Compounding, and unaffected by P1: an idle-pump tick costs ~5.3 s of real
-inference and is single-flight, so the pump only keeps up if the user is idle
-in ~5 s stretches roughly once per 1.5 turns.
+The compact no longer performs inference at all, so the 102.9-s-against-75-s
+arithmetic has no subject. `DRAIN_TIME_BUDGET`, `DRAIN_BATCH_ITEMS` and
+`DRAIN_MAX_BATCHES` are deleted along with the loop they bounded.
 
-Three levers exist and all three are rulings, not fixes for me to invent:
-raise or rework the drain budget, make derivation concurrent (`max_inflight`
-is 1), or re-measure after P1 and see where the number actually lands. **Per
-instruction I did not redesign the timeout or the pump.** Reporting and
-stopping.
+**What is still unmeasured, and must not be claimed.** B3's 1,660 ms/call is
+the only live latency number this project has, and it was taken under the old
+design *and* before P1 removed the 4,392-token agent prompt from every request.
+It remains an upper bound on per-call latency. Nobody has measured:
+
+* per-call latency on the corrected configuration;
+* whether background derivation keeps up with a fast interactive session — the
+  question the idle-pump work was groping at. Background mode drains after each
+  intake commit rather than on an idle tick, which is strictly better, but
+  "strictly better" is not "measured".
+* what a real session's compact costs end to end now.
+
+Those need a live run and none was authorised this round. **The honest position
+is that the old bound is void and no new bound exists.**
 
 ### 5.4 Carried, not escalated
 

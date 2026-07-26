@@ -290,8 +290,17 @@ async fn produce_real_lhc_body() -> (Vec<ResponseItem>, usize, String, serde_jso
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("handle");
+    // Background derivation runs on these; without seeding, the arm waits out
+    // its settle bound and fails open (see compact_lhc::SETTLE_WAIT).
+    slot.set_derivation_callbacks(
+        codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic callbacks"),
+    );
     seed_distinctive_bandable(&session, &tc, 80).await;
     handle.flush().await;
+    assert!(
+        handle.drain_settled(Duration::from_secs(180)).await,
+        "background derivation must settle before the eval compacts"
+    );
 
     let thread_id = handle.thread_id().to_string();
     let root_path = handle.root().map(|p| p.to_path_buf());

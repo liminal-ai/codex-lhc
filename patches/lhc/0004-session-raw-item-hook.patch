@@ -30,7 +30,7 @@ index 71abe5acc3..06ab2bb299 100644
                  sess.set_server_reasoning_included(included).await;
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..1f94cb90ed
+index 0000000000..e5156ebf9f
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 @@ -0,0 +1,599 @@
@@ -177,7 +177,7 @@ index 0000000000..1f94cb90ed
 +
 +    // Close + reopen the LHC thread (process-restart analogue).
 +    let thread_id = session.thread_id().to_string();
-+    let handle2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root))
++    let handle2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root), Default::default())
 +        .await
 +        .expect("reopen");
 +    let events = handle2.list_events().await.expect("list after reopen");
@@ -259,7 +259,7 @@ index 0000000000..1f94cb90ed
 +    assert!(!id_str.is_empty(), "minted id must be non-empty");
 +
 +    let thread_id = session.thread_id().to_string();
-+    let h2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root))
++    let h2 = codex_lhc_host::spawn_capture(&thread_id, None, Some(root), Default::default())
 +        .await
 +        .expect("reopen");
 +    // Re-present the same prepared item twice — must collide.

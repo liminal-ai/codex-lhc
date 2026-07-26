@@ -319,9 +319,16 @@ async fn mapping_goldens_round_trip_and_match_fixtures() {
 
         // Round-trip through real LhcSession and read stored rows back.
         let tid = format!("golden-rt-{name}");
-        let handle = spawn_capture(&tid, None, Some(root.clone()))
-            .await
-            .expect("spawn");
+        let handle = spawn_capture(
+            &tid,
+            None,
+            Some(root.clone()),
+            codex_lhc_host::LateBoundCallbacks::seeded(
+                codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+            ),
+        )
+        .await
+        .expect("spawn");
         handle.persist(&item, provenance);
         handle.flush().await;
         let stored = handle.list_events().await.expect("list");
@@ -402,9 +409,16 @@ async fn arguments_raw_byte_exact_round_trip() {
             call_id: format!("c{i}"),
             internal_chat_message_metadata_passthrough: None,
         };
-        let handle = spawn_capture(&format!("raw-bytes-{i}"), None, Some(root.clone()))
-            .await
-            .expect("spawn");
+        let handle = spawn_capture(
+            &format!("raw-bytes-{i}"),
+            None,
+            Some(root.clone()),
+            codex_lhc_host::LateBoundCallbacks::seeded(
+                codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+            ),
+        )
+        .await
+        .expect("spawn");
         handle.persist(&item, RawItemProvenance::ModelOutput);
         handle.flush().await;
         let events = handle.list_events().await.expect("list");
@@ -434,9 +448,16 @@ async fn image_url_full_round_trip() {
         internal_chat_message_metadata_passthrough: None,
     };
     let dir = tempdir().unwrap();
-    let handle = spawn_capture("img-full", None, Some(dir.path().to_path_buf()))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "img-full",
+        None,
+        Some(dir.path().to_path_buf()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     handle.persist(&item, RawItemProvenance::UserPrompt);
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
@@ -458,18 +479,32 @@ async fn production_restart_replay_records_once() {
     let thread_id = "prod-restart-thread";
     let item = user_msg("one human utterance");
 
-    let h1 = spawn_capture(thread_id, None, Some(root.clone()))
-        .await
-        .expect("spawn");
+    let h1 = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     h1.persist(&item, RawItemProvenance::UserPrompt);
     h1.flush().await;
     let before = h1.list_events().await.expect("list").len();
     assert_eq!(before, 1);
     h1.shutdown().await;
 
-    let h2 = spawn_capture(thread_id, None, Some(root.clone()))
-        .await
-        .expect("reopen");
+    let h2 = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("reopen");
     h2.persist(&item, RawItemProvenance::UserPrompt);
     h2.flush().await;
     let after = h2.list_events().await.expect("list").len();
@@ -485,9 +520,16 @@ async fn production_restart_replay_records_once() {
 async fn distinct_ids_same_text_record_twice() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let handle = spawn_capture("distinct-ids", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "distinct-ids",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     let a = user_msg("same text");
     let mut b = user_msg("same text");
     if let ResponseItem::Message { id, .. } = &mut b {
@@ -534,16 +576,30 @@ async fn crash_partial_submit_then_retry_no_double() {
         // Parameterize over injection points 0, 1, 2 (before / between / after-all).
         for after in [0usize, 1, 2] {
             let tid = format!("crash-{label}-{after}");
-            let h = spawn_capture(&tid, None, Some(root.clone()))
-                .await
-                .expect("spawn");
+            let h = spawn_capture(
+                &tid,
+                None,
+                Some(root.clone()),
+                codex_lhc_host::LateBoundCallbacks::seeded(
+                    codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+                ),
+            )
+            .await
+            .expect("spawn");
             h.arm_crash_mid_persist(after).await;
             h.persist(&item, RawItemProvenance::ModelOutput);
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            let h2 = spawn_capture(&tid, None, Some(root.clone()))
-                .await
-                .expect("respawn");
+            let h2 = spawn_capture(
+                &tid,
+                None,
+                Some(root.clone()),
+                codex_lhc_host::LateBoundCallbacks::seeded(
+                    codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+                ),
+            )
+            .await
+            .expect("respawn");
             h2.persist(&item, RawItemProvenance::ModelOutput);
             h2.flush().await;
             let events = h2.list_events().await.expect("list");
@@ -562,9 +618,16 @@ async fn crash_partial_submit_then_retry_no_double() {
 async fn abort_turn_emits_turn_end() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let handle = spawn_capture("abort-turn", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "abort-turn",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     handle.persist(&user_msg("start"), RawItemProvenance::UserPrompt);
     handle.turn_end("turn-1", "abort");
     handle.flush().await;
@@ -722,9 +785,16 @@ async fn pre_open_items_are_buffered_not_dropped() {
 async fn queue_full_latches_degraded_and_counts_drops() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let handle = spawn_capture("queue-full", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "queue-full",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
 
     // Park the worker so the queue cannot drain.
     let release = handle.block_worker().await;
@@ -778,9 +848,16 @@ async fn queue_full_latches_degraded_and_counts_drops() {
 async fn status_advance_same_id_records_both() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let handle = spawn_capture("status-advance", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "status-advance",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     let in_progress = ResponseItem::ImageGenerationCall {
         id: Some(ResponseItemId::from_server("ig_evolve".into())),
         status: "in_progress".into(),
@@ -842,18 +919,32 @@ async fn open_seeds_occurrence_from_stored_anon_keys() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    let h1 = spawn_capture(thread_id, None, Some(root.clone()))
-        .await
-        .expect("spawn");
+    let h1 = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     h1.persist(&item, RawItemProvenance::UserPrompt);
     h1.persist(&item, RawItemProvenance::UserPrompt);
     h1.flush().await;
     assert_eq!(h1.list_events().await.unwrap().len(), 2);
     h1.shutdown().await;
 
-    let h2 = spawn_capture(thread_id, None, Some(root.clone()))
-        .await
-        .expect("reopen");
+    let h2 = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("reopen");
     h2.persist(&item, RawItemProvenance::UserPrompt);
     h2.flush().await;
     let events = h2.list_events().await.unwrap();
@@ -870,9 +961,14 @@ async fn open_seeds_occurrence_from_stored_anon_keys() {
 async fn capture_disabled_after_poison() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let (mut session, _) = LhcSession::open("poison-thread", None, Some(root.as_path()))
-        .await
-        .expect("open");
+    let (mut session, _) = LhcSession::open(
+        "poison-thread",
+        None,
+        Some(root.as_path()),
+        codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+    )
+    .await
+    .expect("open");
     session.poison();
     let r = session
         .submit_events(&[lhc::intake_stream::MessageEventInput {
@@ -988,9 +1084,16 @@ async fn model_change_transition_keys_restart_stable() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let thread_id = "model-restart";
-    let h1 = spawn_capture(thread_id, None, Some(root.clone()))
-        .await
-        .expect("spawn");
+    let h1 = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     h1.model_or_thinking_change("m1", "m2", "none", "high");
     h1.flush().await;
     let first = h1.list_events().await.unwrap();
@@ -1001,9 +1104,16 @@ async fn model_change_transition_keys_restart_stable() {
         .collect();
     h1.shutdown().await;
 
-    let h2 = spawn_capture(thread_id, None, Some(root))
-        .await
-        .expect("reopen");
+    let h2 = spawn_capture(
+        thread_id,
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("reopen");
     // Same transition re-fire (resume) — must collide.
     h2.model_or_thinking_change("m1", "m2", "none", "high");
     h2.flush().await;
@@ -1037,9 +1147,16 @@ async fn model_change_transition_keys_restart_stable() {
 async fn worker_survives_many_items() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
-    let handle = spawn_capture("worker-survive", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "worker-survive",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     for i in 0..20 {
         handle.persist(
             &user_msg(&format!("item-{i}")),
@@ -1063,9 +1180,16 @@ async fn worker_survives_map_item_panic_and_records_later_items() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     // Sentinel thread id triggers a one-shot panic inside map_item (test-util).
-    let handle = spawn_capture("__lhc_test_panic_map__", None, Some(root))
-        .await
-        .expect("spawn");
+    let handle = spawn_capture(
+        "__lhc_test_panic_map__",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
     handle.persist(
         &user_msg("this-map-panics-once"),
         RawItemProvenance::UserPrompt,
@@ -1092,4 +1216,108 @@ async fn worker_survives_map_item_panic_and_records_later_items() {
     );
     assert!(!handle.is_degraded());
     handle.shutdown().await;
+}
+
+/// Round 11: a settle-wait that cannot finish must neither hang the caller nor
+/// wedge the capture worker.
+///
+/// Unseeded `LateBoundCallbacks` make this reachable deterministically: the
+/// user prompt queues a `smoothed_prompt` derivation, the background scheduler
+/// claims it, and its handler parks on a callback resolve that never comes —
+/// the thread can never settle. That is exactly the production window between
+/// `on_thread_start` and the host seeding real callbacks.
+#[tokio::test]
+async fn unsettleable_drain_neither_hangs_caller_nor_wedges_worker() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let handle = spawn_capture(
+        "unsettleable-drain",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::new(), // deliberately never seeded
+    )
+    .await
+    .expect("spawn");
+    handle.persist(
+        &user_msg("a prompt that queues smoothing work"),
+        RawItemProvenance::UserPrompt,
+    );
+    handle.flush().await;
+
+    // 1. The caller's wait is bounded even though the thread can never settle.
+    let settled = handle.drain_settled(Duration::from_millis(400)).await;
+    assert!(
+        !settled,
+        "unseeded derivation can never settle; reporting settled would mean \
+         the wait is not actually gated on the scheduler"
+    );
+
+    // 2. The worker is not wedged behind that wait: commands queued after it
+    //    must still run. If the settle-wait were awaited unbounded on the
+    //    worker, this flush (and Shutdown below) would never be processed.
+    //    Bounded so a wedged worker fails the test instead of hanging it.
+    handle.persist(&user_msg("second prompt"), RawItemProvenance::UserPrompt);
+    tokio::time::timeout(Duration::from_secs(10), handle.flush())
+        .await
+        .expect("worker must process a flush queued behind a timed-out settle-wait");
+    let events = handle.list_events().await.expect("list");
+    assert!(
+        events.len() >= 2,
+        "worker must keep recording after a timed-out settle-wait; got {}",
+        events.len()
+    );
+
+    // 3. Shutdown returns promptly: unseeded work is provably unsettleable, so
+    //    close skips the settle-wait instead of sitting out its bound.
+    tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+        .await
+        .expect("shutdown must not hang on unsettleable derivation");
+}
+
+/// Round 11: even with callbacks seeded, shutdown must be bounded when
+/// derivation hangs (a wedged model call in production). `LhcSession::close`
+/// waits for quiescence only up to its bound, then abandons the claim to the
+/// durable queue — a hung inference call must never turn shutdown into a hang.
+#[tokio::test]
+async fn shutdown_is_bounded_when_seeded_derivation_hangs() {
+    use std::sync::Arc;
+
+    fn hang<T>() -> Arc<
+        dyn Fn(T) -> lhc::shared_tech::derivation::BoxFuture<lhc::shared_tech::InferenceResult>
+            + Send
+            + Sync,
+    >
+    where
+        T: 'static,
+    {
+        Arc::new(|_input: T| Box::pin(std::future::pending()))
+    }
+    let hanging = lhc::shared_tech::InferenceCallbacks {
+        smooth_prompt: hang(),
+        summarize_tool_result: hang(),
+        compress_detailed_turn: hang(),
+        summarize_chunk_brief: hang(),
+    };
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let handle = spawn_capture(
+        "seeded-hung-derivation",
+        None,
+        Some(root),
+        codex_lhc_host::LateBoundCallbacks::seeded(hanging),
+    )
+    .await
+    .expect("spawn");
+    handle.persist(
+        &user_msg("a prompt whose smoothing call hangs forever"),
+        RawItemProvenance::UserPrompt,
+    );
+    handle.flush().await;
+
+    // Well over close's settle bound (5s) but far under "hang": if this trips,
+    // close is waiting on quiescence without a bound again.
+    tokio::time::timeout(Duration::from_secs(20), handle.shutdown())
+        .await
+        .expect("shutdown must be bounded while a seeded derivation call hangs");
 }
