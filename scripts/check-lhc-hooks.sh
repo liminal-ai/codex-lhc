@@ -262,7 +262,19 @@ else
   fail=1
 fi
 
-pin=$(git -C "$vendor" log -1 --format=%h 2>/dev/null)
+pin=$(git -C codex-rs/lhc/vendor/long-horizon-context log -1 --format=%h 2>/dev/null)
+# Pin-drift check: a pin off the shared certified line is a PENDING
+# RECONCILIATION, not a resting state. This warns on every run (sync
+# drill included) until the pin is an ancestor of origin/lhc-rs-port.
+git -C codex-rs/lhc/vendor/long-horizon-context fetch origin lhc-rs-port --quiet 2>/dev/null || true
+if git -C codex-rs/lhc/vendor/long-horizon-context merge-base --is-ancestor HEAD origin/lhc-rs-port 2>/dev/null; then
+  behind=$(git -C codex-rs/lhc/vendor/long-horizon-context rev-list --count HEAD..origin/lhc-rs-port 2>/dev/null)
+  echo "ok pin: on certified shared line (behind shared tip by ${behind:-?} commits)"
+else
+  echo "WARN pin: OFF the shared certified line — side-branch pin awaiting"
+  echo "  reconciliation (fold into lhc-rs-port + re-pin; policy: FORK.md)."
+  echo "  This warning repeats every run until resolved. It is not a resting state."
+fi
 echo "vendor pin: ${pin:-MISSING} (policy: certified lhc-rs-port commits only — FORK.md)"
 [ -n "$pin" ] || fail=1
 
