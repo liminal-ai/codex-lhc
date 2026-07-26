@@ -233,6 +233,14 @@ impl LhcSession {
         }
     }
 
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn list_turns(&self) -> Result<Vec<lhc::turns::TurnRecord>, String> {
+        match self.lhc.turns.list_turns(self.thread_ref.clone()).await {
+            OpResult::Ok { value } => Ok(value),
+            OpResult::Err { error } => Err(error.reason),
+        }
+    }
+
     /// Wait for this session's scheduler to report the thread quiescent.
     /// Inert (returns immediately) on a `Manual` session — only the capture
     /// session has a scheduler.

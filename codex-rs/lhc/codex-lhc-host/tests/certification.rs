@@ -588,6 +588,9 @@ async fn crash_partial_submit_then_retry_no_double() {
             .expect("spawn");
             h.arm_crash_mid_persist(after).await;
             h.persist(&item, RawItemProvenance::ModelOutput);
+            // ModelOutput is buffered until flush/provider_usage/turn_end so
+            // assistant_text can carry providerUsage; flush forces the crash.
+            let _ = h.flush().await;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
             let h2 = spawn_capture(
@@ -629,7 +632,16 @@ async fn abort_turn_emits_turn_end() {
     .await
     .expect("spawn");
     handle.persist(&user_msg("start"), RawItemProvenance::UserPrompt);
-    handle.turn_end("turn-1", "abort");
+    handle.turn_end(
+        "turn-1",
+        "aborted",
+        codex_lhc_host::TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("interrupted".into()),
+            started_at: None,
+            ended_at: None,
+        },
+    );
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     assert!(

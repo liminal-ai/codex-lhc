@@ -88,6 +88,51 @@ index 0000000000..3b754efc03
 +        })
 +    }
 +}
+diff --git a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
+index e2c9e4bf7b..dd4a9b335c 100644
+--- a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
++++ b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
+@@ -13,6 +13,10 @@ pub struct TurnStartInput<'a> {
+     pub collaboration_mode: &'a CollaborationMode,
+     /// Total token usage snapshot captured when the turn started.
+     pub token_usage_at_turn_start: &'a TokenUsage,
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
+@@ -23,6 +27,14 @@ pub struct TurnStartInput<'a> {
+ 
+ /// Input supplied when the host completes a turn.
+ pub struct TurnStopInput<'a> {
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
++    /// Host-reported turn end time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
++    pub completed_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
+@@ -35,6 +47,14 @@ pub struct TurnStopInput<'a> {
+ pub struct TurnAbortInput<'a> {
+     /// Reason the host aborted the turn.
+     pub reason: TurnAbortReason,
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
++    /// Host-reported turn abort time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
++    pub completed_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
 index cdfb0b4cbd..98f75038ae 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
@@ -174,3 +219,24 @@ index 842155ea29..c2f14b2113 100644
  }
  
  /// Creates an empty shared registry for hosts that do not register contributions.
+diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+index de1615bb64..63e226bcf7 100644
+--- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
++++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
+@@ -1228,6 +1228,7 @@ impl GoalExtensionHarness {
+                     turn_id,
+                     collaboration_mode: &collaboration_mode,
+                     token_usage_at_turn_start: usage,
++                    started_at: None,
+                     session_store: &self.session_store,
+                     thread_store: &self.thread_store,
+                     turn_store: &turn_store,
+@@ -1241,6 +1242,8 @@ impl GoalExtensionHarness {
+         for contributor in self.registry.turn_lifecycle_contributors() {
+             contributor
+                 .on_turn_stop(TurnStopInput {
++                    started_at: None,
++                    completed_at: None,
+                     session_store: &self.session_store,
+                     thread_store: &self.thread_store,
+                     turn_store: &turn_store,

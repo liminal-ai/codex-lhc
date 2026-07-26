@@ -56,6 +56,8 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 2 | `ext/extension-api` | additive `RawItemContributor` / `RawItemProvenance` + registry | `0002-raw-item-contributor` |
 | 3 | `features/src/lib.rs` | `Feature::LhcCapture` (default OFF) | `0003-feature-flag` |
 | 4 | `core/src/session/mod.rs` | provenance-carrying record path + `send_raw_response_items` fan-out + e2e module | `0004-session-raw-item-hook` |
+| 4a | `ext/extension-api/src/contributors/turn_lifecycle.rs` | turn start/stop/abort inputs carry optional host `started_at`/`completed_at` (schema v5 timing) | (with 0002) |
+| 4b | `core/src/tasks/lifecycle.rs` + `tasks/mod.rs` | pass host turn timestamps into turn lifecycle emitters; abort path returns timing from `handle_task_abort` | (with 0007) |
 | 5 | `app-server/Cargo.toml` | `codex-lhc-host` dependency | `0005-app-server-dep` |
 | 6 | `app-server/src/extensions.rs` | `codex_lhc_host::install(...)` (cwd + host seam) | `0006-app-server-install` |
 | 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0007` |
@@ -81,7 +83,11 @@ and a test module, not seams). They were missing from every patch until Chunk 3
 round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing is
 a legitimate combination; fork-owned and *not in any patch* is not.
 
-Expected markers: **39** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **47** (`EXPECTED_HOOKS` in the tripwire script).
+Was 39 before slice A (schema v5 field capture); +8 for turn timing fields on
+`TurnStart`/`TurnStop`/`TurnAbort` inputs and the three lifecycle emit sites that
+thread host `started_at`/`completed_at` (no new raw-item hook sites — provider
+usage rides the existing free `TokenUsageContributor` seam).
 
 Rule: any commit that adds/changes an `LHC-HOOK` line updates, in the
 SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.

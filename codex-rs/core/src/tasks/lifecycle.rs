@@ -13,12 +13,15 @@ impl Session {
         token_usage_at_turn_start: &TokenUsage,
     ) {
         let collaboration_mode = turn_context.collaboration_mode();
+        // LHC-HOOK: pass host turn start time into turn lifecycle (schema v5).
+        let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
                     turn_id: turn_context.sub_id.as_str(),
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start,
+                    started_at,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store: turn_context.extension_data.as_ref(),
@@ -27,10 +30,18 @@ impl Session {
         }
     }
 
-    pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {
+    pub(super) async fn emit_turn_stop_lifecycle(
+        &self,
+        turn_store: &ExtensionData,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+    ) {
+        // LHC-HOOK: pass host turn start/end times into turn lifecycle (schema v5).
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_stop(codex_extension_api::TurnStopInput {
+                    started_at,
+                    completed_at,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store,
@@ -65,11 +76,16 @@ impl Session {
         &self,
         reason: TurnAbortReason,
         turn_store: &ExtensionData,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
     ) {
+        // LHC-HOOK: pass host turn start/end times into turn lifecycle (schema v5).
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
             contributor
                 .on_turn_abort(codex_extension_api::TurnAbortInput {
                     reason: reason.clone(),
+                    started_at,
+                    completed_at,
                     session_store: &self.services.session_extension_data,
                     thread_store: &self.services.thread_extension_data,
                     turn_store,

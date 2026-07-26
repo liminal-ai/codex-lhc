@@ -22,7 +22,7 @@ command -v cargo >/dev/null 2>&1 || . "$HOME/.cargo/env" 2>/dev/null || true
 fail=0
 
 # ── Layer 1: sentinel count ────────────────────────────────────────────
-EXPECTED_HOOKS=39
+EXPECTED_HOOKS=47
 found=$(grep -rl "LHC-HOOK" codex-rs --include="*.rs" --include="*.toml" 2>/dev/null \
         | grep -v "codex-rs/lhc/" | xargs -r grep -o "LHC-HOOK" | wc -l)
 if [ "$found" -ne "$EXPECTED_HOOKS" ]; then

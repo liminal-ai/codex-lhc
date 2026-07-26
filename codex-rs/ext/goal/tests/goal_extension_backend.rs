@@ -1228,6 +1228,7 @@ impl GoalExtensionHarness {
                     turn_id,
                     collaboration_mode: &collaboration_mode,
                     token_usage_at_turn_start: usage,
+                    started_at: None,
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,
@@ -1241,6 +1242,8 @@ impl GoalExtensionHarness {
         for contributor in self.registry.turn_lifecycle_contributors() {
             contributor
                 .on_turn_stop(TurnStopInput {
+                    started_at: None,
+                    completed_at: None,
                     session_store: &self.session_store,
                     thread_store: &self.thread_store,
                     turn_store: &turn_store,

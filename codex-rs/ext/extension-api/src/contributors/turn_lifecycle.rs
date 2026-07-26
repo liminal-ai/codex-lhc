@@ -13,6 +13,10 @@ pub struct TurnStartInput<'a> {
     pub collaboration_mode: &'a CollaborationMode,
     /// Total token usage snapshot captured when the turn started.
     pub token_usage_at_turn_start: &'a TokenUsage,
+    /// Host-reported turn start time (Unix seconds), when known.
+    ///
+    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
+    pub started_at: Option<i64>,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.
@@ -23,6 +27,14 @@ pub struct TurnStartInput<'a> {
 
 /// Input supplied when the host completes a turn.
 pub struct TurnStopInput<'a> {
+    /// Host-reported turn start time (Unix seconds), when known.
+    ///
+    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
+    pub started_at: Option<i64>,
+    /// Host-reported turn end time (Unix seconds), when known.
+    ///
+    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
+    pub completed_at: Option<i64>,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.
@@ -35,6 +47,14 @@ pub struct TurnStopInput<'a> {
 pub struct TurnAbortInput<'a> {
     /// Reason the host aborted the turn.
     pub reason: TurnAbortReason,
+    /// Host-reported turn start time (Unix seconds), when known.
+    ///
+    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
+    pub started_at: Option<i64>,
+    /// Host-reported turn abort time (Unix seconds), when known.
+    ///
+    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
+    pub completed_at: Option<i64>,
     /// Store scoped to the host session runtime.
     pub session_store: &'a ExtensionData,
     /// Store scoped to this thread runtime.

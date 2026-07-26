@@ -34,12 +34,15 @@ use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadResumeInput;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
+use codex_extension_api::TokenUsageContributor;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TurnAbortReason;
 use tracing::debug;
 use tracing::error;
 use tracing::warn;
@@ -50,6 +53,8 @@ use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
 use crate::capture::spawn_capture;
 use crate::gating::lhc_root;
+use crate::mapping::TurnEndFacts;
+use crate::mapping::unix_secs_to_iso;
 
 /// Cap a set to `max` entries by dropping arbitrary extras; **logs** the drop (H3).
 /// Only used on **superseded** provenance — never on the current body (L3).
@@ -97,6 +102,14 @@ enum PendingCmd {
         new_model: String,
         previous_level: String,
         new_level: String,
+    },
+    ProviderUsage {
+        usage: codex_protocol::protocol::TokenUsage,
+    },
+    TurnEnd {
+        turn_id: String,
+        reason: String,
+        facts: TurnEndFacts,
     },
 }
 
@@ -323,6 +336,16 @@ impl LhcCaptureSlot {
                         &new_level,
                     );
                 }
+                PendingCmd::ProviderUsage { usage } => {
+                    handle.provider_usage(&usage);
+                }
+                PendingCmd::TurnEnd {
+                    turn_id,
+                    reason,
+                    facts,
+                } => {
+                    handle.turn_end(&turn_id, &reason, facts);
+                }
             }
         }
         if overflowed {
@@ -414,6 +437,7 @@ pub fn install<C>(
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
+    registry.token_usage_contributor(extension.clone());
     registry.raw_item_contributor(extension.clone());
     registry.config_contributor(extension);
 }
@@ -458,6 +482,7 @@ pub fn install_with_root_and_labels<C>(
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
+    registry.token_usage_contributor(extension.clone());
     registry.raw_item_contributor(extension.clone());
     registry.config_contributor(extension);
 }
@@ -592,6 +617,40 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
     }
 }
 
+fn turn_end_timing_facts(
+    outcome: Option<&'static str>,
+    outcome_reason: Option<String>,
+    started_at: Option<i64>,
+    completed_at: Option<i64>,
+) -> TurnEndFacts {
+    TurnEndFacts {
+        outcome,
+        outcome_reason,
+        started_at: started_at.map(unix_secs_to_iso),
+        ended_at: completed_at.map(unix_secs_to_iso),
+    }
+}
+
+fn abort_reason_label(reason: &TurnAbortReason) -> String {
+    match reason {
+        TurnAbortReason::Interrupted => "interrupted".into(),
+        TurnAbortReason::Replaced => "replaced".into(),
+        TurnAbortReason::ReviewEnded => "review_ended".into(),
+        TurnAbortReason::BudgetLimited => "budget_limited".into(),
+    }
+}
+
+fn dispatch_turn_end(slot: &LhcCaptureSlot, turn_id: &str, reason: &str, facts: TurnEndFacts) {
+    let cmd = PendingCmd::TurnEnd {
+        turn_id: turn_id.to_string(),
+        reason: reason.to_string(),
+        facts: facts.clone(),
+    };
+    if let Some(handle) = slot.buffer_or_handle(cmd) {
+        handle.turn_end(turn_id, reason, facts);
+    }
+}
+
 impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
     fn on_turn_start<'a>(&'a self, input: TurnStartInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
@@ -606,15 +665,18 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
             let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
                 return;
             };
-            let Some(handle) = slot.get() else {
-                return;
-            };
             let turn_id = input
                 .turn_store
                 .get::<LhcTurnId>()
                 .map(|t| t.0.clone())
                 .unwrap_or_else(|| "unknown".into());
-            handle.turn_end(&turn_id, "stop");
+            let facts = turn_end_timing_facts(
+                Some("completed"),
+                None,
+                input.started_at,
+                input.completed_at,
+            );
+            dispatch_turn_end(&slot, &turn_id, "completed", facts);
         })
     }
 
@@ -623,15 +685,18 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
             let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
                 return;
             };
-            let Some(handle) = slot.get() else {
-                return;
-            };
             let turn_id = input
                 .turn_store
                 .get::<LhcTurnId>()
                 .map(|t| t.0.clone())
                 .unwrap_or_else(|| "unknown".into());
-            handle.turn_end(&turn_id, "abort");
+            let facts = turn_end_timing_facts(
+                Some("aborted"),
+                Some(abort_reason_label(&input.reason)),
+                input.started_at,
+                input.completed_at,
+            );
+            dispatch_turn_end(&slot, &turn_id, "aborted", facts);
         })
     }
 
@@ -640,10 +705,40 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
             let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
                 return;
             };
-            let Some(handle) = slot.get() else {
+            // Mid-turn error path: close with aborted + reason when known; no
+            // host timing is on TurnErrorInput today (optional fields stay None).
+            let facts = turn_end_timing_facts(
+                Some("aborted"),
+                Some(format!("{:?}", input.error)),
+                None,
+                None,
+            );
+            dispatch_turn_end(&slot, input.turn_id, "error", facts);
+        })
+    }
+}
+
+impl<C: Send + Sync + 'static> TokenUsageContributor for LhcExtension<C> {
+    fn on_token_usage<'a>(
+        &'a self,
+        _session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        token_usage: &'a TokenUsageInfo,
+    ) -> ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            let Some(slot) = thread_store.get::<LhcCaptureSlot>() else {
                 return;
             };
-            handle.turn_end(input.turn_id, "error");
+            // last_token_usage is the per-model-call figure from
+            // ResponseEvent::Completed (D3).
+            let usage = token_usage.last_token_usage.clone();
+            let cmd = PendingCmd::ProviderUsage {
+                usage: usage.clone(),
+            };
+            if let Some(handle) = slot.buffer_or_handle(cmd) {
+                handle.provider_usage(&usage);
+            }
         })
     }
 }

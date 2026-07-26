@@ -79,10 +79,14 @@ pub use mapping::ACTOR_TOOL;
 pub use mapping::ACTOR_USER;
 pub use mapping::HARNESS;
 pub use mapping::MappedEvent;
+pub use mapping::TurnEndFacts;
+pub use mapping::attach_provider_usage;
 pub use mapping::map_item;
 pub use mapping::map_model_or_thinking_change;
 pub use mapping::map_runtime_note;
 pub use mapping::map_turn_end;
+pub use mapping::token_usage_to_provider_usage;
+pub use mapping::unix_secs_to_iso;
 pub use session::encode_thread_id_for_path;
 pub use session::thread_file_path;
 

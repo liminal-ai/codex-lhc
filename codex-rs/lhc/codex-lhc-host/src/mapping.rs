@@ -406,19 +406,85 @@ pub fn map_item(
     }
 }
 
+/// Host-observed facts for a `turn_end` payload (schema v5 / D1–D2).
+///
+/// All fields optional — empty payload remains valid for hosts that omit them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnEndFacts {
+    /// `"completed"` or `"aborted"`.
+    pub outcome: Option<&'static str>,
+    pub outcome_reason: Option<String>,
+    /// Host wall-clock start (ISO-8601 UTC).
+    pub started_at: Option<String>,
+    /// Host wall-clock end (ISO-8601 UTC).
+    pub ended_at: Option<String>,
+}
+
+/// Convert host Unix-seconds timestamps (as on TurnStarted/Complete/Aborted)
+/// into ISO-8601 UTC strings for the LHC `startedAt`/`endedAt` payload fields.
+pub fn unix_secs_to_iso(secs: i64) -> String {
+    match chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0) {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%S.000Z").to_string(),
+        None => format!("{secs}"),
+    }
+}
+
 /// Map a host turn boundary into a `turn_end` event.
-pub fn map_turn_end(thread_id: &str, turn_id: &str, reason: &str) -> MappedEvent {
+///
+/// `reason` is only the idempotency-key discriminator (`completed`/`aborted`/
+/// `error`/`stop` legacy); payload host facts ride `facts`.
+pub fn map_turn_end(
+    thread_id: &str,
+    turn_id: &str,
+    reason: &str,
+    facts: &TurnEndFacts,
+) -> MappedEvent {
     let key = turn_end_key(thread_id, turn_id, reason);
+    let mut payload = Map::new();
+    if let Some(outcome) = facts.outcome {
+        payload.insert("outcome".into(), json!(outcome));
+    }
+    if let Some(reason) = facts.outcome_reason.as_ref() {
+        payload.insert("outcomeReason".into(), json!(reason));
+    }
+    if let Some(started) = facts.started_at.as_ref() {
+        payload.insert("startedAt".into(), json!(started));
+    }
+    if let Some(ended) = facts.ended_at.as_ref() {
+        payload.insert("endedAt".into(), json!(ended));
+    }
     MappedEvent {
         input: MessageEventInput {
             event_kind: "turn_end".to_string(),
             idempotency_key: Some(key),
             actor: ACTOR_ASSISTANT.to_string(),
             harness: HARNESS.to_string(),
-            payload: Map::new(),
+            payload,
             extra: Map::new(),
         },
     }
+}
+
+/// Serialize a host `TokenUsage` into a free-form JSON object for
+/// `assistant_text.providerUsage` (verbatim; no field filter).
+pub fn token_usage_to_provider_usage(
+    usage: &codex_protocol::protocol::TokenUsage,
+) -> Option<Map<String, Value>> {
+    match serde_json::to_value(usage) {
+        Ok(Value::Object(map)) => Some(map),
+        _ => None,
+    }
+}
+
+/// Attach optional `providerUsage` to a mapped `assistant_text` event.
+pub fn attach_provider_usage(event: &mut MappedEvent, usage: &Map<String, Value>) {
+    if event.input.event_kind != "assistant_text" {
+        return;
+    }
+    event
+        .input
+        .payload
+        .insert("providerUsage".into(), Value::Object(usage.clone()));
 }
 
 /// Host-injected runtime note (degradation / truncation markers). Key is not
@@ -973,6 +1039,62 @@ mod tests {
         assert_eq!(
             events[0].input.idempotency_key,
             again[0].input.idempotency_key
+        );
+    }
+
+    #[test]
+    fn turn_end_empty_payload_when_no_facts() {
+        let event = map_turn_end("t", "turn-1", "stop", &TurnEndFacts::default());
+        assert_eq!(event.input.event_kind, "turn_end");
+        assert!(event.input.payload.is_empty());
+    }
+
+    #[test]
+    fn turn_end_carries_v5_host_facts() {
+        let facts = TurnEndFacts {
+            outcome: Some("aborted"),
+            outcome_reason: Some("interrupted".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:04.000Z".into()),
+        };
+        let event = map_turn_end("t", "turn-1", "aborted", &facts);
+        assert_eq!(event.input.payload.get("outcome"), Some(&json!("aborted")));
+        assert_eq!(
+            event.input.payload.get("outcomeReason"),
+            Some(&json!("interrupted"))
+        );
+        assert_eq!(
+            event.input.payload.get("startedAt"),
+            Some(&json!("2026-07-01T12:00:00.000Z"))
+        );
+        assert_eq!(
+            event.input.payload.get("endedAt"),
+            Some(&json!("2026-07-01T12:00:04.000Z"))
+        );
+        assert!(event.input.extra.is_empty());
+    }
+
+    #[test]
+    fn provider_usage_attaches_only_to_assistant_text() {
+        let item = ResponseItem::Message {
+            id: Some(ResponseItemId::from_server("a1".into())),
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText {
+                text: "hello".into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let mut events = map_item("t", &item, RawItemProvenance::ModelOutput, &mut tracker());
+        assert_eq!(events.len(), 1);
+        let usage = json!({"input_tokens": 11, "output_tokens": 3})
+            .as_object()
+            .cloned()
+            .unwrap();
+        attach_provider_usage(&mut events[0], &usage);
+        assert_eq!(
+            events[0].input.payload.get("providerUsage"),
+            Some(&Value::Object(usage))
         );
     }
 

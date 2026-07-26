@@ -546,12 +546,17 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
         .await;
     handle.flush().await;
     let baseline = handle.list_events().await.expect("list").len();
-    assert!(baseline > 0, "positive control: live turns must be captured");
+    assert!(
+        baseline > 0,
+        "positive control: live turns must be captured"
+    );
 
     // Now reconstruct history from rollout, as resume and fork do.
     let replayed: Vec<ResponseItem> = (0..6)
         .map(|i| ResponseItem::Message {
-            id: Some(codex_protocol::ResponseItemId::from_server(format!("rr{i}"))),
+            id: Some(codex_protocol::ResponseItemId::from_server(format!(
+                "rr{i}"
+            ))),
             role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
             content: vec![if i % 2 == 0 {
                 ContentItem::InputText {
@@ -595,5 +600,336 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
         replayed.len(),
         "positive control: reconstruction must actually have installed history"
     );
+    handle.shutdown().await;
+}
+
+/// Slice A — schema v5 host facts land in the LHC record through production
+/// seams: ModelOutput record path + TokenUsageContributor + turn lifecycle.
+///
+/// Asserts all three facts (outcome/timing on turn_end, providerUsage on
+/// assistant_text) and the abort path; also that omitting host facts still
+/// records a valid turn_end (fields optional).
+#[tokio::test]
+async fn e2e_v5_host_facts_complete_and_provider_usage() {
+    use crate::stream_events_utils::record_completed_response_item;
+    use codex_extension_api::TurnStartInput;
+    use codex_extension_api::TurnStopInput;
+    use codex_protocol::protocol::TokenUsage;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let (mut session, turn_context) = make_session_and_context().await;
+    install_lhc_on_session(&mut session, root).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+
+    // Turn start through the real lifecycle contributor fan-out.
+    let collaboration_mode = turn_context.collaboration_mode();
+    let token_usage_at_start = TokenUsage::default();
+    let started_at = 1_720_000_000_i64;
+    let completed_at = 1_720_000_042_i64;
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: turn_context.sub_id.as_str(),
+                collaboration_mode: &collaboration_mode,
+                token_usage_at_turn_start: &token_usage_at_start,
+                started_at: Some(started_at),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[text_input("v5 host facts prompt")],
+            None,
+        )
+        .await;
+
+    let assistant = ResponseItem::Message {
+        id: Some(codex_protocol::ResponseItemId::from_server(
+            "asst-v5".into(),
+        )),
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText {
+            text: "assistant reply with usage".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    // Production model-output path (ModelOutput provenance).
+    record_completed_response_item(&session, &turn_context, &assistant).await;
+
+    // ResponseEvent::Completed path — TokenUsageContributor fans out last_token_usage.
+    let per_call = TokenUsage {
+        input_tokens: 111,
+        cached_input_tokens: 22,
+        cache_write_input_tokens: 0,
+        output_tokens: 33,
+        reasoning_output_tokens: 4,
+        total_tokens: 170,
+    };
+    session
+        .record_token_usage_info(&turn_context, Some(&per_call))
+        .await
+        .expect("record token usage");
+
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_stop(TurnStopInput {
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    handle.flush().await;
+    let events = handle.list_events().await.expect("list events");
+
+    let assistant_ev = events
+        .iter()
+        .find(|e| e.event_kind().as_str() == "assistant_text")
+        .expect("assistant_text event");
+    let usage = assistant_ev
+        .assistant_text_payload()
+        .and_then(|p| p.provider_usage.clone())
+        .expect("providerUsage on assistant_text");
+    assert_eq!(usage.get("input_tokens"), Some(&serde_json::json!(111)));
+    assert_eq!(usage.get("output_tokens"), Some(&serde_json::json!(33)));
+    assert_eq!(
+        usage.get("cached_input_tokens"),
+        Some(&serde_json::json!(22))
+    );
+    assert_eq!(
+        usage.get("reasoning_output_tokens"),
+        Some(&serde_json::json!(4))
+    );
+
+    let turn_end = events
+        .iter()
+        .find(|e| e.event_kind().as_str() == "turn_end")
+        .expect("turn_end event");
+    let payload = turn_end.turn_end_payload().expect("turn_end payload");
+    assert_eq!(
+        payload.outcome.as_ref().map(|o| o.as_str()),
+        Some("completed")
+    );
+    assert_eq!(
+        payload.started_at.as_deref(),
+        Some("2024-07-03T09:46:40.000Z")
+    );
+    assert_eq!(
+        payload.ended_at.as_deref(),
+        Some("2024-07-03T09:47:22.000Z")
+    );
+
+    // Projected turns surface (rule zero: stored row, not just intake event).
+    let turns = handle.list_turns().await.expect("list turns");
+    let closed = turns
+        .iter()
+        .find(|t| t.status.as_str() == "closed")
+        .expect("closed turn");
+    assert_eq!(
+        closed.outcome.as_ref().map(|o| o.as_str()),
+        Some("completed")
+    );
+    assert_eq!(
+        closed.started_at.as_deref(),
+        Some("2024-07-03T09:46:40.000Z")
+    );
+    assert_eq!(closed.ended_at.as_deref(), Some("2024-07-03T09:47:22.000Z"));
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn e2e_v5_host_facts_abort_with_reason() {
+    use codex_extension_api::TurnAbortInput;
+    use codex_extension_api::TurnStartInput;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TurnAbortReason;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let (mut session, turn_context) = make_session_and_context().await;
+    install_lhc_on_session(&mut session, root).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+
+    let collaboration_mode = turn_context.collaboration_mode();
+    let token_usage_at_start = TokenUsage::default();
+    let started_at = 1_720_000_100_i64;
+    let completed_at = 1_720_000_110_i64;
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: turn_context.sub_id.as_str(),
+                collaboration_mode: &collaboration_mode,
+                token_usage_at_turn_start: &token_usage_at_start,
+                started_at: Some(started_at),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[text_input("abort path prompt")],
+            None,
+        )
+        .await;
+
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_abort(TurnAbortInput {
+                reason: TurnAbortReason::Interrupted,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    handle.flush().await;
+    let events = handle.list_events().await.expect("list");
+    let turn_end = events
+        .iter()
+        .find(|e| e.event_kind().as_str() == "turn_end")
+        .expect("turn_end");
+    let payload = turn_end.turn_end_payload().expect("payload");
+    assert_eq!(
+        payload.outcome.as_ref().map(|o| o.as_str()),
+        Some("aborted")
+    );
+    assert_eq!(payload.outcome_reason.as_deref(), Some("interrupted"));
+    assert!(payload.started_at.is_some());
+    assert!(payload.ended_at.is_some());
+
+    let turns = handle.list_turns().await.expect("list turns");
+    let closed = turns
+        .iter()
+        .find(|t| t.status.as_str() == "closed")
+        .expect("closed turn");
+    assert_eq!(closed.outcome.as_ref().map(|o| o.as_str()), Some("aborted"));
+    assert_eq!(closed.outcome_reason.as_deref(), Some("interrupted"));
+
+    handle.shutdown().await;
+}
+
+/// Optional fields: a turn_end with no host facts still records and closes.
+#[tokio::test]
+async fn e2e_v5_turn_end_without_host_facts_still_records() {
+    use codex_extension_api::TurnStartInput;
+    use codex_extension_api::TurnStopInput;
+    use codex_protocol::protocol::TokenUsage;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let (mut session, turn_context) = make_session_and_context().await;
+    install_lhc_on_session(&mut session, root).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+
+    let collaboration_mode = turn_context.collaboration_mode();
+    let token_usage_at_start = TokenUsage::default();
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: turn_context.sub_id.as_str(),
+                collaboration_mode: &collaboration_mode,
+                token_usage_at_turn_start: &token_usage_at_start,
+                started_at: None,
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[text_input("optional facts prompt")],
+            None,
+        )
+        .await;
+
+    // on_turn_stop always supplies completed when called via install, so drive
+    // the capture handle directly with empty facts to pin optional semantics.
+    handle.turn_end(
+        turn_context.sub_id.as_str(),
+        "completed",
+        codex_lhc_host::TurnEndFacts::default(),
+    );
+    // Also exercise stop with timestamps omitted through the contributor
+    // (started_at/completed_at None) — install still sets outcome completed.
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_stop(TurnStopInput {
+                started_at: None,
+                completed_at: None,
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            })
+            .await;
+    }
+
+    handle.flush().await;
+    let events = handle.list_events().await.expect("list");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_kind().as_str() == "user_prompt"),
+        "user prompt must still record without host facts"
+    );
+    let empty_end = events.iter().find(|e| {
+        e.event_kind().as_str() == "turn_end"
+            && e.turn_end_payload()
+                .is_some_and(|p| p.outcome.is_none() && p.started_at.is_none())
+    });
+    assert!(
+        empty_end.is_some(),
+        "empty turn_end payload must remain valid; events={:?}",
+        events
+            .iter()
+            .filter(|e| e.event_kind().as_str() == "turn_end")
+            .map(|e| e.turn_end_payload().cloned())
+            .collect::<Vec<_>>()
+    );
+
     handle.shutdown().await;
 }

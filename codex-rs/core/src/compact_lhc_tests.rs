@@ -1352,10 +1352,7 @@ async fn background_derivation_leaves_compact_with_no_inference_to_do() {
     // background derivation runs with these, so they must never be canned text
     // in production (J1).
     let calls = Arc::new(AtomicUsize::new(0));
-    slot.set_derivation_callbacks(slow_counting_callbacks(
-        Arc::clone(&calls),
-        Duration::ZERO,
-    ));
+    slot.set_derivation_callbacks(slow_counting_callbacks(Arc::clone(&calls), Duration::ZERO));
 
     seed_conversation_bandable(&session, &tc, TURNS).await;
     handle.flush().await;
@@ -1602,7 +1599,11 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
 
     let psess = Arc::new(parent);
     let pa = run_arm_deterministic(&psess, &ptc, /*manual*/ true).await;
-    let LhcCompactAttempt::Installed { body: parent_body, marker: pmarker } = pa else {
+    let LhcCompactAttempt::Installed {
+        body: parent_body,
+        marker: pmarker,
+    } = pa
+    else {
         panic!("fixture: parent compact must install");
     };
     let durable = psess
@@ -1799,15 +1800,17 @@ async fn c1_derivation_call_input_cost_profile_is_measured() {
                 let n = ($len)(&input);
                 log.lock().expect("log").push(($label, n));
                 let inner = Arc::clone(&inner);
-                Box::pin(async move { inner(input).await })
-                    as codex_lhc_host::BoxInferenceFuture
+                Box::pin(async move { inner(input).await }) as codex_lhc_host::BoxInferenceFuture
             })
         }};
     }
     let callbacks = InferenceCallbacks {
-        smooth_prompt: measured!(smooth_prompt, SmoothPromptInput, "smooth_prompt", |i: &SmoothPromptInput| i
-            .text
-            .len()),
+        smooth_prompt: measured!(
+            smooth_prompt,
+            SmoothPromptInput,
+            "smooth_prompt",
+            |i: &SmoothPromptInput| i.text.len()
+        ),
         summarize_tool_result: measured!(
             summarize_tool_result,
             SummarizeToolResultInput,

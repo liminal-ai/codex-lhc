@@ -41,7 +41,6 @@ use crate::session::turn_context::TurnContext;
 
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-
 #[derive(Debug)]
 pub(crate) enum LhcCompactAttempt {
     Installed {

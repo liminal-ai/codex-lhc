@@ -359,7 +359,10 @@ mod tests {
         }
 
         // Nothing else from the agent turn surface leaks in either.
-        assert!(prompt.tools.is_empty(), "derivation must advertise no tools");
+        assert!(
+            prompt.tools.is_empty(),
+            "derivation must advertise no tools"
+        );
         assert!(!prompt.parallel_tool_calls);
         assert!(prompt.output_schema.is_none());
 

@@ -510,12 +510,13 @@ impl Session {
         let mut aborted_turn = false;
         let mut active_turn_to_clear = None;
         let mut turn_context = None;
+        let mut abort_timing = None;
         if let Some(mut active_turn) = self.take_active_turn().await {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
-                self.handle_task_abort(task, reason.clone()).await;
+                abort_timing = Some(self.handle_task_abort(task, reason.clone()).await);
             }
             if aborted_turn {
                 active_turn_to_clear = Some(active_turn);
@@ -523,8 +524,16 @@ impl Session {
         }
 
         if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
+            // Timestamps were finalized inside handle_task_abort (when it ran).
+            let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
+            let completed_at = abort_timing.map(|t| t.1).unwrap_or(None);
+            self.emit_turn_abort_lifecycle(
+                reason.clone(),
+                turn_context.extension_data.as_ref(),
+                started_at,
+                completed_at,
+            )
+            .await;
         }
         if let Some(active_turn) = active_turn_to_clear {
             // Let interrupted tasks observe cancellation before dropping pending approvals, or an
@@ -559,12 +568,21 @@ impl Session {
 
         let task = active_turn.task.take();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
-        if let Some(task) = task {
-            self.handle_task_abort(task, reason.clone()).await;
-        }
+        let abort_timing = if let Some(task) = task {
+            Some(self.handle_task_abort(task, reason.clone()).await)
+        } else {
+            None
+        };
         if let Some(turn_context) = turn_context.as_deref() {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
+            let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
+            let completed_at = abort_timing.map(|t| t.1).unwrap_or(None);
+            self.emit_turn_abort_lifecycle(
+                reason.clone(),
+                turn_context.extension_data.as_ref(),
+                started_at,
+                completed_at,
+            )
+            .await;
         }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
@@ -783,8 +801,13 @@ impl Session {
                 profile,
             });
         let event = if let Some(reason) = abort_reason {
-            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
-                .await;
+            self.emit_turn_abort_lifecycle(
+                reason.clone(),
+                turn_context.extension_data.as_ref(),
+                started_at,
+                completed_at,
+            )
+            .await;
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
                 reason,
@@ -798,8 +821,12 @@ impl Session {
                 .time_to_first_token_ms()
                 .await;
             let error = turn_context.terminal_error.lock().await.clone();
-            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
-                .await;
+            self.emit_turn_stop_lifecycle(
+                turn_context.extension_data.as_ref(),
+                started_at,
+                completed_at,
+            )
+            .await;
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
@@ -865,10 +892,22 @@ impl Session {
             .await
     }
 
-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
+    /// Abort a running task and emit `TurnAborted`. Returns host turn timing
+    /// `(started_at, completed_at)` so lifecycle contributors can attach the
+    /// same host facts the display event carries (schema v5).
+    async fn handle_task_abort(
+        self: &Arc<Self>,
+        task: RunningTask,
+        reason: TurnAbortReason,
+    ) -> (Option<i64>, Option<i64>) {
         let sub_id = task.turn_context.sub_id.clone();
         if task.cancellation_token.is_cancelled() {
-            return;
+            let started_at = task
+                .turn_context
+                .turn_timing_state
+                .started_at_unix_secs()
+                .await;
+            return (started_at, None);
         }
 
         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
@@ -950,6 +989,7 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
+        (started_at, completed_at)
     }
 }
 
