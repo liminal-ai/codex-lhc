@@ -1163,6 +1163,84 @@ mod tests {
         r
     }
 
+    /// Chunk 3 / gap 1: `DrainReport::remaining` is **not** a progress metric.
+    ///
+    /// Chunk 2's deleted core-level M1 test asserted on `remaining` and saw it
+    /// grow while derivation ran; nobody accounted for it and the test was
+    /// removed. This pins the reason as observed behaviour.
+    ///
+    /// `remaining` is `count_live_items` — `SELECT COUNT(*) FROM work_item
+    /// WHERE status IN ('queued','claimed')` — over a derivation graph that
+    /// **cascades**: settling one item enqueues its successors (detailed-turn
+    /// compression when a turn is applied, chunk summaries when a chunk closes,
+    /// rebuild groups on cascade). So the counter nets settled work against
+    /// newly enqueued successors and systematically under-reports progress: a
+    /// tick can run real inference and leave `remaining` unchanged or higher.
+    ///
+    /// Measured here (8 production idle ticks on an 80-turn thread): `remaining`
+    /// fell 159 → 147 while 32 inference calls ran, and two ticks settled work
+    /// for **zero** net reduction. Read as "work left to do", that says the pump
+    /// did nothing on those ticks. It did.
+    ///
+    /// The M1 claim is therefore measured in compact-time inference calls
+    /// instead — see codex-core
+    /// `m1_core_idle_pump_reduces_compact_time_inference_calls`.
+    #[tokio::test]
+    async fn m1_remaining_is_not_a_monotone_progress_metric() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tid = "m1-remaining-cascade";
+        let h = seeded_slot(root, tid).await;
+        let counter = Arc::new(AtomicUsize::new(0));
+        h.slot
+            .set_derivation_callbacks(counting_callbacks(Arc::clone(&counter)));
+
+        // Per-tick (remaining_before, ran, remaining_after) through the real
+        // idle seam, exactly as production drives it.
+        let mut ticks: Vec<(i64, usize, i64)> = Vec::new();
+        let mut before = drain_backlog(root, tid).await;
+        for tick in 1..=8u64 {
+            let calls_before = counter.load(Ordering::SeqCst);
+            h.fire_idle().await;
+            wait_for_pump_runs(&h.slot, tick, std::time::Duration::from_secs(30)).await;
+            let ran = counter.load(Ordering::SeqCst) - calls_before;
+            let after = drain_backlog(root, tid).await;
+            ticks.push((before, ran, after));
+            before = after;
+        }
+        eprintln!(
+            "M1 cascade ticks (remaining_before, inference_calls, remaining_after): {ticks:?}"
+        );
+
+        let total_calls = counter.load(Ordering::SeqCst);
+        assert!(
+            total_calls > 0,
+            "fixture: derivation must actually run, else this measures nothing"
+        );
+
+        // Decisive observation: at least one tick ran real inference and ended
+        // with no fewer live rows than it began. Over a flat queue that cannot
+        // happen — settling work can only shrink it. It is explicable only by
+        // successors being enqueued as predecessors settle.
+        let stalled = ticks.iter().any(|(b, ran, a)| *ran > 0 && a >= b);
+        assert!(
+            stalled,
+            "expected at least one tick that ran derivation yet did not reduce \
+             `remaining` — that is the cascade this test documents. Ticks: \
+             {ticks:?}. If this now fails, the work graph stopped cascading and \
+             the Chunk 2 observation needs re-deriving, not this comment."
+        );
+
+        // Weaker but flake-proof companion: total reduction across all ticks is
+        // far below the work actually performed.
+        let net_reduction = ticks[0].0 - ticks[ticks.len() - 1].2;
+        assert!(
+            net_reduction < total_calls as i64,
+            "`remaining` fell by {net_reduction} while {total_calls} inference \
+             calls ran; if these ever match, the queue stopped cascading"
+        );
+    }
+
     async fn wait_for_pump_runs(
         slot: &LhcCaptureSlot,
         target: u64,

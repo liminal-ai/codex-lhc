@@ -404,6 +404,7 @@ pub(crate) async fn run_turn(
                         },
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        &cancellation_token,
                     )
                     .await
                     {
@@ -868,6 +869,7 @@ async fn run_pre_sampling_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
     }
@@ -950,6 +952,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
         return Ok(());
@@ -998,6 +1001,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            cancellation_token,
         )
         .await?;
     }
@@ -1010,6 +1014,10 @@ async fn maybe_run_previous_model_inline_compact(
     fields(reason = ?reason, phase = ?phase)
 )]
 // pub(crate) so compact_lhc_tests can drive the production auto ladder (R5).
+// LHC-HOOK: `cancellation_token` is a fork-added parameter (N3). The auto
+// ladder had no token at all, so an aborted turn could not stop LHC derivation.
+// Every caller already had one in scope.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
@@ -1018,6 +1026,7 @@ pub(crate) async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
@@ -1027,6 +1036,7 @@ pub(crate) async fn run_auto_compact(
         turn_context.as_ref(),
         initial_context_injection.clone(),
         /*manual*/ false,
+        cancellation_token,
     )
     .await?
     {

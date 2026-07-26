@@ -26,6 +26,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -98,6 +99,7 @@ pub(crate) async fn try_run_lhc_compact_arm(
     turn_context: &TurnContext,
     initial_context_injection: InitialContextInjection,
     manual: bool,
+    cancellation_token: &CancellationToken,
 ) -> CodexResult<LhcCompactAttempt> {
     let callbacks = match select_production_inference_callbacks(sess.as_ref()).await {
         Ok(c) => c,
@@ -110,18 +112,23 @@ pub(crate) async fn try_run_lhc_compact_arm(
             return Ok(LhcCompactAttempt::Unavailable { reason });
         }
     };
-    try_run_lhc_compact_arm_with_callbacks(
+    try_run_lhc_compact_arm_with_callbacks_and_cancel(
         sess,
         turn_context,
         initial_context_injection,
         manual,
         callbacks,
+        cancellation_token,
     )
     .await
 }
 
 /// Explicit callback injection — used by offline unit tests with deterministic
 /// callbacks. Production entry never reaches this with canned text.
+///
+/// Runs with a token that is never cancelled; tests that exercise abort use
+/// [`try_run_lhc_compact_arm_with_callbacks_and_cancel`].
+#[cfg(test)]
 pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
@@ -129,6 +136,43 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
     manual: bool,
     callbacks: InferenceCallbacks,
 ) -> CodexResult<LhcCompactAttempt> {
+    try_run_lhc_compact_arm_with_callbacks_and_cancel(
+        sess,
+        turn_context,
+        initial_context_injection,
+        manual,
+        callbacks,
+        &CancellationToken::new(),
+    )
+    .await
+}
+
+/// N3: the arm, bound to the **turn's own** cancellation token.
+///
+/// When the user aborts a turn, derivation must stop — not keep billing
+/// inference for a turn nobody is waiting on. Before this the arm only ever saw
+/// its own private `AtomicBool`, set solely by `COMPACT_THREAD_TIMEOUT`;
+/// `CompactTask::run` bound its token as `_cancellation_token` and
+/// `run_auto_compact` had none at all. Production was saved from installing a
+/// post-abort compact only by the hard `handle.abort()` 100 ms later
+/// (`GRACEFULL_INTERRUPTION_TIMEOUT_MS`), and the detached derivation worker
+/// survived that and kept spending.
+///
+/// Cancellation is a fail-open per law 3: no partial install, no marker, native
+/// ladder unaffected.
+pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    initial_context_injection: InitialContextInjection,
+    manual: bool,
+    callbacks: InferenceCallbacks,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<LhcCompactAttempt> {
+    if cancellation_token.is_cancelled() {
+        return Ok(LhcCompactAttempt::Unavailable {
+            reason: "turn cancelled before LHC compact started".into(),
+        });
+    }
     if !sess.enabled(Feature::LhcCapture) {
         return Ok(LhcCompactAttempt::Unavailable {
             reason: "Feature::LhcCapture off".into(),
@@ -176,6 +220,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
         callbacks,
         Arc::clone(&cancel),
         session_derived,
+        cancellation_token,
     )
     .await
     {
@@ -462,6 +507,7 @@ fn content_items_equal(a: &[ContentItem], b: &[ContentItem]) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn produce_lhc_compact_on_thread(
     thread_id: String,
     root: Option<PathBuf>,
@@ -470,6 +516,7 @@ async fn produce_lhc_compact_on_thread(
     callbacks: codex_lhc_host::InferenceCallbacks,
     cancel: Arc<AtomicBool>,
     session_derived: DerivedProvenance,
+    turn_cancel: &CancellationToken,
 ) -> Result<LhcCompactResult, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cancel_thread = Arc::clone(&cancel);
@@ -513,7 +560,21 @@ async fn produce_lhc_compact_on_thread(
         .map_err(|e| format!("spawn lhc-compact thread: {e}"))?;
 
     let thread_timeout = compact_thread_timeout();
-    match tokio::time::timeout(thread_timeout, rx).await {
+    // N3: the turn's own cancellation races the worker and the timeout. The
+    // detached worker checks `cancel` between drain batches (M2), so setting it
+    // here stops further inference within one batch instead of letting it run
+    // out the 75 s derivation budget for an abandoned turn.
+    let raced = tokio::select! {
+        biased;
+        () = turn_cancel.cancelled() => {
+            cancel.store(true, Ordering::SeqCst);
+            drop(join);
+            warn!("LHC compact cancelled by turn abort; stopping derivation and failing open");
+            return Err("lhc-compact cancelled by turn abort".into());
+        }
+        r = tokio::time::timeout(thread_timeout, rx) => r,
+    };
+    match raced {
         Ok(Ok(r)) => {
             // Success path: surface panics without hanging the turn forever.
             // Bound the join so a stuck thread cannot pin the worker.

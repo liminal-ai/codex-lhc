@@ -1,21 +1,18 @@
-diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index 3eac8f03e6..f911dc7921 100644
---- a/codex-rs/core/Cargo.toml
-+++ b/codex-rs/core/Cargo.toml
-@@ -138,6 +138,8 @@ codex-shell-escalation = { workspace = true }
- [dev-dependencies]
- assert_cmd = { workspace = true }
- assert_matches = { workspace = true }
-+# LHC-HOOK: e2e capture suite exercises the real Session raw-item seam.
-+codex-lhc-host = { workspace = true, features = ["test-util"] }
- codex-exec-server-test-support = { workspace = true }
- codex-image-generation-extension = { workspace = true }
- codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 71abe5acc3..09595183b1 100644
+index 71abe5acc3..06ab2bb299 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -714,8 +714,13 @@ async fn drain_to_completed(
+@@ -64,6 +64,9 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+ /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
+ /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
+ /// initial context into the replacement history just above the last real user message.
++// LHC-HOOK: Clone required so auto-compact can try the LHC arm then fall through
++// to native arms with the same injection (Chunk 2b).
++#[derive(Clone)]
+ pub(crate) enum InitialContextInjection {
+     BeforeLastUserMessage {
+         world_state: Arc<WorldState>,
+@@ -714,8 +717,13 @@ async fn drain_to_completed(
          };
          match event {
              Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -33,10 +30,10 @@ index 71abe5acc3..09595183b1 100644
                  sess.set_server_reasoning_included(included).await;
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..7fc988dcd5
+index 0000000000..1f94cb90ed
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,478 @@
+@@ -0,0 +1,599 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -47,7 +44,8 @@ index 0000000000..7fc988dcd5
 +//! registries alone.
 +
 +use std::sync::Arc;
-+use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering;
 +use std::time::Duration;
 +
 +use codex_extension_api::ConfigContributor;
@@ -56,7 +54,6 @@ index 0000000000..7fc988dcd5
 +use codex_extension_api::RawItemContributor;
 +use codex_extension_api::RawItemInput;
 +use codex_extension_api::RawItemProvenance;
-+use codex_extension_api::ThreadLifecycleContributor;
 +use codex_extension_api::ThreadStartInput;
 +use codex_lhc_host::LhcCaptureSlot;
 +use codex_lhc_host::install_with_root;
@@ -487,89 +484,179 @@ index 0000000000..7fc988dcd5
 +    handle.shutdown().await;
 +}
 +
-+/// Structural guard for H10: stream_events_utils and compact must pass ModelOutput.
-+#[test]
-+fn model_output_provenance_sites_are_tagged() {
-+    let stream = include_str!("../stream_events_utils.rs");
-+    let compact = include_str!("../compact.rs");
++/// H10/I2: drive the real model-output recording path
++/// (`record_completed_response_item`) against a live LHC session.
++///
++/// Provenance only changes the map for **user-role** items:
++/// `UserPrompt` → `user_prompt`; `ModelOutput`/`HostContext`/`InterAgent` →
++/// `runtime_note`. Assistant items map via role alone, so they cannot certify
++/// the tag. A user-role item through the model-output path must become
++/// `runtime_note` (fails if the path wrongly uses `UserPrompt`).
++///
++/// **Gap (honest):** `ModelOutput` vs `HostContext` vs `InterAgent` produce
++/// identical stored shapes for every variant today — the precise tag on
++/// stream/compact sites is not observable in LHC rows. Compaction's
++/// `OutputItemDone` path is the same mapping; not separately driven here.
++#[tokio::test]
++async fn e2e_model_output_path_does_not_tag_user_role_as_user_prompt() {
++    use crate::stream_events_utils::record_completed_response_item;
++
++    let dir = tempdir().expect("tempdir");
++    let root = dir.path().to_path_buf();
++    let (mut session, turn_context) = make_session_and_context().await;
++    install_lhc_on_session(&mut session, root).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++
++    // User-role item through the primary model-output recording path.
++    let user_shaped = ResponseItem::Message {
++        id: None,
++        role: "user".into(),
++        content: vec![ContentItem::InputText {
++            text: "should-not-be-user-prompt-via-model-path".into(),
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    };
++    record_completed_response_item(&session, &turn_context, &user_shaped).await;
++
++    handle.flush().await;
++    let events = handle.list_events().await.expect("list");
++    let kinds: Vec<_> = events.iter().map(|e| e.event_kind().as_str()).collect();
 +    assert!(
-+        stream.contains("RawItemProvenance::ModelOutput")
-+            && stream.contains("record_conversation_items_with_provenance"),
-+        "stream_events_utils must tag ModelOutput (H10)"
++        kinds.iter().any(|k| *k == "runtime_note"),
++        "model-output path must not classify user-role as user_prompt; got {kinds:?}"
 +    );
 +    assert!(
-+        compact.contains("RawItemProvenance::ModelOutput")
-+            && compact.contains("record_conversation_items_with_provenance"),
-+        "compact must tag ModelOutput (H10)"
++        !kinds.iter().any(|k| *k == "user_prompt"),
++        "user-role item via record_completed_response_item must not be user_prompt (would mean UserPrompt tag); got {kinds:?}"
 +    );
-+    let stream_fn = stream
-+        .split("record_completed_response_item_with_finalized_facts")
-+        .nth(2)
-+        .unwrap_or("");
-+    let body = stream_fn
-+        .split("mark_thread_memory_mode")
-+        .next()
-+        .unwrap_or("");
-+    assert!(
-+        !body.contains("record_conversation_items(turn_context, std::slice::from_ref(item))"),
-+        "primary model-output path must not use untyped record_conversation_items"
++    handle.shutdown().await;
++}
++
++/// Chunk 3 / C1.2 — the invariant that makes resume and fork safe for LHC.
++///
++/// Rollout reconstruction (`apply_rollout_reconstruction` →
++/// `state.replace_history`) installs history **without** going through
++/// `send_raw_response_items`, so a resumed or forked session does not feed the
++/// replayed history — including a previous compact's served body — back into
++/// the archive as fresh source events.
++///
++/// That is load-bearing and invisible: if an upstream change ever routes
++/// reconstruction through the record path, every resume silently re-ingests
++/// LHC's own summary, and the next compact compounds it. Nothing else in the
++/// fork would notice, because the resumed session's slot has no derived
++/// provenance yet (I2's reseed runs at compact time, after reconstruction).
++///
++/// Written against the real reconstruction entry, not a stand-in.
++#[tokio::test]
++async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
++    let dir = tempdir().expect("tempdir");
++    let root = dir.path().to_path_buf();
++
++    let (mut session, turn_context) = make_session_and_context().await;
++    install_lhc_on_session(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("LhcCaptureSlot installed by on_thread_start");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("capture handle opened");
++
++    // One genuinely captured turn, so "archive is empty" cannot pass by accident.
++    session
++        .record_user_prompt_and_emit_turn_item(
++            &turn_context,
++            &[text_input("live turn that must be captured")],
++            None,
++        )
++        .await;
++    handle.flush().await;
++    let baseline = handle.list_events().await.expect("list").len();
++    assert!(baseline > 0, "positive control: live turns must be captured");
++
++    // Now reconstruct history from rollout, as resume and fork do.
++    let replayed: Vec<ResponseItem> = (0..6)
++        .map(|i| ResponseItem::Message {
++            id: Some(codex_protocol::ResponseItemId::from_server(format!("rr{i}"))),
++            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
++            content: vec![if i % 2 == 0 {
++                ContentItem::InputText {
++                    text: format!("replayed rollout item {i}"),
++                }
++            } else {
++                ContentItem::OutputText {
++                    text: format!("replayed rollout reply {i}"),
++                }
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        })
++        .collect();
++    let rollout_items: Vec<codex_protocol::protocol::RolloutItem> = replayed
++        .iter()
++        .cloned()
++        .map(codex_protocol::protocol::RolloutItem::ResponseItem)
++        .collect();
++
++    // The production entry itself — the same call `InitialHistory::Resumed`
++    // and `InitialHistory::Forked` make in `Session::new`.
++    let _ = session
++        .apply_rollout_reconstruction(&turn_context, &rollout_items)
++        .await;
++
++    // Reconstruction is synchronous into state; give any stray async capture
++    // path a chance to land before declaring nothing was ingested.
++    handle.flush().await;
++    let after = handle.list_events().await.expect("list").len();
++
++    assert_eq!(
++        after, baseline,
++        "rollout reconstruction must not fan replayed history into capture: \
++         archive grew {baseline} -> {after}. On a real resume that means the \
++         previous compact's served body is re-ingested as source, and every \
++         later compact re-summarises LHC's own output."
 +    );
++    assert_eq!(
++        session.clone_history().await.raw_items().len(),
++        replayed.len(),
++        "positive control: reconstruction must actually have installed history"
++    );
++    handle.shutdown().await;
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index d0a14d1223..c880af3a15 100644
+index e06dfb569f..87ad6b9ced 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -2092,13 +2092,17 @@ impl Session {
-     }
+@@ -1316,6 +1316,9 @@ impl Session {
+                 let previous_turn_settings = self
+                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
+                     .await;
++                // I2: re-seed durable LHC derived record from CompactedItem.message.
++                self.seed_last_lhc_durable_from_rollout(&rollout_items)
++                    .await;
  
-     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
-+        let started_at_ms = turn_context
-+            .turn_timing_state
-+            .record_item_started(item.id(), now_unix_timestamp_ms())
-+            .await;
-         self.send_event(
-             turn_context,
-             EventMsg::ItemStarted(ItemStartedEvent {
-                 thread_id: self.thread_id,
-                 turn_id: turn_context.sub_id.clone(),
-                 item: item.clone(),
--                started_at_ms: now_unix_timestamp_ms(),
-+                started_at_ms,
-             }),
-         )
-         .await;
-@@ -2110,13 +2114,29 @@ impl Session {
-         item: TurnItem,
-     ) {
-         record_turn_ttfm_metric(turn_context, &item).await;
-+        let completed_at_ms = now_unix_timestamp_ms();
-+        let item_id = item.id();
-+        let started_at_ms = turn_context
-+            .turn_timing_state
-+            .take_item_started(&item_id)
-+            .await
-+            .unwrap_or_else(|| {
-+                warn!(
-+                    thread_id = %self.thread_id,
-+                    turn_id = %turn_context.sub_id,
-+                    item_id = %item_id,
-+                    "item completed without a recorded start timestamp"
-+                );
-+                completed_at_ms
-+            });
-         self.send_event(
-             turn_context,
-             EventMsg::ItemCompleted(ItemCompletedEvent {
-                 thread_id: self.thread_id,
-                 turn_id: turn_context.sub_id.clone(),
-                 item,
--                completed_at_ms: now_unix_timestamp_ms(),
-+                started_at_ms: Some(started_at_ms),
-+                completed_at_ms,
-             }),
-         )
-         .await;
-@@ -2958,6 +2978,25 @@ impl Session {
+                 // If resuming, warn when the last recorded model differs from the current one.
+                 let curr: &str = turn_context.model_info.slug.as_str();
+@@ -1355,6 +1358,8 @@ impl Session {
+                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
+                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                     .await;
++                self.seed_last_lhc_durable_from_rollout(&rollout_items)
++                    .await;
+ 
+                 // Seed usage info from the recorded rollout so UIs can show token counts
+                 // immediately on resume/fork.
+@@ -2978,6 +2983,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -595,7 +682,7 @@ index d0a14d1223..c880af3a15 100644
      ) {
          let items = self.prepare_conversation_items_for_history(turn_context, items);
          let items = items.as_ref();
-@@ -2970,7 +3009,8 @@ impl Session {
+@@ -2990,7 +3014,8 @@ impl Session {
              );
          }
          self.persist_rollout_response_items(items).await;
@@ -605,7 +692,7 @@ index d0a14d1223..c880af3a15 100644
      }
  
      pub(crate) async fn record_step_world_state_if_changed(
-@@ -3092,7 +3132,13 @@ impl Session {
+@@ -3112,7 +3137,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item),
          ])
          .await;
@@ -620,7 +707,79 @@ index d0a14d1223..c880af3a15 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3261,7 +3307,42 @@ impl Session {
+@@ -3194,7 +3225,7 @@ impl Session {
+     ) {
+         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+         let compacted_item = CompactedItem {
+-            message: metadata.message,
++            message: metadata.message.clone(),
+             replacement_history: Some(items.clone()),
+             window_number: Some(metadata.window_number),
+             first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+@@ -3214,6 +3245,10 @@ impl Session {
+                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
+                 state.history.set_world_state_baseline(snapshot);
+             }
++            // I2: durable LHC derived record rides the same CompactedItem write.
++            if codex_lhc_host::CompactMarker::is_durable_writeback_record(&metadata.message) {
++                state.set_last_lhc_durable_derived(Some(metadata.message.clone()));
++            }
+         }
+ 
+         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
+@@ -3233,6 +3268,27 @@ impl Session {
+         }
+     }
+ 
++    /// I2: remember durable LHC derived record from CompactedItem messages in rollout.
++    pub(crate) async fn seed_last_lhc_durable_from_rollout(&self, rollout_items: &[RolloutItem]) {
++        let last = rollout_items.iter().rev().find_map(|item| match item {
++            RolloutItem::Compacted(c)
++                if codex_lhc_host::CompactMarker::is_durable_writeback_record(&c.message) =>
++            {
++                Some(c.message.clone())
++            }
++            _ => None,
++        });
++        if let Some(msg) = last {
++            let mut state = self.state.lock().await;
++            state.set_last_lhc_durable_derived(Some(msg));
++        }
++    }
++
++    pub(crate) async fn last_lhc_durable_derived_message(&self) -> Option<String> {
++        let state = self.state.lock().await;
++        state.last_lhc_durable_derived().map(str::to_string)
++    }
++
+     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
+         let rollout_items: Vec<RolloutItem> = items
+             .iter()
+@@ -3246,6 +3302,23 @@ impl Session {
+         self.features.enabled(feature)
+     }
+ 
++    /// Test-only: toggle a session feature after construction.
++    #[cfg(test)]
++    pub(crate) fn set_feature_for_test(
++        &mut self,
++        feature: Feature,
++        enabled: bool,
++    ) -> crate::config::ConstraintResult<()> {
++        self.features.set_enabled(feature, enabled)
++    }
++
++    /// Test-only: seed auto-compact prefill for law-2 assertions.
++    #[cfg(test)]
++    pub(crate) async fn set_auto_compact_window_estimated_prefill_for_test(&self, tokens: i64) {
++        let mut state = self.state.lock().await;
++        state.set_auto_compact_window_estimated_prefill(tokens);
++    }
++
+     pub(crate) fn features(&self) -> ManagedFeatures {
+         self.features.clone()
+     }
+@@ -3281,7 +3354,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -664,7 +823,7 @@ index d0a14d1223..c880af3a15 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3896,9 +3977,13 @@ impl Session {
+@@ -3916,9 +4024,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -681,7 +840,7 @@ index d0a14d1223..c880af3a15 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -3917,8 +4002,13 @@ impl Session {
+@@ -3937,8 +4049,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -697,7 +856,7 @@ index d0a14d1223..c880af3a15 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4162,3 +4252,8 @@ mod elicitation_holders_tests;
+@@ -4182,3 +4299,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
@@ -706,6 +865,12 @@ index d0a14d1223..c880af3a15 100644
 +#[cfg(test)]
 +#[path = "lhc_capture_e2e_tests.rs"]
 +mod lhc_capture_e2e_tests;
++
++// Chunk 2a: band-shape eval harness (dry-run always; live behind env flag).
++// Test-only — does not register a production hook site.
++#[cfg(test)]
++#[path = "lhc_band_shape_eval_tests.rs"]
++mod lhc_band_shape_eval_tests;
 diff --git a/codex-rs/core/src/stream_events_utils.rs b/codex-rs/core/src/stream_events_utils.rs
 index dff98f222a..0cebcf085a 100644
 --- a/codex-rs/core/src/stream_events_utils.rs

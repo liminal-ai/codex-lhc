@@ -622,6 +622,7 @@ async fn fail_open_feature_off() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        &CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -717,6 +718,7 @@ async fn production_auto_ladder_invokes_lhc_arm() {
         InitialContextInjection::DoNotInject,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
+        &CancellationToken::new(),
     )
     .await;
     assert!(
@@ -962,6 +964,7 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        &CancellationToken::new(),
     )
     .await
     .expect("arm result");
@@ -1048,6 +1051,7 @@ async fn j1_unavailable_derivation_model_fails_open() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        &CancellationToken::new(),
     )
     .await
     .expect("arm");
@@ -1158,6 +1162,7 @@ async fn j1_explicit_override_installs_via_production_entry() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        &CancellationToken::new(),
     )
     .await
     .expect("arm");
@@ -1206,6 +1211,7 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
             &tc,
             InitialContextInjection::DoNotInject,
             /*manual*/ true,
+            &CancellationToken::new(),
         )
         .await
         .expect("arm");
@@ -1287,10 +1293,193 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
 
 // M1's idle-pump wiring is proven in the host crate (codex-lhc-host
 // `install.rs::tests::m1_*`) through the real extension registry. The
-// core-level end-to-end measurement is an open gap — see the round report.
+// core-level end-to-end measurement is settled below (Chunk 3, gap 1).
 
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering as AtomicOrdering;
+
+/// Chunk 3 / gap 1 — the core-level M1 measurement Chunk 2 could not explain.
+///
+/// The deleted Chunk 2 attempt asserted on `DrainReport::remaining` and saw it
+/// *grow* while the core pump ran. That is the queue behaving as designed, not
+/// a pump failure: `remaining` is `count_live_items` — queued + claimed
+/// `work_item` rows — and LHC's derivation graph cascades, so settling an item
+/// enqueues its successors. `remaining` is therefore not monotone under
+/// progress and cannot support the M1 claim in either direction. That is pinned
+/// as observed behaviour by the host-crate companion test
+/// `m1_remaining_is_not_a_monotone_progress_metric`.
+///
+/// The quantity M1 exists to reduce — and the one core's 120 s
+/// `COMPACT_THREAD_TIMEOUT` is actually spent on — is **inference calls made at
+/// compact time**. This measures exactly that, driving the background pump
+/// through the production idle seam (`emit_thread_idle_lifecycle_if_idle`, the
+/// same call `codex_thread.rs` makes) against an unpumped control on an
+/// identically seeded thread.
+///
+/// Chunk 2's measurement was not wrong, it was **truncated**. Instrumenting the
+/// pump on this exact fixture (60 turns / 120 events / 294 work items) shows two
+/// phases:
+///
+///   * ticks 1–~12 drain only *non-inference* work (ingest, placement,
+///     projection) at the full 8 items/tick. Each settled item enqueues more
+///     successors than it consumed, so `remaining` climbs ~4/tick (121 → ~137)
+///     while the inference counter stays at **0**. A short experiment sees
+///     exactly the reported symptom: "the pump runs, derives nothing, and the
+///     backlog grows".
+///   * from ~tick 13 the cascade front reaches inference-bearing kinds;
+///     `remaining` falls to 0 by ~tick 40 and all derivation is paid in
+///     background.
+///
+/// Hence `TICKS` below is 80, not a handful: fewer ticks measure the transient.
+/// The operational number that falls out is the one worth remembering — roughly
+/// **one idle tick per 1.5 conversation turns** is needed for the pump to keep
+/// up at 8 items/tick. Below that rate compact time still pays the balance.
+#[tokio::test]
+async fn m1_core_idle_pump_reduces_compact_time_inference_calls() {
+    const TURNS: usize = 60;
+    const TICKS: u64 = 80;
+
+    // ── Control arm: no idle pump. Every derivation is paid at compact time.
+    let control_dir = tempdir().unwrap();
+    let (mut control, control_tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut control, control_dir.path().to_path_buf()).await;
+    let control_slot = control
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("control slot");
+    let control_handle = wait_for_handle(&control_slot, Duration::from_secs(30))
+        .await
+        .expect("control handle");
+    seed_conversation_bandable(&control, &control_tc, TURNS).await;
+    control_handle.flush().await;
+    assert_eq!(
+        control_slot.idle_pump_runs(),
+        0,
+        "control arm must never pump — it is the baseline"
+    );
+
+    let control_calls = Arc::new(AtomicUsize::new(0));
+    let control_sess = Arc::new(control);
+    let control_attempt = try_run_lhc_compact_arm_with_callbacks(
+        &control_sess,
+        &control_tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        slow_counting_callbacks(Arc::clone(&control_calls), Duration::ZERO),
+    )
+    .await
+    .expect("control arm");
+    assert!(
+        matches!(control_attempt, LhcCompactAttempt::Installed { .. }),
+        "control compact must install (else the comparison is between two \
+         fail-open paths, not two derivation paths); got {control_attempt:?}"
+    );
+    let control_compact_calls = control_calls.load(AtomicOrdering::SeqCst);
+    assert!(
+        control_compact_calls > 0,
+        "control must actually pay derivation at compact time"
+    );
+
+    // ── Pumped arm: identical seed, derivation pumped from the idle seam.
+    let pumped_dir = tempdir().unwrap();
+    let (mut pumped, pumped_tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut pumped, pumped_dir.path().to_path_buf()).await;
+    let pumped_slot = pumped
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("pumped slot");
+    let pumped_handle = wait_for_handle(&pumped_slot, Duration::from_secs(30))
+        .await
+        .expect("pumped handle");
+    seed_conversation_bandable(&pumped, &pumped_tc, TURNS).await;
+    pumped_handle.flush().await;
+
+    // The idle seam resolves callbacks through the same production selection
+    // the compact arm uses; under cfg(test) that honours this override. One
+    // counter across both phases, so background and compact-time calls are
+    // measured on the same instrument.
+    let pumped_calls = Arc::new(AtomicUsize::new(0));
+    *pumped
+        .services
+        .lhc_test_inference
+        .lock()
+        .expect("lhc_test_inference lock") = Some(slow_counting_callbacks(
+        Arc::clone(&pumped_calls),
+        Duration::ZERO,
+    ));
+
+    for tick in 1..=TICKS {
+        // Production entry — not `spawn_idle_derivation_pump` directly, so
+        // deleting the seam in `tasks/lifecycle.rs` fails this test.
+        pumped.emit_thread_idle_lifecycle_if_idle().await;
+        // Asserted per tick, not once at the end: a mutation that severs the
+        // seam otherwise fails only after every tick has burnt its timeout.
+        let runs = wait_for_core_pump_runs(&pumped_slot, tick, Duration::from_secs(20)).await;
+        assert_eq!(
+            runs, tick,
+            "M1: idle tick {tick} did not pump. Either `on_thread_idle` no longer \
+             pumps, or `seed_lhc_idle_derivation_callbacks` is not reaching the \
+             slot from tasks/lifecycle.rs."
+        );
+    }
+    let background_calls = pumped_calls.load(AtomicOrdering::SeqCst);
+    assert!(
+        background_calls > 0,
+        "M1: idle ticks must run real derivation in the background; got 0"
+    );
+
+    let pumped_sess = Arc::new(pumped);
+    let pumped_attempt = try_run_lhc_compact_arm_with_callbacks(
+        &pumped_sess,
+        &pumped_tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        slow_counting_callbacks(Arc::clone(&pumped_calls), Duration::ZERO),
+    )
+    .await
+    .expect("pumped arm");
+    assert!(
+        matches!(pumped_attempt, LhcCompactAttempt::Installed { .. }),
+        "pumped compact must install; got {pumped_attempt:?}"
+    );
+    let pumped_compact_calls = pumped_calls.load(AtomicOrdering::SeqCst) - background_calls;
+
+    // Printed so the certification record can quote measured numbers.
+    eprintln!(
+        "M1 core measurement: turns={TURNS} ticks={TICKS} \
+         control_compact_calls={control_compact_calls} \
+         pumped_background_calls={background_calls} \
+         pumped_compact_calls={pumped_compact_calls}"
+    );
+
+    assert!(
+        pumped_compact_calls < control_compact_calls,
+        "M1: the idle pump must move derivation off the compact-time deadline — \
+         control paid {control_compact_calls} calls at compact time, pumped paid \
+         {pumped_compact_calls} after {background_calls} background calls. \
+         Not smaller means the pump derived nothing the compact would have had \
+         to do, i.e. background derivation is not persisting to the archive."
+    );
+}
+
+/// Core-local copy of the host crate's pump-run waiter (that one is private to
+/// `install.rs`'s test module).
+async fn wait_for_core_pump_runs(
+    slot: &LhcCaptureSlot,
+    target: u64,
+    timeout: Duration,
+) -> u64 {
+    let start = std::time::Instant::now();
+    loop {
+        let runs = slot.idle_pump_runs();
+        if runs >= target || start.elapsed() > timeout {
+            return runs;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 /// M2 through the production chain: when the compact arm's own thread timeout
 /// fires, the detached worker's drain must observe the cancel flag and stop —
@@ -1379,4 +1568,591 @@ fn slow_counting_callbacks(counter: Arc<AtomicUsize>, delay: Duration) -> Infere
         compress_detailed_turn: wrap!(compress_detailed_turn, CompressDetailedTurnInput),
         summarize_chunk_brief: wrap!(summarize_chunk_brief, SummarizeChunkBriefInput),
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Chunk 3 / C1 — paths drivable offline (Phase A). Everything here runs on
+// deterministic callbacks; the live-model half of C1 is Phase B and is named
+// as not-exercised in CHUNK3-CERTIFICATION.md rather than faked here.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Install LHC against an **explicit** LHC thread id, so a second `Session` can
+/// be opened over the same archive. That is what resume and fork do: a new
+/// Session object over an existing thread record.
+async fn install_lhc_with_thread_id(
+    session: &mut Session,
+    root: std::path::PathBuf,
+    thread_id: &str,
+) {
+    session.services.thread_extension_data = ExtensionData::new(thread_id.to_string());
+    install_lhc_and_enable(session, root).await;
+}
+
+/// C1.2 — resume after a compact, through I2's durable path.
+///
+/// A resumed Session is a *new* `Session` over an existing archive whose
+/// history was reconstructed from rollout. Three things must hold, and each is
+/// asserted against the archive rather than argued:
+///
+///  1. the served body is **not re-ingested** as source events (it is LHC's own
+///     output; ingesting it would compound summaries every compact);
+///  2. the durable derived record survives the process boundary and is found by
+///     `seed_last_lhc_durable_from_rollout` — the production resume seam in
+///     `session/mod.rs`;
+///  3. the resumed session recovers derived provenance into its (fresh, empty)
+///     process slot, so it can tell LHC output from user content.
+///
+/// History *reconstruction* itself is covered where it lives, by
+/// `session::lhc_capture_e2e_tests::e2e_rollout_reconstruction_does_not_re_ingest_into_capture`
+/// — that is the seam that keeps a resume from feeding the served body back in,
+/// and it is driven through `apply_rollout_reconstruction` directly.
+#[tokio::test]
+async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let tid = "c3-resume-thread";
+
+    let (mut s1, tc1) = make_session_and_context().await;
+    install_lhc_with_thread_id(&mut s1, root.clone(), tid).await;
+    let slot1 = s1
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let h1 = wait_for_handle(&slot1, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&s1, &tc1, 80).await;
+    h1.flush().await;
+
+    let sess1 = Arc::new(s1);
+    let a1 = run_arm_deterministic(&sess1, &tc1, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { marker, .. } = a1 else {
+        panic!("fixture: first compact must install");
+    };
+    assert!(
+        !marker.derived_host_ids.is_empty(),
+        "fixture: compact must have produced derived provenance"
+    );
+    let events_after_first = archive_source_event_count(tid, Some(dir.path())).await;
+
+    // Production write-back recorded the durable record on the CompactedItem.
+    let durable = sess1
+        .last_lhc_durable_derived_message()
+        .await
+        .expect("I2: write-back must record a durable derived message");
+
+    // ── the resume: a new Session over the same archive, rollout-reconstructed.
+    let (mut s2, tc2) = make_session_and_context().await;
+    install_lhc_with_thread_id(&mut s2, root.clone(), tid).await;
+    let slot2 = s2
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("resumed slot");
+    let h2 = wait_for_handle(&slot2, Duration::from_secs(30))
+        .await
+        .expect("resumed handle");
+    assert!(
+        slot2.derived_ids().is_empty(),
+        "a fresh process slot starts empty — otherwise this test proves nothing \
+         about the durable path"
+    );
+
+    // The production resume seam, fed the CompactedItem rollout shape it is
+    // fed on a real resume.
+    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
+        codex_protocol::protocol::CompactedItem {
+            message: durable.clone(),
+            replacement_history: None,
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        },
+    )];
+    s2.seed_last_lhc_durable_from_rollout(&rollout).await;
+    assert_eq!(
+        s2.last_lhc_durable_derived_message().await.as_deref(),
+        Some(durable.as_str()),
+        "I2: the resume seam must recover the durable record from rollout"
+    );
+
+    h2.flush().await;
+
+    let sess2 = Arc::new(s2);
+    let a2 = run_arm_deterministic(&sess2, &tc2, /*manual*/ true).await;
+
+    let events_after_resume = archive_source_event_count(tid, Some(dir.path())).await;
+    eprintln!(
+        "C1 resume: source_events after_first={events_after_first} \
+         after_resume={events_after_resume} derived_ids={} second_attempt={}",
+        marker.derived_host_ids.len(),
+        match &a2 {
+            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+        }
+    );
+
+    assert_eq!(
+        events_after_resume, events_after_first,
+        "a resumed session must not add source events merely by resuming: \
+         {events_after_first} -> {events_after_resume}"
+    );
+    assert!(
+        !slot2.derived_ids().is_empty(),
+        "I2: after the resumed session's arm ran, the slot must carry derived \
+         provenance recovered from the durable record — without it the resumed \
+         session cannot tell LHC output from user content"
+    );
+}
+
+/// C1.3 — fork (`SpawnAgentForkMode::FullHistory`) after a compact.
+///
+/// The census ranks this the highest-risk consumer: the child inherits the
+/// **compacted replacement history** as its full history, over an archive it
+/// has never written to. The invariant is that the child either produces a
+/// coherent body or fails open — never compacts a partial archive into a full
+/// replacement (Chunk 2 stopping rule 5).
+#[tokio::test]
+async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let parent_tid = "c3-fork-parent";
+    let child_tid = "c3-fork-child";
+
+    let (mut parent, ptc) = make_session_and_context().await;
+    install_lhc_with_thread_id(&mut parent, root.clone(), parent_tid).await;
+    let pslot = parent
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("parent slot");
+    let ph = wait_for_handle(&pslot, Duration::from_secs(30))
+        .await
+        .expect("parent handle");
+    seed_conversation_bandable(&parent, &ptc, 80).await;
+    ph.flush().await;
+
+    let psess = Arc::new(parent);
+    let pa = run_arm_deterministic(&psess, &ptc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body: parent_body, marker: pmarker } = pa else {
+        panic!("fixture: parent compact must install");
+    };
+    let durable = psess
+        .last_lhc_durable_derived_message()
+        .await
+        .expect("parent durable record");
+
+    // The fork: a fresh thread id (fresh archive) inheriting the parent's
+    // post-compact history verbatim, plus the rollout-carried durable record.
+    let (mut child, ctc) = make_session_and_context().await;
+    install_lhc_with_thread_id(&mut child, root.clone(), child_tid).await;
+    let cslot = child
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("child slot");
+    let ch = wait_for_handle(&cslot, Duration::from_secs(30))
+        .await
+        .expect("child handle");
+    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
+        codex_protocol::protocol::CompactedItem {
+            message: durable.clone(),
+            replacement_history: Some(parent_body.clone()),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        },
+    )];
+    child.seed_last_lhc_durable_from_rollout(&rollout).await;
+    for item in &parent_body {
+        child
+            .record_conversation_items_with_provenance(
+                &ctc,
+                std::slice::from_ref(item),
+                codex_extension_api::RawItemProvenance::HostContext,
+            )
+            .await;
+    }
+    ch.flush().await;
+
+    let csess = Arc::new(child);
+    let inherited = csess.clone_history().await.raw_items().to_vec();
+    assert!(
+        response_items_structurally_equal(&inherited, &parent_body),
+        "fork must inherit the parent's post-compact body verbatim: \
+         parent={} items, child={} items",
+        parent_body.len(),
+        inherited.len()
+    );
+
+    let ca = run_arm_deterministic(&csess, &ctc, /*manual*/ true).await;
+    eprintln!(
+        "C1 fork: parent_body={} items parent_derived={} child_attempt={}",
+        parent_body.len(),
+        pmarker.derived_host_ids.len(),
+        match &ca {
+            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+        }
+    );
+
+    // Coherence, not a particular outcome: install a real reduction, or fail
+    // open. A partial-archive install would be the Chunk 2 defect returning.
+    match ca {
+        LhcCompactAttempt::Installed { body, marker } => {
+            assert!(!body.is_empty(), "child install must not be empty");
+            assert_eq!(
+                marker.body_item_count,
+                body.len(),
+                "child marker must describe the body it installed"
+            );
+        }
+        LhcCompactAttempt::Unavailable { .. } => {}
+    }
+}
+
+/// C1 — KV / prefix-cache impact of a compact, measured.
+///
+/// The brief asks for numbers and nobody had produced any. A provider's prefix
+/// cache keys on the literal leading token sequence of the request, so the cost
+/// of a compact is exactly: how much of the previous request's prefix survives
+/// into the next one. This measures the shared leading run between the
+/// pre-compact history and the installed body, in items and in estimated
+/// tokens, on a real compact through the production arm.
+///
+/// This is the *invalidation* half and it is exact offline — it depends only on
+/// the two histories, not on the provider. The half that needs a live run is
+/// the billing confirmation (`cached_input_tokens` on the turn after a compact),
+/// which is Phase B.
+#[tokio::test]
+async fn c1_kv_prefix_cache_invalidation_after_compact_is_measured() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let before = sess.clone_history().await.raw_items().to_vec();
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { .. } = attempt else {
+        panic!("fixture: compact must install to measure its cache cost");
+    };
+    let after = sess.clone_history().await.raw_items().to_vec();
+
+    // Longest common leading run of structurally identical items. Anything past
+    // the first divergence is a cache miss for the provider regardless of what
+    // follows it.
+    let shared_items = before
+        .iter()
+        .zip(after.iter())
+        .take_while(|(a, b)| {
+            response_items_structurally_equal(std::slice::from_ref(*a), std::slice::from_ref(*b))
+        })
+        .count();
+
+    let before_tokens = codex_lhc_host::estimate_response_items_tokens(&before);
+    let after_tokens = codex_lhc_host::estimate_response_items_tokens(&after);
+    let shared_tokens = codex_lhc_host::estimate_response_items_tokens(&before[..shared_items]);
+
+    eprintln!(
+        "C1 KV/prefix-cache: before_items={} before_tokens={} after_items={} \
+         after_tokens={} shared_prefix_items={} shared_prefix_tokens={} \
+         reusable_pct_of_next_request={:.1}",
+        before.len(),
+        before_tokens,
+        after.len(),
+        after_tokens,
+        shared_items,
+        shared_tokens,
+        if after_tokens == 0 {
+            0.0
+        } else {
+            100.0 * shared_tokens as f64 / after_tokens as f64
+        }
+    );
+
+    assert!(
+        after_tokens < before_tokens,
+        "fixture: a compact must reduce, else the cache question is moot"
+    );
+    // The measured fact, pinned so it cannot silently change: the compacted
+    // body does NOT preserve the old prefix, so the first post-compact turn
+    // re-sends its whole body uncached. If a future change makes LHC emit a
+    // cache-preserving prefix, this assertion is the thing that notices.
+    assert!(
+        shared_tokens * 2 < after_tokens,
+        "prefix-cache behaviour changed: {shared_tokens} of {after_tokens} body \
+         tokens are now a shared prefix with the pre-compact request. That is \
+         good news, but CHUNK3-CERTIFICATION.md records the opposite — update it."
+    );
+}
+
+/// C1 / gap 2 groundwork — the real per-call **input** cost profile.
+///
+/// Chunk 2's timeout arithmetic multiplied an assumed *latency* by a call
+/// count. The other factor — and the one that determines spend on a live run —
+/// is input tokens per call. That is measurable offline, because the callback
+/// inputs are the exact payloads the live `ModelClient` bridge would send.
+///
+/// It also pins a load-bearing invariant: derivation is fed **per-turn and
+/// per-chunk excerpts**, never the whole conversation. If a single call ever
+/// carried history-sized input, cost and latency would scale quadratically with
+/// thread length and the 120 s bound would be unreachable.
+#[tokio::test]
+async fn c1_derivation_call_input_cost_profile_is_measured() {
+    use codex_lhc_host::CompressDetailedTurnInput;
+    use codex_lhc_host::SmoothPromptInput;
+    use codex_lhc_host::SummarizeChunkBriefInput;
+    use codex_lhc_host::SummarizeToolResultInput;
+
+    const TURNS: usize = 60;
+
+    // (kind, chars) per call, in call order.
+    let log: Arc<std::sync::Mutex<Vec<(&'static str, usize)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let base = deterministic_callbacks();
+    macro_rules! measured {
+        ($field:ident, $ty:ty, $label:literal, $len:expr) => {{
+            let log = Arc::clone(&log);
+            let inner = Arc::clone(&base.$field);
+            Arc::new(move |input: $ty| {
+                #[allow(clippy::redundant_closure_call)]
+                let n = ($len)(&input);
+                log.lock().expect("log").push(($label, n));
+                let inner = Arc::clone(&inner);
+                Box::pin(async move { inner(input).await })
+                    as codex_lhc_host::BoxInferenceFuture
+            })
+        }};
+    }
+    let callbacks = InferenceCallbacks {
+        smooth_prompt: measured!(smooth_prompt, SmoothPromptInput, "smooth_prompt", |i: &SmoothPromptInput| i
+            .text
+            .len()),
+        summarize_tool_result: measured!(
+            summarize_tool_result,
+            SummarizeToolResultInput,
+            "summarize_tool_result",
+            |i: &SummarizeToolResultInput| i.content.len()
+        ),
+        compress_detailed_turn: measured!(
+            compress_detailed_turn,
+            CompressDetailedTurnInput,
+            "compress_detailed_turn",
+            |i: &CompressDetailedTurnInput| i.dialogue_text.len()
+        ),
+        summarize_chunk_brief: measured!(
+            summarize_chunk_brief,
+            SummarizeChunkBriefInput,
+            "summarize_chunk_brief",
+            |i: &SummarizeChunkBriefInput| i.text.len()
+        ),
+    };
+
+    let dir = tempdir().unwrap();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, dir.path().to_path_buf()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, TURNS).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let history = sess.clone_history().await.raw_items().to_vec();
+    let history_tokens = codex_lhc_host::estimate_response_items_tokens(&history);
+    let attempt = try_run_lhc_compact_arm_with_callbacks(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        callbacks,
+    )
+    .await
+    .expect("arm");
+    assert!(
+        matches!(attempt, LhcCompactAttempt::Installed { .. }),
+        "fixture: compact must install; got {attempt:?}"
+    );
+
+    let calls = log.lock().expect("log").clone();
+    assert!(!calls.is_empty(), "no derivation calls were made");
+
+    // char/4, the same order-of-magnitude estimate LHC and the arm both use.
+    let tok = |chars: usize| chars.div_ceil(4);
+    let mut by_kind: std::collections::BTreeMap<&str, (usize, usize, usize)> =
+        std::collections::BTreeMap::new();
+    for (kind, chars) in &calls {
+        let e = by_kind.entry(kind).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += tok(*chars);
+        e.2 = e.2.max(tok(*chars));
+    }
+    let total_calls = calls.len();
+    let total_input_tokens: usize = calls.iter().map(|(_, c)| tok(*c)).sum();
+    let max_call_tokens = calls.iter().map(|(_, c)| tok(*c)).max().unwrap_or(0);
+
+    eprintln!(
+        "C1 derivation cost profile: turns={TURNS} history_tokens={history_tokens} \
+         calls={total_calls} calls_per_turn={:.2} total_input_tokens={total_input_tokens} \
+         mean_input_tokens_per_call={} max_input_tokens_per_call={max_call_tokens}",
+        total_calls as f64 / TURNS as f64,
+        total_input_tokens / total_calls,
+    );
+    for (kind, (n, sum, max)) in &by_kind {
+        eprintln!(
+            "C1 derivation cost profile:   {kind}: calls={n} total_input_tokens={sum} \
+             mean={} max={max}",
+            sum / n.max(&1)
+        );
+    }
+
+    assert!(
+        max_call_tokens * 4 < history_tokens as usize,
+        "derivation must be fed excerpts, not the conversation: largest single \
+         call carried {max_call_tokens} input tokens against a {history_tokens}-token \
+         history. If this trips, per-call cost now scales with thread length."
+    );
+}
+
+/// N3 / C1.4 — a turn abort must stop derivation and install nothing.
+///
+/// Driven through the **production manual ladder** (`CompactTask::run`) with
+/// the turn's real `CancellationToken`, cancelled while derivation is
+/// demonstrably in flight. The task future is deliberately *not* dropped: the
+/// point is that the token alone is now sufficient. Before N3 it was not —
+/// `CompactTask` bound it as `_cancellation_token` and the arm only ever saw
+/// its own private `AtomicBool`, so this same sequence ran the compact to
+/// completion, rewrote history 160 -> 31 items, and committed the marker, all
+/// after the abort. Production was saved only by the hard `handle.abort()`
+/// 100 ms later, and the detached derivation worker survived even that: 3 calls
+/// at abort, 12 by 500 ms later, still climbing against a 75 s budget.
+///
+/// Three assertions, one per way to be wrong: derivation stops promptly, no
+/// body is installed, no marker is committed (law 3 fail-open).
+#[tokio::test]
+async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    // Slow enough that the abort lands with derivation genuinely in flight.
+    let calls = Arc::new(AtomicUsize::new(0));
+    *session
+        .services
+        .lhc_test_inference
+        .lock()
+        .expect("lhc_test_inference lock") = Some(slow_counting_callbacks(
+        Arc::clone(&calls),
+        Duration::from_millis(30),
+    ));
+
+    let thread_id = handle.thread_id().to_string();
+    let root_for_marker = handle.root().map(|p| p.to_path_buf());
+    let sess = Arc::new(session);
+    let history_before = sess.clone_history().await.raw_items().to_vec();
+
+    let turn_ext = Arc::new(ExtensionData::new(tc.sub_id.clone()));
+    let ctx = SessionTaskContext::new(Arc::clone(&sess), turn_ext);
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        SessionTask::run(
+            Arc::new(CompactTask),
+            Arc::new(ctx),
+            Arc::new(tc),
+            Vec::new(),
+            task_cancel,
+        )
+        .await
+    });
+
+    let start = std::time::Instant::now();
+    while calls.load(AtomicOrdering::SeqCst) == 0 && start.elapsed() < Duration::from_secs(60) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let at_cancel = calls.load(AtomicOrdering::SeqCst);
+    assert!(
+        at_cancel > 0,
+        "fixture: the abort must arrive with derivation actually running"
+    );
+
+    cancel.cancel();
+
+    // The task must return on its own — no hard abort. If it hangs, the token
+    // is not reaching the arm.
+    let result = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("N3: the compact task must return after the turn is cancelled")
+        .expect("compact task must not panic");
+    assert!(
+        result.is_ok(),
+        "cancellation is a fail-open, not a turn error: {result:?}"
+    );
+    let at_return = calls.load(AtomicOrdering::SeqCst);
+
+    // Give any surviving worker a generous window to keep spending.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after_grace = calls.load(AtomicOrdering::SeqCst);
+
+    let history_after = sess.clone_history().await.raw_items().to_vec();
+    let marker = archive_has_compact_marker(&thread_id, root_for_marker.as_deref()).await;
+    eprintln!(
+        "N3 abort: calls_at_cancel={at_cancel} calls_at_return={at_return} \
+         calls_2s_later={after_grace} history_before={} history_after={} \
+         marker_committed={marker}",
+        history_before.len(),
+        history_after.len()
+    );
+
+    // Cancellation is checked between drain batches (DRAIN_BATCH_ITEMS = 4), so
+    // that many derivations can still be in flight. Anything beyond one batch
+    // means the worker never observed the abort.
+    assert!(
+        after_grace - at_cancel <= 8,
+        "N3: derivation must stop within one drain batch of the abort — fired \
+         {} more calls (at_cancel={at_cancel}, 2s later={after_grace}). Without \
+         the turn token reaching the arm this keeps climbing to completion.",
+        after_grace - at_cancel
+    );
+    assert!(
+        response_items_structurally_equal(&history_before, &history_after),
+        "abort must not install a body: history went from {} items to {}",
+        history_before.len(),
+        history_after.len()
+    );
+    assert!(
+        !marker,
+        "abort must not commit a compact marker — the archive would claim a \
+         compact that was never served to the model"
+    );
 }

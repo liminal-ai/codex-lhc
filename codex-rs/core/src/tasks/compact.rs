@@ -29,7 +29,9 @@ impl SessionTask for CompactTask {
         session: Arc<SessionTaskContext>,
         ctx: Arc<TurnContext>,
         _input: Vec<TurnInput>,
-        _cancellation_token: CancellationToken,
+        // LHC-HOOK: bound, not `_cancellation_token` — the LHC arm runs ~2
+        // inference calls per turn of derivation and must stop on abort (N3).
+        cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let session = session.clone_session();
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
@@ -39,6 +41,7 @@ impl SessionTask for CompactTask {
             ctx.as_ref(),
             crate::compact::InitialContextInjection::DoNotInject,
             /*manual*/ true,
+            &cancellation_token,
         )
         .await?
         {

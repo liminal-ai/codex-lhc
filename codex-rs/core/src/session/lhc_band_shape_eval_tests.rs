@@ -44,6 +44,7 @@ use crate::compact_lhc::try_run_lhc_compact_arm;
 use crate::lhc_inference_bridge::LHC_DERIVATION_MODEL;
 use crate::lhc_inference_bridge::resolve_lhc_derivation_effort;
 use crate::responses_metadata::CodexResponsesMetadata;
+use tokio_util::sync::CancellationToken;
 
 /// Distinctive facts planted in seed history. Eval questions must **not** name these.
 const PROJECT_CODENAME: &str = "Quokka-Nimbus-417";
@@ -309,6 +310,7 @@ async fn produce_real_lhc_body() -> (Vec<ResponseItem>, usize, String, serde_jso
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        &CancellationToken::new(),
     )
     .await
     .expect("arm");

@@ -504,3 +504,96 @@ async fn e2e_model_output_path_does_not_tag_user_role_as_user_prompt() {
     );
     handle.shutdown().await;
 }
+
+/// Chunk 3 / C1.2 — the invariant that makes resume and fork safe for LHC.
+///
+/// Rollout reconstruction (`apply_rollout_reconstruction` →
+/// `state.replace_history`) installs history **without** going through
+/// `send_raw_response_items`, so a resumed or forked session does not feed the
+/// replayed history — including a previous compact's served body — back into
+/// the archive as fresh source events.
+///
+/// That is load-bearing and invisible: if an upstream change ever routes
+/// reconstruction through the record path, every resume silently re-ingests
+/// LHC's own summary, and the next compact compounds it. Nothing else in the
+/// fork would notice, because the resumed session's slot has no derived
+/// provenance yet (I2's reseed runs at compact time, after reconstruction).
+///
+/// Written against the real reconstruction entry, not a stand-in.
+#[tokio::test]
+async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    install_lhc_on_session(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot installed by on_thread_start");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("capture handle opened");
+
+    // One genuinely captured turn, so "archive is empty" cannot pass by accident.
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[text_input("live turn that must be captured")],
+            None,
+        )
+        .await;
+    handle.flush().await;
+    let baseline = handle.list_events().await.expect("list").len();
+    assert!(baseline > 0, "positive control: live turns must be captured");
+
+    // Now reconstruct history from rollout, as resume and fork do.
+    let replayed: Vec<ResponseItem> = (0..6)
+        .map(|i| ResponseItem::Message {
+            id: Some(codex_protocol::ResponseItemId::from_server(format!("rr{i}"))),
+            role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+            content: vec![if i % 2 == 0 {
+                ContentItem::InputText {
+                    text: format!("replayed rollout item {i}"),
+                }
+            } else {
+                ContentItem::OutputText {
+                    text: format!("replayed rollout reply {i}"),
+                }
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        })
+        .collect();
+    let rollout_items: Vec<codex_protocol::protocol::RolloutItem> = replayed
+        .iter()
+        .cloned()
+        .map(codex_protocol::protocol::RolloutItem::ResponseItem)
+        .collect();
+
+    // The production entry itself — the same call `InitialHistory::Resumed`
+    // and `InitialHistory::Forked` make in `Session::new`.
+    let _ = session
+        .apply_rollout_reconstruction(&turn_context, &rollout_items)
+        .await;
+
+    // Reconstruction is synchronous into state; give any stray async capture
+    // path a chance to land before declaring nothing was ingested.
+    handle.flush().await;
+    let after = handle.list_events().await.expect("list").len();
+
+    assert_eq!(
+        after, baseline,
+        "rollout reconstruction must not fan replayed history into capture: \
+         archive grew {baseline} -> {after}. On a real resume that means the \
+         previous compact's served body is re-ingested as source, and every \
+         later compact re-summarises LHC's own output."
+    );
+    assert_eq!(
+        session.clone_history().await.raw_items().len(),
+        replayed.len(),
+        "positive control: reconstruction must actually have installed history"
+    );
+    handle.shutdown().await;
+}

@@ -55,7 +55,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 4 | `core/src/session/mod.rs` | provenance-carrying record path + `send_raw_response_items` fan-out + e2e module | `0004-session-raw-item-hook` |
 | 5 | `app-server/Cargo.toml` | `codex-lhc-host` dependency | `0005-app-server-dep` |
 | 6 | `app-server/src/extensions.rs` | `codex_lhc_host::install(...)` (cwd + host seam) | `0006-app-server-install` |
-| 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0004` / `0007` |
+| 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0007` |
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
@@ -66,8 +66,19 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
 | 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot before the `on_thread_idle` fan-out (background drain pump) | (with 0007) |
+| 18 | `core/src/tasks/compact.rs` | manual ladder binds `cancellation_token` (was `_cancellation_token`) and passes it to the arm — N3 | (with 0007) |
+| 19 | `core/src/session/turn.rs` | `run_auto_compact` gains a `cancellation_token` parameter (fork-added; all four callers already had one in scope) — N3 | (with 0007) |
+| 20 | `core/src/state/service.rs` | `lhc_test_inference` slot on `SessionServices` | (with 0007) |
+| 21 | `core/src/session/session.rs` | initialises `lhc_test_inference` | (with 0007) |
+| 22 | `core/src/session/tests.rs` | initialises `lhc_test_inference` (x2) | (with 0007) |
+| 23 | `core/src/session/lhc_band_shape_eval_tests.rs` | band-shape eval harness (Chunk 2a); `session/mod.rs` declares the module | (with 0007) |
 
-Expected markers: **36** (`EXPECTED_HOOKS` in the tripwire script).
+Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
+and a test module, not seams). They were missing from every patch until Chunk 3
+round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing is
+a legitimate combination; fork-owned and *not in any patch* is not.
+
+Expected markers: **38** (`EXPECTED_HOOKS` in the tripwire script).
 
 Rule: any commit that adds/changes an `LHC-HOOK` line updates, in the
 SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.
@@ -99,13 +110,83 @@ Two invariants hold that cadence honest:
 4. `./scripts/check-lhc-hooks.sh` — all layers green before push.
 5. Commit with tripwire output summarized in the body; push to origin only.
 
-## History-reset recovery
+### Drill run 2026-07-26 (Chunk 3 / C2) — clean, and thinner than intended
 
-Fresh clone of upstream → branch `lhc` → restore fork-owned files
-(FORK.md, patches/lhc/, scripts/, `codex-rs/lhc/`) →
-`git submodule update --init` at the pinned commit →
-`git apply patches/lhc/*.patch` → tripwires green → force-push with Lee's
-sign-off.
+`322d5b96cf..61a44880a8`: **3 commits, 9 hours**, merged by `ort` with **zero
+conflicts**; no hook file touched. Tripwire on the merged tree: 12/13 green
+(layer 13 red for the pre-existing reason below). Nothing broke, so nothing was
+resolved — **this exercised the procedure, not the conflict resolution.** Run on
+a branch off `lhc` in a separate worktree (Chunk 3 was not allowed to commit).
+
+Real exposure, measured on upstream over 30 days rather than assumed:
+
+| File | upstream commits | commits touching the fork's own line ranges |
+|---|---|---|
+| `core/src/session/mod.rs` | 66 | **1** (of 13 hook sites) |
+| `core/src/session/turn.rs` | 35 | 1 (of 2) |
+| `core/src/tasks/compact.rs` | 2 | 1 (of 1) |
+| every other hooked file | ≤ 20 each | 0 |
+
+3 of 26 hook sites saw any churn in a month. The tiny-footprint mitigation is
+real; a sync after a *week or more* of gap has still never been rehearsed.
+
+## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
+
+The whole series is a diff from **one upstream base**, recorded in
+`patches/lhc/BASE` (currently `322d5b96cf`, the last upstream commit before
+Chunk 0). Each fork-owned file appears in **exactly one** patch. Tripwire
+layer 4 runs this drill on every invocation and fails if it stops reproducing
+the tree, so it cannot rot silently again.
+
+### Procedure
+
+1. Fresh clone of upstream → branch `lhc`.
+2. Restore fork-owned files that are **not** core touchpoints:
+   `FORK.md`, `.gitmodules`, `patches/`, `scripts/`, `codex-rs/lhc/`.
+3. Restore the vendored submodule at the pin in §Layout:
+   `git clone <lhc url> codex-rs/lhc/vendor/long-horizon-context && git -C … checkout <pin>`.
+   **Not `git submodule update --init`** — the gitlink is a tree entry in fork
+   *commits*, so on a clean upstream base there is nothing to init. That step
+   was wrong in the previous text and would stop the drill dead.
+4. `git apply patches/lhc/0*.patch` (in order).
+5. `cargo` regenerates `codex-rs/Cargo.lock` — it is deliberately in no patch
+   (inventory row 8).
+6. `./scripts/check-lhc-hooks.sh` — all layers green.
+7. Force-push with Lee's sign-off.
+
+### Verified 2026-07-26
+
+Drill run at `322d5b96cf`: all 7 patches applied, **26 of 26 fork-owned core
+files byte-identical** to the working tree (0 differ, 0 missing; `Cargo.lock`
+excluded by policy), and the reconstructed tree **compiles**
+(`cargo check -p codex-core -p codex-app-server -p codex-extension-api`).
+
+### What was wrong before (round 9 fixed all four)
+
+Recorded because the failure mode — a series regenerated piecemeal against
+whatever `HEAD` happened to be — is easy to re-introduce.
+
+- **R1** No single valid base: `0004` needed `session/mod.rs` at the Chunk 1
+  upstream base, `0007` needed Chunk 2a's, and the upstream drift between them
+  was in no patch. *Fixed:* whole series regenerated from `patches/lhc/BASE`.
+- **R2** `0006-app-server-install` matched no fork commit and restored the
+  Chunk-1-era `include_str!` registration test a later round had replaced.
+  *Fixed by the same regeneration.*
+- **R3** Four fork-owned core files were in no patch, all compile-critical:
+  `core/src/state/service.rs`, `core/src/session/session.rs`,
+  `core/src/session/tests.rs`, `core/src/session/lhc_band_shape_eval_tests.rs`
+  (whose `mod` declaration *is* inside `0007`). *Fixed:* added to `0007` and to
+  the inventory as rows 20-23; layer 4 now fails on any uncovered fork-owned
+  file.
+- **R4** No gate caught it: layer 4 tested `0007` alone, applied to `HEAD`, so
+  it could only ever be green pre-commit — it had been red since `3aa3a44d22`.
+  *Fixed:* layer 4 now runs the whole drill at `BASE` and checks coverage.
+
+**Rule:** any change to a fork-owned core file regenerates the series in the
+same commit — as does any upstream sync that moves `patches/lhc/BASE`.
+Regenerate with `git diff $(cat patches/lhc/BASE) -- <files for that patch>`
+after `git add -N` (so untracked fork-owned files appear), keeping the
+one-file-one-patch partition.
 
 ## Scheduled verification
 
@@ -115,7 +196,11 @@ sign-off.
 | Capture→rebuild diff | Chunk 2b — tripwire runs `compact_bridge` + `compact_lhc` (marker + law1/2) |
 | LHC compact arm + write-back | Chunk 2b — **done**: body from `lhc.compact` + view map; derived provenance is **assigned host ids** co-written on `CompactedItem` (`lhc_compact_durable`); model-visible LHC note is small/constant (no digests); NoReduction falls open |
 | Derived provenance cap | Process slot capped (`SESSION_DERIVED_CAP=512`, drops logged); archive summary notes do not carry digests. **Fork limit:** durable record is last CompactedItem message; forks that drop that item lose reseed — refuse/fail-open. |
-| Real-session item-shape vs hand fixtures | Chunk 3 live cert |
+| Real-session item-shape vs hand fixtures | Chunk 3 — **still open**: no live model call was made; Phase B blocked on budget ruling (`CHUNK3-CERTIFICATION.md` §6) |
+| M1 core-level measurement (Chunk 2 gap 1) | Chunk 3 — **SETTLED**: pump moves 117/117 derivation calls off compact time; `remaining` is a cascading counter, not a progress metric (§3.1) |
+| Real per-call latency (Chunk 2 gap 2) | Chunk 3 — **half**: input size measured (1.95 calls/turn, mean 649 tok/call, total input ≈ 1× history). Latency still needs Phase B run B3 |
+| KV / prefix-cache impact | Chunk 3 — **MEASURED**: a compact invalidates 100% of the prefix (0 of 37,079 body tokens reusable). Billing confirmation is Phase B (§3.4) |
+| Turn cancellation reaching the LHC compact arm | **Open with Lee** — `CompactTask` binds `_cancellation_token` (upstream's shape); derivation keeps spending after abort (12 calls 500 ms later). §5.2 |
 | Band-shape tolerance eval harness | Chunk 2a — **built, not live-run** (`lhc_band_shape_eval_*`); live needs Lee auth-lane |
 | Conversation-consumer census (law 3) | Chunk 2a — `codex-rs/lhc/CHUNK2-CENSUS.md` |
 | Auth-lane ruling | **Open with Lee** — ChatGPT plan is the only available lane; live band-eval spends quota |
