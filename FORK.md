@@ -6,6 +6,10 @@ Context): event-sourced capture of every session into a per-thread SQLite
 record, with banded compaction replacing native auto-compact — full
 history preserved and rebuildable at full fidelity.
 
+- **[`lhc/README.md`](lhc/README.md)** — what this fork is and why, for
+  humans or agents evaluating it. Start there; this file is the maintenance
+  contract. (Note the two different `lhc` directories: root `lhc/` is
+  documentation, `codex-rs/lhc/` is the adapter and vendored SDK.)
 - Fork work lives on **`lhc`** (default branch). `main` tracks upstream.
 - Never run any self-update path on this checkout — it is a git-tracked
   source build.
