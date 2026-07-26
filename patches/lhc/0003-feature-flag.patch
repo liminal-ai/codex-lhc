@@ -26,3 +26,27 @@ index 000f2c4bf4..0b689b5e48 100644
      FeatureSpec {
          id: Feature::UseAgentIdentity,
          key: "use_agent_identity",
+diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
+index 0e42e3e9aa..80a1f87195 100644
+--- a/codex-rs/core/config.schema.json
++++ b/codex-rs/core/config.schema.json
+@@ -582,6 +582,9 @@
+             "js_repl_tools_only": {
+               "type": "boolean"
+             },
++            "lhc_capture": {
++              "type": "boolean"
++            },
+             "local_thread_store_compression": {
+               "type": "boolean"
+             },
+@@ -5132,6 +5135,9 @@
+         "js_repl_tools_only": {
+           "type": "boolean"
+         },
++        "lhc_capture": {
++          "type": "boolean"
++        },
+         "local_thread_store_compression": {
+           "type": "boolean"
+         },

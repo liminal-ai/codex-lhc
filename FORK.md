@@ -55,17 +55,41 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 4 | `core/src/session/mod.rs` | provenance-carrying record path + `send_raw_response_items` fan-out + e2e module | `0004-session-raw-item-hook` |
 | 5 | `app-server/Cargo.toml` | `codex-lhc-host` dependency | `0005-app-server-dep` |
 | 6 | `app-server/src/extensions.rs` | `codex_lhc_host::install(...)` (cwd + host seam) | `0006-app-server-install` |
-| 7 | `core/Cargo.toml` | dev-dep on `codex-lhc-host` for e2e | (with 0004) |
+| 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0004` / `0007` |
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
+| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) | `0007-lhc-compact-arm` |
+| 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
+| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget | (with 0007) |
+| 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated) | (with 0007) |
+| 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
+| 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
+| 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot before the `on_thread_idle` fan-out (background drain pump) | (with 0007) |
 
-Expected markers: **30** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **36** (`EXPECTED_HOOKS` in the tripwire script).
 
 Rule: any commit that adds/changes an `LHC-HOOK` line updates, in the
 SAME commit: `EXPECTED_HOOKS`, this inventory, and `patches/lhc/`.
 
-Chunk 2 remaining: feature-gated LHC arm in `core/src/tasks/compact.rs::run`.
+Chunk 2b compact arm: **done** (offline, deterministic inference). Chunk 3
+remains: live cert with real model (auth lane).
+
+### Derivation cadence (Chunk 2b, fix round 8)
+
+Derivation is pumped **in the background from `on_thread_idle`** (bounded,
+8 work items per tick) and drained at compact time only for what is left.
+Two invariants hold that cadence honest:
+
+- The idle pump runs **only** on host-seeded production callbacks. The
+  capture worker's own `LhcSession` carries deterministic callbacks, and
+  pumping from it would bake canned text into the durable record and serve it
+  as real derivation — a law-3 violation the compact-time gates cannot see.
+  No callbacks seeded ⇒ no pump ⇒ every derivation falls back to compact time.
+- The compact-time drain is **bounded and cancellable between batches**
+  (`DRAIN_BATCH_ITEMS`, `DRAIN_TIME_BUDGET` = 75 s under the caller's 120 s
+  `COMPACT_THREAD_TIMEOUT`). Past the caller's deadline, further inference is
+  orphaned traffic billed to a session that already failed open.
 
 ## Sync drill (merge-based; weekly minimum — upstream runs ~760 commits/mo)
 
@@ -88,7 +112,9 @@ sign-off.
 | Item | Checkpoint |
 |------|-----------|
 | Mapping goldens (byte-eq + LhcSession round-trip) | Chunk 1 — DONE (rule zero) |
-| Capture→rebuild diff | Chunk 2b (bridge) |
+| Capture→rebuild diff | Chunk 2b — tripwire runs `compact_bridge` + `compact_lhc` (marker + law1/2) |
+| LHC compact arm + write-back | Chunk 2b — **done**: body from `lhc.compact` + view map; derived provenance is **assigned host ids** co-written on `CompactedItem` (`lhc_compact_durable`); model-visible LHC note is small/constant (no digests); NoReduction falls open |
+| Derived provenance cap | Process slot capped (`SESSION_DERIVED_CAP=512`, drops logged); archive summary notes do not carry digests. **Fork limit:** durable record is last CompactedItem message; forks that drop that item lose reseed — refuse/fail-open. |
 | Real-session item-shape vs hand fixtures | Chunk 3 live cert |
 | Band-shape tolerance eval harness | Chunk 2a — **built, not live-run** (`lhc_band_shape_eval_*`); live needs Lee auth-lane |
 | Conversation-consumer census (law 3) | Chunk 2a — `codex-rs/lhc/CHUNK2-CENSUS.md` |

@@ -88,4 +88,9 @@ pub(crate) struct SessionServices {
     pub(crate) code_mode_service: CodeModeService,
     pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
     pub(crate) turn_environments: Arc<ThreadEnvironments>,
+    /// Test-only: explicit LHC inference override for production-entry tests
+    /// (CompactTask / auto ladder). Must be installed by the test; never set
+    /// for real sessions. Production default remains ModelClient bridge.
+    #[cfg(test)]
+    pub(crate) lhc_test_inference: std::sync::Mutex<Option<codex_lhc_host::InferenceCallbacks>>,
 }

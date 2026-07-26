@@ -77,6 +77,8 @@ enum CaptureCmd {
 
 struct CaptureShared {
     thread_id: String,
+    /// LHC root used for this thread (for compact bridge re-open).
+    root: Option<PathBuf>,
     tx: mpsc::Sender<CaptureCmd>,
     dropped: Arc<AtomicU64>,
     /// Latched when a drop occurs or capture is permanently disabled.
@@ -90,6 +92,16 @@ pub struct CaptureHandle {
 }
 
 impl CaptureHandle {
+    /// Thread id this capture worker is bound to.
+    pub fn thread_id(&self) -> &str {
+        &self.inner.thread_id
+    }
+
+    /// LHC root directory used when this worker was spawned.
+    pub fn root(&self) -> Option<&std::path::Path> {
+        self.inner.root.as_deref()
+    }
+
     /// Remaining channel capacity. Reserves one slot for the truncation note.
     fn user_slots_available(&self) -> bool {
         // tokio mpsc::Sender::capacity() = remaining free slots.
@@ -323,6 +335,7 @@ pub async fn spawn_capture(
     let degraded = Arc::new(AtomicBool::new(false));
     let shared = Arc::new(CaptureShared {
         thread_id: thread_id.to_string(),
+        root: root.clone(),
         tx,
         dropped: Arc::clone(&dropped),
         degraded: Arc::clone(&degraded),

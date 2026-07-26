@@ -1,0 +1,1893 @@
+//! LHC compact bridge — real `lhc.compact` + served view write-back.
+//!
+//! # Required shape (Chunk 2b redo)
+//!
+//! 1. `lhc.compact(thread_ref, opts)` → [`CompactReceipt`] (real compaction).
+//! 2. `get_llm_request_context` → served body (typed roles/parts; never rebuild
+//!    structure from rendered text — FORK.md law 6).
+//! 3. Map to `Vec<ResponseItem>` for host write-back.
+//! 4. Compact **marker** is submitted only **after** the host reports durable
+//!    write-back (see [`commit_compact_marker`]).
+//!
+//! # Reconciliation
+//!
+//! The served body is **not** re-ingested into capture. The archive receives a
+//! marker describing the CompactReceipt (event range + band stats). Coverage is
+//! by **item identity** (host ResponseItemId ↔ archive idempotency key), never
+//! by text. LHC-derived body digests recorded on the marker are never import
+//! candidates.
+
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
+
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
+use lhc::intake_stream::EventRecord;
+use lhc::intake_stream::MessageEventInput;
+use lhc::sdk::CompactReceipt;
+use lhc::sdk::DrainOpts;
+use lhc::sdk::LlmRequestContext;
+use lhc::sdk::OpResult;
+use lhc::shared_tech::InferenceCallbacks;
+use lhc::shared_tech::LlmRequestContextRole;
+use lhc::shared_tech::scheduler::DrainDisposition;
+use lhc::shared_tech::scheduler::DrainStoppedBecause;
+use lhc::thread_view::CompactOpts;
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
+
+use crate::idempotency::item_digest;
+use crate::idempotency::item_stable_id;
+use crate::inference::lhc_inference_callbacks;
+use crate::mapping::ACTOR_SYSTEM;
+use crate::mapping::HARNESS;
+use crate::session::LhcSession;
+
+/// Mapping seam: LHC `LlmRequestContext` → host `ResponseItem` list.
+/// This is the only body construction path (not a host-side summarizer).
+pub const VIEW_MAP_SEAM_ID: &str = "llm_request_context_to_response_items/v1";
+
+/// Result of an LHC compact production pass (before host write-back).
+///
+/// Marker is **not** yet in the archive — call [`commit_compact_marker`] after
+/// durable write-back.
+#[derive(Debug, Clone)]
+pub struct LhcCompactResult {
+    pub body: Vec<ResponseItem>,
+    pub marker: CompactMarker,
+    pub receipt: CompactReceipt,
+}
+
+/// Archive marker describing a served compact (CompactReceipt fields).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactMarker {
+    pub view_id: String,
+    pub covered_from: i64,
+    pub compact_point: i64,
+    pub total_tokens: i64,
+    pub tail_tokens: i64,
+    pub first_kept_message_id: Option<String>,
+    pub profile: Option<String>,
+    pub bands: Value,
+    pub view_map_seam: String,
+    /// Host-visible body size after mapping (items).
+    pub body_item_count: usize,
+    /// Stable idempotency key for marker submit (retry-safe).
+    pub marker_key: String,
+    /// Content digests (id-stripped) of the served body — anon-path secondary.
+    pub derived_content_digests: Vec<String>,
+    /// Host ResponseItemIds assigned at write-back (H1). Empty until filled
+    /// after `replace_compacted_history`; committed on the marker for resume.
+    #[serde(default)]
+    pub derived_host_ids: Vec<String>,
+    /// Archive tip identity used to form `marker_key` (last event key / order).
+    pub archive_tip: String,
+}
+
+impl CompactMarker {
+    /// Build marker from a CompactReceipt + the archive state being compacted.
+    ///
+    /// `archive_tip` is the identity of the tip event at compact time (last
+    /// event's idempotency key, or `order:{n}`). Combined with compact_point it
+    /// distinguishes distinct compacts while remaining stable across retries of
+    /// the same archive state.
+    pub fn from_receipt(
+        receipt: &CompactReceipt,
+        thread_id: &str,
+        body: &[ResponseItem],
+        archive_tip: &str,
+    ) -> Self {
+        let tid = crate::idempotency::encode_thread_id(thread_id);
+        let tip = crate::idempotency::encode_thread_id(archive_tip);
+        let derived_content_digests: Vec<String> =
+            body.iter().map(content_identity_digest).collect();
+        // Tip + compact_point + covered_from + body fingerprint: stable on
+        // retry of the same compact, distinct when archive state or outcome
+        // changes (F5). Not view_id (retries mint fresh views).
+        let body_fp = {
+            let mut hasher_in = derived_content_digests.join("|");
+            if hasher_in.len() > 64 {
+                hasher_in = format!("{:x}", {
+                    use std::hash::Hash;
+                    use std::hash::Hasher;
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    hasher_in.hash(&mut h);
+                    h.finish()
+                });
+            }
+            hasher_in
+        };
+        let marker_key = format!(
+            "codex:{tid}:compact_marker:{tip}:{}:{}:{body_fp}",
+            receipt.compact_point, receipt.covered_from
+        );
+        Self {
+            view_id: receipt.view_id.clone(),
+            covered_from: receipt.covered_from,
+            compact_point: receipt.compact_point,
+            total_tokens: receipt.total_tokens,
+            tail_tokens: receipt.tail_tokens,
+            first_kept_message_id: receipt.first_kept_message_id.clone(),
+            profile: receipt.profile.clone(),
+            bands: serde_json::to_value(&receipt.bands).unwrap_or(Value::Null),
+            view_map_seam: VIEW_MAP_SEAM_ID.to_string(),
+            body_item_count: body.len(),
+            marker_key,
+            derived_content_digests,
+            derived_host_ids: Vec::new(),
+            archive_tip: archive_tip.to_string(),
+        }
+    }
+
+    /// Model-visible / LHC-rendered note. **Constant-size** — no digest/id lists
+    /// (I1: bookkeeping must not be served to the model).
+    pub fn to_runtime_note_text(&self) -> String {
+        let summary = json!({
+            "viewId": self.view_id,
+            "coveredFrom": self.covered_from,
+            "compactPoint": self.compact_point,
+            "totalTokens": self.total_tokens,
+            "bodyItemCount": self.body_item_count,
+            "markerKey": self.marker_key,
+            "archiveTip": self.archive_tip,
+            "viewMapSeam": self.view_map_seam,
+        });
+        format!(
+            "lhc_compact_marker {}",
+            serde_json::to_string(&summary).unwrap_or_else(|_| "{}".into())
+        )
+    }
+
+    /// Bound on model-visible note size (I1 test).
+    pub const RUNTIME_NOTE_MAX_CHARS: usize = 1024;
+
+    /// Host-durable record co-written with CompactedItem (I2). Not rendered by LHC.
+    pub fn to_durable_writeback_record(&self) -> String {
+        format!(
+            "lhc_compact_durable {}",
+            serde_json::to_string(self).unwrap_or_else(|_| "{}".into())
+        )
+    }
+
+    pub fn parse_durable_writeback_record(text: &str) -> Option<Self> {
+        let json = text.strip_prefix("lhc_compact_durable ")?;
+        serde_json::from_str(json).ok()
+    }
+
+    pub fn is_durable_writeback_record(text: &str) -> bool {
+        text.starts_with("lhc_compact_durable ")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LhcCompactUnavailable {
+    OpenFailed(String),
+    NoEvents,
+    ArchiveDoesNotCoverHost(String),
+    CompactFailed(String),
+    EmptyView(String),
+    ViewFetchFailed(String),
+    Inference(String),
+    /// Derivation work failed or produced only degraded fallbacks (L1/L2).
+    /// Fail open to the native ladder — never install degraded LHC content.
+    DerivationFailed(String),
+    Cancelled,
+    /// Body did not reduce vs host history — fail open to native ladder (F3).
+    NoReduction(String),
+}
+
+impl std::fmt::Display for LhcCompactUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenFailed(s) => write!(f, "lhc open failed: {s}"),
+            Self::NoEvents => write!(f, "lhc thread has no events"),
+            Self::ArchiveDoesNotCoverHost(s) => {
+                write!(f, "archive does not cover host history: {s}")
+            }
+            Self::CompactFailed(s) => write!(f, "lhc.compact failed: {s}"),
+            Self::EmptyView(s) => write!(f, "empty served view: {s}"),
+            Self::ViewFetchFailed(s) => write!(f, "get_llm_request_context failed: {s}"),
+            Self::Inference(s) => write!(f, "inference: {s}"),
+            Self::DerivationFailed(s) => write!(f, "lhc derivation failed: {s}"),
+            Self::Cancelled => write!(f, "lhc compact cancelled"),
+            Self::NoReduction(s) => write!(f, "lhc compact no reduction: {s}"),
+        }
+    }
+}
+
+/// Content-only digest of a host item (id stripped). Used to mark LHC-derived
+/// body items so they are never re-imported as source (F1b).
+pub fn content_identity_digest(item: &ResponseItem) -> String {
+    let mut stripped = item.clone();
+    stripped.set_id(None);
+    item_digest(&stripped)
+}
+
+/// Cheap char/4 token estimate (same order as LHC `estimate_tokens`).
+pub fn estimate_response_items_tokens(items: &[ResponseItem]) -> i64 {
+    let chars: usize = items
+        .iter()
+        .map(|item| match item {
+            ResponseItem::Message { content, .. } => content
+                .iter()
+                .map(|c| match c {
+                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                        text.len()
+                    }
+                    ContentItem::InputImage { image_url, .. } => image_url.len(),
+                    ContentItem::InputAudio { audio_url } => audio_url.len(),
+                })
+                .sum::<usize>(),
+            _ => 64,
+        })
+        .sum();
+    (chars / 4) as i64
+}
+
+/// Map LHC's served LLM request context to host `ResponseItem`s (law 6: typed roles).
+pub fn llm_request_context_to_response_items(ctx: &LlmRequestContext) -> Vec<ResponseItem> {
+    ctx.messages
+        .iter()
+        .filter_map(|msg| {
+            let text = msg
+                .content
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>()
+                .join("");
+            if text.is_empty() {
+                return None;
+            }
+            let role = match msg.role {
+                LlmRequestContextRole::User => "user",
+                LlmRequestContextRole::Assistant => "assistant",
+            };
+            Some(ResponseItem::Message {
+                id: None,
+                role: role.into(),
+                content: vec![if role == "assistant" {
+                    ContentItem::OutputText { text }
+                } else {
+                    ContentItem::InputText { text }
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })
+        })
+        .collect()
+}
+
+/// Parse host ResponseItemId from a codex id-primary idempotency key.
+///
+/// Shape: `codex:{tid}:id:{iid}:{digest}:{event_kind}[:part]`
+fn parse_host_id_from_archive_key(key: &str) -> Option<String> {
+    let rest = key.strip_prefix("codex:")?;
+    let after_tid = rest.split_once(':')?.1;
+    let after_id = after_tid.strip_prefix("id:")?;
+    let iid = after_id.split(':').next()?;
+    if iid.is_empty() {
+        return None;
+    }
+    Some(decode_thread_id(iid))
+}
+
+fn decode_thread_id(encoded: &str) -> String {
+    // Inverse of encode_thread_id: %3A → :, %25 → %
+    let mut out = String::with_capacity(encoded.len());
+    let bytes = encoded.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &encoded[i + 1..i + 3];
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// Collect host item ids present in the archive (identity, not text — F1a).
+pub fn archive_host_item_ids(events: &[EventRecord]) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|e| parse_host_id_from_archive_key(e.idempotency_key()))
+        .collect()
+}
+
+/// Wall-clock budget for the pre-compact derivation drain (M2).
+///
+/// Chosen to sit **under** core's `COMPACT_THREAD_TIMEOUT` (120 s) with
+/// headroom for everything the drain gates: `thread_view.compact()`, the
+/// `get_llm_request_context` fetch, view mapping, and the caller's write-back
+/// plus 30 s marker commit. Past the caller's deadline every further inference
+/// round-trip is orphaned — the session has already failed open.
+const DRAIN_TIME_BUDGET: Duration = Duration::from_secs(75);
+
+/// Work items per drain batch. Cancellation and the deadline are checked
+/// **between** batches, so this is also the cancellation granularity: at most
+/// this many derivations can still fire after the flag is set.
+const DRAIN_BATCH_ITEMS: i64 = 4;
+
+/// Hard cap on batches so a scheduler that never reports `Empty` (or a queue
+/// that keeps refilling) cannot spin indefinitely inside one compact.
+const DRAIN_MAX_BATCHES: usize = 1024;
+
+/// Run derivation work in bounded batches, honouring cancellation between them.
+///
+/// Returns `Err` (fail open, law 3) when derivation cannot be completed inside
+/// the bound — never a partial "good enough" state. Completing normally means
+/// the scheduler reported no more claimable work; leftover work still shows up
+/// as degraded bands on the receipt, which L2 rejects downstream.
+async fn run_bounded_derivation_drain(
+    session: &LhcSession,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), LhcCompactUnavailable> {
+    let started = Instant::now();
+    let mut batches = 0usize;
+    let mut ran_total = 0usize;
+    let mut remaining = 0i64;
+    let mut stopped;
+
+    loop {
+        // Cancellation first: the caller may have timed out and detached us.
+        check_cancel(cancel)?;
+
+        let elapsed = started.elapsed();
+        if elapsed >= DRAIN_TIME_BUDGET {
+            warn!(
+                budget_s = DRAIN_TIME_BUDGET.as_secs(),
+                batches,
+                ran = ran_total,
+                remaining,
+                "LHC derivation drain exceeded its time budget; failing open"
+            );
+            return Err(LhcCompactUnavailable::DerivationFailed(format!(
+                "derivation drain exceeded {}s budget (batches={batches} ran={ran_total} \
+                 remaining={remaining})",
+                DRAIN_TIME_BUDGET.as_secs()
+            )));
+        }
+        if batches >= DRAIN_MAX_BATCHES {
+            warn!(
+                batches,
+                ran = ran_total,
+                remaining,
+                "LHC derivation drain hit its batch cap; failing open"
+            );
+            return Err(LhcCompactUnavailable::DerivationFailed(format!(
+                "derivation drain hit batch cap {DRAIN_MAX_BATCHES} (ran={ran_total} \
+                 remaining={remaining})"
+            )));
+        }
+
+        let report = match session
+            .lhc
+            .work
+            .drain(
+                session.thread_ref.clone(),
+                Some(DrainOpts {
+                    max_items: Some(DRAIN_BATCH_ITEMS),
+                }),
+            )
+            .await
+        {
+            OpResult::Ok { value } => value,
+            OpResult::Err { error } => {
+                return Err(LhcCompactUnavailable::DerivationFailed(format!(
+                    "work.drain failed: {}",
+                    error.reason
+                )));
+            }
+        };
+        batches += 1;
+        ran_total += report.ran.len();
+        remaining = report.remaining;
+        stopped = report.stopped_because;
+
+        let failed_n = report
+            .ran
+            .iter()
+            .filter(|e| e.disposition == DrainDisposition::FailedTerminal)
+            .count();
+        if failed_n > 0 {
+            let sample: Vec<String> = report
+                .ran
+                .iter()
+                .filter(|e| e.disposition == DrainDisposition::FailedTerminal)
+                .take(3)
+                .map(|e| {
+                    format!(
+                        "{}:{}",
+                        e.kind,
+                        e.reason.as_deref().unwrap_or("failed_terminal")
+                    )
+                })
+                .collect();
+            warn!(
+                failed = failed_n,
+                ran = ran_total,
+                remaining,
+                ?sample,
+                "LHC derivation failed during drain; failing open (no degraded install)"
+            );
+            return Err(LhcCompactUnavailable::DerivationFailed(format!(
+                "{failed_n} derivation item(s) failed_terminal (sample={sample:?})"
+            )));
+        }
+
+        // `MaxItems` is the only "there is more claimable work" signal. `Empty`
+        // and `InFlight` both mean this caller cannot make further progress
+        // now; leftover work surfaces as degraded bands, which L2 rejects.
+        if stopped != DrainStoppedBecause::MaxItems {
+            break;
+        }
+        // Defensive: a batch that claims the cap but runs nothing is no
+        // progress — break rather than spin the deadline down.
+        if report.ran.is_empty() {
+            break;
+        }
+    }
+
+    info!(
+        ran = ran_total,
+        batches,
+        remaining,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        stopped = %stopped.as_str(),
+        "LHC derivation work.drain completed before compact (bounded)"
+    );
+    Ok(())
+}
+
+/// Max compact markers whose derived digests/ids we retain (most recent).
+/// Linear history: each new marker re-fingerprints the whole served body.
+/// Forks off an older point can drop provenance past this window — see FORK.md.
+const DERIVED_MARKER_CAP: usize = 8;
+
+/// Parse full CompactMarker from archive events when present (legacy full notes
+/// or future non-rendered stores). Model-visible notes are summaries only and
+/// yield no digests/ids — durable provenance lives on CompactedItem (I1/I2).
+fn markers_from_archive(events: &[EventRecord]) -> Vec<CompactMarker> {
+    let mut rows: Vec<(i64, CompactMarker)> = Vec::new();
+    for ev in events {
+        let Some(tp) = ev.text_payload() else {
+            continue;
+        };
+        let json = if let Some(rest) = tp.text.strip_prefix("lhc_compact_durable ") {
+            rest
+        } else if let Some(rest) = tp.text.strip_prefix("lhc_compact_marker ") {
+            rest
+        } else if let Some(idx) = tp.text.find("lhc_compact_marker ") {
+            tp.text[idx + "lhc_compact_marker ".len()..].trim()
+        } else {
+            continue;
+        };
+        // Summary-only runtime notes fail full CompactMarker parse — skip (I1).
+        if let Ok(marker) = serde_json::from_str::<CompactMarker>(json) {
+            rows.push((ev.event_order(), marker));
+        }
+    }
+    rows.sort_by_key(|(order, _)| *order);
+    rows.into_iter()
+        .rev()
+        .take(DERIVED_MARKER_CAP)
+        .map(|(_, m)| m)
+        .collect()
+}
+
+/// Content digests of LHC-derived bodies from compact markers in the archive.
+pub fn derived_digests_from_archive(events: &[EventRecord]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for m in markers_from_archive(events) {
+        out.extend(m.derived_content_digests);
+    }
+    out
+}
+
+/// Assigned host ids of LHC-installed bodies from archive markers (H1).
+pub fn derived_ids_from_archive(events: &[EventRecord]) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for m in markers_from_archive(events) {
+        out.extend(m.derived_host_ids);
+    }
+    out
+}
+
+fn is_coverage_candidate(item: &ResponseItem) -> bool {
+    match item {
+        ResponseItem::Message { role, .. } => role == "user" || role == "assistant",
+        _ => false,
+    }
+}
+
+/// Session-local + archive derived provenance for coverage (H1).
+#[derive(Debug, Clone, Default)]
+pub struct DerivedProvenance {
+    /// Host ResponseItemIds known to come from LHC write-back.
+    pub ids: HashSet<String>,
+    /// Content digests (anon secondary).
+    pub digests: HashSet<String>,
+}
+
+impl DerivedProvenance {
+    pub fn from_session_and_archive(
+        session_ids: &HashSet<String>,
+        session_digests: &HashSet<String>,
+        events: &[EventRecord],
+    ) -> Self {
+        let mut ids = derived_ids_from_archive(events);
+        ids.extend(session_ids.iter().cloned());
+        let mut digests = derived_digests_from_archive(events);
+        digests.extend(session_digests.iter().cloned());
+        Self { ids, digests }
+    }
+}
+
+/// Host messages that must exist in the archive by **identity** before compact
+/// is safe.
+///
+/// # Provenance-aware identity (H1 / law 6)
+///
+/// Stable-id branch: derived-id set first, then archive presence. Derived ids
+/// are write-back-assigned host ids (identity + provenance), not content
+/// matching. Content digests apply only on the anonymous path.
+pub fn host_items_missing_from_archive(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+) -> Vec<ResponseItem> {
+    host_items_missing_from_archive_with_provenance(
+        host_items,
+        events,
+        &DerivedProvenance::default(),
+    )
+}
+
+/// Like [`host_items_missing_from_archive`] with session+archive provenance.
+pub fn host_items_missing_from_archive_with_provenance(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+    derived: &DerivedProvenance,
+) -> Vec<ResponseItem> {
+    let archive_ids = archive_host_item_ids(events);
+    let mut anon_digest_counts: HashMap<String, usize> = HashMap::new();
+    for e in events {
+        let key = e.idempotency_key();
+        if let Some(rest) = key.split(":anon:").nth(1) {
+            if let Some(digest) = rest.split(':').next() {
+                *anon_digest_counts.entry(digest.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut missing = Vec::new();
+    for item in host_items {
+        if !is_coverage_candidate(item) {
+            continue;
+        }
+        if let Some(id) = item_stable_id(item) {
+            // H1: derived-id set first — installed body ids never import.
+            if derived.ids.contains(&id) {
+                continue;
+            }
+            if archive_ids.contains(&id) {
+                continue;
+            }
+            missing.push(item.clone());
+            continue;
+        }
+        let content_d = content_identity_digest(item);
+        if derived.digests.contains(&content_d) {
+            continue;
+        }
+        let digest = item_digest(item);
+        let count = anon_digest_counts.entry(digest.clone()).or_insert(0);
+        if *count > 0 {
+            *count -= 1;
+            continue;
+        }
+        missing.push(item.clone());
+    }
+    missing
+}
+
+/// Backward-compatible: digests only (prefer provenance API).
+pub fn host_items_missing_from_archive_with_derived(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+    session_digests: &HashSet<String>,
+) -> Vec<ResponseItem> {
+    let derived = DerivedProvenance {
+        ids: HashSet::new(),
+        digests: session_digests.clone(),
+    };
+    host_items_missing_from_archive_with_provenance(host_items, events, &derived)
+}
+
+/// Host message identities that must appear in the archive before compact is safe.
+pub fn host_history_coverage_gap(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+) -> Option<String> {
+    host_history_coverage_gap_with_provenance(host_items, events, &DerivedProvenance::default())
+}
+
+pub fn host_history_coverage_gap_with_derived(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+    session_digests: &HashSet<String>,
+) -> Option<String> {
+    let derived = DerivedProvenance {
+        ids: HashSet::new(),
+        digests: session_digests.clone(),
+    };
+    host_history_coverage_gap_with_provenance(host_items, events, &derived)
+}
+
+pub fn host_history_coverage_gap_with_provenance(
+    host_items: &[ResponseItem],
+    events: &[EventRecord],
+    derived: &DerivedProvenance,
+) -> Option<String> {
+    let missing = host_items_missing_from_archive_with_provenance(host_items, events, derived);
+    if missing.is_empty() {
+        return None;
+    }
+    let candidates = host_items
+        .iter()
+        .filter(|i| is_coverage_candidate(i))
+        .count();
+    let excluded = derived.ids.len() + derived.digests.len();
+    if events.is_empty() {
+        return Some(format!(
+            "host has {candidates} message candidate(s) but archive is empty (resume/fork without import?)"
+        ));
+    }
+    Some(format!(
+        "{}/{} host message(s) missing from archive by identity (derived_excluded={excluded})",
+        missing.len(),
+        candidates
+    ))
+}
+
+/// Import **only** the given host items (identity-missing natives) into the archive.
+/// Callers must pass the output of [`host_items_missing_from_archive`] — never the
+/// full post-compact body.
+pub async fn import_host_items_into_archive(
+    session: &mut LhcSession,
+    host_items: &[ResponseItem],
+) -> Result<usize, String> {
+    use crate::idempotency::OccurrenceTracker;
+    use crate::mapping::map_item;
+    use codex_extension_api::RawItemProvenance;
+
+    let mut tracker = OccurrenceTracker::new();
+    // Seed from existing keys so anon occurrences do not collide.
+    if let Ok(existing) = session.list_events().await {
+        let keys: Vec<&str> = existing.iter().map(EventRecord::idempotency_key).collect();
+        tracker = crate::idempotency::seed_occurrence_from_keys(keys);
+    }
+    let mut n = 0usize;
+    for item in host_items {
+        let provenance = match item {
+            ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
+            ResponseItem::Message { role, .. } if role == "assistant" => {
+                RawItemProvenance::ModelOutput
+            }
+            _ => RawItemProvenance::HostContext,
+        };
+        let mapped = map_item(&session.thread_id, item, provenance, &mut tracker);
+        if mapped.is_empty() {
+            continue;
+        }
+        let inputs: Vec<_> = mapped.into_iter().map(|m| m.input).collect();
+        session.submit_events(&inputs).await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// Tip identity of the archive for marker keying (F5).
+pub fn archive_tip_identity(events: &[EventRecord]) -> String {
+    events
+        .iter()
+        .max_by_key(|e| e.event_order())
+        .map(|e| e.idempotency_key().to_string())
+        .unwrap_or_else(|| "empty".into())
+}
+
+/// Run real LHC compact and map the served view to ResponseItems.
+///
+/// Does **not** write the archive marker — call [`commit_compact_marker`] after
+/// the host has durably installed the body.
+pub async fn produce_lhc_compact(
+    thread_id: &str,
+    root: Option<&Path>,
+    host_items: &[ResponseItem],
+    import_missing: bool,
+    inference: InferenceCallbacks,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<LhcCompactResult, LhcCompactUnavailable> {
+    produce_lhc_compact_with_provenance(
+        thread_id,
+        root,
+        host_items,
+        import_missing,
+        inference,
+        cancel,
+        &DerivedProvenance::default(),
+    )
+    .await
+}
+
+/// Like [`produce_lhc_compact`], with session-local derived provenance (H1/G3).
+pub async fn produce_lhc_compact_with_derived(
+    thread_id: &str,
+    root: Option<&Path>,
+    host_items: &[ResponseItem],
+    import_missing: bool,
+    inference: InferenceCallbacks,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    session_digests: &HashSet<String>,
+) -> Result<LhcCompactResult, LhcCompactUnavailable> {
+    let derived = DerivedProvenance {
+        ids: HashSet::new(),
+        digests: session_digests.clone(),
+    };
+    produce_lhc_compact_with_provenance(
+        thread_id,
+        root,
+        host_items,
+        import_missing,
+        inference,
+        cancel,
+        &derived,
+    )
+    .await
+}
+
+/// Produce with full derived provenance (ids + digests).
+pub async fn produce_lhc_compact_with_provenance(
+    thread_id: &str,
+    root: Option<&Path>,
+    host_items: &[ResponseItem],
+    import_missing: bool,
+    inference: InferenceCallbacks,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    session_derived: &DerivedProvenance,
+) -> Result<LhcCompactResult, LhcCompactUnavailable> {
+    check_cancel(cancel.as_deref())?;
+
+    let (mut session, _) = LhcSession::open_with_inference(thread_id, None, root, inference)
+        .await
+        .ok_or_else(|| {
+            LhcCompactUnavailable::OpenFailed("LhcSession::open returned None".into())
+        })?;
+
+    check_cancel(cancel.as_deref())?;
+
+    let mut events = session
+        .list_events()
+        .await
+        .map_err(LhcCompactUnavailable::OpenFailed)?;
+
+    let derived = DerivedProvenance::from_session_and_archive(
+        &session_derived.ids,
+        &session_derived.digests,
+        &events,
+    );
+
+    // Import only identity-missing *native* items; never the served body (H1).
+    let missing = host_items_missing_from_archive_with_provenance(host_items, &events, &derived);
+    if !missing.is_empty() {
+        if import_missing {
+            info!(
+                missing = missing.len(),
+                "importing identity-missing native host history into LHC archive before compact"
+            );
+            import_host_items_into_archive(&mut session, &missing)
+                .await
+                .map_err(LhcCompactUnavailable::OpenFailed)?;
+            events = session
+                .list_events()
+                .await
+                .map_err(LhcCompactUnavailable::OpenFailed)?;
+            let derived2 = DerivedProvenance::from_session_and_archive(
+                &session_derived.ids,
+                &session_derived.digests,
+                &events,
+            );
+            let still =
+                host_items_missing_from_archive_with_provenance(host_items, &events, &derived2);
+            if !still.is_empty() {
+                session.close().await;
+                return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
+                    "{} host message(s) still missing after import",
+                    still.len()
+                )));
+            }
+        } else {
+            session.close().await;
+            return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
+                "{} host message(s) missing from archive by identity",
+                missing.len()
+            )));
+        }
+    }
+
+    if events.is_empty() {
+        session.close().await;
+        return Err(LhcCompactUnavailable::NoEvents);
+    }
+
+    check_cancel(cancel.as_deref())?;
+
+    // L1: actually run derivation work. `drain_settled` only waits for idle —
+    // it never schedules or executes work. Without `work.drain`, every band is
+    // the degraded excerpt fallback and inference callbacks are never invoked.
+    //
+    // M2: the drain is **bounded** and **cancellable**. An unbounded
+    // `drain(ref, None)` keeps issuing inference round-trips long after the
+    // caller's `COMPACT_THREAD_TIMEOUT` has elapsed and Codex has already
+    // failed open to the native ladder — orphaned traffic billed to a session
+    // that has stopped listening.
+    if let Err(err) = run_bounded_derivation_drain(&session, cancel.as_deref()).await {
+        session.close().await;
+        return Err(err);
+    }
+
+    // Await quiescence after work has been run (not a substitute for drain).
+    session.lhc.drain_settled(session.thread_ref.clone()).await;
+
+    check_cancel(cancel.as_deref())?;
+
+    let archive_tip = archive_tip_identity(&events);
+
+    let receipt = match session
+        .lhc
+        .thread_view
+        .compact(
+            session.thread_ref.clone(),
+            CompactOpts {
+                profile: None,
+                params: None,
+                signal: None,
+            },
+        )
+        .await
+    {
+        OpResult::Ok { value } => value,
+        OpResult::Err { error } => {
+            session.close().await;
+            return Err(LhcCompactUnavailable::CompactFailed(error.reason));
+        }
+    };
+
+    // L2: never install a degraded fallback body. Law 3 — native ladder instead.
+    if !receipt.degraded.is_empty() {
+        let n = receipt.degraded.len();
+        let sample: Vec<String> = receipt
+            .degraded
+            .iter()
+            .take(3)
+            .map(|d| format!("{}:{}:{}", d.band.as_str(), d.subject_id, d.used_derivation))
+            .collect();
+        warn!(
+            degraded = n,
+            ?sample,
+            "LHC compact receipt has degraded bands; failing open (no degraded install)"
+        );
+        session.close().await;
+        return Err(LhcCompactUnavailable::DerivationFailed(format!(
+            "compact produced {n} degraded band(s) (sample={sample:?}); refusing install"
+        )));
+    }
+
+    debug!(
+        view_id = %receipt.view_id,
+        covered_from = receipt.covered_from,
+        compact_point = receipt.compact_point,
+        total_tokens = receipt.total_tokens,
+        archive_tip = %archive_tip,
+        "LHC compact produced CompactReceipt"
+    );
+
+    check_cancel(cancel.as_deref())?;
+
+    let view = match session
+        .lhc
+        .thread_view
+        .get_llm_request_context(session.thread_ref.clone())
+        .await
+    {
+        OpResult::Ok { value } => value,
+        OpResult::Err { error } => {
+            session.close().await;
+            return Err(LhcCompactUnavailable::ViewFetchFailed(error.reason));
+        }
+    };
+
+    let body = llm_request_context_to_response_items(&view);
+    if body.is_empty() {
+        session.close().await;
+        return Err(LhcCompactUnavailable::EmptyView(
+            "LlmRequestContext mapped to zero ResponseItems".into(),
+        ));
+    }
+
+    // Defence in depth: body text must not carry degraded markers either.
+    if body_contains_degraded_marker(&body) {
+        session.close().await;
+        return Err(LhcCompactUnavailable::DerivationFailed(
+            "served body contains [degraded: …] markers; refusing install".into(),
+        ));
+    }
+
+    let marker = CompactMarker::from_receipt(&receipt, thread_id, &body, &archive_tip);
+    // Close without marker; commit reopens after durable host write-back.
+    session.close().await;
+
+    Ok(LhcCompactResult {
+        body,
+        marker,
+        receipt,
+    })
+}
+
+fn body_contains_degraded_marker(body: &[ResponseItem]) -> bool {
+    body.iter().any(|item| match item {
+        ResponseItem::Message { content, .. } => content.iter().any(|c| match c {
+            ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                text.contains("[degraded:")
+            }
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
+/// Persist compact marker **after** durable host write-back (R6).
+pub async fn commit_compact_marker(
+    thread_id: &str,
+    root: Option<&Path>,
+    marker: &CompactMarker,
+) -> Result<(), String> {
+    let callbacks = lhc_inference_callbacks(false).map_err(|e| e.to_string())?;
+    let (mut session, _) = LhcSession::open_with_inference(thread_id, None, root, callbacks)
+        .await
+        .ok_or_else(|| "open for marker commit failed".to_string())?;
+    let note = compact_marker_event(marker);
+    session.submit_events(std::slice::from_ref(&note)).await?;
+    session.close().await;
+    Ok(())
+}
+
+fn compact_marker_event(marker: &CompactMarker) -> MessageEventInput {
+    let mut payload = Map::new();
+    payload.insert("text".into(), json!(marker.to_runtime_note_text()));
+    MessageEventInput {
+        event_kind: "runtime_note".to_string(),
+        idempotency_key: Some(marker.marker_key.clone()),
+        actor: ACTOR_SYSTEM.to_string(),
+        harness: HARNESS.to_string(),
+        payload,
+        extra: Map::new(),
+    }
+}
+
+fn check_cancel(
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), LhcCompactUnavailable> {
+    if cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(LhcCompactUnavailable::Cancelled);
+    }
+    Ok(())
+}
+
+/// Convenience: produce with deterministic inference (tests / offline).
+pub async fn produce_lhc_compact_deterministic(
+    thread_id: &str,
+    root: Option<&Path>,
+    host_items: &[ResponseItem],
+    import_missing: bool,
+) -> Result<LhcCompactResult, LhcCompactUnavailable> {
+    let callbacks = lhc_inference_callbacks(false)
+        .map_err(|e| LhcCompactUnavailable::Inference(e.to_string()))?;
+    produce_lhc_compact(thread_id, root, host_items, import_missing, callbacks, None).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mapping::map_item;
+    use codex_extension_api::RawItemProvenance;
+    use codex_protocol::ResponseItemId;
+    use tempfile::tempdir;
+
+    fn user(text: &str, id: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(id.into())),
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn assistant(text: &str, id: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(id.into())),
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    async fn submit_items(root: &Path, tid: &str, items: &[ResponseItem]) {
+        let callbacks = lhc_inference_callbacks(false).unwrap();
+        let (mut session, mut tracker) =
+            LhcSession::open_with_inference(tid, None, Some(root), callbacks)
+                .await
+                .expect("open");
+        for item in items {
+            let prov = match item {
+                ResponseItem::Message { role, .. } if role == "user" => {
+                    RawItemProvenance::UserPrompt
+                }
+                _ => RawItemProvenance::ModelOutput,
+            };
+            let mapped = map_item(tid, item, prov, &mut tracker);
+            let inputs: Vec<_> = mapped.into_iter().map(|m| m.input).collect();
+            session.submit_events(&inputs).await.expect("submit");
+        }
+        session.close().await;
+    }
+
+    async fn seed_thread(root: &Path, tid: &str) -> Vec<ResponseItem> {
+        let items = vec![
+            user("turn one about cats", "u1"),
+            assistant("cats are fine", "a1"),
+            user("turn two about dogs", "u2"),
+            assistant("dogs too", "a2"),
+            user("turn three about birds", "u3"),
+            assistant("birds as well", "a3"),
+            user("turn four final", "u4"),
+            assistant("done", "a4"),
+        ];
+        submit_items(root, tid, &items).await;
+        items
+    }
+
+    /// Large history so LHC actually bands (lower_bound 120k tokens).
+    async fn seed_bandable_thread(root: &Path, tid: &str, turns: usize) -> Vec<ResponseItem> {
+        let pad = "x".repeat(2500);
+        let mut items = Vec::with_capacity(turns * 2);
+        for i in 0..turns {
+            items.push(user(
+                &format!("user turn {i} about topic series {pad}"),
+                &format!("bu{i}"),
+            ));
+            items.push(assistant(
+                &format!("assistant reply {i} covering topic {pad}"),
+                &format!("ba{i}"),
+            ));
+        }
+        submit_items(root, tid, &items).await;
+        items
+    }
+
+    async fn list_archive(root: &Path, tid: &str) -> Vec<EventRecord> {
+        let callbacks = lhc_inference_callbacks(false).unwrap();
+        let (s, _) = LhcSession::open_with_inference(tid, None, Some(root), callbacks)
+            .await
+            .unwrap();
+        let events = s.list_events().await.unwrap();
+        s.close().await;
+        events
+    }
+
+    fn marker_count(events: &[EventRecord]) -> usize {
+        events
+            .iter()
+            .filter(|e| {
+                e.text_payload()
+                    .is_some_and(|p| p.text.contains("lhc_compact_marker"))
+            })
+            .count()
+    }
+
+    fn forbidden_source_content(events: &[EventRecord]) -> bool {
+        events.iter().any(|e| {
+            let kind = e.event_kind().as_str();
+            if !matches!(kind, "user_prompt" | "assistant_text") {
+                return false;
+            }
+            e.text_payload().is_some_and(|p| {
+                p.text.contains("[context ·")
+                    || (p.text.contains("lhc_compact_marker") && kind == "user_prompt")
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn produce_uses_lhc_compact_receipt_not_heuristic() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-real-1";
+        // Band-scale: body must differ from host (not a host_items pass-through).
+        let host_items = seed_bandable_thread(root, tid, 80).await;
+
+        let result = produce_lhc_compact_deterministic(tid, Some(root), &host_items, false)
+            .await
+            .expect("produce");
+
+        assert!(!result.body.is_empty());
+        assert!(
+            result.body.len() < host_items.len(),
+            "LHC compact must reduce item count (body={}, host={}); pass-through would fail this",
+            result.body.len(),
+            host_items.len()
+        );
+        // Must not be a verbatim copy of host history (mutation: body = host_items).
+        let body_digests: HashSet<_> = result.body.iter().map(content_identity_digest).collect();
+        let host_digests: HashSet<_> = host_items.iter().map(content_identity_digest).collect();
+        assert_ne!(
+            body_digests, host_digests,
+            "body must come from LHC view, not host_items.to_vec()"
+        );
+        assert!(
+            !result.marker.derived_content_digests.is_empty(),
+            "marker must record derived digests"
+        );
+        assert_eq!(
+            marker_count(&list_archive(root, tid).await),
+            0,
+            "marker must not be written before commit"
+        );
+
+        commit_compact_marker(tid, Some(root), &result.marker)
+            .await
+            .expect("commit");
+        commit_compact_marker(tid, Some(root), &result.marker)
+            .await
+            .expect("retry commit");
+
+        let events2 = list_archive(root, tid).await;
+        assert_eq!(marker_count(&events2), 1, "marker must be retry-idempotent");
+    }
+
+    /// F5: two distinct compacts → two markers; two retries of one → one.
+    ///
+    /// Uses **sub-threshold** history so covered_from/compact_point stay `0:0`
+    /// (the collision Sol reproduced). Distinction must come from archive tip
+    /// identity, not from covered_from:compact_point alone.
+    #[tokio::test]
+    async fn marker_key_distinguishes_distinct_compacts_and_retries() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-marker-key-1";
+        let mut host = seed_thread(root, tid).await;
+
+        let r1 = produce_lhc_compact_deterministic(tid, Some(root), &host, false)
+            .await
+            .expect("produce1");
+        // Sub-threshold pass-through: range fields are the 0:0 trap.
+        assert_eq!(r1.receipt.covered_from, 0);
+        assert_eq!(r1.receipt.compact_point, 0);
+        commit_compact_marker(tid, Some(root), &r1.marker)
+            .await
+            .expect("c1");
+        commit_compact_marker(tid, Some(root), &r1.marker)
+            .await
+            .expect("c1-retry");
+        assert_eq!(marker_count(&list_archive(root, tid).await), 1);
+
+        // New source events change the archive tip while covered_from:compact_point
+        // remain 0:0 — keys must still diverge.
+        let extra = vec![
+            user("post-compact native turn", "post1"),
+            assistant("post-compact native reply", "posta1"),
+        ];
+        submit_items(root, tid, &extra).await;
+        host.extend(extra);
+
+        let r2 = produce_lhc_compact_deterministic(tid, Some(root), &host, false)
+            .await
+            .expect("produce2");
+        assert_eq!(r2.receipt.covered_from, 0);
+        assert_eq!(r2.receipt.compact_point, 0);
+        assert_ne!(
+            r1.marker.marker_key, r2.marker.marker_key,
+            "distinct archive tips must mint distinct marker keys even when \
+             covered_from:compact_point are both 0:0; a 0:0-only key fails this"
+        );
+        assert_ne!(
+            r1.marker.archive_tip, r2.marker.archive_tip,
+            "tips must differ after new source events"
+        );
+        commit_compact_marker(tid, Some(root), &r2.marker)
+            .await
+            .expect("c2");
+        assert_eq!(
+            marker_count(&list_archive(root, tid).await),
+            2,
+            "two distinct compacts must yield two markers"
+        );
+    }
+
+    /// Simulate production write-back: body gets assigned stable ids (H1).
+    /// Must not re-ingest when derived-id provenance is recorded.
+    #[tokio::test]
+    async fn three_compacts_do_not_reingest_body() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-no-reingest";
+        let host = seed_thread(root, tid).await;
+        assert_eq!(list_archive(root, tid).await.len(), 8);
+
+        let mut simulated_host = host;
+        let mut provenance = DerivedProvenance::default();
+        for round in 0..3 {
+            let result = produce_lhc_compact_with_provenance(
+                tid,
+                Some(root),
+                &simulated_host,
+                true,
+                lhc_inference_callbacks(false).unwrap(),
+                None,
+                &provenance,
+            )
+            .await
+            .expect("produce");
+            // Simulate replace_compacted_history: assign stable ids to body.
+            let mut body = result.body.clone();
+            for (i, item) in body.iter_mut().enumerate() {
+                item.set_id(Some(ResponseItemId::from_server(
+                    format!("installed-r{round}-{i}").into(),
+                )));
+            }
+            let assigned: Vec<String> = body.iter().filter_map(item_stable_id).collect();
+            assert!(
+                !assigned.is_empty(),
+                "round {round}: production assigns stable ids at write-back"
+            );
+            let mut marker = result.marker;
+            marker.derived_host_ids = assigned.clone();
+            provenance.ids.extend(assigned);
+            provenance
+                .digests
+                .extend(marker.derived_content_digests.iter().cloned());
+            commit_compact_marker(tid, Some(root), &marker)
+                .await
+                .expect("commit");
+            simulated_host = body;
+
+            let events = list_archive(root, tid).await;
+            let source = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.event_kind().as_str(),
+                        "user_prompt" | "assistant_text" | "assistant_thinking"
+                    )
+                })
+                .count();
+            assert_eq!(
+                source,
+                8,
+                "round {round}: source events must stay at 8, got {source} (total {})",
+                events.len()
+            );
+            assert!(
+                !forbidden_source_content(&events),
+                "round {round}: archive must not re-ingest derived body as source"
+            );
+        }
+    }
+
+    /// G1: fresh stable id + text equal to a derived body item must be missing.
+    #[tokio::test]
+    async fn coverage_stable_id_wins_over_derived_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-g1-id-wins";
+        let host = seed_thread(root, tid).await;
+        let result = produce_lhc_compact_deterministic(tid, Some(root), &host, false)
+            .await
+            .expect("produce");
+        commit_compact_marker(tid, Some(root), &result.marker)
+            .await
+            .expect("commit");
+        let events = list_archive(root, tid).await;
+        // Resume/fork: same text as a real prior turn, brand-new stable id.
+        let resumed = user("turn one about cats", "new-native-stable-id");
+        assert_eq!(
+            content_identity_digest(&resumed),
+            content_identity_digest(&host[0]),
+            "fixture: text collides with an archived turn"
+        );
+        let missing = host_items_missing_from_archive(std::slice::from_ref(&resumed), &events);
+        assert_eq!(
+            missing.len(),
+            1,
+            "G1: new stable id must be reported missing even when text matches derived/archive content; \
+             content-first exclusion would return []"
+        );
+        assert_eq!(
+            item_stable_id(&missing[0]).as_deref(),
+            Some("new-native-stable-id")
+        );
+    }
+
+    /// H1/G3: session-local **ids** (post write-back assignment) block re-ingest
+    /// even when the archive marker was never committed.
+    #[tokio::test]
+    async fn session_derived_without_marker_blocks_reingest() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-g3-no-marker";
+        let host = seed_thread(root, tid).await;
+        let r1 = produce_lhc_compact_deterministic(tid, Some(root), &host, false)
+            .await
+            .expect("produce1");
+        // Assign ids as replace_compacted_history would; skip marker commit.
+        let mut body_host = r1.body.clone();
+        for (i, item) in body_host.iter_mut().enumerate() {
+            item.set_id(Some(ResponseItemId::from_server(format!("wb-{i}").into())));
+        }
+        let provenance = DerivedProvenance {
+            ids: body_host.iter().filter_map(item_stable_id).collect(),
+            digests: r1.marker.derived_content_digests.iter().cloned().collect(),
+        };
+        assert!(!provenance.ids.is_empty());
+        let r2 = produce_lhc_compact_with_provenance(
+            tid,
+            Some(root),
+            &body_host,
+            true,
+            lhc_inference_callbacks(false).unwrap(),
+            None,
+            &provenance,
+        )
+        .await
+        .expect("produce2 without marker must not re-import body");
+        let after = list_archive(root, tid).await;
+        let source = after
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.event_kind().as_str(),
+                    "user_prompt" | "assistant_text" | "assistant_thinking"
+                )
+            })
+            .count();
+        assert_eq!(
+            source,
+            8,
+            "without marker, session derived ids must still block body re-ingest \
+             (after total={})",
+            after.len()
+        );
+        assert!(!forbidden_source_content(&after));
+        let _ = r2;
+    }
+
+    /// F1a: equal text, distinct ids — identity decides.
+    #[test]
+    fn coverage_is_by_identity_not_text() {
+        let a = user("same text twice", "id-a");
+        let b = user("same text twice", "id-b");
+        let key = crate::idempotency::item_event_key(
+            "t",
+            Some("id-a"),
+            &item_digest(&a),
+            0,
+            "user_prompt",
+            None,
+        );
+        assert_eq!(
+            parse_host_id_from_archive_key(&key).as_deref(),
+            Some("id-a")
+        );
+        assert_eq!(content_identity_digest(&a), content_identity_digest(&b));
+        assert_ne!(item_stable_id(&a), item_stable_id(&b));
+    }
+
+    #[tokio::test]
+    async fn refuse_compact_when_archive_misses_host_history() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-gap-1";
+        let _ = seed_thread(root, tid).await;
+        let host_items = vec![user("never captured utterance", "ghost")];
+        let err = produce_lhc_compact_deterministic(tid, Some(root), &host_items, false)
+            .await
+            .expect_err("must refuse");
+        assert!(
+            matches!(err, LhcCompactUnavailable::ArchiveDoesNotCoverHost(_)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_then_compact_covers_host() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-import-1";
+        let host_items = vec![
+            user("imported one", "iu1"),
+            assistant("imported reply", "ia1"),
+            user("imported two", "iu2"),
+            assistant("imported reply two", "ia2"),
+        ];
+        let result =
+            produce_lhc_compact_deterministic(tid, Some(root), &host_items, /*import*/ true)
+                .await
+                .expect("import+compact");
+        assert!(!result.body.is_empty());
+        // After import, archive holds the four items by identity.
+        let events = list_archive(root, tid).await;
+        let ids = archive_host_item_ids(&events);
+        assert!(ids.contains("iu1") && ids.contains("ia1"));
+    }
+
+    #[tokio::test]
+    async fn resume_then_compact_imports_inherited_history() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-resume-1";
+        let early = vec![
+            user("resume early one", "re1"),
+            assistant("resume early reply", "ra1"),
+        ];
+        submit_items(root, tid, &early).await;
+        let mut host = early;
+        host.extend([
+            user("resume late two", "re2"),
+            assistant("resume late reply", "ra2"),
+            user("resume late three", "re3"),
+            assistant("resume late reply three", "ra3"),
+        ]);
+        let err = produce_lhc_compact_deterministic(tid, Some(root), &host, false)
+            .await
+            .expect_err("partial archive must refuse");
+        assert!(matches!(
+            err,
+            LhcCompactUnavailable::ArchiveDoesNotCoverHost(_)
+        ));
+        let result = produce_lhc_compact_deterministic(tid, Some(root), &host, true)
+            .await
+            .expect("resume import+compact");
+        assert!(!result.body.is_empty());
+        let events = list_archive(root, tid).await;
+        let ids = archive_host_item_ids(&events);
+        assert!(ids.contains("re2") && ids.contains("re3"));
+    }
+
+    #[tokio::test]
+    async fn fork_then_compact_imports_parent_history() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let parent = "compact-fork-parent";
+        let child = "compact-fork-child";
+        let parent_items = seed_thread(root, parent).await;
+        let result = produce_lhc_compact_deterministic(
+            child,
+            Some(root),
+            &parent_items,
+            /*import*/ true,
+        )
+        .await
+        .expect("fork import+compact");
+        assert!(!result.body.is_empty());
+        let dir2 = tempdir().unwrap();
+        let refuse2 =
+            produce_lhc_compact_deterministic(child, Some(dir2.path()), &parent_items, false)
+                .await
+                .expect_err("empty child must refuse without import");
+        assert!(matches!(
+            refuse2,
+            LhcCompactUnavailable::ArchiveDoesNotCoverHost(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_compact_writes_nothing() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-cancel-1";
+        let host_items = seed_thread(root, tid).await;
+        let cancel = Arc::new(AtomicBool::new(true));
+        let callbacks = lhc_inference_callbacks(false).unwrap();
+        let err = produce_lhc_compact(
+            tid,
+            Some(root),
+            &host_items,
+            false,
+            callbacks,
+            Some(Arc::clone(&cancel)),
+        )
+        .await
+        .expect_err("must cancel");
+        assert_eq!(err, LhcCompactUnavailable::Cancelled);
+        assert_eq!(marker_count(&list_archive(root, tid).await), 0);
+    }
+
+    #[test]
+    fn map_context_preserves_roles() {
+        use lhc::sdk::LlmRequestContextMessage;
+        use lhc::sdk::LlmRequestContextPart;
+        use lhc::shared_tech::LlmRequestContextPartType;
+        let ctx = LlmRequestContext {
+            thread_id: "t".into(),
+            messages: vec![
+                LlmRequestContextMessage {
+                    role: LlmRequestContextRole::User,
+                    content: vec![LlmRequestContextPart {
+                        type_: LlmRequestContextPartType::Text,
+                        text: "hello".into(),
+                    }],
+                },
+                LlmRequestContextMessage {
+                    role: LlmRequestContextRole::Assistant,
+                    content: vec![LlmRequestContextPart {
+                        type_: LlmRequestContextPartType::Text,
+                        text: "world".into(),
+                    }],
+                },
+            ],
+        };
+        let items = llm_request_context_to_response_items(&ctx);
+        assert_eq!(items.len(), 2);
+        match &items[0] {
+            ResponseItem::Message { role, .. } => assert_eq!(role, "user"),
+            _ => panic!("expected message"),
+        }
+        match &items[1] {
+            ResponseItem::Message { role, .. } => assert_eq!(role, "assistant"),
+            _ => panic!("expected message"),
+        }
+    }
+
+    /// L1: work.drain must run before compact so inference callbacks fire and
+    /// bands are model-derived (not degraded excerpt fallbacks).
+    #[tokio::test]
+    async fn l1_derivation_runs_callbacks_and_bands_are_not_degraded() {
+        use lhc::shared_tech::CompressDetailedTurnInput;
+        use lhc::shared_tech::InferenceResult;
+        use lhc::shared_tech::SmoothPromptInput;
+        use lhc::shared_tech::SummarizeChunkBriefInput;
+        use lhc::shared_tech::SummarizeToolResultInput;
+        use lhc::shared_tech::create_deterministic_inference_callbacks;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "l1-derive-runs";
+        let host = seed_bandable_thread(root, tid, 80).await;
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let base = create_deterministic_inference_callbacks();
+        let a = Arc::clone(&counter);
+        let b = Arc::clone(&counter);
+        let c = Arc::clone(&counter);
+        let d = Arc::clone(&counter);
+        let base_a = base.clone();
+        let base_b = base.clone();
+        let base_c = base.clone();
+        let base_d = base;
+        let callbacks = InferenceCallbacks {
+            smooth_prompt: Arc::new(move |input: SmoothPromptInput| {
+                a.fetch_add(1, Ordering::SeqCst);
+                let f = Arc::clone(&base_a.smooth_prompt);
+                Box::pin(async move { f(input).await })
+            }),
+            summarize_tool_result: Arc::new(move |input: SummarizeToolResultInput| {
+                b.fetch_add(1, Ordering::SeqCst);
+                let f = Arc::clone(&base_b.summarize_tool_result);
+                Box::pin(async move { f(input).await })
+            }),
+            compress_detailed_turn: Arc::new(move |input: CompressDetailedTurnInput| {
+                c.fetch_add(1, Ordering::SeqCst);
+                let f = Arc::clone(&base_c.compress_detailed_turn);
+                Box::pin(async move { f(input).await })
+            }),
+            summarize_chunk_brief: Arc::new(move |input: SummarizeChunkBriefInput| {
+                d.fetch_add(1, Ordering::SeqCst);
+                let f = Arc::clone(&base_d.summarize_chunk_brief);
+                Box::pin(async move { f(input).await })
+            }),
+        };
+
+        let result = produce_lhc_compact(tid, Some(root), &host, true, callbacks, None)
+            .await
+            .expect("produce must succeed with derivation");
+        let invoked = counter.load(Ordering::SeqCst);
+        assert!(
+            invoked > 0,
+            "L1: inference callbacks must be invoked by work.drain (got {invoked}); \
+             if this is 0, drain was not run and derivation is still dead"
+        );
+        assert!(
+            result.receipt.degraded.is_empty(),
+            "L1: receipt.degraded must be empty after successful derivation; got {:?}",
+            result.receipt.degraded
+        );
+        assert!(
+            !body_contains_degraded_marker(&result.body),
+            "L1: body must not contain [degraded: …] markers"
+        );
+        // Silence unused import warning path for InferenceResult if needed.
+        let _ = InferenceResult::Err {
+            reason: String::new(),
+            request_messages: None,
+        };
+    }
+
+    /// Counting inference callbacks over the deterministic base.
+    /// `on_call` runs before each derivation and may set a cancel flag.
+    fn counting_callbacks(
+        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        on_call: std::sync::Arc<dyn Fn(usize) + Send + Sync>,
+    ) -> InferenceCallbacks {
+        use lhc::shared_tech::CompressDetailedTurnInput;
+        use lhc::shared_tech::SmoothPromptInput;
+        use lhc::shared_tech::SummarizeChunkBriefInput;
+        use lhc::shared_tech::SummarizeToolResultInput;
+        use lhc::shared_tech::create_deterministic_inference_callbacks;
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let base = create_deterministic_inference_callbacks();
+        macro_rules! wrap {
+            ($field:ident, $ty:ty) => {{
+                let counter = Arc::clone(&counter);
+                let on_call = Arc::clone(&on_call);
+                let inner = Arc::clone(&base.$field);
+                Arc::new(move |input: $ty| {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    on_call(n);
+                    let inner = Arc::clone(&inner);
+                    Box::pin(async move { inner(input).await })
+                        as lhc::shared_tech::derivation::BoxFuture<
+                            lhc::shared_tech::InferenceResult,
+                        >
+                })
+            }};
+        }
+        InferenceCallbacks {
+            smooth_prompt: wrap!(smooth_prompt, SmoothPromptInput),
+            summarize_tool_result: wrap!(summarize_tool_result, SummarizeToolResultInput),
+            compress_detailed_turn: wrap!(compress_detailed_turn, CompressDetailedTurnInput),
+            summarize_chunk_brief: wrap!(summarize_chunk_brief, SummarizeChunkBriefInput),
+        }
+    }
+
+    /// M2: the compact-time drain must stop promptly when the caller cancels.
+    ///
+    /// Before M2 the drain was a single unbounded `work.drain(ref, None)` and
+    /// `cancel` was only consulted **after** it returned — so every remaining
+    /// derivation still fired (and still billed) after Codex had already failed
+    /// open to the native ladder.
+    ///
+    /// Cancellation is checked *between batches*, so the bound proven here is
+    /// "at most one batch of further derivations", not zero.
+    #[tokio::test]
+    async fn m2_cancel_mid_drain_stops_further_inference() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Baseline: how much derivation an uncancelled compact performs.
+        let tid_base = "m2-cancel-baseline";
+        let host_base = seed_bandable_thread(root, tid_base, 80).await;
+        let baseline_counter = Arc::new(AtomicUsize::new(0));
+        produce_lhc_compact(
+            tid_base,
+            Some(root),
+            &host_base,
+            true,
+            counting_callbacks(Arc::clone(&baseline_counter), Arc::new(|_| {})),
+            None,
+        )
+        .await
+        .expect("baseline produce");
+        let baseline = baseline_counter.load(Ordering::SeqCst);
+        assert!(
+            baseline > 3 * DRAIN_BATCH_ITEMS as usize,
+            "fixture: baseline derivation ({baseline}) must span several batches \
+             for the cancellation bound to mean anything"
+        );
+
+        // Cancel from inside the 5th derivation callback.
+        let tid = "m2-cancel-mid-drain";
+        let host = seed_bandable_thread(root, tid, 80).await;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cancel_at = 5usize;
+        let flag = Arc::clone(&cancel);
+        let callbacks = counting_callbacks(
+            Arc::clone(&counter),
+            Arc::new(move |n| {
+                if n >= cancel_at {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }),
+        );
+
+        let err = produce_lhc_compact(
+            tid,
+            Some(root),
+            &host,
+            true,
+            callbacks,
+            Some(Arc::clone(&cancel)),
+        )
+        .await
+        .expect_err("cancelled drain must not produce a body");
+        assert_eq!(err, LhcCompactUnavailable::Cancelled, "got {err:?}");
+
+        let at_return = counter.load(Ordering::SeqCst);
+        // Bound: the batch in flight when the flag was set may finish, and the
+        // flag is only set part-way through a batch — never a second one.
+        let bound = cancel_at + 2 * DRAIN_BATCH_ITEMS as usize;
+        assert!(
+            at_return <= bound,
+            "M2: cancellation must stop the drain within one batch — fired {at_return} \
+             derivations (bound {bound}, uncancelled baseline {baseline}); \
+             without a per-batch cancel check this reaches the baseline"
+        );
+        assert!(
+            at_return < baseline,
+            "M2: cancelled run ({at_return}) must derive strictly less than the \
+             uncancelled baseline ({baseline})"
+        );
+
+        // Nothing keeps firing after produce returned.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            at_return,
+            "M2: no derivation may fire after the cancelled produce returned"
+        );
+        assert_eq!(
+            marker_count(&list_archive(root, tid).await),
+            0,
+            "M2: cancelled compact writes no marker"
+        );
+    }
+
+    /// M2: the drain is bounded — it issues many small batches, not one
+    /// unbounded call. Proven by `remaining`/batch behaviour being reachable:
+    /// a single `max_items: None` drain would run every item in one batch and
+    /// the per-batch cancel check above could never bite.
+    #[tokio::test]
+    async fn m2_drain_batches_are_bounded_by_max_items() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "m2-bounded-batches";
+        let host = seed_bandable_thread(root, tid, 80).await;
+
+        // Count derivations observed by the *first* batch only: cancel as soon
+        // as the first batch's items have run.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&cancel);
+        let callbacks = counting_callbacks(
+            Arc::clone(&counter),
+            Arc::new(move |_| flag.store(true, Ordering::SeqCst)),
+        );
+        let err = produce_lhc_compact(tid, Some(root), &host, true, callbacks, Some(cancel))
+            .await
+            .expect_err("cancel on first derivation");
+        assert_eq!(err, LhcCompactUnavailable::Cancelled);
+        let fired = counter.load(Ordering::SeqCst);
+        assert!(
+            fired <= DRAIN_BATCH_ITEMS as usize,
+            "M2: cancelling on the very first derivation must not exceed one \
+             batch of {DRAIN_BATCH_ITEMS} items; fired {fired} (unbounded drain \
+             would run the whole backlog)"
+        );
+    }
+
+    /// L2: inference failure mid-compact must fail open — no Install of degraded body.
+    #[tokio::test]
+    async fn l2_inference_errors_fail_open_not_degraded_install() {
+        use lhc::shared_tech::CompressDetailedTurnInput;
+        use lhc::shared_tech::InferenceResult;
+        use lhc::shared_tech::SmoothPromptInput;
+        use lhc::shared_tech::SummarizeChunkBriefInput;
+        use lhc::shared_tech::SummarizeToolResultInput;
+        use std::sync::Arc;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "l2-infer-fail";
+        let host = seed_bandable_thread(root, tid, 80).await;
+        let source_before = list_archive(root, tid).await.len();
+
+        let fail = || {
+            Box::pin(async {
+                InferenceResult::Err {
+                    reason: "forced inference failure for L2".into(),
+                    request_messages: None,
+                }
+            }) as lhc::shared_tech::derivation::BoxFuture<InferenceResult>
+        };
+        let callbacks = InferenceCallbacks {
+            smooth_prompt: Arc::new(move |_input: SmoothPromptInput| fail()),
+            summarize_tool_result: Arc::new(move |_input: SummarizeToolResultInput| fail()),
+            compress_detailed_turn: Arc::new(move |_input: CompressDetailedTurnInput| fail()),
+            summarize_chunk_brief: Arc::new(move |_input: SummarizeChunkBriefInput| fail()),
+        };
+
+        let outcome = produce_lhc_compact(tid, Some(root), &host, true, callbacks, None).await;
+        match outcome {
+            Err(LhcCompactUnavailable::DerivationFailed(reason)) => {
+                assert!(!reason.is_empty(), "DerivationFailed must carry a reason");
+            }
+            Ok(r) => panic!(
+                "L2: inference failure must not Install; got body_items={} degraded={}",
+                r.body.len(),
+                r.receipt.degraded.len()
+            ),
+            Err(other) => panic!("expected DerivationFailed, got {other:?}"),
+        }
+        // No marker committed (produce never succeeded).
+        assert_eq!(
+            marker_count(&list_archive(root, tid).await),
+            0,
+            "L2: no compact marker on failure"
+        );
+        assert_eq!(
+            list_archive(root, tid).await.len(),
+            source_before,
+            "L2: archive source size unchanged on fail-open"
+        );
+    }
+}

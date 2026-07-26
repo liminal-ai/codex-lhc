@@ -339,10 +339,9 @@ mod tests {
             "[features]\nsecret_auth_storage = false\n",
         )?;
 
-        let config_manager =
-            crate::config_manager::ConfigManager::without_managed_config_for_tests(
-                temp_dir.path().to_path_buf(),
-            );
+        let config_manager = crate::config_manager::ConfigManager::without_managed_config_for_tests(
+            temp_dir.path().to_path_buf(),
+        );
         let mut config = config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,

@@ -18,7 +18,6 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::RawItemContributor;
 use codex_extension_api::RawItemInput;
 use codex_extension_api::RawItemProvenance;
-use codex_extension_api::ThreadLifecycleContributor;
 use codex_extension_api::ThreadStartInput;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::install_with_root;

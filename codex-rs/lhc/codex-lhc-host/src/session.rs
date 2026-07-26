@@ -7,22 +7,25 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use lhc::intake_stream::EventRecord;
 use lhc::sdk::Lhc;
 use lhc::sdk::OpResult;
 use lhc::sdk::SdkConfig;
 use lhc::sdk::ThreadRef;
 use lhc::sdk::init_lhc;
 use lhc::shared_tech::SdkMode;
-use lhc::shared_tech::create_deterministic_inference_callbacks;
 use lhc::threads::NewThreadInput;
 use lhc::threads::ResolveInput;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::error;
 use tracing::warn;
 
+use lhc::shared_tech::InferenceCallbacks;
+
 use crate::gating::lhc_root;
 use crate::idempotency::OccurrenceTracker;
 use crate::idempotency::seed_occurrence_from_keys;
+use crate::inference::lhc_inference_callbacks;
 
 /// Serialize registry schema init — concurrent `new_thread` races on CREATE TABLE.
 fn registry_lock() -> &'static AsyncMutex<()> {
@@ -49,16 +52,24 @@ pub struct LhcSession {
 }
 
 impl LhcSession {
-    /// Create or reopen the per-thread thread under `root` (or `CODEX_LHC_ROOT` / default).
-    ///
-    /// Returns the session and an occurrence tracker seeded from LHC's stored
-    /// events. Refuses to open if `list_events` fails.
+    /// Create or reopen with deterministic inference (capture path).
     pub async fn open(
         thread_id: &str,
         cwd: Option<&str>,
         root: Option<&Path>,
     ) -> Option<(Self, OccurrenceTracker)> {
-        let root_buf = root.map(|p| p.to_path_buf()).unwrap_or_else(lhc_root);
+        let callbacks = lhc_inference_callbacks(false).ok()?;
+        Self::open_with_inference(thread_id, cwd, root, callbacks).await
+    }
+
+    /// Create or reopen with explicit inference callbacks (compact / live path).
+    pub async fn open_with_inference(
+        thread_id: &str,
+        cwd: Option<&str>,
+        root: Option<&Path>,
+        inference_callbacks: InferenceCallbacks,
+    ) -> Option<(Self, OccurrenceTracker)> {
+        let root_buf = root.map(Path::to_path_buf).unwrap_or_else(lhc_root);
         let root = root_buf.as_path();
         if let Err(err) = std::fs::create_dir_all(root.join("threads")) {
             error!(?err, "LHC: failed to create threads directory");
@@ -68,11 +79,8 @@ impl LhcSession {
         let registry_path = root.join("registry.sqlite");
         let file_path = thread_file_path(root, thread_id);
 
-        // Chunk 1 capture needs a valid initLhc XOR pair; derivation is unused
-        // until Chunk 2. Deterministic callbacks satisfy construction without
-        // host ModelClient wiring.
         let lhc = init_lhc(SdkConfig {
-            inference_callbacks: Some(create_deterministic_inference_callbacks()),
+            inference_callbacks: Some(inference_callbacks),
             inference: None,
             mode: SdkMode::Manual,
             clock: None,
@@ -121,11 +129,11 @@ impl LhcSession {
         let events = self.list_events().await?;
         self.generation = events
             .iter()
-            .map(|e| e.event_order())
+            .map(EventRecord::event_order)
             .max()
             .unwrap_or(0)
             .max(0) as u64;
-        let keys: Vec<&str> = events.iter().map(|e| e.idempotency_key()).collect();
+        let keys: Vec<&str> = events.iter().map(EventRecord::idempotency_key).collect();
         Ok(seed_occurrence_from_keys(keys))
     }
 
@@ -272,6 +280,9 @@ async fn open_existing(
     }
 }
 
+/// Serialize registry CREATE TABLE races. Intentional MutexGuard hold across
+/// the SDK await — concurrent `new_thread` on the same registry is unsafe.
+#[allow(clippy::await_holding_invalid_type)]
 async fn create_new(
     lhc: &Lhc,
     thread_id: &str,

@@ -43,6 +43,9 @@ pub(crate) struct SessionState {
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
     next_turn_is_first: bool,
+    /// Last LHC durable derived record co-written with CompactedItem (I2).
+    /// Survives process restart when reseeded from rollout reconstruction.
+    pub(crate) last_lhc_durable_derived: Option<String>,
 }
 
 impl SessionState {
@@ -75,7 +78,16 @@ impl SessionState {
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
             next_turn_is_first: true,
+            last_lhc_durable_derived: None,
         }
+    }
+
+    pub(crate) fn set_last_lhc_durable_derived(&mut self, message: Option<String>) {
+        self.last_lhc_durable_derived = message;
+    }
+
+    pub(crate) fn last_lhc_durable_derived(&self) -> Option<&str> {
+        self.last_lhc_durable_derived.as_deref()
     }
 
     // History helpers

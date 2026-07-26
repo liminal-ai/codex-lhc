@@ -1,21 +1,60 @@
-//! LHC host adapter for Codex — Chunk 1 capture + Chunk 2a band-shape helpers.
+//! LHC host adapter for Codex — capture + compact bridge.
 //!
-//! Chunk 1: capture only. Chunk 2a: band-shaped history construction for the
-//! pre-bridge model-tolerance harness (no compact bridge yet). Chunks 2b–3
-//! remain (bridge + live cert).
+//! Chunk 1: capture. Chunk 2a: band-shape helpers. Chunk 2b: compact arm
+//! produces a served body + archive compact marker (no body re-ingest).
+//! Chunk 3: live cert.
 
 mod band_shape;
 mod capture;
+mod compact_bridge;
 mod gating;
 mod idempotency;
+mod inference;
 mod install;
 mod mapping;
 mod session;
 
-pub use band_shape::{
-    BandShapeItem, BandShapeReport, DEFAULT_FULL_BAND_USER_TURNS, band_shaped_history_from_events,
-    synthetic_minimal_band_history,
-};
+pub use band_shape::BandShapeItem;
+pub use band_shape::BandShapeReport;
+pub use band_shape::DEFAULT_FULL_BAND_USER_TURNS;
+pub use band_shape::band_shaped_history_from_events;
+pub use band_shape::synthetic_minimal_band_history;
+pub use compact_bridge::CompactMarker;
+pub use compact_bridge::DerivedProvenance;
+pub use compact_bridge::LhcCompactResult;
+pub use compact_bridge::LhcCompactUnavailable;
+pub use compact_bridge::VIEW_MAP_SEAM_ID;
+pub use compact_bridge::archive_tip_identity;
+pub use compact_bridge::commit_compact_marker;
+pub use compact_bridge::content_identity_digest;
+pub use compact_bridge::derived_ids_from_archive;
+pub use compact_bridge::estimate_response_items_tokens;
+pub use compact_bridge::host_history_coverage_gap;
+pub use compact_bridge::host_history_coverage_gap_with_derived;
+pub use compact_bridge::host_history_coverage_gap_with_provenance;
+pub use compact_bridge::host_items_missing_from_archive;
+pub use compact_bridge::host_items_missing_from_archive_with_derived;
+pub use compact_bridge::host_items_missing_from_archive_with_provenance;
+pub use compact_bridge::import_host_items_into_archive;
+pub use compact_bridge::llm_request_context_to_response_items;
+pub use compact_bridge::produce_lhc_compact;
+pub use compact_bridge::produce_lhc_compact_deterministic;
+pub use compact_bridge::produce_lhc_compact_with_derived;
+pub use compact_bridge::produce_lhc_compact_with_provenance;
+pub use inference::LhcInferenceError;
+pub use inference::lhc_inference_callbacks;
+/// Re-export so core can pass live ModelClient-backed callbacks without a
+/// direct `lhc` path dep.
+pub use lhc::shared_tech::CompressDetailedTurnInput;
+pub use lhc::shared_tech::InferenceCallbacks;
+pub use lhc::shared_tech::InferenceResult;
+pub use lhc::shared_tech::SmoothPromptInput;
+pub use lhc::shared_tech::SummarizeChunkBriefInput;
+pub use lhc::shared_tech::SummarizeToolResultInput;
+/// Return type of every [`InferenceCallbacks`] lane — lets hosts wrap the
+/// callbacks (counting, tracing, delaying) without a direct `lhc` path dep.
+pub type BoxInferenceFuture = lhc::shared_tech::derivation::BoxFuture<InferenceResult>;
+pub use session::LhcSession;
 
 pub use capture::CAPTURE_QUEUE_CAP;
 pub use capture::CaptureHandle;
@@ -33,6 +72,10 @@ pub use idempotency::turn_end_key;
 pub use install::LhcCaptureSlot;
 pub use install::LhcTurnId;
 pub use install::install;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::reset_session_derived_cap_for_test;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::set_session_derived_cap_for_test;
 pub use mapping::ACTOR_ASSISTANT;
 pub use mapping::ACTOR_SYSTEM;
 pub use mapping::ACTOR_TOOL;
@@ -63,8 +106,6 @@ pub use install::install_with_root;
 pub use install::install_with_root_and_labels;
 #[cfg(any(test, feature = "test-util"))]
 pub use install::wait_for_handle;
-#[cfg(any(test, feature = "test-util"))]
-pub use session::LhcSession;
 
 #[cfg(test)]
 mod tests {

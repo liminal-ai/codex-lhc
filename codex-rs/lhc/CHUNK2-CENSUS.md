@@ -122,7 +122,7 @@ Highest **shape-risk** consumers for band-shaped replacement (still native):
 | Submit failures ×3 | `capture_disabled` + runtime_note | Thread-lifetime latch |
 | Open / worker spawn fail | `open_failed` / degraded | No capture |
 | Core contributor panic | `catch_unwind` in `send_raw_response_items` | Session continues |
-| **Compact write-back** | Not teed into capture | LHC may diverge until bridge policy |
+| **Compact write-back (2b)** | Body **not** re-ingested; archive gets `lhc_compact_marker` runtime_note (`CompactReceipt`-shaped). Host history equals produced body (law 1). | Marker is one bounded note; body install hard-capped at 512 items |
 
 Degraded latch: subsequent captures refused — loud truncated record (self-
 describing note when possible). Fits law 3 for *session* path (never blocks);

@@ -33,6 +33,27 @@ impl SessionTask for CompactTask {
     ) -> SessionTaskResult {
         let session = session.clone_session();
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
+        // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
+        match crate::compact_lhc::try_run_lhc_compact_arm(
+            &session,
+            ctx.as_ref(),
+            crate::compact::InitialContextInjection::DoNotInject,
+            /*manual*/ true,
+        )
+        .await?
+        {
+            crate::compact_lhc::LhcCompactAttempt::Installed { .. } => {
+                super::emit_compact_metric(
+                    &session.services.session_telemetry,
+                    "lhc",
+                    /*manual*/ true,
+                );
+                return Ok(None);
+            }
+            crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
+                tracing::debug!(%reason, "LHC compact arm unavailable; native ladder continues");
+            }
+        }
         if ctx.config.features.enabled(Feature::TokenBudget) {
             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
             return Ok(None);

@@ -5620,6 +5620,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
+        #[cfg(test)]
+        lhc_test_inference: std::sync::Mutex::new(None),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
             &config.features,
@@ -7793,6 +7795,8 @@ where
             /*attestation_provider*/ None,
             config.http_client_factory(),
         ),
+        #[cfg(test)]
+        lhc_test_inference: std::sync::Mutex::new(None),
         code_mode_service: crate::tools::code_mode::CodeModeService::new(
             Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
             &config.features,

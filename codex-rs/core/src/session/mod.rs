@@ -1316,6 +1316,9 @@ impl Session {
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
                     .await;
+                // I2: re-seed durable LHC derived record from CompactedItem.message.
+                self.seed_last_lhc_durable_from_rollout(&rollout_items)
+                    .await;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -1354,6 +1357,8 @@ impl Session {
                 let turn_context = self.new_default_turn().await;
                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                    .await;
+                self.seed_last_lhc_durable_from_rollout(&rollout_items)
                     .await;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
@@ -3220,7 +3225,7 @@ impl Session {
     ) {
         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
         let compacted_item = CompactedItem {
-            message: metadata.message,
+            message: metadata.message.clone(),
             replacement_history: Some(items.clone()),
             window_number: Some(metadata.window_number),
             first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
@@ -3239,6 +3244,10 @@ impl Session {
                 let snapshot = world_state.snapshot();
                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
                 state.history.set_world_state_baseline(snapshot);
+            }
+            // I2: durable LHC derived record rides the same CompactedItem write.
+            if codex_lhc_host::CompactMarker::is_durable_writeback_record(&metadata.message) {
+                state.set_last_lhc_durable_derived(Some(metadata.message.clone()));
             }
         }
 
@@ -3259,6 +3268,27 @@ impl Session {
         }
     }
 
+    /// I2: remember durable LHC derived record from CompactedItem messages in rollout.
+    pub(crate) async fn seed_last_lhc_durable_from_rollout(&self, rollout_items: &[RolloutItem]) {
+        let last = rollout_items.iter().rev().find_map(|item| match item {
+            RolloutItem::Compacted(c)
+                if codex_lhc_host::CompactMarker::is_durable_writeback_record(&c.message) =>
+            {
+                Some(c.message.clone())
+            }
+            _ => None,
+        });
+        if let Some(msg) = last {
+            let mut state = self.state.lock().await;
+            state.set_last_lhc_durable_derived(Some(msg));
+        }
+    }
+
+    pub(crate) async fn last_lhc_durable_derived_message(&self) -> Option<String> {
+        let state = self.state.lock().await;
+        state.last_lhc_durable_derived().map(str::to_string)
+    }
+
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
         let rollout_items: Vec<RolloutItem> = items
             .iter()
@@ -3270,6 +3300,23 @@ impl Session {
 
     pub fn enabled(&self, feature: Feature) -> bool {
         self.features.enabled(feature)
+    }
+
+    /// Test-only: toggle a session feature after construction.
+    #[cfg(test)]
+    pub(crate) fn set_feature_for_test(
+        &mut self,
+        feature: Feature,
+        enabled: bool,
+    ) -> crate::config::ConstraintResult<()> {
+        self.features.set_enabled(feature, enabled)
+    }
+
+    /// Test-only: seed auto-compact prefill for law-2 assertions.
+    #[cfg(test)]
+    pub(crate) async fn set_auto_compact_window_estimated_prefill_for_test(&self, tokens: i64) {
+        let mut state = self.state.lock().await;
+        state.set_auto_compact_window_estimated_prefill(tokens);
     }
 
     pub(crate) fn features(&self) -> ManagedFeatures {

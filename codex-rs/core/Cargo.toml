@@ -50,6 +50,8 @@ codex-shell-command = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
 codex-hooks = { workspace = true }
+# LHC-HOOK: fork-only LHC capture + compact bridge adapter.
+codex-lhc-host = { workspace = true }
 codex-http-client = { workspace = true }
 codex-install-context = { workspace = true }
 codex-network-proxy = { workspace = true }

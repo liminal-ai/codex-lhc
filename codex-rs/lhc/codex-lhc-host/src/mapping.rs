@@ -293,7 +293,7 @@ pub fn map_item(
         } => {
             let tool_call_id = id
                 .as_ref()
-                .map(|i| i.to_string())
+                .map(ToString::to_string)
                 .unwrap_or_else(|| format!("synthetic:{digest}"));
             let arguments = web_search_arguments(action.as_ref());
             vec![tool_call_event(
@@ -315,7 +315,7 @@ pub fn map_item(
         } => {
             let tool_call_id = id
                 .as_ref()
-                .map(|i| i.to_string())
+                .map(ToString::to_string)
                 .unwrap_or_else(|| format!("synthetic:{digest}"));
             let mut args = Map::new();
             if let Some(p) = revised_prompt {

@@ -1,0 +1,2757 @@
+diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
+index f911dc7921..85c83fe4ea 100644
+--- a/codex-rs/core/Cargo.toml
++++ b/codex-rs/core/Cargo.toml
+@@ -50,6 +50,8 @@ codex-shell-command = { workspace = true }
+ codex-execpolicy = { workspace = true }
+ codex-git-utils = { workspace = true }
+ codex-hooks = { workspace = true }
++# LHC-HOOK: fork-only LHC capture + compact bridge adapter.
++codex-lhc-host = { workspace = true }
+ codex-http-client = { workspace = true }
+ codex-install-context = { workspace = true }
+ codex-network-proxy = { workspace = true }
+diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
+index 09595183b1..06ab2bb299 100644
+--- a/codex-rs/core/src/compact.rs
++++ b/codex-rs/core/src/compact.rs
+@@ -64,6 +64,9 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+ /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
+ /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
+ /// initial context into the replacement history just above the last real user message.
++// LHC-HOOK: Clone required so auto-compact can try the LHC arm then fall through
++// to native arms with the same injection (Chunk 2b).
++#[derive(Clone)]
+ pub(crate) enum InitialContextInjection {
+     BeforeLastUserMessage {
+         world_state: Arc<WorldState>,
+diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
+new file mode 100644
+index 0000000000..358a9973ac
+--- /dev/null
++++ b/codex-rs/core/src/compact_lhc.rs
+@@ -0,0 +1,604 @@
++//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
++//!
++//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
++//! archive is missing, degraded, or compact fails.
++//!
++//! Marker is committed only after durable write-back. Body is never re-ingested.
++
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::atomic::AtomicBool;
++use std::sync::atomic::Ordering;
++use std::time::Duration;
++
++use codex_features::Feature;
++use codex_lhc_host::CompactMarker;
++use codex_lhc_host::DerivedProvenance;
++use codex_lhc_host::InferenceCallbacks;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::LhcCompactResult;
++use codex_lhc_host::commit_compact_marker;
++use codex_lhc_host::content_identity_digest;
++use codex_lhc_host::estimate_response_items_tokens;
++use codex_lhc_host::item_stable_id;
++use codex_lhc_host::produce_lhc_compact_with_provenance;
++use codex_protocol::error::CodexErr;
++use codex_protocol::error::Result as CodexResult;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use tracing::debug;
++use tracing::info;
++use tracing::warn;
++
++use crate::compact::CompactedHistoryMetadata;
++use crate::compact::InitialContextInjection;
++use crate::compact::build_compaction_initial_context;
++use crate::compact::insert_initial_context_before_last_real_user_or_summary;
++use crate::session::context_window::context_window_token_status;
++use crate::session::session::Session;
++use crate::session::turn_context::TurnContext;
++
++const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
++
++// Test-only shrink of COMPACT_THREAD_TIMEOUT so the timeout → cancel →
++// bounded-drain chain can be driven in seconds instead of minutes (M2).
++// `0` means "use the production constant".
++//
++// Thread-local, not a global: the test harness runs each test on its own
++// thread and `#[tokio::test]` awaits the arm inline, so a global would leak a
++// 400 ms compact timeout into every test running concurrently.
++#[cfg(test)]
++thread_local! {
++    static COMPACT_THREAD_TIMEOUT_MS_OVERRIDE: std::cell::Cell<u64> =
++        const { std::cell::Cell::new(0) };
++}
++
++#[cfg(test)]
++pub(crate) fn set_compact_thread_timeout_ms_for_test(ms: u64) {
++    COMPACT_THREAD_TIMEOUT_MS_OVERRIDE.with(|c| c.set(ms));
++}
++
++fn compact_thread_timeout() -> Duration {
++    #[cfg(test)]
++    {
++        let ms = COMPACT_THREAD_TIMEOUT_MS_OVERRIDE.with(std::cell::Cell::get);
++        if ms > 0 {
++            return Duration::from_millis(ms);
++        }
++    }
++    COMPACT_THREAD_TIMEOUT
++}
++
++#[derive(Debug)]
++pub(crate) enum LhcCompactAttempt {
++    Installed {
++        /// Served body installed on the host (law-1 reference).
++        #[allow(dead_code)]
++        body: Vec<ResponseItem>,
++        /// Receipt-backed marker (committed after write-back).
++        #[allow(dead_code)]
++        marker: CompactMarker,
++    },
++    Unavailable {
++        reason: String,
++    },
++}
++
++// LHC-HOOK: LHC compact arm entry (manual + auto ladders).
++
++//
++// J1: production default is real ModelClient inference (pinned model, lowest
++// effort). Deterministic callbacks are never the silent default — tests must
++// call [`try_run_lhc_compact_arm_with_callbacks`] or install a cfg(test)
++// override. If the real client cannot be resolved, fail open to the native
++// ladder (Unavailable) — never substitute canned text.
++#[tracing::instrument(level = "info", skip_all, fields(manual = manual))]
++pub(crate) async fn try_run_lhc_compact_arm(
++    sess: &Arc<Session>,
++    turn_context: &TurnContext,
++    initial_context_injection: InitialContextInjection,
++    manual: bool,
++) -> CodexResult<LhcCompactAttempt> {
++    let callbacks = match select_production_inference_callbacks(sess.as_ref()).await {
++        Ok(c) => c,
++        Err(reason) => {
++            warn!(
++                %reason,
++                manual,
++                "LHC compact inference unavailable; failing open to native arms"
++            );
++            return Ok(LhcCompactAttempt::Unavailable { reason });
++        }
++    };
++    try_run_lhc_compact_arm_with_callbacks(
++        sess,
++        turn_context,
++        initial_context_injection,
++        manual,
++        callbacks,
++    )
++    .await
++}
++
++/// Explicit callback injection — used by offline unit tests with deterministic
++/// callbacks. Production entry never reaches this with canned text.
++pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
++    sess: &Arc<Session>,
++    turn_context: &TurnContext,
++    initial_context_injection: InitialContextInjection,
++    manual: bool,
++    callbacks: InferenceCallbacks,
++) -> CodexResult<LhcCompactAttempt> {
++    if !sess.enabled(Feature::LhcCapture) {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "Feature::LhcCapture off".into(),
++        });
++    }
++
++    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "no LhcCaptureSlot (capture not opened)".into(),
++        });
++    };
++    let Some(handle) = slot.get() else {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "capture handle not ready".into(),
++        });
++    };
++    if handle.is_degraded() {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "capture degraded".into(),
++        });
++    }
++
++    handle.flush().await;
++
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(|p| p.to_path_buf());
++    let host_items = sess.clone_history().await.raw_items().to_vec();
++
++    let cancel = Arc::new(AtomicBool::new(false));
++
++    // I2: re-seed slot from durable CompactedItem record (resume / crash window).
++    reseed_slot_from_durable_session(sess.as_ref(), &slot).await;
++
++    let host_token_estimate = estimate_response_items_tokens(&host_items);
++    // H1/G3: ids + digests from prior write-backs (process-local + durable reseed).
++    let session_derived = DerivedProvenance {
++        ids: slot.derived_ids(),
++        digests: slot.derived_digests(),
++    };
++    let produced = match produce_lhc_compact_on_thread(
++        thread_id.clone(),
++        root.clone(),
++        host_items,
++        /*import_missing*/ true,
++        callbacks,
++        Arc::clone(&cancel),
++        session_derived,
++    )
++    .await
++    {
++        Ok(v) => v,
++        Err(err) => {
++            warn!(%err, manual, "LHC compact unavailable; failing open to native arms");
++            return Ok(LhcCompactAttempt::Unavailable { reason: err });
++        }
++    };
++
++    let mut new_history = produced.body.clone();
++    if new_history.is_empty() {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "LHC compact produced empty body".into(),
++        });
++    }
++
++    // F3: zero-reduction is not an install — fall through to native ladder.
++    let body_token_estimate = estimate_response_items_tokens(&new_history);
++    if body_token_estimate >= host_token_estimate {
++        let reason = format!(
++            "NoReduction: body_tokens={body_token_estimate} host_tokens={host_token_estimate} \
++             items_body={} (LHC pass-through or non-reducing compact)",
++            new_history.len()
++        );
++        warn!(%reason, manual, "LHC compact did not reduce; failing open to native arms");
++        return Ok(LhcCompactAttempt::Unavailable { reason });
++    }
++
++    let (initial_context, world_state_baseline) =
++        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
++    if !initial_context.is_empty() {
++        new_history =
++            insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
++    }
++
++    // Token bound against context window (after injection). R8.
++    if let Some(reason) = body_exceeds_window(turn_context, &new_history) {
++        warn!(%reason, "LHC compact body over window; fail open");
++        return Ok(LhcCompactAttempt::Unavailable { reason });
++    }
++
++    let reference_context_item = match &initial_context_injection {
++        InitialContextInjection::DoNotInject => None,
++        InitialContextInjection::BeforeLastUserMessage { .. } => {
++            Some(turn_context.to_turn_context_item())
++        }
++    };
++
++    // Pre-assign host ids so the durable CompactedItem record includes them in
++    // the same write as the body (I2). replace_compacted_history will not reassign.
++    let mut body_with_ids = new_history;
++    for item in &mut body_with_ids {
++        if item_stable_id(item).is_none() {
++            // Mirror Session::assign_missing_response_item_id prefix path.
++            if let Some(prefix) = item.id_prefix() {
++                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
++            }
++        }
++    }
++    let assigned_ids: Vec<String> = body_with_ids.iter().filter_map(item_stable_id).collect();
++    if assigned_ids.is_empty() {
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: "derived provenance: no stable ids for write-back body".into(),
++        });
++    }
++    let digests: Vec<String> = body_with_ids.iter().map(content_identity_digest).collect();
++
++    let mut marker = produced.marker;
++    marker.derived_host_ids = assigned_ids.clone();
++    marker.derived_content_digests = digests.clone();
++
++    // I1: model-visible LHC note is small/constant. I2: durable full record rides
++    // CompactedItem.message (same durable write as the body).
++    let durable_message = marker.to_durable_writeback_record();
++    let expected_body = body_with_ids.clone();
++    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
++    sess.replace_compacted_history(
++        body_with_ids,
++        reference_context_item,
++        world_state_baseline,
++        CompactedHistoryMetadata {
++            message: durable_message,
++            window_number,
++            window_ids,
++        },
++    )
++    .await;
++    sess.recompute_token_usage(turn_context).await;
++
++    let installed = sess.clone_history().await;
++    let installed_items = installed.raw_items();
++    if !response_items_structurally_equal(installed_items, &expected_body) {
++        return Err(CodexErr::UnsupportedOperation(format!(
++            "LHC compact law-1 violation: host history drifted from LHC body (host={}, body={})",
++            installed_items.len(),
++            expected_body.len()
++        )));
++    }
++
++    // Process-local slot (fast path); durable already on CompactedItem.
++    if let Err(err) =
++        slot.mark_derived_after_writeback(assigned_ids.iter().cloned(), digests.iter().cloned())
++    {
++        warn!(%err, manual, "LHC compact failed to record derived provenance on slot");
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: format!("derived provenance record failed: {err}"),
++        });
++    }
++
++    // LHC archive: small constant-size note only (I1). Digests stay off the model path.
++    if let Err(err) = commit_marker_on_thread(thread_id, root, marker.clone()).await {
++        warn!(
++            %err,
++            manual,
++            "LHC compact archive note commit failed after write-back; failing open \
++             (durable derived record already on CompactedItem + slot)"
++        );
++        return Ok(LhcCompactAttempt::Unavailable {
++            reason: format!("marker commit failed after write-back: {err}"),
++        });
++    }
++
++    info!(
++        manual,
++        items = expected_body.len(),
++        covered_from = marker.covered_from,
++        compact_point = marker.compact_point,
++        total_tokens = marker.total_tokens,
++        derived_ids = marker.derived_host_ids.len(),
++        runtime_note_chars = marker.to_runtime_note_text().len(),
++        "LHC compact arm installed write-back from real CompactReceipt"
++    );
++
++    Ok(LhcCompactAttempt::Installed {
++        body: expected_body,
++        marker,
++    })
++}
++
++/// M1: hand the LHC capture slot the **production** derivation callbacks so its
++/// `on_thread_idle` pump can derive in the background.
++///
++/// Resolved once per thread (the models-manager lookup is not free) and only
++/// through [`select_production_inference_callbacks`] — the same selection the
++/// compact arm uses, so the idle pump can never be the path that quietly
++/// persists deterministic text into the durable record (J1). If the derivation
++/// model is unavailable the pump simply stays off and every derivation falls
++/// back to compact time, exactly as before this hook existed.
++pub(crate) async fn seed_lhc_idle_derivation_callbacks(sess: &Session) {
++    if !sess.enabled(Feature::LhcCapture) {
++        return;
++    }
++    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
++        return;
++    };
++    if slot.has_derivation_callbacks() {
++        return;
++    }
++    match select_production_inference_callbacks(sess).await {
++        Ok(callbacks) => slot.set_derivation_callbacks(callbacks),
++        Err(reason) => {
++            debug!(
++                %reason,
++                "LHC background derivation callbacks unavailable; idle pump stays off"
++            );
++        }
++    }
++}
++
++/// Production inference selection: real ModelClient bridge only.
++///
++/// Under `cfg(test)`, an explicit session override may supply callbacks (for
++/// CompactTask / auto-ladder tests that cannot pass callbacks through the
++/// production entry). The override is never set for real sessions.
++async fn select_production_inference_callbacks(
++    sess: &Session,
++) -> Result<InferenceCallbacks, String> {
++    #[cfg(test)]
++    {
++        if let Ok(guard) = sess.services.lhc_test_inference.lock() {
++            if let Some(cbs) = guard.as_ref() {
++                return Ok(cbs.clone());
++            }
++        }
++    }
++    crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
++}
++
++/// I2/L3: re-seed process slot from durable CompactedItem record.
++/// Durable is source of truth — always merge even when the cache is warm.
++async fn reseed_slot_from_durable_session(sess: &Session, slot: &LhcCaptureSlot) {
++    let Some(msg) = sess.last_lhc_durable_derived_message().await else {
++        return;
++    };
++    let Some(marker) = CompactMarker::parse_durable_writeback_record(&msg) else {
++        return;
++    };
++    slot.ensure_derived_from_durable(
++        marker.derived_host_ids.iter().cloned(),
++        marker.derived_content_digests.iter().cloned(),
++    );
++}
++
++fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
++    let window = turn_context.model_context_window().or_else(|| {
++        turn_context
++            .config
++            .model_auto_compact_token_limit
++            .or_else(|| turn_context.model_info.auto_compact_token_limit())
++    })?;
++    // Cheap char/4 estimate (same order as LHC estimate_tokens).
++    let chars: usize = body
++        .iter()
++        .map(|item| match item {
++            ResponseItem::Message { content, .. } => content
++                .iter()
++                .map(|c| match c {
++                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
++                        text.len()
++                    }
++                    ContentItem::InputImage { image_url, .. } => image_url.len(),
++                    ContentItem::InputAudio { audio_url } => audio_url.len(),
++                })
++                .sum::<usize>(),
++            _ => 64,
++        })
++        .sum();
++    let est_tokens = (chars / 4) as i64;
++    if est_tokens > window {
++        Some(format!(
++            "estimated body tokens {est_tokens} exceed context window {window}"
++        ))
++    } else {
++        None
++    }
++}
++
++/// Structural equality for law 1: role + each content variant (incl. media URLs).
++pub(crate) fn response_items_structurally_equal(a: &[ResponseItem], b: &[ResponseItem]) -> bool {
++    if a.len() != b.len() {
++        return false;
++    }
++    a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
++        (
++            ResponseItem::Message {
++                role: r1,
++                content: c1,
++                phase: p1,
++                ..
++            },
++            ResponseItem::Message {
++                role: r2,
++                content: c2,
++                phase: p2,
++                ..
++            },
++        ) => r1 == r2 && p1 == p2 && content_items_equal(c1, c2),
++        (x, y) => format!("{x:?}") == format!("{y:?}"),
++    })
++}
++
++fn content_items_equal(a: &[ContentItem], b: &[ContentItem]) -> bool {
++    if a.len() != b.len() {
++        return false;
++    }
++    a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
++        (ContentItem::InputText { text: t1 }, ContentItem::InputText { text: t2 }) => t1 == t2,
++        (ContentItem::OutputText { text: t1 }, ContentItem::OutputText { text: t2 }) => t1 == t2,
++        (
++            ContentItem::InputImage {
++                image_url: u1,
++                detail: d1,
++            },
++            ContentItem::InputImage {
++                image_url: u2,
++                detail: d2,
++            },
++        ) => u1 == u2 && d1 == d2,
++        (ContentItem::InputAudio { audio_url: u1 }, ContentItem::InputAudio { audio_url: u2 }) => {
++            u1 == u2
++        }
++        _ => false,
++    })
++}
++
++async fn produce_lhc_compact_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    host_items: Vec<ResponseItem>,
++    import_missing: bool,
++    callbacks: codex_lhc_host::InferenceCallbacks,
++    cancel: Arc<AtomicBool>,
++    session_derived: DerivedProvenance,
++) -> Result<LhcCompactResult, String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let cancel_thread = Arc::clone(&cancel);
++    let join = std::thread::Builder::new()
++        .name(format!("lhc-compact-{thread_id}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| format!("runtime: {e}"))?;
++                rt.block_on(async move {
++                    produce_lhc_compact_with_provenance(
++                        &thread_id,
++                        root.as_deref(),
++                        &host_items,
++                        import_missing,
++                        callbacks,
++                        Some(cancel_thread),
++                        &session_derived,
++                    )
++                    .await
++                    .map_err(|e| e.to_string())
++                })
++            }));
++            let out = match result {
++                Ok(inner) => inner,
++                Err(payload) => {
++                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
++                        (*s).to_string()
++                    } else if let Some(s) = payload.downcast_ref::<String>() {
++                        s.clone()
++                    } else {
++                        "lhc-compact thread panicked".into()
++                    };
++                    Err(msg)
++                }
++            };
++            let _ = tx.send(out);
++        })
++        .map_err(|e| format!("spawn lhc-compact thread: {e}"))?;
++
++    let thread_timeout = compact_thread_timeout();
++    match tokio::time::timeout(thread_timeout, rx).await {
++        Ok(Ok(r)) => {
++            // Success path: surface panics without hanging the turn forever.
++            // Bound the join so a stuck thread cannot pin the worker.
++            match tokio::time::timeout(Duration::from_secs(5), async {
++                tokio::task::spawn_blocking(move || join.join())
++                    .await
++                    .map_err(|e| format!("join spawn_blocking failed: {e}"))
++            })
++            .await
++            {
++                Ok(Ok(Ok(()))) => {}
++                Ok(Ok(Err(_))) => {
++                    if r.is_ok() {
++                        return Err("lhc-compact thread panicked after success".into());
++                    }
++                }
++                Ok(Err(e)) => warn!(%e, "join spawn_blocking failed"),
++                Err(_) => {
++                    // Detach: drop JoinHandle (detaches thread) rather than block.
++                    warn!("lhc-compact join timed out after success path; detaching thread");
++                }
++            }
++            r
++        }
++        Ok(Err(_)) => {
++            cancel.store(true, Ordering::SeqCst);
++            // Detach rather than join — timeout must bound the caller (F4).
++            drop(join);
++            Err("lhc-compact thread dropped".into())
++        }
++        Err(_) => {
++            cancel.store(true, Ordering::SeqCst);
++            // F4: do not await join on the timeout path — leak/detach the thread
++            // so the turn can fail-open. A leaked thread beats a hung session.
++            drop(join);
++            warn!(
++                timeout_ms = thread_timeout.as_millis() as u64,
++                "lhc-compact timed out; detaching worker thread and failing open"
++            );
++            Err(format!(
++                "lhc-compact timed out after {}ms",
++                thread_timeout.as_millis()
++            ))
++        }
++    }
++}
++
++async fn commit_marker_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    marker: CompactMarker,
++) -> Result<(), String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    std::thread::Builder::new()
++        .name(format!("lhc-marker-{thread_id}"))
++        .spawn(move || {
++            let rt = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(e) => {
++                    let _ = tx.send(Err(format!("runtime: {e}")));
++                    return;
++                }
++            };
++            let r = rt.block_on(commit_compact_marker(&thread_id, root.as_deref(), &marker));
++            let _ = tx.send(r);
++        })
++        .map_err(|e| format!("spawn marker thread: {e}"))?;
++    match tokio::time::timeout(Duration::from_secs(30), rx).await {
++        Ok(Ok(r)) => r,
++        Ok(Err(_)) => Err("marker thread dropped".into()),
++        Err(_) => Err("marker commit timed out".into()),
++    }
++}
++
++/// Used by law-2 next-turn test.
++#[cfg_attr(not(test), allow(dead_code))]
++pub(crate) async fn token_limit_reached(sess: &Session, turn_context: &TurnContext) -> bool {
++    context_window_token_status(sess, turn_context)
++        .await
++        .token_limit_reached
++}
++
++#[cfg(test)]
++#[path = "compact_lhc_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
+new file mode 100644
+index 0000000000..14bf9ab18d
+--- /dev/null
++++ b/codex-rs/core/src/compact_lhc_tests.rs
+@@ -0,0 +1,1382 @@
++//! Tests for the LHC compact arm (Chunk 2b fix round 1).
++//! Rule zero: production paths + structural equality. No include_str.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_extension_api::ExtensionData;
++use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::ThreadStartInput;
++use codex_features::Feature;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::install_with_root;
++use codex_lhc_host::wait_for_handle;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::MessagePhase;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::SessionSource;
++use codex_protocol::user_input::UserInput;
++use pretty_assertions::assert_eq;
++use tempfile::tempdir;
++
++use super::LhcCompactAttempt;
++use super::response_items_structurally_equal;
++use super::token_limit_reached;
++use super::try_run_lhc_compact_arm;
++use super::try_run_lhc_compact_arm_with_callbacks;
++use crate::compact::InitialContextInjection;
++use crate::session::context_window::context_window_token_status;
++use crate::session::session::Session;
++use crate::session::tests::make_session_and_context;
++use crate::tasks::CompactTask;
++use crate::tasks::SessionTask;
++use crate::tasks::SessionTaskContext;
++use codex_lhc_host::InferenceCallbacks;
++use tokio_util::sync::CancellationToken;
++
++/// Test-only deterministic callbacks. Production never selects these silently.
++fn deterministic_callbacks() -> InferenceCallbacks {
++    codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic offline callbacks")
++}
++
++/// Install deterministic override so production entry (CompactTask / auto ladder)
++/// can exercise Install offline. Explicit test setup only.
++fn install_deterministic_test_override(session: &Session) {
++    *session
++        .services
++        .lhc_test_inference
++        .lock()
++        .expect("lhc_test_inference lock") = Some(deterministic_callbacks());
++}
++
++async fn run_arm_deterministic(
++    sess: &Arc<Session>,
++    tc: &crate::session::turn_context::TurnContext,
++    manual: bool,
++) -> LhcCompactAttempt {
++    try_run_lhc_compact_arm_with_callbacks(
++        sess,
++        tc,
++        InitialContextInjection::DoNotInject,
++        manual,
++        deterministic_callbacks(),
++    )
++    .await
++    .expect("arm")
++}
++
++fn text_input(text: &str) -> UserInput {
++    UserInput::Text {
++        text: text.into(),
++        text_elements: Vec::new(),
++    }
++}
++
++async fn install_lhc_and_enable(session: &mut Session, root: std::path::PathBuf) {
++    session
++        .set_feature_for_test(Feature::LhcCapture, true)
++        .expect("enable LhcCapture");
++    let mut builder = ExtensionRegistryBuilder::<crate::config::Config>::new();
++    install_with_root(&mut builder, |_c| true, root);
++    let registry = Arc::new(builder.build());
++    session.services.extensions = Arc::clone(&registry);
++    let config = session.get_config().await;
++    let environments = [];
++    let session_source = SessionSource::Exec;
++    for contributor in registry.thread_lifecycle_contributors() {
++        contributor
++            .on_thread_start(ThreadStartInput {
++                config: config.as_ref(),
++                session_source: &session_source,
++                persistent_thread_state_available: false,
++                environments: &environments,
++                mcp_resource_client: None,
++                session_store: &session.services.session_extension_data,
++                thread_store: &session.services.thread_extension_data,
++            })
++            .await;
++    }
++}
++
++async fn seed_conversation_small(
++    session: &Session,
++    tc: &crate::session::turn_context::TurnContext,
++) {
++    for text in [
++        "first user turn about alpha project setup",
++        "second user turn about beta implementation",
++        "third user turn about gamma tests",
++        "fourth user turn about delta polish",
++    ] {
++        session
++            .record_user_prompt_and_emit_turn_item(tc, &[text_input(text)], None)
++            .await;
++        session
++            .record_conversation_items_with_provenance(
++                tc,
++                &[ResponseItem::Message {
++                    id: None,
++                    role: "assistant".into(),
++                    content: vec![ContentItem::OutputText {
++                        text: format!("assistant reply covering {text}"),
++                    }],
++                    phase: None,
++                    internal_chat_message_metadata_passthrough: None,
++                }],
++                codex_extension_api::RawItemProvenance::ModelOutput,
++            )
++            .await;
++    }
++}
++
++/// Scale where LHC lower_bound (120k tokens) is exceeded so compact bands.
++async fn seed_conversation_bandable(
++    session: &Session,
++    tc: &crate::session::turn_context::TurnContext,
++    turns: usize,
++) {
++    let pad = "p".repeat(2500);
++    for i in 0..turns {
++        let user = format!("user turn {i} long-horizon bandable seed {pad}");
++        session
++            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
++            .await;
++        session
++            .record_conversation_items_with_provenance(
++                tc,
++                &[ResponseItem::Message {
++                    id: None,
++                    role: "assistant".into(),
++                    content: vec![ContentItem::OutputText {
++                        text: format!("assistant reply {i} bandable seed {pad}"),
++                    }],
++                    phase: None,
++                    internal_chat_message_metadata_passthrough: None,
++                }],
++                codex_extension_api::RawItemProvenance::ModelOutput,
++            )
++            .await;
++    }
++}
++
++async fn archive_has_compact_marker(thread_id: &str, root: Option<&std::path::Path>) -> bool {
++    let Ok(callbacks) = codex_lhc_host::lhc_inference_callbacks(false) else {
++        return false;
++    };
++    let Some((session, _)) =
++        codex_lhc_host::LhcSession::open_with_inference(thread_id, None, root, callbacks).await
++    else {
++        return false;
++    };
++    let Ok(events) = session.list_events().await else {
++        session.close().await;
++        return false;
++    };
++    session.close().await;
++    events.iter().any(|e| {
++        e.text_payload()
++            .is_some_and(|p| p.text.contains("lhc_compact_marker"))
++    })
++}
++
++#[tokio::test]
++async fn law1_installed_items_equal_lhc_body_structurally() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::Installed { body, marker } = attempt else {
++        panic!("expected Installed at band scale: {attempt:?}");
++    };
++    assert!(!body.is_empty());
++    assert!(
++        marker.body_item_count == body.len() && marker.body_item_count > 0,
++        "marker body_item_count must match installed body: {marker:?}"
++    );
++    assert!(
++        marker.total_tokens > 0 || marker.compact_point > 0,
++        "receipt-backed marker must not be synthetic zeros: {marker:?}"
++    );
++
++    let host = sess.clone_history().await;
++    assert!(
++        response_items_structurally_equal(host.raw_items(), &body),
++        "law1: host history must equal the mapped LHC body field-for-field"
++    );
++}
++
++#[test]
++fn law1_structural_eq_includes_phase_and_media() {
++    let plain = ResponseItem::Message {
++        id: None,
++        role: "user".into(),
++        content: vec![ContentItem::InputText { text: "hi".into() }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let with_phase = ResponseItem::Message {
++        id: None,
++        role: "user".into(),
++        content: vec![ContentItem::InputText { text: "hi".into() }],
++        phase: Some(MessagePhase::Commentary),
++        internal_chat_message_metadata_passthrough: None,
++    };
++    assert!(!response_items_structurally_equal(
++        std::slice::from_ref(&plain),
++        std::slice::from_ref(&with_phase)
++    ));
++
++    let with_image = ResponseItem::Message {
++        id: None,
++        role: "user".into(),
++        content: vec![
++            ContentItem::InputText { text: "see".into() },
++            ContentItem::InputImage {
++                image_url: "data:image/png;base64,abc".into(),
++                detail: None,
++            },
++        ],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let image_only_text = ResponseItem::Message {
++        id: None,
++        role: "user".into(),
++        content: vec![ContentItem::InputText { text: "see".into() }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    };
++    assert!(!response_items_structurally_equal(
++        std::slice::from_ref(&with_image),
++        std::slice::from_ref(&image_only_text)
++    ));
++    assert!(response_items_structurally_equal(
++        std::slice::from_ref(&with_image),
++        std::slice::from_ref(&with_image)
++    ));
++}
++
++/// F2: law 2 at band scale — tokens must strictly drop; mutation that installs
++/// host history unchanged must fail this test.
++#[tokio::test]
++async fn law2_token_count_drops_and_threshold_does_not_retrigger() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    session
++        .set_auto_compact_window_estimated_prefill_for_test(/*tokens*/ 90_000)
++        .await;
++    // Populate production token counters from current history.
++    session.recompute_token_usage(&tc).await;
++
++    let sess = Arc::new(session);
++    let before = context_window_token_status(sess.as_ref(), &tc).await;
++    let tokens_before = before.active_context_tokens;
++    assert!(
++        tokens_before > 0,
++        "pre-compact token usage must be positive after recompute"
++    );
++
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    assert!(
++        matches!(attempt, LhcCompactAttempt::Installed { .. }),
++        "band-scale compact must Install: {attempt:?}"
++    );
++
++    assert_eq!(
++        sess.auto_compact_window_snapshot()
++            .await
++            .prefill_input_tokens,
++        None
++    );
++
++    // recompute runs inside the arm after install; read production path.
++    let after = context_window_token_status(sess.as_ref(), &tc).await;
++    assert!(
++        after.active_context_tokens < tokens_before,
++        "law2: active_context_tokens must strictly drop (before={tokens_before}, after={}); \
++         a zero-reduction pass-through install must fail this",
++        after.active_context_tokens
++    );
++    assert!(
++        !after.token_limit_reached,
++        "after LHC compact, threshold must not be latched true; status={after:?}"
++    );
++    assert!(!token_limit_reached(sess.as_ref(), &tc).await);
++
++    sess.record_user_prompt_and_emit_turn_item(&tc, &[text_input("follow-up after compact")], None)
++        .await;
++    let status2 = context_window_token_status(sess.as_ref(), &tc).await;
++    assert!(
++        !status2.token_limit_reached,
++        "follow-up turn must not re-trigger solely from residual prefill; {status2:?}"
++    );
++}
++
++/// F3: sub-threshold history → Unavailable(NoReduction), native ladder free.
++#[tokio::test]
++async fn sub_threshold_returns_no_reduction() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_small(&session, &tc).await;
++    handle.flush().await;
++
++    let before = session.clone_history().await.raw_items().to_vec();
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    match attempt {
++        LhcCompactAttempt::Unavailable { reason } => {
++            assert!(
++                reason.contains("NoReduction"),
++                "expected NoReduction reason, got: {reason}"
++            );
++        }
++        other => panic!("sub-threshold must not Install: {other:?}"),
++    }
++    // History unchanged (did not shadow native).
++    assert!(response_items_structurally_equal(
++        sess.clone_history().await.raw_items(),
++        &before
++    ));
++}
++
++/// H1: three production write-backs must not re-ingest body into the archive.
++/// Round-trips through `try_run_lhc_compact_arm` → `replace_compacted_history`
++/// (which assigns stable ids).
++#[tokio::test]
++async fn production_three_compacts_do_not_reingest_body() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    // Enough for at least one Install; subsequent may NoReduction after body shrinks.
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let thread_id = handle.thread_id().to_string();
++    let root_path = handle.root().map(|p| p.to_path_buf());
++    let events_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
++    assert!(events_before >= 100, "seed must leave large archive");
++
++    let sess = Arc::new(session);
++    let mut installed_once = false;
++    for round in 0..3 {
++        let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++        match &attempt {
++            LhcCompactAttempt::Installed { body, .. } => {
++                installed_once = true;
++                // Production assigns ids at write-back.
++                let host = sess.clone_history().await;
++                let with_id = host
++                    .raw_items()
++                    .iter()
++                    .filter(|i| codex_lhc_host::item_stable_id(i).is_some())
++                    .count();
++                assert_eq!(
++                    with_id,
++                    host.raw_items().len(),
++                    "round {round}: all installed items must have stable ids"
++                );
++                assert!(!body.is_empty());
++            }
++            LhcCompactAttempt::Unavailable { reason } => {
++                // After first Install, further rounds may NoReduction — still
++                // must not re-ingest during produce's import path.
++                assert!(
++                    installed_once || reason.contains("NoReduction"),
++                    "round {round}: unexpected Unavailable before Install: {reason}"
++                );
++            }
++        }
++        let source = archive_source_event_count(&thread_id, root_path.as_deref()).await;
++        assert_eq!(
++            source, events_before,
++            "round {round}: archive source events must stay at {events_before}, got {source} \
++             (body re-ingest would grow the archive)"
++        );
++    }
++    assert!(
++        installed_once,
++        "at least one Install expected at band scale"
++    );
++}
++
++/// I1: many consecutive production compacts — model-visible marker is bounded
++/// and independent of body size; digests never enter the served note.
++#[tokio::test]
++async fn production_many_compacts_marker_bounded_body_not_growing() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let mut note_chars: Vec<usize> = Vec::new();
++    let mut body_item_counts: Vec<usize> = Vec::new();
++    let mut installs = 0usize;
++    let pad = "z".repeat(3500);
++    // ≥20 rounds with enough bulk for repeated Installs.
++    for round in 0..20 {
++        if round > 0 {
++            for k in 0..20 {
++                sess.record_user_prompt_and_emit_turn_item(
++                    &tc,
++                    &[text_input(&format!("bulk r{round} t{k} {pad}"))],
++                    None,
++                )
++                .await;
++                sess.record_conversation_items_with_provenance(
++                    &tc,
++                    &[ResponseItem::Message {
++                        id: None,
++                        role: "assistant".into(),
++                        content: vec![ContentItem::OutputText {
++                            text: format!("bulk reply r{round} t{k} {pad}"),
++                        }],
++                        phase: None,
++                        internal_chat_message_metadata_passthrough: None,
++                    }],
++                    codex_extension_api::RawItemProvenance::ModelOutput,
++                )
++                .await;
++            }
++            handle.flush().await;
++        }
++        let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++        if let LhcCompactAttempt::Installed { body, marker } = attempt {
++            installs += 1;
++            body_item_counts.push(body.len());
++            let note = marker.to_runtime_note_text();
++            note_chars.push(note.len());
++            assert!(
++                note.len() <= codex_lhc_host::CompactMarker::RUNTIME_NOTE_MAX_CHARS,
++                "round {round}: runtime note must be bounded, got {} (body_items={})",
++                note.len(),
++                body.len()
++            );
++            assert!(
++                !note.contains("derivedContentDigests")
++                    && !note.contains("derived_content_digests")
++                    && !note.contains("derivedHostIds")
++                    && !note.contains("derived_host_ids"),
++                "round {round}: digests/ids must not appear in model-visible note"
++            );
++            // Digest list would be ~64 chars × body_item_count; note must stay far below.
++            let digest_list_floor = 40 * body.len().max(1);
++            assert!(
++                note.len() < digest_list_floor,
++                "round {round}: note chars {} embeds digests for {} items if ≥ {digest_list_floor}",
++                note.len(),
++                body.len()
++            );
++        }
++    }
++    assert!(
++        installs >= 10,
++        "expected many Installs over 20 bulk rounds, got {installs}"
++    );
++    let max = note_chars.iter().copied().max().unwrap();
++    let min = note_chars.iter().copied().min().unwrap();
++    assert!(
++        max - min < 200,
++        "runtime note size must be near-constant across installs (independent of body), \
++         min={min} max={max} notes={note_chars:?} body_items={body_item_counts:?}"
++    );
++    // Cumulative model-visible bookkeeping must stay << one body item of pad.
++    let cumulative_notes = note_chars.iter().sum::<usize>();
++    assert!(
++        cumulative_notes < pad.len() * installs,
++        "cumulative note chars {cumulative_notes} must not dominate content scale"
++    );
++}
++
++/// I2: install then drop process slot (crash before archive note) — durable
++/// CompactedItem record reseeds and blocks re-ingest.
++#[tokio::test]
++async fn crash_between_install_and_marker_no_reingest() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let thread_id = handle.thread_id().to_string();
++    let root_path = handle.root().map(|p| p.to_path_buf());
++    let source_before = archive_source_event_count(&thread_id, root_path.as_deref()).await;
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    assert!(
++        matches!(attempt, LhcCompactAttempt::Installed { .. }),
++        "first compact must Install: {attempt:?}"
++    );
++
++    // Simulate process death: process-local slot wiped; durable CompactedItem remains.
++    slot.clear_derived_for_test();
++    assert!(slot.derived_ids().is_empty());
++
++    // Second compact must reseed from durable record and not re-ingest body.
++    let attempt2 = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let _ = attempt2; // may Install or NoReduction
++
++    let source_after = archive_source_event_count(&thread_id, root_path.as_deref()).await;
++    assert_eq!(
++        source_after, source_before,
++        "crash window must not re-ingest body (before={source_before} after={source_after})"
++    );
++}
++
++async fn archive_source_event_count(thread_id: &str, root: Option<&std::path::Path>) -> usize {
++    let Ok(callbacks) = codex_lhc_host::lhc_inference_callbacks(false) else {
++        return 0;
++    };
++    let Some((session, _)) =
++        codex_lhc_host::LhcSession::open_with_inference(thread_id, None, root, callbacks).await
++    else {
++        return 0;
++    };
++    let Ok(events) = session.list_events().await else {
++        session.close().await;
++        return 0;
++    };
++    session.close().await;
++    events
++        .iter()
++        .filter(|e| {
++            matches!(
++                e.event_kind().as_str(),
++                "user_prompt" | "assistant_text" | "assistant_thinking"
++            )
++        })
++        .count()
++}
++
++#[tokio::test]
++async fn fail_open_feature_off() {
++    let (session, tc) = make_session_and_context().await;
++    let sess = Arc::new(session);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++    )
++    .await
++    .unwrap();
++    assert!(matches!(attempt, LhcCompactAttempt::Unavailable { .. }));
++}
++
++/// R5 manual ladder through CompactTask at band scale (no network fallback).
++#[tokio::test]
++async fn production_manual_ladder_invokes_lhc_arm() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++    // Explicit test-only override: CompactTask calls production entry which
++    // would otherwise require live ModelClient. Not a silent production default.
++    install_deterministic_test_override(&session);
++
++    let root_for_marker = handle.root().map(|p| p.to_path_buf());
++    let thread_id = handle.thread_id().to_string();
++    let sess = Arc::new(session);
++
++    let turn_ext = Arc::new(ExtensionData::new(tc.sub_id.clone()));
++    let ctx = SessionTaskContext::new(Arc::clone(&sess), turn_ext);
++    let task = Arc::new(CompactTask);
++    let result = SessionTask::run(
++        task,
++        Arc::new(ctx),
++        Arc::new(tc),
++        Vec::new(),
++        CancellationToken::new(),
++    )
++    .await;
++    assert!(
++        result.is_ok(),
++        "manual CompactTask must succeed via LHC at band scale: {result:?}"
++    );
++    assert!(
++        archive_has_compact_marker(&thread_id, root_for_marker.as_deref()).await,
++        "manual CompactTask must commit LHC compact marker (production ladder hook)"
++    );
++}
++
++/// R5 auto ladder: production `run_auto_compact` at band scale.
++/// LHC Installs before any native/model path; inert client must not be hit.
++#[tokio::test]
++async fn production_auto_ladder_invokes_lhc_arm() {
++    use crate::session::turn::run_auto_compact;
++    use codex_analytics::CompactionPhase;
++    use codex_analytics::CompactionReason;
++
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++    install_deterministic_test_override(&session);
++
++    let root_for_marker = handle.root().map(|p| p.to_path_buf());
++    let thread_id = handle.thread_id().to_string();
++    let tokens_before = context_window_token_status(&session, &tc)
++        .await
++        .active_context_tokens;
++    let sess = Arc::new(session);
++    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
++    // Inert client on a loopback base URL — never dials a live endpoint.
++    // At band scale LHC Installs before native; hook removal would fail open
++    // into this client (which has no credentials).
++    let mut client = inert_model_client_session();
++    let result = run_auto_compact(
++        &sess,
++        step,
++        /*fallback*/ None,
++        &mut client,
++        InitialContextInjection::DoNotInject,
++        CompactionReason::ContextLimit,
++        CompactionPhase::PreTurn,
++    )
++    .await;
++    assert!(
++        result.is_ok(),
++        "auto ladder must complete via LHC Install without live model: {result:?}"
++    );
++    let tokens_after = {
++        // TurnContext moved into step; recompute via session history size proxy
++        // is insufficient — use marker + reduced history length.
++        sess.clone_history().await.raw_items().len()
++    };
++    assert!(
++        tokens_after > 0 && (tokens_before == 0 || tokens_after < 160),
++        "auto ladder should leave a reduced band body (items={tokens_after}, tokens_before={tokens_before})"
++    );
++    assert!(
++        archive_has_compact_marker(&thread_id, root_for_marker.as_deref()).await,
++        "auto run_auto_compact must commit LHC compact marker (production ladder hook)"
++    );
++}
++
++fn inert_model_client_session() -> crate::client::ModelClientSession {
++    use crate::client::ModelClient;
++    use codex_http_client::HttpClientFactory;
++    use codex_http_client::OutboundProxyPolicy;
++    use codex_login::auth::AgentIdentityAuthPolicy;
++    use codex_model_provider_info::ModelProviderInfo;
++    use codex_protocol::ThreadId;
++    use codex_protocol::protocol::SessionSource;
++
++    let thread_id =
++        ThreadId::try_from("00000000-0000-4000-8000-000000000099").expect("test thread id");
++    // Explicit non-routable local base URL — never api.openai.com (G4).
++    let provider =
++        ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string()));
++    ModelClient::new(
++        /*auth_manager*/ None,
++        AgentIdentityAuthPolicy::JwtOnly,
++        thread_id,
++        provider,
++        SessionSource::Exec,
++        "test_originator".to_string(),
++        /*model_verbosity*/ None,
++        /*enable_request_compression*/ false,
++        /*include_timing_metrics*/ false,
++        /*beta_features_header*/ None,
++        /*concurrent_reasoning_summaries_enabled*/ false,
++        /*attestation_provider*/ None,
++        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++    )
++    .new_session()
++}
++
++/// Shape-risk: Compacted.replacement_history is verbatim for resume/fork.
++#[test]
++fn band_body_replacement_history_byte_equal() {
++    use crate::context_manager::ContextManager;
++    use codex_protocol::protocol::CompactedItem;
++
++    let body = vec![
++        ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: "hello".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText {
++                text: "world".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++    ];
++    let compacted = CompactedItem {
++        message: "lhc".into(),
++        replacement_history: Some(body.clone()),
++        window_number: Some(1),
++        first_window_id: Some("a".into()),
++        previous_window_id: None,
++        window_id: Some("b".into()),
++    };
++    let mut history = ContextManager::new();
++    history.replace(compacted.replacement_history.clone().unwrap());
++    assert!(response_items_structurally_equal(
++        history.raw_items(),
++        &body
++    ));
++}
++
++/// Shape-risk goldens: fork/resume consumers see band-shaped replacement as-is.
++#[test]
++fn shape_risk_consumers_see_band_replacement() {
++    use crate::context_manager::ContextManager;
++    use codex_protocol::protocol::CompactedItem;
++
++    let band = vec![
++        ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: "[compact summary of early turns]".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText {
++                text: "ack summary".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: "latest user turn".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText {
++                text: "latest assistant turn".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++    ];
++
++    let compacted = CompactedItem {
++        message: "lhc_compact_marker".into(),
++        replacement_history: Some(band.clone()),
++        window_number: Some(2),
++        first_window_id: Some("w0".into()),
++        previous_window_id: Some("w1".into()),
++        window_id: Some("w2".into()),
++    };
++    let mut resume = ContextManager::new();
++    resume.replace(
++        compacted
++            .replacement_history
++            .clone()
++            .expect("replacement_history present"),
++    );
++    assert!(response_items_structurally_equal(resume.raw_items(), &band));
++
++    let mut full_fork = ContextManager::new();
++    full_fork.replace(band.clone());
++    assert!(response_items_structurally_equal(
++        full_fork.raw_items(),
++        &band
++    ));
++
++    let last_n: Vec<_> = band[band.len().saturating_sub(2)..].to_vec();
++    let mut last_n_fork = ContextManager::new();
++    last_n_fork.replace(last_n.clone());
++    assert!(response_items_structurally_equal(
++        last_n_fork.raw_items(),
++        &last_n
++    ));
++
++    let mut btw = ContextManager::new();
++    btw.replace(last_n.clone());
++    assert!(response_items_structurally_equal(btw.raw_items(), &last_n));
++
++    let mut guardian = ContextManager::new();
++    guardian.replace(band.clone());
++    assert!(response_items_structurally_equal(
++        guardian.raw_items(),
++        &band
++    ));
++}
++
++// ── J1 / J2: real inference default + pinned model/effort ─────────────────
++
++/// J1: production entry without test override must not Install via canned
++/// deterministic text. Uses an inert ModelClient so stream cannot succeed.
++#[tokio::test]
++async fn j1_production_without_override_fails_open_not_deterministic() {
++    // Ensure the old opt-in env is not what drives production (deleted as switch).
++    // SAFETY: test-local env mutation for invariant check.
++    unsafe {
++        std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
++    }
++
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    // Inert client: real bridge will attempt stream and fail (no canned text).
++    session.services.model_client = {
++        use crate::client::ModelClient;
++        use codex_http_client::HttpClientFactory;
++        use codex_http_client::OutboundProxyPolicy;
++        use codex_login::auth::AgentIdentityAuthPolicy;
++        use codex_model_provider_info::ModelProviderInfo;
++        use codex_protocol::ThreadId;
++        use codex_protocol::protocol::SessionSource;
++        let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000088").expect("tid");
++        ModelClient::new(
++            /*auth_manager*/ None,
++            AgentIdentityAuthPolicy::JwtOnly,
++            thread_id,
++            ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string())),
++            SessionSource::Exec,
++            "test_originator".to_string(),
++            /*model_verbosity*/ None,
++            /*enable_request_compression*/ false,
++            /*include_timing_metrics*/ false,
++            /*beta_features_header*/ None,
++            /*concurrent_reasoning_summaries_enabled*/ false,
++            /*attestation_provider*/ None,
++            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++        )
++    };
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let before = session.clone_history().await.raw_items().to_vec();
++    let sess = Arc::new(session);
++    // No lhc_test_inference override → production ModelClient bridge.
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++    )
++    .await
++    .expect("arm result");
++
++    match attempt {
++        LhcCompactAttempt::Installed { body, .. } => {
++            let joined: String = body
++                .iter()
++                .filter_map(|item| match item {
++                    ResponseItem::Message { content, .. } => Some(
++                        content
++                            .iter()
++                            .filter_map(|c| match c {
++                                ContentItem::InputText { text }
++                                | ContentItem::OutputText { text } => Some(text.as_str()),
++                                _ => None,
++                            })
++                            .collect::<Vec<_>>()
++                            .join("\n"),
++                    ),
++                    _ => None,
++                })
++                .collect::<Vec<_>>()
++                .join("\n");
++            let has_det = joined.contains("smoothed(")
++                || joined.contains("brief(")
++                || joined.contains("projection(")
++                || joined.contains("toolresult(");
++            assert!(
++                !has_det,
++                "J1: production must not install deterministic canned markers; preview={}",
++                joined.chars().take(500).collect::<String>()
++            );
++            // If produce still Installs after stream failures, body must not be
++            // canned deterministic text (the shim Lee rejected).
++            eprintln!(
++                "J1: production Installed without deterministic markers (items={})",
++                body.len()
++            );
++        }
++        LhcCompactAttempt::Unavailable { reason } => {
++            assert!(!reason.is_empty(), "fail-open reason should be non-empty");
++            // History unchanged — native ladder free.
++            assert!(response_items_structurally_equal(
++                sess.clone_history().await.raw_items(),
++                &before
++            ));
++        }
++    }
++}
++
++/// J1: when derivation model is unavailable, fail open — never turn model.
++#[tokio::test]
++async fn j1_unavailable_derivation_model_fails_open() {
++    use codex_models_manager::manager::StaticModelsManager;
++    use codex_protocol::openai_models::ModelsResponse;
++
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    // Empty catalog → luna resolves as fallback metadata → Err.
++    session.services.models_manager = Arc::new(StaticModelsManager::new(
++        /*auth_manager*/ None,
++        ModelsResponse {
++            models: vec![],
++            ..ModelsResponse::default()
++        },
++    ));
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 40).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++    )
++    .await
++    .expect("arm");
++    match attempt {
++        LhcCompactAttempt::Unavailable { reason } => {
++            assert!(
++                reason.contains("gpt-5.6-luna") || reason.contains("unavailable"),
++                "expected derivation-model unavailable reason, got: {reason}"
++            );
++            assert!(
++                !reason.to_lowercase().contains("deterministic"),
++                "must not mention deterministic substitution: {reason}"
++            );
++        }
++        other => panic!("must Unavailable when luna missing: {other:?}"),
++    }
++}
++
++/// J2: resolve pins gpt-5.6-luna and lowest effort (Low for luna catalog).
++#[tokio::test]
++async fn j2_resolve_pins_luna_and_lowest_effort_not_turn_model() {
++    use crate::lhc_inference_bridge::LHC_DERIVATION_MODEL;
++    use crate::lhc_inference_bridge::resolve_lhc_derivation_target;
++    use codex_protocol::openai_models::ReasoningEffort;
++
++    let (session, tc) = make_session_and_context().await;
++    let target = resolve_lhc_derivation_target(&session)
++        .await
++        .expect("luna must resolve from bundled catalog in tests");
++    // Hard-coded pin (not only the constant) so renaming the const fails this test.
++    assert_eq!(
++        LHC_DERIVATION_MODEL, "gpt-5.6-luna",
++        "ruling pin must stay gpt-5.6-luna"
++    );
++    assert!(
++        target.model_info.slug.contains("luna"),
++        "pinned derivation model must be luna, got slug={}",
++        target.model_info.slug
++    );
++    assert_eq!(
++        target.effort,
++        ReasoningEffort::Low,
++        "luna supports low..max (no none); min must be Low, got {:?}",
++        target.effort
++    );
++    // Must not ride the turn model when it differs.
++    if tc.model_info.slug != target.model_info.slug {
++        assert_ne!(
++            target.model_info.slug, tc.model_info.slug,
++            "derivation must not equal turn model when they differ"
++        );
++    }
++}
++
++/// J2: pin constant + lowest effort for luna-shaped catalog (behavioural unit).
++/// Request-level pin for all four callbacks is covered by the wiremock test in
++/// `lhc_inference_bridge::tests::j2_all_four_callbacks_request_pinned_model_and_lowest_effort`.
++#[test]
++fn j2_resolve_effort_and_pin_constant() {
++    use crate::lhc_inference_bridge::LHC_DERIVATION_MODEL;
++    use crate::lhc_inference_bridge::resolve_lhc_derivation_effort;
++    use codex_models_manager::ModelsManagerConfig;
++    use codex_models_manager::test_support::construct_model_info_offline_for_tests;
++    use codex_protocol::openai_models::ReasoningEffort;
++    use codex_protocol::openai_models::ReasoningEffortPreset;
++
++    assert_eq!(LHC_DERIVATION_MODEL, "gpt-5.6-luna");
++    let mut model = construct_model_info_offline_for_tests(
++        LHC_DERIVATION_MODEL,
++        &ModelsManagerConfig::default(),
++    );
++    model.supported_reasoning_levels = vec![
++        ReasoningEffortPreset {
++            effort: ReasoningEffort::Low,
++            description: "low".into(),
++        },
++        ReasoningEffortPreset {
++            effort: ReasoningEffort::Medium,
++            description: "medium".into(),
++        },
++    ];
++    assert_eq!(resolve_lhc_derivation_effort(&model), ReasoningEffort::Low);
++}
++
++/// J1: with explicit test override, production entry uses bridge of override
++/// (deterministic Install) — proves override path is the only offline Install.
++#[tokio::test]
++async fn j1_explicit_override_installs_via_production_entry() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++    install_deterministic_test_override(&session);
++
++    let sess = Arc::new(session);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++    )
++    .await
++    .expect("arm");
++    assert!(
++        matches!(attempt, LhcCompactAttempt::Installed { .. }),
++        "explicit test override must Install offline: {attempt:?}"
++    );
++}
++
++/// K1: behavioural — production with no usable derivation model returns
++/// `Unavailable` (native ladder free), never deterministic canned Install.
++/// `CODEX_LHC_LIVE_INFERENCE=1` must not change that outcome (env is not a
++/// production switch).
++#[tokio::test]
++async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
++    use codex_models_manager::manager::StaticModelsManager;
++    use codex_protocol::openai_models::ModelsResponse;
++
++    async fn run_with_empty_catalog() -> LhcCompactAttempt {
++        let dir = tempdir().unwrap();
++        let root = dir.path().to_path_buf();
++        let (mut session, tc) = make_session_and_context().await;
++        // No usable derivation model → resolve fails open before produce.
++        session.services.models_manager = Arc::new(StaticModelsManager::new(
++            /*auth_manager*/ None,
++            ModelsResponse {
++                models: vec![],
++                ..ModelsResponse::default()
++            },
++        ));
++        install_lhc_and_enable(&mut session, root).await;
++        let slot = session
++            .services
++            .thread_extension_data
++            .get::<LhcCaptureSlot>()
++            .expect("slot");
++        let handle = wait_for_handle(&slot, Duration::from_secs(5))
++            .await
++            .expect("handle");
++        seed_conversation_bandable(&session, &tc, 40).await;
++        handle.flush().await;
++        let before_len = session.clone_history().await.raw_items().len();
++        let sess = Arc::new(session);
++        let attempt = try_run_lhc_compact_arm(
++            &sess,
++            &tc,
++            InitialContextInjection::DoNotInject,
++            /*manual*/ true,
++        )
++        .await
++        .expect("arm");
++        let after_len = sess.clone_history().await.raw_items().len();
++        assert_eq!(
++            before_len, after_len,
++            "Unavailable must leave host history unchanged (native ladder free)"
++        );
++        // Body must never be deterministic canned install.
++        let joined: String =
++            sess.clone_history()
++                .await
++                .raw_items()
++                .iter()
++                .filter_map(|item| match item {
++                    ResponseItem::Message { content, .. } => Some(
++                        content
++                            .iter()
++                            .filter_map(|c| match c {
++                                ContentItem::InputText { text }
++                                | ContentItem::OutputText { text } => Some(text.as_str()),
++                                _ => None,
++                            })
++                            .collect::<Vec<_>>()
++                            .join("\n"),
++                    ),
++                    _ => None,
++                })
++                .collect::<Vec<_>>()
++                .join("\n");
++        assert!(
++            !joined.contains("smoothed(")
++                && !joined.contains("brief(")
++                && !joined.contains("projection(")
++                && !joined.contains("toolresult("),
++            "must not install deterministic canned markers"
++        );
++        attempt
++    }
++
++    // SAFETY: test-local env only.
++    unsafe {
++        std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
++    }
++    let a = run_with_empty_catalog().await;
++    let reason_a = match a {
++        LhcCompactAttempt::Unavailable { reason } => reason,
++        other => panic!("no usable client must Unavailable, got {other:?}"),
++    };
++    assert!(
++        reason_a.contains("gpt-5.6-luna") || reason_a.contains("unavailable"),
++        "expected derivation-model unavailable, got: {reason_a}"
++    );
++
++    unsafe {
++        std::env::set_var("CODEX_LHC_LIVE_INFERENCE", "1");
++    }
++    let b = run_with_empty_catalog().await;
++    unsafe {
++        std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
++    }
++    let reason_b = match b {
++        LhcCompactAttempt::Unavailable { reason } => reason,
++        other => panic!(
++            "CODEX_LHC_LIVE_INFERENCE=1 must not re-enable deterministic Install; got {other:?}"
++        ),
++    };
++    assert!(
++        reason_b.contains("gpt-5.6-luna") || reason_b.contains("unavailable"),
++        "with env=1 still derivation-model unavailable, got: {reason_b}"
++    );
++    // Same failure class: env is not a production switch.
++    assert_eq!(
++        reason_a.split(':').next(),
++        reason_b.split(':').next(),
++        "env must not change failure class: a={reason_a} b={reason_b}"
++    );
++}
++
++// M1's idle-pump wiring is proven in the host crate (codex-lhc-host
++// `install.rs::tests::m1_*`) through the real extension registry. The
++// core-level end-to-end measurement is an open gap — see the round report.
++
++use std::sync::atomic::AtomicUsize;
++use std::sync::atomic::Ordering as AtomicOrdering;
++
++/// M2 through the production chain: when the compact arm's own thread timeout
++/// fires, the detached worker's drain must observe the cancel flag and stop —
++/// not keep billing inference for a session that already failed open.
++#[tokio::test]
++async fn m2_compact_timeout_cancels_in_flight_derivation() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++
++    let counter = Arc::new(AtomicUsize::new(0));
++    let slow = slow_counting_callbacks(Arc::clone(&counter), Duration::from_millis(20));
++    let sess = Arc::new(session);
++
++    super::set_compact_thread_timeout_ms_for_test(400);
++    let attempt = try_run_lhc_compact_arm_with_callbacks(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++        slow,
++    )
++    .await
++    .expect("arm");
++    super::set_compact_thread_timeout_ms_for_test(0);
++
++    let reason = match attempt {
++        LhcCompactAttempt::Unavailable { reason } => reason,
++        other => panic!("timeout must fail open, got {other:?}"),
++    };
++    assert!(
++        reason.contains("timed out"),
++        "expected timeout fail-open, got: {reason}"
++    );
++
++    // The worker is detached; the cancel flag must stop it within a batch.
++    let at_timeout = counter.load(AtomicOrdering::SeqCst);
++    tokio::time::sleep(Duration::from_secs(3)).await;
++    let after = counter.load(AtomicOrdering::SeqCst);
++    assert!(
++        after - at_timeout <= 8,
++        "M2: after the caller timed out and failed open, derivation must stop \
++         within one drain batch — fired {} more calls in 3s (at_timeout={at_timeout}, \
++         after={after}); without the per-batch cancel check this keeps climbing",
++        after - at_timeout
++    );
++}
++
++/// Deterministic callbacks that count and sleep — used to make the compact-time
++/// drain slow enough to time out deterministically.
++fn slow_counting_callbacks(counter: Arc<AtomicUsize>, delay: Duration) -> InferenceCallbacks {
++    use codex_lhc_host::CompressDetailedTurnInput;
++    use codex_lhc_host::SmoothPromptInput;
++    use codex_lhc_host::SummarizeChunkBriefInput;
++    use codex_lhc_host::SummarizeToolResultInput;
++
++    let base = deterministic_callbacks();
++    macro_rules! wrap {
++        ($field:ident, $ty:ty) => {{
++            let counter = Arc::clone(&counter);
++            let inner = Arc::clone(&base.$field);
++            Arc::new(move |input: $ty| {
++                counter.fetch_add(1, AtomicOrdering::SeqCst);
++                let inner = Arc::clone(&inner);
++                Box::pin(async move {
++                    tokio::time::sleep(delay).await;
++                    inner(input).await
++                }) as codex_lhc_host::BoxInferenceFuture
++            })
++        }};
++    }
++    InferenceCallbacks {
++        smooth_prompt: wrap!(smooth_prompt, SmoothPromptInput),
++        summarize_tool_result: wrap!(summarize_tool_result, SummarizeToolResultInput),
++        compress_detailed_turn: wrap!(compress_detailed_turn, CompressDetailedTurnInput),
++        summarize_chunk_brief: wrap!(summarize_chunk_brief, SummarizeChunkBriefInput),
++    }
++}
+diff --git a/codex-rs/core/src/lhc_inference_bridge.rs b/codex-rs/core/src/lhc_inference_bridge.rs
+new file mode 100644
+index 0000000000..269d2de116
+--- /dev/null
++++ b/codex-rs/core/src/lhc_inference_bridge.rs
+@@ -0,0 +1,490 @@
++//! ModelClient → LHC [`InferenceCallbacks`] bridge (R2 / J1–J2).
++//!
++//! Production derivation always uses this bridge: pinned model
++//! [`LHC_DERIVATION_MODEL`] at the lowest accepted reasoning effort.
++//! Deterministic callbacks live only on the host crate's test/offline path
++//! and must never be the silent production default.
++
++use std::sync::Arc;
++
++use codex_lhc_host::CompressDetailedTurnInput;
++use codex_lhc_host::InferenceCallbacks;
++use codex_lhc_host::InferenceResult;
++use codex_lhc_host::SmoothPromptInput;
++use codex_lhc_host::SummarizeChunkBriefInput;
++use codex_lhc_host::SummarizeToolResultInput;
++use codex_otel::SessionTelemetry;
++use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ReasoningEffort;
++use codex_rollout_trace::InferenceTraceContext;
++use futures::StreamExt;
++use tracing::info;
++use tracing::warn;
++
++use crate::client::ModelClient;
++use crate::client_common::Prompt;
++use crate::client_common::ResponseEvent;
++use crate::responses_metadata::CodexResponsesMetadata;
++use crate::session::session::Session;
++
++/// Pinned derivation model for both small-op and big-op lanes (ruling 8c3ca18).
++pub(crate) const LHC_DERIVATION_MODEL: &str = "gpt-5.6-luna";
++
++/// Resolved derivation target: model metadata + pinned lowest effort.
++#[derive(Debug, Clone)]
++pub(crate) struct LhcDerivationTarget {
++    pub model_info: ModelInfo,
++    pub effort: ReasoningEffort,
++}
++
++/// Rank for selecting the minimum supported effort (lower = cheaper/faster).
++fn effort_rank(effort: &ReasoningEffort) -> u8 {
++    match effort {
++        ReasoningEffort::None => 0,
++        ReasoningEffort::Minimal => 1,
++        ReasoningEffort::Low => 2,
++        ReasoningEffort::Medium => 3,
++        ReasoningEffort::High => 4,
++        ReasoningEffort::XHigh => 5,
++        ReasoningEffort::Max => 6,
++        ReasoningEffort::Ultra => 7,
++        ReasoningEffort::Custom(_) => 100,
++    }
++}
++
++/// Prefer [`ReasoningEffort::None`]; else the minimum listed for the model.
++/// Logs when falling back so silent higher-effort landings are visible.
++pub(crate) fn resolve_lhc_derivation_effort(model_info: &ModelInfo) -> ReasoningEffort {
++    let supported: Vec<ReasoningEffort> = model_info
++        .supported_reasoning_levels
++        .iter()
++        .map(|p| p.effort.clone())
++        .collect();
++
++    if supported.is_empty() {
++        info!(
++            model = %model_info.slug,
++            "LHC derivation: no supported_reasoning_levels; using ReasoningEffort::None"
++        );
++        return ReasoningEffort::None;
++    }
++
++    if supported.iter().any(|e| matches!(e, ReasoningEffort::None)) {
++        return ReasoningEffort::None;
++    }
++
++    let min = supported
++        .into_iter()
++        .min_by_key(|e| effort_rank(e))
++        .unwrap_or(ReasoningEffort::Low);
++    warn!(
++        model = %model_info.slug,
++        effort = %min,
++        "LHC derivation: ReasoningEffort::None not accepted by model; using minimum supported effort"
++    );
++    min
++}
++
++/// Resolve pinned derivation model + effort for the session's provider.
++/// Fails open (Err) when the model is not in the catalog — never falls back
++/// to the user's turn model.
++pub(crate) async fn resolve_lhc_derivation_target(
++    sess: &Session,
++) -> Result<LhcDerivationTarget, String> {
++    let config = sess.get_config().await;
++    let model_info = sess
++        .services
++        .models_manager
++        .get_model_info(LHC_DERIVATION_MODEL, &config.to_models_manager_config())
++        .await;
++    if model_info.used_fallback_model_metadata {
++        return Err(format!(
++            "derivation model `{LHC_DERIVATION_MODEL}` unavailable for provider \
++             (fallback metadata only); failing open — not using turn model"
++        ));
++    }
++    if model_info.slug != LHC_DERIVATION_MODEL
++        && !model_info.slug.ends_with(LHC_DERIVATION_MODEL)
++        && !model_info.slug.contains(LHC_DERIVATION_MODEL)
++    {
++        // Prefix match from models manager may return a longer slug; require
++        // the pinned name is still the identity.
++        if !model_info.slug.contains("luna") {
++            return Err(format!(
++                "derivation model resolve returned unexpected slug `{}` \
++                 (wanted `{LHC_DERIVATION_MODEL}`)",
++                model_info.slug
++            ));
++        }
++    }
++    let effort = resolve_lhc_derivation_effort(&model_info);
++    Ok(LhcDerivationTarget { model_info, effort })
++}
++
++#[derive(Clone)]
++struct LiveInferCtx {
++    client: ModelClient,
++    model_info: ModelInfo,
++    effort: ReasoningEffort,
++    telemetry: SessionTelemetry,
++    installation_id: String,
++    session_id: String,
++    thread_id: String,
++    window_id: String,
++}
++
++impl LiveInferCtx {
++    async fn complete(&self, text: &str) -> InferenceResult {
++        model_complete_text(self, text).await
++    }
++}
++
++/// Build live inference callbacks for production (pinned model + lowest effort).
++/// Returns Err when the derivation model is unavailable — callers fail open.
++pub(crate) async fn try_lhc_model_inference_callbacks(
++    sess: &Session,
++) -> Result<InferenceCallbacks, String> {
++    let target = resolve_lhc_derivation_target(sess).await?;
++    Ok(lhc_model_inference_callbacks_from_target(sess, target))
++}
++
++/// Build callbacks from an already-resolved target (testable seam).
++pub(crate) fn lhc_model_inference_callbacks_from_target(
++    sess: &Session,
++    target: LhcDerivationTarget,
++) -> InferenceCallbacks {
++    let ctx = LiveInferCtx {
++        client: sess.services.model_client.clone(),
++        model_info: target.model_info,
++        effort: target.effort,
++        telemetry: sess.services.session_telemetry.clone(),
++        installation_id: sess.installation_id.clone(),
++        session_id: sess.session_id().to_string(),
++        thread_id: sess.thread_id().to_string(),
++        window_id: format!("{}:lhc-infer", sess.thread_id()),
++    };
++    callbacks_from_live_ctx(ctx)
++}
++
++fn callbacks_from_live_ctx(ctx: LiveInferCtx) -> InferenceCallbacks {
++    let a = ctx.clone();
++    let b = ctx.clone();
++    let c = ctx.clone();
++    let d = ctx;
++    InferenceCallbacks {
++        smooth_prompt: Arc::new(move |input: SmoothPromptInput| {
++            let ctx = a.clone();
++            Box::pin(async move { ctx.complete(&input.text).await })
++        }),
++        summarize_tool_result: Arc::new(move |input: SummarizeToolResultInput| {
++            let ctx = b.clone();
++            Box::pin(async move { ctx.complete(&input.content).await })
++        }),
++        compress_detailed_turn: Arc::new(move |input: CompressDetailedTurnInput| {
++            let ctx = c.clone();
++            Box::pin(async move { ctx.complete(&input.dialogue_text).await })
++        }),
++        summarize_chunk_brief: Arc::new(move |input: SummarizeChunkBriefInput| {
++            let ctx = d.clone();
++            Box::pin(async move { ctx.complete(&input.text).await })
++        }),
++    }
++}
++
++async fn model_complete_text(ctx: &LiveInferCtx, text: &str) -> InferenceResult {
++    let mut session = ctx.client.new_session();
++    let prompt = Prompt {
++        input: vec![ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: text.to_string(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }],
++        ..Default::default()
++    };
++    let meta = CodexResponsesMetadata::new(
++        ctx.installation_id.clone(),
++        ctx.session_id.clone(),
++        ctx.thread_id.clone(),
++        ctx.window_id.clone(),
++    );
++    // Explicit Some(effort): Option::None would mean "unspecified" and fall
++    // back to the model's default (often medium) — not lowest effort.
++    let stream = match session
++        .stream(
++            &prompt,
++            &ctx.model_info,
++            &ctx.telemetry,
++            Some(ctx.effort.clone()),
++            ReasoningSummaryConfig::None,
++            /*service_tier*/ None,
++            &meta,
++            &InferenceTraceContext::disabled(),
++        )
++        .await
++    {
++        Ok(s) => s,
++        Err(err) => {
++            warn!(%err, model = %ctx.model_info.slug, effort = %ctx.effort, "LHC live ModelClient stream failed");
++            return InferenceResult::Err {
++                reason: err.to_string(),
++                request_messages: None,
++            };
++        }
++    };
++
++    let mut out = String::new();
++    let mut stream = stream;
++    while let Some(ev) = stream.next().await {
++        match ev {
++            Ok(ResponseEvent::OutputTextDelta(delta)) => out.push_str(&delta),
++            Ok(ResponseEvent::OutputItemDone(item)) => {
++                if let ResponseItem::Message { content, .. } = item {
++                    for part in content {
++                        if let ContentItem::OutputText { text } = part {
++                            if out.is_empty() {
++                                out = text;
++                            }
++                        }
++                    }
++                }
++            }
++            Ok(_) => {}
++            Err(err) => {
++                return InferenceResult::Err {
++                    reason: err.to_string(),
++                    request_messages: None,
++                };
++            }
++        }
++    }
++    if out.is_empty() {
++        InferenceResult::Err {
++            reason: "empty model response for LHC inference".into(),
++            request_messages: None,
++        }
++    } else {
++        InferenceResult::Ok {
++            text: out,
++            provenance: None,
++            request_messages: None,
++            raw_response: None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use codex_lhc_host::lhc_inference_callbacks;
++    use codex_models_manager::ModelsManagerConfig;
++    use codex_models_manager::test_support::construct_model_info_offline_for_tests;
++    use codex_protocol::openai_models::ReasoningEffortPreset;
++    use pretty_assertions::assert_eq;
++
++    fn model_with_levels(levels: Vec<ReasoningEffort>) -> ModelInfo {
++        let mut model = construct_model_info_offline_for_tests(
++            LHC_DERIVATION_MODEL,
++            &ModelsManagerConfig::default(),
++        );
++        model.supported_reasoning_levels = levels
++            .into_iter()
++            .map(|effort| ReasoningEffortPreset {
++                effort,
++                description: "t".into(),
++            })
++            .collect();
++        model
++    }
++
++    #[test]
++    fn host_live_flag_fails_closed() {
++        assert!(lhc_inference_callbacks(true).is_err());
++    }
++
++    #[test]
++    fn derivation_model_slug_is_pinned_luna() {
++        assert_eq!(LHC_DERIVATION_MODEL, "gpt-5.6-luna");
++    }
++
++    #[test]
++    fn effort_prefers_none_when_supported() {
++        let model = model_with_levels(vec![
++            ReasoningEffort::None,
++            ReasoningEffort::Low,
++            ReasoningEffort::Medium,
++        ]);
++        assert_eq!(resolve_lhc_derivation_effort(&model), ReasoningEffort::None);
++    }
++
++    #[test]
++    fn effort_falls_back_to_minimum_when_none_unsupported() {
++        // Luna catalog shape: low..max, no none.
++        let model = model_with_levels(vec![
++            ReasoningEffort::Low,
++            ReasoningEffort::Medium,
++            ReasoningEffort::High,
++            ReasoningEffort::XHigh,
++            ReasoningEffort::Max,
++        ]);
++        assert_eq!(resolve_lhc_derivation_effort(&model), ReasoningEffort::Low);
++    }
++
++    #[test]
++    fn effort_empty_supported_uses_none() {
++        let model = model_with_levels(vec![]);
++        assert_eq!(resolve_lhc_derivation_effort(&model), ReasoningEffort::None);
++    }
++
++    /// J2: every one of the four callbacks streams with pinned model + lowest effort.
++    #[tokio::test]
++    async fn j2_all_four_callbacks_request_pinned_model_and_lowest_effort() {
++        use codex_http_client::HttpClientFactory;
++        use codex_http_client::OutboundProxyPolicy;
++        use codex_login::auth::AgentIdentityAuthPolicy;
++        use codex_model_provider_info::ModelProviderInfo;
++        use codex_protocol::ThreadId;
++        use codex_protocol::protocol::SessionSource;
++        use wiremock::Mock;
++        use wiremock::MockServer;
++        use wiremock::ResponseTemplate;
++        use wiremock::matchers::method;
++        use wiremock::matchers::path_regex;
++
++        use crate::client::ModelClient;
++        use crate::session::tests::make_session_and_context;
++        use codex_lhc_host::CompressDetailedTurnInput;
++        use codex_lhc_host::SmoothPromptInput;
++        use codex_lhc_host::SummarizeChunkBriefInput;
++        use codex_lhc_host::SummarizeToolResultInput;
++
++        let server = MockServer::start().await;
++        // Minimal SSE: created + assistant message + completed.
++        let sse_body = concat!(
++            "event: response.created\n",
++            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n",
++            "event: response.output_item.done\n",
++            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}}\n\n",
++            "event: response.completed\n",
++            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
++        );
++        Mock::given(method("POST"))
++            .and(path_regex(".*/responses.*"))
++            .respond_with(
++                ResponseTemplate::new(200)
++                    .insert_header("content-type", "text/event-stream")
++                    .set_body_string(sse_body),
++            )
++            .mount(&server)
++            .await;
++
++        let (mut session, _tc) = make_session_and_context().await;
++        let mut provider =
++            ModelProviderInfo::create_openai_provider(Some(format!("{}/v1", server.uri())));
++        // Force HTTP so wiremock can capture request bodies (no WS upgrade).
++        provider.supports_websockets = false;
++        session.services.model_client = ModelClient::new(
++            /*auth_manager*/ None,
++            AgentIdentityAuthPolicy::JwtOnly,
++            ThreadId::new(),
++            provider,
++            SessionSource::Exec,
++            "test_originator".to_string(),
++            /*model_verbosity*/ None,
++            /*enable_request_compression*/ false,
++            /*include_timing_metrics*/ false,
++            /*beta_features_header*/ None,
++            /*concurrent_reasoning_summaries_enabled*/ false,
++            /*attestation_provider*/ None,
++            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
++        );
++
++        let target = resolve_lhc_derivation_target(&session)
++            .await
++            .expect("luna from catalog");
++        let expected_effort = target.effort.clone();
++        assert_eq!(expected_effort, ReasoningEffort::Low);
++        let callbacks = lhc_model_inference_callbacks_from_target(&session, target);
++
++        // Invoke all four lanes.
++        let r1 = (callbacks.smooth_prompt)(SmoothPromptInput {
++            text: "smooth-me".into(),
++        })
++        .await;
++        let r2 = (callbacks.summarize_tool_result)(SummarizeToolResultInput {
++            tool_name: "shell".into(),
++            content: "tool-out".into(),
++            outcome: None,
++            target_tokens: None,
++            operation_class: None,
++            response_shape: None,
++            prompt_mode: None,
++            facts: None,
++        })
++        .await;
++        let r3 = (callbacks.compress_detailed_turn)(CompressDetailedTurnInput {
++            dialogue_text: "turn-dialogue".into(),
++            input_tokens: 100,
++            target_min_tokens: 10,
++            target_aim_tokens: 20,
++            target_max_tokens: 40,
++        })
++        .await;
++        let r4 = (callbacks.summarize_chunk_brief)(SummarizeChunkBriefInput {
++            text: "chunk-brief".into(),
++            input_tokens: 100,
++            target_min_tokens: 10,
++            target_aim_tokens: 20,
++            target_max_tokens: 40,
++        })
++        .await;
++        // At least attempt streams; some may Err if SSE shape mismatches — still check requests.
++        let _ = (r1, r2, r3, r4);
++
++        let requests = server.received_requests().await.expect("requests");
++        let model_requests: Vec<_> = requests
++            .iter()
++            .filter_map(|req| {
++                if req.body.is_empty() {
++                    return None;
++                }
++                let body: serde_json::Value = serde_json::from_slice(&req.body).ok()?;
++                body.get("model")?;
++                Some(body)
++            })
++            .collect();
++        assert!(
++            model_requests.len() >= 4,
++            "expected ≥4 derivation POSTs with model field, got {} (total reqs={}); sample paths={:?}",
++            model_requests.len(),
++            requests.len(),
++            requests
++                .iter()
++                .map(|r| r.url.path().to_string())
++                .collect::<Vec<_>>()
++        );
++        for (i, body) in model_requests.iter().enumerate() {
++            let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
++            assert!(
++                model.contains("luna") || model == LHC_DERIVATION_MODEL,
++                "request {i}: model must be pinned luna, got {model:?} body={body}"
++            );
++            let effort = body
++                .pointer("/reasoning/effort")
++                .and_then(|v| v.as_str())
++                .unwrap_or("");
++            assert_eq!(
++                effort,
++                expected_effort.as_str(),
++                "request {i}: effort must be {}, got {effort:?} body={body}",
++                expected_effort.as_str()
++            );
++        }
++    }
++}
+diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
+index e37c17ca5d..dee828af95 100644
+--- a/codex-rs/core/src/lib.rs
++++ b/codex-rs/core/src/lib.rs
+@@ -20,11 +20,13 @@ pub use responses_metadata::CodexResponsesMetadata;
+ pub use session::SteerInputError;
+ pub use turn_metadata::detached_memory_responses_metadata;
+ mod codex_thread;
++mod compact_lhc;
+ mod compact_model_fallback;
+ mod compact_remote;
+ mod compact_remote_v2;
+ mod compact_token_budget;
+ mod config_lock;
++mod lhc_inference_bridge;
+ pub use codex_thread::BackgroundTerminalInfo;
+ pub use codex_thread::CodexThread;
+ pub use codex_thread::CodexThreadSettingsOverrides;
+diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
+index 2389a217df..87ad6b9ced 100644
+--- a/codex-rs/core/src/session/mod.rs
++++ b/codex-rs/core/src/session/mod.rs
+@@ -1316,6 +1316,9 @@ impl Session {
+                 let previous_turn_settings = self
+                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
+                     .await;
++                // I2: re-seed durable LHC derived record from CompactedItem.message.
++                self.seed_last_lhc_durable_from_rollout(&rollout_items)
++                    .await;
+ 
+                 // If resuming, warn when the last recorded model differs from the current one.
+                 let curr: &str = turn_context.model_info.slug.as_str();
+@@ -1355,6 +1358,8 @@ impl Session {
+                 Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
+                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
+                     .await;
++                self.seed_last_lhc_durable_from_rollout(&rollout_items)
++                    .await;
+ 
+                 // Seed usage info from the recorded rollout so UIs can show token counts
+                 // immediately on resume/fork.
+@@ -3220,7 +3225,7 @@ impl Session {
+     ) {
+         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
+         let compacted_item = CompactedItem {
+-            message: metadata.message,
++            message: metadata.message.clone(),
+             replacement_history: Some(items.clone()),
+             window_number: Some(metadata.window_number),
+             first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+@@ -3240,6 +3245,10 @@ impl Session {
+                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
+                 state.history.set_world_state_baseline(snapshot);
+             }
++            // I2: durable LHC derived record rides the same CompactedItem write.
++            if codex_lhc_host::CompactMarker::is_durable_writeback_record(&metadata.message) {
++                state.set_last_lhc_durable_derived(Some(metadata.message.clone()));
++            }
+         }
+ 
+         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
+@@ -3259,6 +3268,27 @@ impl Session {
+         }
+     }
+ 
++    /// I2: remember durable LHC derived record from CompactedItem messages in rollout.
++    pub(crate) async fn seed_last_lhc_durable_from_rollout(&self, rollout_items: &[RolloutItem]) {
++        let last = rollout_items.iter().rev().find_map(|item| match item {
++            RolloutItem::Compacted(c)
++                if codex_lhc_host::CompactMarker::is_durable_writeback_record(&c.message) =>
++            {
++                Some(c.message.clone())
++            }
++            _ => None,
++        });
++        if let Some(msg) = last {
++            let mut state = self.state.lock().await;
++            state.set_last_lhc_durable_derived(Some(msg));
++        }
++    }
++
++    pub(crate) async fn last_lhc_durable_derived_message(&self) -> Option<String> {
++        let state = self.state.lock().await;
++        state.last_lhc_durable_derived().map(str::to_string)
++    }
++
+     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
+         let rollout_items: Vec<RolloutItem> = items
+             .iter()
+@@ -3272,6 +3302,23 @@ impl Session {
+         self.features.enabled(feature)
+     }
+ 
++    /// Test-only: toggle a session feature after construction.
++    #[cfg(test)]
++    pub(crate) fn set_feature_for_test(
++        &mut self,
++        feature: Feature,
++        enabled: bool,
++    ) -> crate::config::ConstraintResult<()> {
++        self.features.set_enabled(feature, enabled)
++    }
++
++    /// Test-only: seed auto-compact prefill for law-2 assertions.
++    #[cfg(test)]
++    pub(crate) async fn set_auto_compact_window_estimated_prefill_for_test(&self, tokens: i64) {
++        let mut state = self.state.lock().await;
++        state.set_auto_compact_window_estimated_prefill(tokens);
++    }
++
+     pub(crate) fn features(&self) -> ManagedFeatures {
+         self.features.clone()
+     }
+diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
+index 5d82afc620..85aeb9d823 100644
+--- a/codex-rs/core/src/session/turn.rs
++++ b/codex-rs/core/src/session/turn.rs
+@@ -1009,7 +1009,8 @@ async fn maybe_run_previous_model_inline_compact(
+     skip_all,
+     fields(reason = ?reason, phase = ?phase)
+ )]
+-async fn run_auto_compact(
++// pub(crate) so compact_lhc_tests can drive the production auto ladder (R5).
++pub(crate) async fn run_auto_compact(
+     sess: &Arc<Session>,
+     step_context: Arc<StepContext>,
+     fallback_step_context: Option<Arc<StepContext>>,
+@@ -1020,6 +1021,27 @@ async fn run_auto_compact(
+ ) -> CodexResult<()> {
+     let turn_context = &step_context.turn;
+     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
++    // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
++    match crate::compact_lhc::try_run_lhc_compact_arm(
++        sess,
++        turn_context.as_ref(),
++        initial_context_injection.clone(),
++        /*manual*/ false,
++    )
++    .await?
++    {
++        crate::compact_lhc::LhcCompactAttempt::Installed { .. } => {
++            crate::tasks::emit_compact_metric(
++                &sess.services.session_telemetry,
++                "lhc",
++                /*manual*/ false,
++            );
++            return Ok(());
++        }
++        crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
++            tracing::debug!(%reason, "LHC auto-compact arm unavailable; native ladder continues");
++        }
++    }
+     if turn_context.config.features.enabled(Feature::TokenBudget) {
+         // Compaction is the reset request, so force a new context window
+         // instead of consuming a pending `new_context` tool request.
+diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
+index 28a08ef4d6..c7c1c46bac 100644
+--- a/codex-rs/core/src/state/session.rs
++++ b/codex-rs/core/src/state/session.rs
+@@ -43,6 +43,9 @@ pub(crate) struct SessionState {
+     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
+     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
+     next_turn_is_first: bool,
++    /// Last LHC durable derived record co-written with CompactedItem (I2).
++    /// Survives process restart when reseeded from rollout reconstruction.
++    pub(crate) last_lhc_durable_derived: Option<String>,
+ }
+ 
+ impl SessionState {
+@@ -75,9 +78,18 @@ impl SessionState {
+             pending_session_start_sources: VecDeque::new(),
+             granted_permissions_by_environment_id: HashMap::new(),
+             next_turn_is_first: true,
++            last_lhc_durable_derived: None,
+         }
+     }
+ 
++    pub(crate) fn set_last_lhc_durable_derived(&mut self, message: Option<String>) {
++        self.last_lhc_durable_derived = message;
++    }
++
++    pub(crate) fn last_lhc_durable_derived(&self) -> Option<&str> {
++        self.last_lhc_durable_derived.as_deref()
++    }
++
+     // History helpers
+     pub(crate) fn record_items<I>(&mut self, items: I, policy: TruncationPolicy)
+     where
+diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
+index def729b2ac..d9a4c5580a 100644
+--- a/codex-rs/core/src/tasks/compact.rs
++++ b/codex-rs/core/src/tasks/compact.rs
+@@ -33,6 +33,27 @@ impl SessionTask for CompactTask {
+     ) -> SessionTaskResult {
+         let session = session.clone_session();
+         let _profile_guard = ctx.turn_timing_state.begin_compaction();
++        // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
++        match crate::compact_lhc::try_run_lhc_compact_arm(
++            &session,
++            ctx.as_ref(),
++            crate::compact::InitialContextInjection::DoNotInject,
++            /*manual*/ true,
++        )
++        .await?
++        {
++            crate::compact_lhc::LhcCompactAttempt::Installed { .. } => {
++                super::emit_compact_metric(
++                    &session.services.session_telemetry,
++                    "lhc",
++                    /*manual*/ true,
++                );
++                return Ok(None);
++            }
++            crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
++                tracing::debug!(%reason, "LHC compact arm unavailable; native ladder continues");
++            }
++        }
+         if ctx.config.features.enabled(Feature::TokenBudget) {
+             crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
+             return Ok(None);
+diff --git a/codex-rs/core/src/tasks/lifecycle.rs b/codex-rs/core/src/tasks/lifecycle.rs
+index 789955df13..673dec03d0 100644
+--- a/codex-rs/core/src/tasks/lifecycle.rs
++++ b/codex-rs/core/src/tasks/lifecycle.rs
+@@ -46,6 +46,11 @@ impl Session {
+             return;
+         }
+ 
++        // LHC-HOOK: seed production derivation callbacks before the idle
++        // fan-out so LHC's background drain pump derives with the real model
++        // (never deterministic text). No-op when the feature is off.
++        crate::compact_lhc::seed_lhc_idle_derivation_callbacks(self).await;
++
+         for contributor in self.services.extensions.thread_lifecycle_contributors() {
+             contributor
+                 .on_thread_idle(codex_extension_api::ThreadIdleInput {

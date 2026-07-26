@@ -1009,7 +1009,8 @@ async fn maybe_run_previous_model_inline_compact(
     skip_all,
     fields(reason = ?reason, phase = ?phase)
 )]
-async fn run_auto_compact(
+// pub(crate) so compact_lhc_tests can drive the production auto ladder (R5).
+pub(crate) async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
@@ -1020,6 +1021,27 @@ async fn run_auto_compact(
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
+    // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
+    match crate::compact_lhc::try_run_lhc_compact_arm(
+        sess,
+        turn_context.as_ref(),
+        initial_context_injection.clone(),
+        /*manual*/ false,
+    )
+    .await?
+    {
+        crate::compact_lhc::LhcCompactAttempt::Installed { .. } => {
+            crate::tasks::emit_compact_metric(
+                &sess.services.session_telemetry,
+                "lhc",
+                /*manual*/ false,
+            );
+            return Ok(());
+        }
+        crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
+            tracing::debug!(%reason, "LHC auto-compact arm unavailable; native ladder continues");
+        }
+    }
     if turn_context.config.features.enabled(Feature::TokenBudget) {
         // Compaction is the reset request, so force a new context window
         // instead of consuming a pending `new_context` tool request.

@@ -1149,6 +1149,8 @@ impl Session {
                         session_configuration.parent_thread_id,
                     ),
                 ),
+                #[cfg(test)]
+                lhc_test_inference: std::sync::Mutex::new(None),
                 code_mode_service: crate::tools::code_mode::CodeModeService::new(
                     Arc::clone(&code_mode_session_provider),
                     &config.features,
