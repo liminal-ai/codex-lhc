@@ -276,6 +276,20 @@ else
   echo "  This warning repeats every run until resolved. It is not a resting state."
 fi
 echo "vendor pin: ${pin:-MISSING} (policy: certified lhc-rs-port commits only — FORK.md)"
+# Pin-drift check: a pin off the shared certified line is a PENDING
+# reconciliation, not a resting state — this renags every run until fixed.
+git -C codex-rs/lhc/vendor/long-horizon-context fetch origin lhc-rs-port --quiet 2>/dev/null || true
+if git -C codex-rs/lhc/vendor/long-horizon-context rev-parse --verify --quiet origin/lhc-rs-port >/dev/null; then
+  if git -C codex-rs/lhc/vendor/long-horizon-context merge-base --is-ancestor HEAD origin/lhc-rs-port; then
+    behind=$(git -C codex-rs/lhc/vendor/long-horizon-context rev-list --count HEAD..origin/lhc-rs-port)
+    echo "ok pin: on certified shared line ($behind commits behind shared tip)"
+  else
+    echo "WARN pin: OFF the shared certified line — side-branch pin awaiting"
+    echo "  reconciliation (fold into lhc-rs-port + re-pin; see FORK.md). Repeats every run."
+  fi
+else
+  echo "SKIP pin-drift: shared branch unreachable (offline?)"
+fi
 [ -n "$pin" ] || fail=1
 
 if [ "$fail" -eq 0 ]; then echo "ALL TRIPWIRES GREEN"; else echo "TRIPWIRES FAILED"; fi
