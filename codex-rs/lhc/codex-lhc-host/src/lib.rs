@@ -12,6 +12,7 @@ mod idempotency;
 mod inference;
 mod install;
 mod mapping;
+mod materialize;
 mod session;
 
 pub use band_shape::BandShapeItem;
@@ -87,6 +88,14 @@ pub use mapping::map_runtime_note;
 pub use mapping::map_turn_end;
 pub use mapping::token_usage_to_provider_usage;
 pub use mapping::unix_secs_to_iso;
+pub use materialize::CAPTURE_GAPS;
+pub use materialize::CompactBoundaryMeta;
+pub use materialize::MaterializeInput;
+pub use materialize::MaterializeResult;
+pub use materialize::boundary_completeness_error;
+pub use materialize::iso_to_unix_secs;
+pub use materialize::materialize_rollout;
+pub use materialize::model_stream_response_item_count;
 pub use session::encode_thread_id_for_path;
 pub use session::thread_file_path;
 
