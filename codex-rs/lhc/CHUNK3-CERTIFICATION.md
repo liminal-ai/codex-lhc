@@ -1061,3 +1061,34 @@ The `--nocapture` runs print every number quoted in §3 and §4.4. The recovery
 drill is now layer 13 of the tripwire, so §4.2 reproduces on every run; to do it
 by hand, `git worktree add --detach <tmp> $(cat patches/lhc/BASE)`, restore the
 fork-owned trees, and apply `patches/lhc/0*.patch` in order.
+
+## 10. Derivation quality on `gpt-5.6-luna` — untested, needs carve-out
+
+The derivation model is pinned (`LHC_DERIVATION_MODEL`) rather than following
+the session's model. That is deliberate and it is what keeps auth symmetric:
+derivation rides the same provider as the CLI's own inference, so there is no
+state where the agent can infer but derivation cannot. Per-host the pin
+differs — claude models for cc-lhc, grok for grok-build, ChatGPT for this
+fork.
+
+**What has NOT been tested: whether the derivations luna produces are any
+good.** B3 proved the path works — 10 real calls, non-degraded bands, correct
+receipt — but nothing has judged the *content*.
+
+Two specifics for whoever picks this up:
+
+1. **Read the actual thread SQLite files** and assess derivation quality
+   directly: are smoothed prompts faithful (intent, constraints, exact
+   identifiers preserved)? Do turn compressions keep what a later turn would
+   need? Are chunk briefs accurate rather than plausible?
+2. **Model history, for context — not a concern.** Derivation previously
+   used `5.4-mini` for most work and `5.4` for the broader brief-band
+   derivation. All four callbacks now share `gpt-5.6-luna`, which is stronger
+   than `5.4-mini` and at least comparable to `5.4`, at close to mini's
+   rate-limit cost (~$6/M output vs ~$4.50/M). So no derivation type is on a
+   weaker model than before; the small-op lane is straightforwardly upgraded.
+   There is no band to watch more closely than any other on that account.
+
+The open question is therefore absolute, not relative: is luna's output good
+enough, anywhere? Reasonable prior: fine, possibly better than what preceded
+it. Not a substitute for looking.
