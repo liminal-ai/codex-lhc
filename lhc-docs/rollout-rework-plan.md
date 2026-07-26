@@ -158,9 +158,10 @@ ruling):**
 6. (Slice E) Delete rollout, regenerate, resume, converse — the
    conformance drill performed live.
 
-Estimated layer-3 spend: 50–80k tokens on plan quota across the matrix
-(band-eval precedent: ~5–10k per run). **Authorization for this spend
-is the one open ask before slice D.**
+Layer-3 spend: AUTHORIZED (Lee, 2026-07-26) — up to and beyond 1M
+tokens on plan quota if the matrix warrants it (rate-limit headroom is
+ample). Do not thin the matrix to save tokens; add runs where they buy
+evidence.
 
 ## Sequencing and status
 
