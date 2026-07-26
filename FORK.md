@@ -155,8 +155,14 @@ terminal failure.
 1. `git fetch upstream && git checkout lhc && git merge upstream/main`
 2. Expect conflicts near `core/src/session/mod.rs` (~70 commits/mo).
 3. Watch item: compaction dispatch ladder in `core/src/tasks/compact.rs`.
-4. `./scripts/check-lhc-hooks.sh` — all layers green before push.
-5. Commit with tripwire output summarized in the body; push to origin only.
+4. **Advance the patch base.** `patches/lhc/BASE` names the upstream commit the
+   whole series diffs from. A merge moves the tree past it, so upstream's own
+   changed files then read as "fork-owned but in no patch" and `patch-repro`
+   fails. Write the merged upstream tip into `BASE` and regenerate all seven
+   patches against it (`patches/lhc/README.md`). This step is **part of the
+   sync**, not cleanup after it.
+5. `./scripts/check-lhc-hooks.sh` — all layers green before push.
+6. Commit with tripwire output summarized in the body; push to origin only.
 
 ### Drill run 2026-07-26 (Chunk 3 / C2) — clean, and thinner than intended
 
@@ -165,6 +171,15 @@ conflicts**; no hook file touched. Tripwire on the merged tree: 12/13 green
 (layer 13 red for the pre-existing reason below). Nothing broke, so nothing was
 resolved — **this exercised the procedure, not the conflict resolution.** Run on
 a branch off `lhc` in a separate worktree (Chunk 3 was not allowed to commit).
+
+**That drill's green verdict did not cover the patch base, and could not
+have.** It ran at 03:54; `patches/lhc/BASE` was added at 05:39 (`ed22b96375`),
+1h45m later. The rehearsal therefore ran against a `patch-repro` with no
+fixed-base concept, so base-drift was invisible to it by construction. When
+the same upstream range was merged for real on `lhc`, `patch-repro` failed
+exactly there. Step 4 above is that missing step. Recorded because the drill
+looked like evidence the sync was clean end-to-end and was not — a rehearsal
+only covers the checks that existed when it ran.
 
 Real exposure, measured on upstream over 30 days rather than assumed:
 
@@ -181,8 +196,9 @@ real; a sync after a *week or more* of gap has still never been rehearsed.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `322d5b96cf`, the last upstream commit before
-Chunk 0). Each fork-owned file appears in **exactly one** patch. Tripwire
+`patches/lhc/BASE` (currently `61a44880a8`; it was `322d5b96cf`, the last
+upstream commit before Chunk 0, until the first real sync advanced it — see
+Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing
 the tree, so it cannot rot silently again.
 

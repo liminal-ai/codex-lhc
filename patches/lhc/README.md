@@ -25,7 +25,12 @@ with the working tree, plus that every fork-owned file under `codex-rs/`
 See FORK.md's touchpoint inventory for the authoritative file list, and
 FORK.md §History-reset recovery for the drill this series exists to serve.
 
-## Series (regenerated Chunk 3 round 9 against `BASE`)
+## Series (regenerated 2026-07-26 against `BASE` = `61a44880a8`)
+
+`BASE` advances on every upstream sync — see FORK.md "Sync drill" step 4.
+Regenerate the *whole* series against the new base in the same commit as the
+merge; a series left at the old base makes upstream's own changed files look
+fork-owned-but-uncovered, and `patch-repro` fails.
 
 One base for all seven; each fork-owned file in exactly one patch.
 
