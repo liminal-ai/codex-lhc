@@ -1,3 +1,22 @@
+> **(This is a fork of [`openai/codex`](https://github.com/openai/codex).)**
+>
+> It replaces Codex's native context compaction with
+> [LHC](https://github.com/liminal-ai/long-horizon-context) (Long Horizon
+> Context). Every session is captured into a durable per-thread SQLite
+> record, and what the model sees is a *rendering* of that record built as a
+> ramp of fidelity — recent work verbatim, older work progressively
+> summarized — rather than a summary that replaces the original. History is
+> never destroyed, so any band can be rebuilt at any time. The effect is
+> context that degrades over days and weeks instead of falling off a cliff
+> at the first compact.
+>
+> - [**What this fork is**](lhc-docs/README.md) — purpose, LHC concepts, and
+>   how it is integrated.
+> - [**Install**](lhc-docs/INSTALL.md) — build, configure, and verify from
+>   source.
+>
+> Everything below is upstream's README.
+
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">
   <img src="https://github.com/openai/codex/blob/main/.github/codex-cli-splash.png" alt="Codex CLI splash" width="80%" />
