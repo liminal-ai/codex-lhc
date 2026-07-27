@@ -21,6 +21,7 @@ pub use session::SteerInputError;
 pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
 mod compact_lhc;
+pub use compact_lhc::reconcile_rollout_before_history_load;
 mod compact_model_fallback;
 mod compact_remote;
 mod compact_remote_v2;

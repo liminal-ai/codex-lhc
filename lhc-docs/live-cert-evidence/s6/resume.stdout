@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fa129-ad11-7402-a4f1-f7ce7a4f378c"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Secret: `BLUE-MARBLE-ORBIT-42`\n\nLIVE-CERT markers: `ALPHA`, `BETA`, `GAMMA`, `COMPACT`."}}
+{"type":"turn.completed","usage":{"input_tokens":477584,"cached_input_tokens":275456,"cache_write_input_tokens":0,"output_tokens":1282,"reasoning_output_tokens":144}}

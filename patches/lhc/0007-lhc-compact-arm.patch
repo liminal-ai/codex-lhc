@@ -1,3 +1,22 @@
+diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
+index 85dfb9ecfe..2da65fb0d8 100644
+--- a/codex-rs/app-server/src/request_processors/thread_processor.rs
++++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
+@@ -3704,6 +3704,14 @@ impl ThreadRequestProcessor {
+         &self,
+         stored_thread: StoredThread,
+     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
++        // LHC-HOOK: startup reconciliation before history load (slice E).
++        // MISSING / CORRUPT / STALE → regenerate from the LHC thread so resume
++        // serves coherent history. Fail-open when the thread is unavailable.
++        if let Some(path) = stored_thread.rollout_path.as_ref() {
++            let tid = stored_thread.thread_id.to_string();
++            codex_core::reconcile_rollout_before_history_load(path.as_path(), &tid).await;
++        }
++
+         if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
+             let model_context = self
+                 .thread_store
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
 index 3eac8f03e6..85c83fe4ea 100644
 --- a/codex-rs/core/Cargo.toml
@@ -22,10 +41,10 @@ index 3eac8f03e6..85c83fe4ea 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..d29e2a2298
+index 0000000000..df0f88adc0
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,956 @@
+@@ -0,0 +1,1050 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -103,6 +122,75 @@ index 0000000000..d29e2a2298
 +}
 +
 +// LHC-HOOK: LHC compact arm entry (manual + auto ladders).
++
++/// Slice E startup reconciliation: if the rollout is MISSING / CORRUPT / STALE
++/// relative to the LHC thread, regenerate it from the thread **before** history
++/// is loaded. Fail-open when the thread is unavailable (native behavior).
++///
++/// Loud `info!` is emitted by the host with the triggering state name.
++/// LHC SDK futures are `!Send` — this hops to a dedicated thread so callers on
++/// multi-thread runtimes (app-server) stay `Send`.
++// LHC-HOOK: startup rollout reconciliation before history load (slice E)
++pub async fn reconcile_rollout_before_history_load(
++    rollout_path: &std::path::Path,
++    thread_id: &str,
++) {
++    let path = rollout_path.to_path_buf();
++    let tid = thread_id.to_string();
++    let root = codex_lhc_host::lhc_root();
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let spawn_result = std::thread::Builder::new()
++        .name(format!("lhc-reconcile-{tid}"))
++        .spawn(move || {
++            let rt = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(err) => {
++                    let _ = tx.send(Err(format!("runtime: {err}")));
++                    return;
++                }
++            };
++            let outcome = rt.block_on(codex_lhc_host::reconcile_rollout_at_path(
++                path.as_path(),
++                &tid,
++                Some(root.as_path()),
++            ));
++            let _ = tx.send(Ok((outcome, path, tid)));
++        });
++    if let Err(err) = spawn_result {
++        warn!(%err, "LHC startup reconciliation: spawn failed; fail-open");
++        return;
++    }
++    match rx.await {
++        Ok(Ok((outcome, path, tid))) => match outcome {
++            codex_lhc_host::ReconcileOutcome::Regenerated { trigger, items } => {
++                info!(
++                    path = %path.display(),
++                    thread_id = %tid,
++                    ?trigger,
++                    items,
++                    "LHC startup reconciliation completed before history load"
++                );
++            }
++            codex_lhc_host::ReconcileOutcome::Unchanged { reason } => {
++                debug!(
++                    path = %path.display(),
++                    thread_id = %tid,
++                    reason,
++                    "LHC startup reconciliation: no rewrite"
++                );
++            }
++        },
++        Ok(Err(err)) => {
++            warn!(%err, "LHC startup reconciliation thread error; fail-open");
++        }
++        Err(_) => {
++            warn!("LHC startup reconciliation thread dropped; fail-open");
++        }
++    }
++}
 +
 +//
 +// J1: production default is real ModelClient inference (pinned model, lowest
@@ -256,16 +344,27 @@ index 0000000000..d29e2a2298
 +    // When the live host history is substantially larger (rollout lag, or a
 +    // test that seeded a tiny pre-rewrite file then grew the host), fall back
 +    // to the host stream so we do not false-positive NoReduction.
++    //
++    // Slice E Part 1: NoReduction is a pathology tripwire, not a size optimizer.
++    // When the rollout is native-append-polluted (more than one Compacted record
++    // — appended Compacted after/atop an LHC rewrite), a NORMALIZATION rewrite
++    // proceeds regardless of the size comparison.
 +    let host_est = estimate_response_items_tokens(&host_items);
-+    let rollout_est = match sess.current_rollout_path().await {
++    let (rollout_est, native_append_polluted) = match sess.current_rollout_path().await {
 +        Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
-+            Ok(items) => model_context_token_estimate_from_rollout_items(&items),
++            Ok(items) => {
++                let polluted = codex_lhc_host::is_native_append_polluted(&items);
++                (
++                    model_context_token_estimate_from_rollout_items(&items),
++                    polluted,
++                )
++            }
 +            Err(err) => {
 +                warn!(%err, path = %path.display(), "rollout parse for reduction baseline failed");
-+                0
++                (0, false)
 +            }
 +        },
-+        _ => 0,
++        _ => (0, false),
 +    };
 +    let baseline_tokens = if rollout_est > 0 && rollout_est.saturating_mul(2) >= host_est {
 +        rollout_est
@@ -306,16 +405,30 @@ index 0000000000..d29e2a2298
 +
 +    // F-L4: refuse only genuine pathology — materialized body larger than the
 +    // current rollout model-context (like-for-like). Equal/smaller installs.
++    // Exception (slice E): native-append-polluted multi-Compacted files get a
++    // NORMALIZATION rewrite even when body > baseline — the size guard is not a
++    // size optimizer.
 +    let body_token_estimate = estimate_response_items_tokens(&produce_body);
 +    if body_token_estimate > baseline_tokens {
-+        let reason = format!(
-+            "NoReduction: body_tokens={body_token_estimate} \
-+             rollout_model_context_tokens={baseline_tokens} \
-+             items_body={} (materialized body larger than current model-context)",
-+            produce_body.len()
-+        );
-+        warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
-+        return Ok(LhcCompactAttempt::Unavailable { reason });
++        if native_append_polluted {
++            info!(
++                body_tokens = body_token_estimate,
++                rollout_model_context_tokens = baseline_tokens,
++                items_body = produce_body.len(),
++                manual,
++                "LHC compact NORMALIZATION rewrite: native-append-polluted rollout \
++                 (multiple Compacted records); skipping NoReduction size guard"
++            );
++        } else {
++            let reason = format!(
++                "NoReduction: body_tokens={body_token_estimate} \
++                 rollout_model_context_tokens={baseline_tokens} \
++                 items_body={} (materialized body larger than current model-context)",
++                produce_body.len()
++            );
++            warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
++            return Ok(LhcCompactAttempt::Unavailable { reason });
++        }
 +    }
 +
 +    let (_initial_context, world_state_baseline) =
@@ -5347,14 +5460,15 @@ index 0000000000..bd9d354c19
 +    }
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index e37c17ca5d..dee828af95 100644
+index e37c17ca5d..00e4eaa1c5 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
-@@ -20,11 +20,13 @@ pub use responses_metadata::CodexResponsesMetadata;
+@@ -20,11 +20,14 @@ pub use responses_metadata::CodexResponsesMetadata;
  pub use session::SteerInputError;
  pub use turn_metadata::detached_memory_responses_metadata;
  mod codex_thread;
 +mod compact_lhc;
++pub use compact_lhc::reconcile_rollout_before_history_load;
  mod compact_model_fallback;
  mod compact_remote;
  mod compact_remote_v2;
@@ -6526,6 +6640,47 @@ index 54e561de4f..3076ee4c8f 100644
      }
  }
  
+diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
+index 5c718cede6..97f7aa389e 100644
+--- a/codex-rs/core/src/thread_manager.rs
++++ b/codex-rs/core/src/thread_manager.rs
+@@ -1069,6 +1069,16 @@ impl ThreadManager {
+         &self,
+         rollout_path: PathBuf,
+     ) -> CodexResult<InitialHistory> {
++        // LHC-HOOK: startup reconciliation before history load (slice E).
++        // Prefer regenerating MISSING/CORRUPT/STALE projections from the LHC
++        // thread so resume serves a coherent file. Fail-open if no thread.
++        if let Some(thread_id) = thread_id_hint_from_rollout_path(&rollout_path) {
++            crate::compact_lhc::reconcile_rollout_before_history_load(
++                rollout_path.as_path(),
++                &thread_id,
++            )
++            .await;
++        }
+         let requested_rollout_path = rollout_path.clone();
+         let stored_thread = self
+             .state
+@@ -1912,6 +1922,19 @@ impl ThreadManagerState {
+     }
+ }
+ 
++/// Best-effort thread id from a rollout filename (`rollout-<ts>-<uuid>.jsonl`).
++fn thread_id_hint_from_rollout_path(path: &std::path::Path) -> Option<String> {
++    let name = path.file_name()?.to_str()?;
++    let stem = name.strip_suffix(".jsonl")?;
++    if stem.len() >= 36 {
++        let candidate = &stem[stem.len() - 36..];
++        if uuid::Uuid::parse_str(candidate).is_ok() {
++            return Some(candidate.to_string());
++        }
++    }
++    None
++}
++
+ fn stored_thread_to_initial_history(
+     stored_thread: StoredThread,
+     rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
 index 43be695398..d38277f688 100644
 --- a/codex-rs/rollout/src/recorder.rs

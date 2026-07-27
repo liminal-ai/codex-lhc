@@ -3704,6 +3704,14 @@ impl ThreadRequestProcessor {
         &self,
         stored_thread: StoredThread,
     ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
+        // LHC-HOOK: startup reconciliation before history load (slice E).
+        // MISSING / CORRUPT / STALE → regenerate from the LHC thread so resume
+        // serves coherent history. Fail-open when the thread is unavailable.
+        if let Some(path) = stored_thread.rollout_path.as_ref() {
+            let tid = stored_thread.thread_id.to_string();
+            codex_core::reconcile_rollout_before_history_load(path.as_path(), &tid).await;
+        }
+
         if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
             let model_context = self
                 .thread_store

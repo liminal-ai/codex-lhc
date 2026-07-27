@@ -88,6 +88,9 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 25 | `thread-store/src/live_thread.rs` | `LiveThread::reopen_rollout_after_rewrite` escape hatch (slice C) | `0007-lhc-compact-arm` |
 | 26 | `thread-store/src/local/{mod,live_writer}.rs` | local-store reopen implementation (slice C; no sentinel on impl) | `0007-lhc-compact-arm` |
 | 27 | `core/src/session/mod.rs` | `install_compacted_history_memory` — in-memory install without append (slice C) | (with 0004) |
+| 28 | `core/src/compact_lhc.rs` | startup reconciliation entry before history load (slice E) | (with 0007) |
+| 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
+| 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
@@ -95,7 +98,9 @@ round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing
 a legitimate combination; fork-owned and *not in any patch* is not. Row 26 is
 the same pattern (impl details under a sentinel-bearing LiveThread API).
 
-Expected markers: **51** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **54** (`EXPECTED_HOOKS` in the tripwire script).
+Was 51 before slice E (startup reconciliation); +3 for reconcile entry +
+thread_manager history-load seam + app-server resume history-load seam.
 Was 47 before slice C (rollout rewrite); +4 for recorder reopen, LiveThread
 reopen, compact-arm rewrite install, and in-memory-only compact install.
 Was 39 before slice A (schema v5 field capture); +8 for turn timing fields on
@@ -426,7 +431,21 @@ the fallback ladder (less-derived bands, full-fidelity residue). The fork arm
 loud-logs terminal failures and installs via the ladder; derivations upgrade
 later. A `NoReduction` loud-fail remains only when the **materialized body is
 strictly larger** than the current rollout file's model-context size
-(like-for-like; F-L4).
+(like-for-like; F-L4) **and** the file is a pure single-boundary projection.
+When the rollout is **native-append-polluted** (more than one `Compacted`
+record — native append after an LHC rewrite), a NORMALIZATION rewrite
+proceeds regardless of the size comparison (slice E Part 1; loud `info!`).
+
+## Startup reconciliation (slice E)
+
+At resume / history load: classify the rollout vs the LHC thread compact
+point as MISSING (file gone), CORRUPT (unparseable), or STALE (LHC compact
+point advanced past the file boundary — crash window between LHC commit and
+rename). In each case regenerate via materialize + atomic swap **before**
+history is served; loud log names the trigger. If the thread is unavailable,
+leave the file alone (fail-open, native behavior). Logic lives in
+`codex-lhc-host::rollout_reconcile`; thin core/app-server hooks call it at
+the history-load seams.
 
 ## Host obligations
 

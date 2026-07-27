@@ -76,6 +76,75 @@ pub(crate) enum LhcCompactAttempt {
 
 // LHC-HOOK: LHC compact arm entry (manual + auto ladders).
 
+/// Slice E startup reconciliation: if the rollout is MISSING / CORRUPT / STALE
+/// relative to the LHC thread, regenerate it from the thread **before** history
+/// is loaded. Fail-open when the thread is unavailable (native behavior).
+///
+/// Loud `info!` is emitted by the host with the triggering state name.
+/// LHC SDK futures are `!Send` — this hops to a dedicated thread so callers on
+/// multi-thread runtimes (app-server) stay `Send`.
+// LHC-HOOK: startup rollout reconciliation before history load (slice E)
+pub async fn reconcile_rollout_before_history_load(
+    rollout_path: &std::path::Path,
+    thread_id: &str,
+) {
+    let path = rollout_path.to_path_buf();
+    let tid = thread_id.to_string();
+    let root = codex_lhc_host::lhc_root();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("lhc-reconcile-{tid}"))
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = tx.send(Err(format!("runtime: {err}")));
+                    return;
+                }
+            };
+            let outcome = rt.block_on(codex_lhc_host::reconcile_rollout_at_path(
+                path.as_path(),
+                &tid,
+                Some(root.as_path()),
+            ));
+            let _ = tx.send(Ok((outcome, path, tid)));
+        });
+    if let Err(err) = spawn_result {
+        warn!(%err, "LHC startup reconciliation: spawn failed; fail-open");
+        return;
+    }
+    match rx.await {
+        Ok(Ok((outcome, path, tid))) => match outcome {
+            codex_lhc_host::ReconcileOutcome::Regenerated { trigger, items } => {
+                info!(
+                    path = %path.display(),
+                    thread_id = %tid,
+                    ?trigger,
+                    items,
+                    "LHC startup reconciliation completed before history load"
+                );
+            }
+            codex_lhc_host::ReconcileOutcome::Unchanged { reason } => {
+                debug!(
+                    path = %path.display(),
+                    thread_id = %tid,
+                    reason,
+                    "LHC startup reconciliation: no rewrite"
+                );
+            }
+        },
+        Ok(Err(err)) => {
+            warn!(%err, "LHC startup reconciliation thread error; fail-open");
+        }
+        Err(_) => {
+            warn!("LHC startup reconciliation thread dropped; fail-open");
+        }
+    }
+}
+
 //
 // J1: production default is real ModelClient inference (pinned model, lowest
 // effort). Deterministic callbacks are never the silent default — tests must
@@ -228,16 +297,27 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     // When the live host history is substantially larger (rollout lag, or a
     // test that seeded a tiny pre-rewrite file then grew the host), fall back
     // to the host stream so we do not false-positive NoReduction.
+    //
+    // Slice E Part 1: NoReduction is a pathology tripwire, not a size optimizer.
+    // When the rollout is native-append-polluted (more than one Compacted record
+    // — appended Compacted after/atop an LHC rewrite), a NORMALIZATION rewrite
+    // proceeds regardless of the size comparison.
     let host_est = estimate_response_items_tokens(&host_items);
-    let rollout_est = match sess.current_rollout_path().await {
+    let (rollout_est, native_append_polluted) = match sess.current_rollout_path().await {
         Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
-            Ok(items) => model_context_token_estimate_from_rollout_items(&items),
+            Ok(items) => {
+                let polluted = codex_lhc_host::is_native_append_polluted(&items);
+                (
+                    model_context_token_estimate_from_rollout_items(&items),
+                    polluted,
+                )
+            }
             Err(err) => {
                 warn!(%err, path = %path.display(), "rollout parse for reduction baseline failed");
-                0
+                (0, false)
             }
         },
-        _ => 0,
+        _ => (0, false),
     };
     let baseline_tokens = if rollout_est > 0 && rollout_est.saturating_mul(2) >= host_est {
         rollout_est
@@ -278,16 +358,30 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
 
     // F-L4: refuse only genuine pathology — materialized body larger than the
     // current rollout model-context (like-for-like). Equal/smaller installs.
+    // Exception (slice E): native-append-polluted multi-Compacted files get a
+    // NORMALIZATION rewrite even when body > baseline — the size guard is not a
+    // size optimizer.
     let body_token_estimate = estimate_response_items_tokens(&produce_body);
     if body_token_estimate > baseline_tokens {
-        let reason = format!(
-            "NoReduction: body_tokens={body_token_estimate} \
-             rollout_model_context_tokens={baseline_tokens} \
-             items_body={} (materialized body larger than current model-context)",
-            produce_body.len()
-        );
-        warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
-        return Ok(LhcCompactAttempt::Unavailable { reason });
+        if native_append_polluted {
+            info!(
+                body_tokens = body_token_estimate,
+                rollout_model_context_tokens = baseline_tokens,
+                items_body = produce_body.len(),
+                manual,
+                "LHC compact NORMALIZATION rewrite: native-append-polluted rollout \
+                 (multiple Compacted records); skipping NoReduction size guard"
+            );
+        } else {
+            let reason = format!(
+                "NoReduction: body_tokens={body_token_estimate} \
+                 rollout_model_context_tokens={baseline_tokens} \
+                 items_body={} (materialized body larger than current model-context)",
+                produce_body.len()
+            );
+            warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
+            return Ok(LhcCompactAttempt::Unavailable { reason });
+        }
     }
 
     let (_initial_context, world_state_baseline) =

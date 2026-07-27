@@ -1,0 +1,5 @@
+compacted_count=2
+bands_len=7
+native_tail=18
+windows=[1, 2]
+SHAPE_PARTIAL_OR_FAIL

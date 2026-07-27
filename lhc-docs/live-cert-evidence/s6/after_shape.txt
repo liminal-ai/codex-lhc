@@ -1,0 +1,5 @@
+compacted_count=1
+bands_len=1
+native_tail=51
+windows=[1]
+SHAPE_OK

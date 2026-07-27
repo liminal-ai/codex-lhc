@@ -1,0 +1,2 @@
+regen=1 shape_ok=1 recall=1 log_hit=1 rc=0
+RESULT PASS

@@ -1069,6 +1069,16 @@ impl ThreadManager {
         &self,
         rollout_path: PathBuf,
     ) -> CodexResult<InitialHistory> {
+        // LHC-HOOK: startup reconciliation before history load (slice E).
+        // Prefer regenerating MISSING/CORRUPT/STALE projections from the LHC
+        // thread so resume serves a coherent file. Fail-open if no thread.
+        if let Some(thread_id) = thread_id_hint_from_rollout_path(&rollout_path) {
+            crate::compact_lhc::reconcile_rollout_before_history_load(
+                rollout_path.as_path(),
+                &thread_id,
+            )
+            .await;
+        }
         let requested_rollout_path = rollout_path.clone();
         let stored_thread = self
             .state
@@ -1910,6 +1920,19 @@ impl ThreadManagerState {
             .map(|thread| thread.session.services.rollout_thread_trace.clone())
             .unwrap_or_else(codex_rollout_trace::ThreadTraceContext::disabled)
     }
+}
+
+/// Best-effort thread id from a rollout filename (`rollout-<ts>-<uuid>.jsonl`).
+fn thread_id_hint_from_rollout_path(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".jsonl")?;
+    if stem.len() >= 36 {
+        let candidate = &stem[stem.len() - 36..];
+        if uuid::Uuid::parse_str(candidate).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
 }
 
 fn stored_thread_to_initial_history(

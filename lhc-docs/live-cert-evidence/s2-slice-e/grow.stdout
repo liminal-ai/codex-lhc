@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"019fa129-ad11-7402-a4f1-f7ce7a4f378c"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll read the fixture and confirm the requested markers from the session context."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sample_data/readme.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sample_data/readme.txt'","aggregated_output":"LIVE CERT FIXTURE\n=================\nSecret phrase for coherence checks: BLUE-MARBLE-ORBIT-42\nProject codename: Helios Compact\nAuthor: Slice D Live Cert\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"S2E-NORM confirmed.\n\nSecret: `BLUE-MARBLE-ORBIT-42`\n\nKnown markers: `ALPHA`, `BETA`, `GAMMA`."}}
+{"type":"turn.completed","usage":{"input_tokens":372716,"cached_input_tokens":218624,"cache_write_input_tokens":0,"output_tokens":1154,"reasoning_output_tokens":115}}

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fa129-ad11-7402-a4f1-f7ce7a4f378c"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Secret phrase: `BLUE-MARBLE-ORBIT-42`\n\nMarkers: `LIVE-CERT-MARKER-ALPHA`, `-BETA`, `-GAMMA`; S2 markers: `S2A`, `S2E-NORM`."}}
+{"type":"turn.completed","usage":{"input_tokens":421881,"cached_input_tokens":265472,"cache_write_input_tokens":0,"output_tokens":1212,"reasoning_output_tokens":115}}
