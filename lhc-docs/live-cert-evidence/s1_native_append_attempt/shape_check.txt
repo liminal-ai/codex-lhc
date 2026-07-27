@@ -1,0 +1,7 @@
+compacted_count 1
+bands_len 4
+native_tail_response_items 1
+window_numbers [1]
+prev_exists False
+ctc_function_call_ids ['ctc_08b023520db923dc016a66a6afad7881a1b041b4f115a40581']
+SHAPE_FAIL

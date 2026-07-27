@@ -1,0 +1,12 @@
+[2m2026-07-27T00:29:04.186805Z[0m [32m INFO[0m [1mtry_run_lhc_compact_arm[0m[1m{[0m[3mmanual[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mcodex_core::compact_lhc[0m[2m:[0m LHC rollout rewrite installed (atomic swap) [3mpath[0m[2m=[0m/srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T00-28-44-019fa0f9-5b56-7592-b219-04863ce4169b.jsonl [3mitems[0m[2m=[0m15
+[2m2026-07-27T00:29:04.291792Z[0m [32m INFO[0m [1mtry_run_lhc_compact_arm[0m[1m{[0m[3mmanual[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mcodex_core::compact_lhc[0m[2m:[0m LHC compact arm installed write-back from real CompactReceipt (rewrite path) [3mmanual[0m[2m=[0mfalse [3mitems[0m[2m=[0m3 [3mcovered_from[0m[2m=[0m0 [3mcompact_point[0m[2m=[0m0 [3mtotal_tokens[0m[2m=[0m5573 [3mderived_ids[0m[2m=[0m3 [3mruntime_note_chars[0m[2m=[0m475
+[2m2026-07-27T00:29:08.555910Z[0m [32m INFO[0m [1mtry_run_lhc_compact_arm[0m[1m{[0m[3mmanual[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mcodex_core::compact_lhc[0m[2m:[0m LHC rollout rewrite installed (atomic swap) [3mpath[0m[2m=[0m/srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T00-28-44-019fa0f9-5b56-7592-b219-04863ce4169b.jsonl [3mitems[0m[2m=[0m30
+[2m2026-07-27T00:29:08.594842Z[0m [32m INFO[0m [1mtry_run_lhc_compact_arm[0m[1m{[0m[3mmanual[0m[2m=[0mfalse[1m}[0m[2m:[0m [2mcodex_core::compact_lhc[0m[2m:[0m LHC compact arm installed write-back from real CompactReceipt (rewrite path) [3mmanual[0m[2m=[0mfalse [3mitems[0m[2m=[0m9 [3mcovered_from[0m[2m=[0m0 [3mcompact_point[0m[2m=[0m0 [3mtotal_tokens[0m[2m=[0m12399 [3mderived_ids[0m[2m=[0m9 [3mruntime_note_chars[0m[2m=[0m673
+[2m2026-07-27T00:29:08.911917Z[0m [32m INFO[0m [2mcodex_core::session::turn[0m[2m:[0m Turn error: {
+  "type": "error",
+  "error": {
+    "type": "invalid_request_error",
+    "message": "[ApiIdParam] [input[9].id] [invalid_id_prefix] Invalid 'input[9].id': 'ctc_0695851a6456c30b016a66a651de78819c887458ac0e8029a7'. Expected an ID that begins with 'fc'."
+  },
+  "status": 400
+}

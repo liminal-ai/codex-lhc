@@ -1,0 +1,18 @@
+=== DB: /srv/work/codex/lhc-docs/live-cert-scratch/lhc/threads/019fa0fb-11ad-7be2-b406-46634c402fd3.sqlite exact_match= True
+tables: ['thread_metadata', 'event', 'turns', 'message', 'message_block', 'work_item', 'derivation', 'chunk', 'chunk_member', 'thread_view', 'thread_view_band', 'view_boundary', 'log', 'sqlite_sequence', 'derivation_log']
+--- turns (3) ---
+{'turn_id': 't1', 'turn_order': 1, 'status': 'closed', 'opened_at_event_order': 0, 'closed_at_event_order': 2, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+{'turn_id': 't2', 'turn_order': 2, 'status': 'closed', 'opened_at_event_order': 2, 'closed_at_event_order': 8, 'outcome': 'completed', 'outcome_reason': None, 'started_at': '2026-07-27T00:30:36.000Z', 'ended_at': '2026-07-27T00:31:48.000Z', 'deleted_at': None}
+{'turn_id': 't3', 'turn_order': 3, 'status': 'open', 'opened_at_event_order': 8, 'closed_at_event_order': None, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+aborted_turns: []
+--- message (7) ---
+{'message_id': 'm1', 'source_event_order': 1, 'kind': 'runtime_note', 'token_estimate': 5563, 'actor': 'system', 'harness': 'codex', 'turn_id': 't1', 'provider_usage': None, 'deleted_at': None}
+{'message_id': 'm2', 'source_event_order': 2, 'kind': 'user_prompt', 'token_estimate': 62, 'actor': 'user', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': None, 'deleted_at': None}
+{'message_id': 'm3', 'source_event_order': 3, 'kind': 'assistant_thinking', 'token_estimate': 710, 'actor': 'assistant', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': None, 'deleted_at': None}
+{'message_id': 'm4', 'source_event_order': 4, 'kind': 'assistant_text', 'token_estimate': 22, 'actor': 'assistant', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': '{"input_tokens":18088,"cached_input_tokens":17152,"cache_write_input_tokens":0,"output_tokens":163,"reasoning_output_tokens":22,"total_tokens":18251}', 'deleted_at': None, 'provider_usage_parsed': {'input_tokens': 18088, 'cached_input_tokens': 17152, 'cache_write_input_tokens': 0, 'output_tokens': 163, 'reasoning_output_tokens': 22, 'total_tokens': 18251}}
+{'message_id': 'm5', 'source_event_order': 5, 'kind': 'tool_call', 'token_estimate': 227, 'actor': 'assistant', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': None, 'deleted_at': None}
+{'message_id': 'm6', 'source_event_order': 6, 'kind': 'tool_result', 'token_estimate': 1023, 'actor': 'tool', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': None, 'deleted_at': None}
+{'message_id': 'm7', 'source_event_order': 7, 'kind': 'assistant_text', 'token_estimate': 92, 'actor': 'assistant', 'harness': 'codex', 'turn_id': 't2', 'provider_usage': '{"input_tokens":18539,"cached_input_tokens":17152,"cache_write_input_tokens":0,"output_tokens":96,"reasoning_output_tokens":0,"total_tokens":18635}', 'deleted_at': None, 'provider_usage_parsed': {'input_tokens': 18539, 'cached_input_tokens': 17152, 'cache_write_input_tokens': 0, 'output_tokens': 96, 'reasoning_output_tokens': 0, 'total_tokens': 18635}}
+provider_usage_calls: 2 sum_total_tokens: 36886
+thread_view: []
+thread_view_band: []

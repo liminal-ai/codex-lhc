@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fa0fb-11ad-7be2-b406-46634c402fd3"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"BLUE-MARBLE-ORBIT-42\n\nLIVE-CERT-MARKER-ALPHA; LIVE-CERT-RESUME-1"}}
+{"type":"turn.completed","usage":{"input_tokens":55297,"cached_input_tokens":44288,"cache_write_input_tokens":0,"output_tokens":291,"reasoning_output_tokens":22}}

@@ -1,0 +1,34 @@
+=== TWO-COUNTERS COMPARISON (scenario 5, s1 thread) ===
+session_id: 019fa0fe-22df-7342-8afb-4c99d8bdca3f
+rollout newest TokenCount total: 268453
+LHC provider_usage call count: 14
+LHC sum total_tokens: 268453
+LHC sum input_tokens: 267281
+LHC sum output_tokens: 1172
+
+Per-call provider_usage totals:
+  m4 assistant_text: total=18226 in=18070 out=156
+  m7 assistant_text: total=19096 in=19034 out=62
+  m11 assistant_text: total=19287 in=19135 out=152
+  m14 assistant_text: total=19862 in=19815 out=47
+  m18 assistant_text: total=20038 in=19912 out=126
+  m21 assistant_text: total=20586 in=20494 out=92
+  m26 assistant_text: total=19022 in=18905 out=117
+  m29 assistant_text: total=18942 in=18865 out=77
+  m35 assistant_text: total=19037 in=18924 out=113
+  m38 assistant_text: total=18843 in=18797 out=46
+  m41 assistant_text: total=18915 in=18880 out=35
+  m47 assistant_text: total=19313 in=19215 out=98
+  m50 assistant_text: total=18609 in=18587 out=22
+  m53 assistant_text: total=18677 in=18648 out=29
+
+delta (LHC_sum - rollout_newest) = 0
+MATCH: counters equal
+
+Interpretation:
+- Rollout TokenCount events are regenerated cumulatively from provider usage;
+  newest total often equals sum of per-call total_tokens when materializer
+  sums all assistant_text provider_usage fields.
+- Live session usage field on turn.completed is per-turn last request, not lifetime sum.
+- Derivation inference is separate (luna lane) and is NOT in these host session TokenCounts.
+RESULT PASS

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fa104-b573-79a2-b1c6-aa81e79737ff"}
+{"type":"turn.started"}
+{"type":"error","message":"{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"invalid_request_error\",\n    \"message\": \"[ApiIdParam] [input[4].id] [invalid_id_prefix] Invalid 'input[4].id': 'ctc_06b533a9ac823d3b016a66a928a0508191b9359d7b48652955'. Expected an ID that begins with 'fc'.\"\n  },\n  \"status\": 400\n}"}
+{"type":"turn.failed","error":{"message":"{\n  \"type\": \"error\",\n  \"error\": {\n    \"type\": \"invalid_request_error\",\n    \"message\": \"[ApiIdParam] [input[4].id] [invalid_id_prefix] Invalid 'input[4].id': 'ctc_06b533a9ac823d3b016a66a928a0508191b9359d7b48652955'. Expected an ID that begins with 'fc'.\"\n  },\n  \"status\": 400\n}"}}

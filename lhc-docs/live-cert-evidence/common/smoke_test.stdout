@@ -1,0 +1,20 @@
+Reading additional input from stdin...
+OpenAI Codex v0.0.0
+--------
+[1mworkdir:[0m /srv/work/codex/lhc-docs/live-cert-workspace
+[1mmodel:[0m gpt-5.6-luna
+[1mprovider:[0m openai
+[1mapproval:[0m never
+[1msandbox:[0m danger-full-access
+[1mreasoning effort:[0m low
+[1mreasoning summaries:[0m none
+[1msession id:[0m 019fa0f7-efcf-7f90-9de8-2ebef875b3f8
+--------
+[36muser[0m
+Reply with exactly: PONG-LIVE-CERT. No tools.
+[1m[33mwarning:[0m[0m Under-development features enabled: lhc_capture. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /srv/work/codex/lhc-docs/live-cert-scratch/config.toml.
+[35m[3mcodex[0m[0m
+PONG-LIVE-CERT
+[2mtokens used[0m
+8,066
+PONG-LIVE-CERT

@@ -1,0 +1,10 @@
+path: /srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T00-41-08-019fa104-b573-79a2-b1c6-aa81e79737ff.jsonl
+lines_by_type: {'session_meta': 1, 'event_msg': 24, 'compacted': 1, 'response_item': 15, 'world_state': 1, 'turn_context': 1}
+compacted_count: 1
+  compacted[0]: {'window_number': 1, 'window_id': '019fa105-6fb8-7fb1-ad8b-5f95c6702c80', 'previous_window_id': '019fa104-b573-79a2-b1c6-aa970d145695', 'first_window_id': '019fa104-b573-79a2-b1c6-aa970d145695', 'message_len': 2121, 'bands_len': 0}
+token_count_events: 5
+newest_token_total: 55464
+all_token_totals: [18293, 36836, 55464, 55464, 55464]
+prev_exists: True
+prev_size: 98510
+active_size: 127119

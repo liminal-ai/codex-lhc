@@ -1,0 +1,9 @@
+resume_ok True
+rewritten True
+trace after grow 1: compacted=1 prev=1
+
+stdout_tail bers.csv\npad_1.txt\npad_10.txt\npad_11.txt\npad_12.txt\npad_13.txt\npad_14.txt\npad_15.txt\npad_16.txt\npad_17.txt\npad_18.txt\npad_19.txt\npad_2.txt\npad_20.txt\npad_3.txt\npad_4.txt\npad_5.txt\npad_6.txt\npad_7.txt\npad_8.txt\npad_9.txt\nreadme.txt\nLIVE CERT FIXTURE\n=================\nSecret phrase for coherence checks: BLUE-MARBLE-ORBIT-42\nProject codename: Helios Compact\nAuthor: Slice D Live Cert\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Prior markers: `OLD-FORMAT-ANCHOR-77` and `LIVE-CERT-OLD-FORMAT`.\n\nSecret phrase: `BLUE-MARBLE-ORBIT-42`"}}
+{"type":"turn.completed","usage":{"input_tokens":36638,"cached_input_tokens":27136,"cache_write_input_tokens":0,"output_tokens":173,"reasoning_output_tokens":28}}
+
+RESULT PASS

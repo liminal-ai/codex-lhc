@@ -1,0 +1,8 @@
+path: /srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T00-33-57-019fa0fe-22df-7342-8afb-4c99d8bdca3f.jsonl
+lines_by_type: {'session_meta': 1, 'event_msg': 23, 'response_item': 20, 'world_state': 1, 'turn_context': 3}
+compacted_count: 0
+token_count_events: 6
+newest_token_total: 117095
+all_token_totals: [18226, 37322, 56609, 76471, 96509, 117095]
+prev_exists: False
+active_size: 110732

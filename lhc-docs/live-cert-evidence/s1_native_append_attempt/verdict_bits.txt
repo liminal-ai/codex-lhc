@@ -1,0 +1,1 @@
+shape_has_one_compacted=True bands=4 prev=False coherent=True api_err=False rc=resume_rc=0

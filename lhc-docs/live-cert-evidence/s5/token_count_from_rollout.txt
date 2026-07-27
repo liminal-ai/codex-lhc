@@ -1,0 +1,27 @@
+token_count_events 20
+all_totals [18226, 37322, 56609, 76471, 96509, 117095, 117095, 136117, 136117, 155059, 155059, 174096, 174096, 192939, 211854, 211854, 231167, 231167, 249776, 268453]
+newest_total 268453
+last_event_raw_keys sample
+{'type': 'token_count',
+ 'info': {'total_token_usage': {'input_tokens': 267281,
+                                'cached_input_tokens': 198144,
+                                'cache_write_input_tokens': 0,
+                                'output_tokens': 1172,
+                                'reasoning_output_tokens': 75,
+                                'total_tokens': 268453},
+          'last_token_usage': {'input_tokens': 18648,
+                               'cached_input_tokens': 18176,
+                               'cache_write_input_tokens': 0,
+                               'output_tokens': 29,
+                               'reasoning_output_tokens': 0,
+                               'total_tokens': 18677},
+          'model_context_window': 258400},
+ 'rate_limits': {'limit_id': 'codex',
+                 'limit_name': None,
+                 'primary': {'used_percent': 9.0, 'window_minutes': 10080, 'resets_at': 1785615359},
+                 'secondary': None,
+                 'credits': {'has_credits': False, 'unlimited': False, 'balance': '0'},
+                 'individual_limit': None,
+                 'spend_control_reached': None,
+                 'plan_type': 'pro',
+                 'rate_limit_reached_type': None}}
