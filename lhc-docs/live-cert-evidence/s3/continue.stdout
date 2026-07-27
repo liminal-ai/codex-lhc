@@ -1,7 +1,7 @@
-{"type":"thread.started","thread_id":"019fa104-b573-79a2-b1c6-aa81e79737ff"}
+{"type":"thread.started","thread_id":"019fa130-b394-7d01-b7ac-e2c45a4b0fde"}
 {"type":"turn.started"}
-{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’m checking the full fixture file now, then I’ll continue with a brief marked excerpt."}}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll check the requested sample file, then continue with a brief orbital-mechanics passage."}}
 {"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sample_data/readme.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
 {"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sample_data/readme.txt'","aggregated_output":"LIVE CERT FIXTURE\n=================\nSecret phrase for coherence checks: BLUE-MARBLE-ORBIT-42\nProject codename: Helios Compact\nAuthor: Slice D Live Cert\n","exit_code":0,"status":"completed"}}
-{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"S3A — The secret phrase is: “BLUE-MARBLE-ORBIT-42”."}}
-{"type":"turn.completed","usage":{"input_tokens":55108,"cached_input_tokens":53504,"cache_write_input_tokens":0,"output_tokens":356,"reasoning_output_tokens":138}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Orbital mechanics describes motion under gravity, where trajectories emerge from the balance between inertia and attraction. In an ideal two-body system, the orbit is a conic section determined by position and velocity.\n\nThe requested marker is S3A. The sample file’s secret phrase is: “BLUE-MARBLE-ORBIT-42”.\n\nIn practical missions, perturbations from additional bodies, atmospheric drag, radiation pressure, and uneven planetary gravity gradually alter the ideal trajectory. Engineers model these effects to plan launches, transfers, station-keeping, and reentry with sufficient precision."}}
+{"type":"turn.completed","usage":{"input_tokens":36527,"cached_input_tokens":34304,"cache_write_input_tokens":0,"output_tokens":241,"reasoning_output_tokens":34}}

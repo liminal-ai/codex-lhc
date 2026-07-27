@@ -1,0 +1,4 @@
+coherent True
+lhc_rewrite False
+FINDING: LHC arm fail-open (NoReduction / claim_expired derivation); native append Compacted x4; no .prev
+RESULT PARTIAL

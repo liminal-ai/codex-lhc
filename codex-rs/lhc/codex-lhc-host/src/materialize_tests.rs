@@ -102,6 +102,16 @@ fn tool_call_tail(
     name: &str,
     args: Map<String, Value>,
 ) -> SessionThreadViewEntry {
+    tool_call_tail_with_key(mid, call_id, name, args, None)
+}
+
+fn tool_call_tail_with_key(
+    mid: &str,
+    call_id: &str,
+    name: &str,
+    args: Map<String, Value>,
+    key: Option<&str>,
+) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
         SessionAssistantMessage {
             content: vec![SessionAssistantPart {
@@ -114,7 +124,7 @@ fn tool_call_tail(
             }],
             source_messages: vec![SessionThreadViewEntrySource {
                 message_id: mid.into(),
-                idempotency_key: None,
+                idempotency_key: key.map(str::to_string),
             }],
         },
     ))
@@ -127,6 +137,17 @@ fn tool_result_tail(
     content: &str,
     is_error: Option<bool>,
 ) -> SessionThreadViewEntry {
+    tool_result_tail_with_key(mid, call_id, name, content, is_error, None)
+}
+
+fn tool_result_tail_with_key(
+    mid: &str,
+    call_id: &str,
+    name: &str,
+    content: &str,
+    is_error: Option<bool>,
+    key: Option<&str>,
+) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(
         SessionToolResultMessage {
             tool_call_id: call_id.into(),
@@ -135,7 +156,7 @@ fn tool_result_tail(
             is_error,
             source_messages: vec![SessionThreadViewEntrySource {
                 message_id: mid.into(),
-                idempotency_key: None,
+                idempotency_key: key.map(str::to_string),
             }],
         },
     ))
@@ -1400,6 +1421,202 @@ fn law6_function_result_with_image_shaped_body_stays_function_output() {
             .iter()
             .any(|r| matches!(r, ResponseItem::ImageGenerationCall { .. })),
         "content sniffer must not invent ImageGenerationCall"
+    );
+}
+
+// ── F-L2: ctc_ / ctco_ id prefix → CustomToolCall kind (never FunctionCall) ─
+
+#[test]
+fn fl2_ctc_id_round_trips_as_custom_tool_call_with_id() {
+    // Host id `ctc_…` recovered from id-primary idempotency key must reverse
+    // as CustomToolCall (input from stored arguments), not FunctionCall.
+    let call_id = "call_WzQWJPGLgp4UwPLYaxiCYvGu";
+    let host_id = "ctc_0695851a6456c30b016a66a651de78819c887458ac0e8029a7";
+    let out_id = "ctco_019fa0f9-ba40-7780-b860-d52dbbf93f85";
+    let key = format!("codex:tid123:id:{host_id}:deadbeef:tool_call:{call_id}");
+    let out_key = format!("codex:tid123:id:{out_id}:cafebabe:tool_result:{call_id}");
+    let mut args = Map::new();
+    args.insert(
+        "__hostRaw".into(),
+        json!("const r = await tools.exec_command({cmd:\"ls\"});"),
+    );
+    args.insert("cmd".into(), json!("ls"));
+    let body = "numbers.csv\nreadme.txt\n";
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            user_tail("m1", "list files"),
+            tool_call_tail_with_key("m2", call_id, "exec", args, Some(&key)),
+            tool_result_tail_with_key("m3", call_id, "exec", body, Some(false), Some(&out_key)),
+        ],
+    };
+    let messages = [
+        msg("m1", "t1", MessageKind::UserPrompt, 1, "list files", None),
+        msg("m2", "t1", MessageKind::ToolCall, 2, "", None),
+        msg_tool_result("m3", "t1", 3, call_id, body, false),
+    ];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1", "m2", "m3"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let result = materialize_full(view, &messages, &turns, &[], None, None);
+    let tail = tail_response_items(&result.items);
+    let call = tail.iter().find_map(|r| match r {
+        ResponseItem::CustomToolCall {
+            id,
+            call_id: cid,
+            name,
+            input,
+            ..
+        } => Some((id.clone(), cid.clone(), name.clone(), input.clone())),
+        _ => None,
+    });
+    let (id, cid, name, input) =
+        call.unwrap_or_else(|| panic!("CustomToolCall required, got {tail:?}"));
+    assert_eq!(cid, call_id);
+    assert_eq!(name, "exec");
+    assert!(
+        input.contains("exec_command") || input.contains("ls"),
+        "input from stored payload: {input}"
+    );
+    assert_eq!(
+        id.as_ref().map(codex_protocol::ResponseItemId::as_str),
+        Some(host_id),
+        "ctc_ id must be retained on CustomToolCall"
+    );
+    assert!(
+        !tail
+            .iter()
+            .any(|r| matches!(r, ResponseItem::FunctionCall { .. })),
+        "must not emit FunctionCall wearing a ctc_ id: {tail:?}"
+    );
+    let out = tail.iter().find_map(|r| match r {
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id: cid,
+            output,
+            ..
+        } => Some((id.clone(), cid.clone(), output.clone())),
+        _ => None,
+    });
+    let (oid, ocid, output) =
+        out.unwrap_or_else(|| panic!("CustomToolCallOutput required, got {tail:?}"));
+    assert_eq!(ocid, call_id);
+    assert_eq!(
+        oid.as_ref().map(codex_protocol::ResponseItemId::as_str),
+        Some(out_id)
+    );
+    assert!(matches!(
+        &output.body,
+        FunctionCallOutputBody::Text(t) if t == body
+    ));
+}
+
+#[test]
+fn fl2_unrepresentable_id_prefix_clears_id_with_gap() {
+    // msg_ prefix on a tool_call is unrepresentable as FunctionCall/Custom —
+    // reverse must clear id (provider remints) and record a gap note.
+    let call_id = "call_bad";
+    let host_id = "msg_should_not_be_on_tool_call";
+    let key = format!("codex:tid123:id:{host_id}:deadbeef:tool_call:{call_id}");
+    let mut args = Map::new();
+    args.insert("__hostRaw".into(), json!("{}"));
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            user_tail("m1", "x"),
+            tool_call_tail_with_key("m2", call_id, "exec", args, Some(&key)),
+            tool_result_tail("m3", call_id, "exec", "ok", Some(false)),
+        ],
+    };
+    let messages = [
+        msg("m1", "t1", MessageKind::UserPrompt, 1, "x", None),
+        msg("m2", "t1", MessageKind::ToolCall, 2, "", None),
+        msg_tool_result("m3", "t1", 3, call_id, "ok", false),
+    ];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1", "m2", "m3"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let result = materialize_full(view, &messages, &turns, &[], None, None);
+    let tail = tail_response_items(&result.items);
+    let call = tail.iter().find(|r| {
+        matches!(
+            r,
+            ResponseItem::FunctionCall { .. } | ResponseItem::CustomToolCall { .. }
+        )
+    });
+    let call = call.expect("tool call present");
+    assert!(
+        call.id().is_none(),
+        "unrepresentable id must be cleared: {call:?}"
+    );
+    assert!(
+        result
+            .gap_notes
+            .iter()
+            .any(|n| n.contains("unrepresentable")),
+        "gap_notes must record unrepresentable id: {:?}",
+        result.gap_notes
+    );
+}
+
+#[test]
+fn fl2_mutation_demo_ctc_must_not_become_function_call() {
+    // Mutation target: if reverse always emitted FunctionCall, this would
+    // pair a ctc_ id with FunctionCall — the live-cert 400 class of bug.
+    let call_id = "call_mut";
+    let host_id = "ctc_mutation_probe_id";
+    let key = format!("codex:t:id:{host_id}:d:tool_call:{call_id}");
+    let mut args = Map::new();
+    args.insert("__hostRaw".into(), json!("input-body"));
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![tool_call_tail_with_key(
+            "m1",
+            call_id,
+            "shell",
+            args,
+            Some(&key),
+        )],
+    };
+    let messages = [msg("m1", "t1", MessageKind::ToolCall, 1, "", None)];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let items = materialize(view, &messages, &turns, &[], None);
+    let tail = tail_response_items(&items);
+    for r in &tail {
+        if let ResponseItem::FunctionCall { id: Some(id), .. } = r {
+            assert!(
+                !id.as_str().starts_with("ctc"),
+                "MUTATION: FunctionCall must never wear a ctc_ id (got {id})"
+            );
+        }
+    }
+    assert!(
+        tail.iter().any(|r| matches!(
+            r,
+            ResponseItem::CustomToolCall { id: Some(id), .. }
+                if id.as_str() == host_id
+        )),
+        "ctc_ must reverse as CustomToolCall: {tail:?}"
     );
 }
 

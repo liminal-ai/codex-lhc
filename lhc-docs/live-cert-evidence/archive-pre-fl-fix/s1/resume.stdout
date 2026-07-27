@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fa0fe-22df-7342-8afb-4c99d8bdca3f"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Secret phrase: `BLUE-MARBLE-ORBIT-42`\n\nTags: ALPHA, BETA, GAMMA, COMPACT, COMPACT2"}}
+{"type":"turn.completed","usage":{"input_tokens":210831,"cached_input_tokens":160000,"cache_write_input_tokens":0,"output_tokens":1023,"reasoning_output_tokens":61}}

@@ -1348,7 +1348,7 @@ fn slice_d_mutation_demo_drill_requires_structural_eq() {
 /// of the newest, bands would be band-v1.
 #[test]
 fn slice_d_mutation_demo_dual_format_picks_newest_boundary() {
-    let items = vec![
+    let items = [
         compacted("c1", vec![user_msg("band-v1")], 1, "w1", None),
         RolloutItem::ResponseItem(user_msg("tail-old")),
         compacted("c2", vec![user_msg("band-v2")], 2, "w2", Some("w1")),

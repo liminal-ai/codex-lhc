@@ -396,6 +396,38 @@ and does not open a worker or insert a slot. Contributors remain registered
 no SQLite, no mapping**. Not bit-identical registration to upstream empty
 registry, but no LHC code path that touches durable state.
 
+## Turn abort / SIGINT capture (slice A + F-L3 live-cert)
+
+**Graceful interrupt path (host emits abort):** `codex exec` listens for
+`ctrl_c` / SIGINT and sends `turn/interrupt` → `Session::abort_all_tasks(
+TurnAbortReason::Interrupted)` → `emit_turn_abort_lifecycle` → LHC
+`on_turn_abort` with `outcome=aborted` + reason (`interrupted`) + host
+timestamps. The contributor **awaits `flush()`** after `turn_end` so the row
+is durable before process shutdown continues. Covered by
+`e2e_v5_host_facts_abort_with_reason`.
+
+**Hard process death (no host abort signal):** SIGKILL, or SIGTERM that does
+not flow through the interrupt handler, or any kill that races past
+`on_turn_abort`/`flush` leaves the open turn as-is. LHC does **not** invent
+`outcome=aborted` — `outcome=None` (or a later prompt-boundary close with
+unset host facts) is the honest record. Vendor store documents the same:
+prompt-boundary closes leave outcome/timing NULL. Do not fabricate aborts.
+
+**Next-open boundary:** when a new user turn starts while a prior turn is
+still open in the LHC record (resume after hard death), the SDK/prompt-boundary
+close path may close the prior turn without host facts — again `outcome=None`
+is correct, not a capture bug.
+
+## Compact vs derivation (F-L1 / doctrine)
+
+LHC compact **must not refuse** because derivation failed or is unready
+(`claim_expired`, terminal_failed, degraded bands). The selection walk uses
+the fallback ladder (less-derived bands, full-fidelity residue). The fork arm
+loud-logs terminal failures and installs via the ladder; derivations upgrade
+later. A `NoReduction` loud-fail remains only when the **materialized body is
+strictly larger** than the current rollout file's model-context size
+(like-for-like; F-L4).
+
 ## Host obligations
 
 - Canonical ISO timestamps only for work-queue APIs.

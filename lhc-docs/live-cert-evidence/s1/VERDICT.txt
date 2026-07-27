@@ -1,4 +1,6 @@
-coherent True
-lhc_rewrite False
-FINDING: LHC arm fail-open (NoReduction / claim_expired derivation); native append Compacted x4; no .prev
-RESULT PARTIAL
+compacted [{'window_number': 1, 'bands': 0, 'msg_len': 2965}, {'window_number': 2, 'bands': 8, 'msg_len': 0}]
+prev True
+custom_tool_call 4 function_call 0 bad_ctc_on_fc []
+
+rewrite True prev_ok True coherent True api_err False
+RESULT PASS

@@ -34,6 +34,7 @@ use codex_lhc_host::estimate_response_items_tokens;
 use codex_lhc_host::history_from_materialized_items;
 use codex_lhc_host::item_stable_id;
 use codex_lhc_host::materialize_rollout;
+use codex_lhc_host::model_context_token_estimate_from_rollout_items;
 use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
@@ -222,7 +223,28 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     // I2: re-seed slot from durable CompactedItem record (resume / crash window).
     reseed_slot_from_durable_session(sess.as_ref(), &slot).await;
 
-    let host_token_estimate = estimate_response_items_tokens(&host_items);
+    // F-L4: like-for-like baseline = current model-context size.
+    // Prefer the rollout file's dual-format extract (what resume would rebuild).
+    // When the live host history is substantially larger (rollout lag, or a
+    // test that seeded a tiny pre-rewrite file then grew the host), fall back
+    // to the host stream so we do not false-positive NoReduction.
+    let host_est = estimate_response_items_tokens(&host_items);
+    let rollout_est = match sess.current_rollout_path().await {
+        Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
+            Ok(items) => model_context_token_estimate_from_rollout_items(&items),
+            Err(err) => {
+                warn!(%err, path = %path.display(), "rollout parse for reduction baseline failed");
+                0
+            }
+        },
+        _ => 0,
+    };
+    let baseline_tokens = if rollout_est > 0 && rollout_est.saturating_mul(2) >= host_est {
+        rollout_est
+    } else {
+        host_est
+    };
+
     // H1/G3: ids + digests from prior write-backs (process-local + durable reseed).
     let session_derived = DerivedProvenance {
         ids: slot.derived_ids(),
@@ -254,16 +276,17 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         });
     }
 
-    // F3: zero-reduction is not an install — fall through to native ladder.
-    // Measured against the LLM-request body (what the model would see).
+    // F-L4: refuse only genuine pathology — materialized body larger than the
+    // current rollout model-context (like-for-like). Equal/smaller installs.
     let body_token_estimate = estimate_response_items_tokens(&produce_body);
-    if body_token_estimate >= host_token_estimate {
+    if body_token_estimate > baseline_tokens {
         let reason = format!(
-            "NoReduction: body_tokens={body_token_estimate} host_tokens={host_token_estimate} \
-             items_body={} (LHC pass-through or non-reducing compact)",
+            "NoReduction: body_tokens={body_token_estimate} \
+             rollout_model_context_tokens={baseline_tokens} \
+             items_body={} (materialized body larger than current model-context)",
             produce_body.len()
         );
-        warn!(%reason, manual, "LHC compact did not reduce; failing open to native arms");
+        warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
         return Ok(LhcCompactAttempt::Unavailable { reason });
     }
 

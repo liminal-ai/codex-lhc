@@ -1,8 +1,17 @@
-S3 findings:
-- SIGINT mid-stream: process exit 143
-- LHC turns after interrupt: t2 closed with outcome=None (NOT aborted) — FINDING: interrupt path may not set outcome=aborted on the interrupted turn
-- Later t5 has outcome=aborted reason=Other (compact-trigger turn after rewrite / API error)
-- LHC REWRITE SUCCEEDED: 'LHC rollout rewrite installed', compacted_count=1, .prev exists
-- Post-rewrite resume FAILED: invalid_id_prefix ctc_ vs fc_ on function_call id in rewritten tail
-RESULT: PARTIAL (rewrite+prev ok; interrupt outcome gap; resume blocked by ctc_ id bug)
-
+rewrite True prev True
+aborted_anywhere False
+interrupt_rc interrupt_rc=143
+coherent True api_err False
+RESULT PASS
+F-L3 note: see FORK.md — graceful interrupt should land aborted; hard kill leaves outcome=None (honest)
+{'turn_id': 't1', 'turn_order': 1, 'status': 'closed', 'opened_at_event_order': 0, 'closed_at_event_order': 2, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+{'turn_id': 't2', 'turn_order': 2, 'status': 'open', 'opened_at_event_order': 2, 'closed_at_event_order': None, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+aborted_turns: []
+{'turn_id': 't1', 'turn_order': 1, 'status': 'closed', 'opened_at_event_order': 0, 'closed_at_event_order': 2, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+{'turn_id': 't2', 'turn_order': 2, 'status': 'closed', 'opened_at_event_order': 2, 'closed_at_event_order': 3, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+{'turn_id': 't3', 'turn_order': 3, 'status': 'closed', 'opened_at_event_order': 3, 'closed_at_event_order': 9, 'outcome': 'completed', 'outcome_reason': None, 'started_at': '2026-07-27T01:29:48.000Z', 'ended_at': '2026-0
+{'turn_id': 't4', 'turn_order': 4, 'status': 'closed', 'opened_at_event_order': 9, 'closed_at_event_order': 12, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+{'turn_id': 't5', 'turn_order': 5, 'status': 'closed', 'opened_at_event_order': 12, 'closed_at_event_order': 19, 'outcome': 'completed', 'outcome_reason': None, 'started_at': '2026-07-27T01:29:11.000Z', 'ended_at': '2026
+{'turn_id': 't6', 'turn_order': 6, 'status': 'closed', 'opened_at_event_order': 19, 'closed_at_event_order': 21, 'outcome': 'completed', 'outcome_reason': None, 'started_at': '2026-07-27T01:30:24.000Z', 'ended_at': '2026
+{'turn_id': 't7', 'turn_order': 7, 'status': 'open', 'opened_at_event_order': 21, 'closed_at_event_order': None, 'outcome': None, 'outcome_reason': None, 'started_at': None, 'ended_at': None, 'deleted_at': None}
+aborted_turns: []

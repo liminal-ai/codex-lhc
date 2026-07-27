@@ -1,0 +1,8 @@
+S3 findings:
+- SIGINT mid-stream: process exit 143
+- LHC turns after interrupt: t2 closed with outcome=None (NOT aborted) — FINDING: interrupt path may not set outcome=aborted on the interrupted turn
+- Later t5 has outcome=aborted reason=Other (compact-trigger turn after rewrite / API error)
+- LHC REWRITE SUCCEEDED: 'LHC rollout rewrite installed', compacted_count=1, .prev exists
+- Post-rewrite resume FAILED: invalid_id_prefix ctc_ vs fc_ on function_call id in rewritten tail
+RESULT: PARTIAL (rewrite+prev ok; interrupt outcome gap; resume blocked by ctc_ id bug)
+

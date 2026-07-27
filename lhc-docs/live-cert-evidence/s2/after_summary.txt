@@ -1,14 +1,13 @@
-path: /srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T00-33-57-019fa0fe-22df-7342-8afb-4c99d8bdca3f.jsonl
-lines_by_type: {'session_meta': 1, 'event_msg': 65, 'response_item': 46, 'world_state': 7, 'turn_context': 10, 'compacted': 6}
-compacted_count: 6
-  compacted[0]: {'window_number': 1, 'window_id': '019fa100-e99e-7173-9cae-d03adcdaea26', 'previous_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 4}
-  compacted[1]: {'window_number': 2, 'window_id': '019fa101-49ee-7ee0-ab70-330f53f5c2c0', 'previous_window_id': '019fa100-e99e-7173-9cae-d03adcdaea26', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 7}
-  compacted[2]: {'window_number': 3, 'window_id': '019fa102-7658-7fc1-8013-0dae62f3f994', 'previous_window_id': '019fa101-49ee-7ee0-ab70-330f53f5c2c0', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 5}
-  compacted[3]: {'window_number': 4, 'window_id': '019fa102-c2f9-7d33-ad70-5b5020e94814', 'previous_window_id': '019fa102-7658-7fc1-8013-0dae62f3f994', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 8}
-  compacted[4]: {'window_number': 5, 'window_id': '019fa104-12b3-7443-93c0-955719e4b87d', 'previous_window_id': '019fa102-c2f9-7d33-ad70-5b5020e94814', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 7}
-  compacted[5]: {'window_number': 6, 'window_id': '019fa104-4b7c-75d0-acc2-73a60ea0359a', 'previous_window_id': '019fa104-12b3-7443-93c0-955719e4b87d', 'first_window_id': '019fa0fe-22df-7342-8afb-4ca64ace5c54', 'message_len': 0, 'bands_len': 10}
-token_count_events: 19
-newest_token_total: 249776
-all_token_totals: [18226, 37322, 56609, 76471, 96509, 117095, 117095, 136117, 136117, 155059, 155059, 174096, 174096, 192939, 211854, 211854, 231167, 231167, 249776]
-prev_exists: False
-active_size: 562513
+path: /srv/work/codex/lhc-docs/live-cert-scratch/sessions/2026/07/27/rollout-2026-07-27T01-21-30-019fa129-ad11-7402-a4f1-f7ce7a4f378c.jsonl
+lines_by_type: {'session_meta': 1, 'event_msg': 58, 'compacted': 4, 'response_item': 37, 'world_state': 4, 'turn_context': 5}
+compacted_count: 4
+  compacted[0]: {'window_number': 1, 'window_id': '019fa12c-83ac-79a1-ac0d-e16f6a23e59c', 'previous_window_id': '019fa129-ad11-7402-a4f1-f7dc53251d27', 'first_window_id': '019fa129-ad11-7402-a4f1-f7dc53251d27', 'message_len': 2965, 'bands_len': 0}
+  compacted[1]: {'window_number': 2, 'window_id': '019fa12d-9f24-75b0-9f6e-1bdd355b2787', 'previous_window_id': '019fa12c-83ac-79a1-ac0d-e16f6a23e59c', 'first_window_id': '019fa129-ad11-7402-a4f1-f7dc53251d27', 'message_len': 0, 'bands_len': 8}
+  compacted[2]: {'window_number': 3, 'window_id': '019fa12e-a4fe-74f3-91fb-d1c95d6c69a3', 'previous_window_id': '019fa12d-9f24-75b0-9f6e-1bdd355b2787', 'first_window_id': '019fa129-ad11-7402-a4f1-f7dc53251d27', 'message_len': 0, 'bands_len': 7}
+  compacted[3]: {'window_number': 4, 'window_id': '019fa12f-bd19-7a52-b50c-925516f46444', 'previous_window_id': '019fa12e-a4fe-74f3-91fb-d1c95d6c69a3', 'first_window_id': '019fa129-ad11-7402-a4f1-f7dc53251d27', 'message_len': 0, 'bands_len': 10}
+token_count_events: 15
+newest_token_total: 251701
+all_token_totals: [18909, 38688, 60149, 82202, 104429, 127186, 127186, 153491, 153491, 178066, 202712, 202712, 227181, 227181, 251701]
+prev_exists: True
+prev_size: 129607
+active_size: 440386

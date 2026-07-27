@@ -105,6 +105,7 @@ pub use rollout_swap::SwapFailpoint;
 pub use rollout_swap::SwapPaths;
 pub use rollout_swap::atomic_rewrite_rollout;
 pub use rollout_swap::history_from_materialized_items;
+pub use rollout_swap::model_context_token_estimate_from_rollout_items;
 pub use rollout_swap::parse_rollout_items;
 pub use session::encode_thread_id_for_path;
 pub use session::thread_file_path;

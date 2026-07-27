@@ -1,0 +1,3 @@
+compacted [{'window_number': 1, 'bands': 0, 'msg_len': 2965}, {'window_number': 2, 'bands': 8, 'msg_len': 0}]
+prev True
+custom_tool_call 4 function_call 0 bad_ctc_on_fc []

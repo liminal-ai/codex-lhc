@@ -1,0 +1,5 @@
+windows_before=1,2,3,4
+windows_after=1,2,3,4,5,6
+coherent True prev False lhc_rewrite False
+FINDING: window numbers monotonic via native append Compacted; no .prev generation rotation (LHC rewrite not engaged)
+RESULT PARTIAL

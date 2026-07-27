@@ -154,24 +154,41 @@ pub fn atomic_rewrite_rollout(rollout_path: &Path, items: &[RolloutItem]) -> std
 /// `Compacted.replacement_history` (bands) followed by post-boundary
 /// `ResponseItem`s (and inter-agent communications converted to model input).
 ///
-/// Must equal the in-memory history installed at compact (slice C alignment).
+/// Dual-format: when multiple `Compacted` records are present (pre-rework
+/// appended shape), only the **newest** boundary's bands + the tail after that
+/// boundary contribute. Earlier generations are ignored.
+///
+/// Must equal the in-memory history installed at compact (slice C alignment)
+/// for rewritten (single-boundary) files.
 pub fn history_from_materialized_items(items: &[RolloutItem]) -> Vec<ResponseItem> {
+    // Find newest Compacted index.
+    let mut last_idx: Option<usize> = None;
     let mut bands: Option<Vec<ResponseItem>> = None;
+    for (i, item) in items.iter().enumerate() {
+        if let RolloutItem::Compacted(CompactedItem {
+            replacement_history,
+            ..
+        }) = item
+        {
+            last_idx = Some(i);
+            bands = replacement_history.clone();
+        }
+    }
     let mut tail: Vec<ResponseItem> = Vec::new();
-    let mut past_boundary = false;
-    for item in items {
+    let start = last_idx.map(|i| i + 1).unwrap_or(0);
+    // No Compacted → entire file's ResponseItems are the model stream
+    // (pre-first-compact session).
+    let scan = if last_idx.is_some() {
+        &items[start..]
+    } else {
+        items
+    };
+    for item in scan {
         match item {
-            RolloutItem::Compacted(CompactedItem {
-                replacement_history,
-                ..
-            }) => {
-                bands = replacement_history.clone();
-                past_boundary = true;
-            }
-            RolloutItem::ResponseItem(response_item) if past_boundary => {
+            RolloutItem::ResponseItem(response_item) => {
                 tail.push(response_item.clone());
             }
-            RolloutItem::InterAgentCommunication(communication) if past_boundary => {
+            RolloutItem::InterAgentCommunication(communication) => {
                 tail.push(communication.to_model_input_item());
             }
             _ => {}
@@ -180,6 +197,13 @@ pub fn history_from_materialized_items(items: &[RolloutItem]) -> Vec<ResponseIte
     let mut out = bands.unwrap_or_default();
     out.extend(tail);
     out
+}
+
+/// Model-context size baseline for the reduction self-check (F-L4): estimate
+/// tokens of [`history_from_materialized_items`] for a rollout file.
+pub fn model_context_token_estimate_from_rollout_items(items: &[RolloutItem]) -> i64 {
+    use crate::estimate_response_items_tokens;
+    estimate_response_items_tokens(&history_from_materialized_items(items))
 }
 
 /// Parse a rollout JSONL file into items (best-effort, skips corrupt lines).

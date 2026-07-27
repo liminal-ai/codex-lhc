@@ -631,9 +631,10 @@ async fn lhc_band_shape_eval_live() {
                     if let ResponseItem::Message { content, .. } = &item {
                         for part in content {
                             if let ContentItem::OutputText { text } = part
-                                && out.is_empty() {
-                                    out = text.clone();
-                                }
+                                && out.is_empty()
+                            {
+                                out = text.clone();
+                            }
                         }
                     }
                     conversation.push(item);

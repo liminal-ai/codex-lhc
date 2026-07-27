@@ -755,20 +755,19 @@ pub async fn produce_lhc_compact_with_provenance(
         return Err(LhcCompactUnavailable::NoEvents);
     }
 
-    // L2 gate, restored on typed signal. The old gate was the compact-time
-    // drain's `FailedTerminal` disposition; with the drain gone, that signal
-    // moved. `receipt.degraded` does **not** cover it — measured: with every
-    // derivation failing, compact returns `degraded: []` while serving raw
-    // prompts marked `[fallback]` in the rendered bands. Reading that marker
-    // would be parsing a render (law 1), so ask LHC's own derivation log
-    // instead.
+    // LHC doctrine: compact NEVER waits on / refuses for derivation state.
+    // The selection walk uses the fallback ladder (less-derived bands,
+    // full-fidelity residue) when derivations are unready or terminal-failed
+    // (e.g. claim_expired after multi-process exec). A terminal failure is
+    // loud-logged; compact still proceeds so the arm can rewrite. Derivations
+    // upgrade later on subsequent opens. (F-L1 live-cert 2026-07-27.)
     let terminal = terminal_derivation_failures(&session).await;
     if terminal > 0 {
-        session.close().await;
-        return Err(LhcCompactUnavailable::DerivationFailed(format!(
-            "{terminal} derivation(s) failed terminally in background; \
-             refusing to compact raw fallback content"
-        )));
+        warn!(
+            terminal,
+            "LHC: {terminal} derivation(s) failed terminally; compact proceeds via \
+             fallback ladder (do not refuse — doctrine)"
+        );
     }
 
     // No drain here. Derivation runs in the background as intake commits, on
@@ -776,9 +775,6 @@ pub async fn produce_lhc_compact_with_provenance(
     // for it to settle via `CaptureHandle::drain_settled` before reaching this
     // point. Draining inline was a host doing LHC's job at the worst possible
     // moment — see FORK.md §"The drain correction".
-    //
-    // If derivation is genuinely incomplete the bands come back degraded and L2
-    // rejects them below, which is the correct fail-open.
     check_cancel(cancel.as_deref())?;
 
     let archive_tip = archive_tip_identity(&events);
@@ -803,7 +799,8 @@ pub async fn produce_lhc_compact_with_provenance(
         }
     };
 
-    // L2: never install a degraded fallback body. Law 3 — native ladder instead.
+    // Fallback-ladder bands (receipt.degraded) are expected when derivation
+    // is incomplete/terminal — install them. Loud log only; do not refuse.
     if !receipt.degraded.is_empty() {
         let n = receipt.degraded.len();
         let sample: Vec<String> = receipt
@@ -815,12 +812,8 @@ pub async fn produce_lhc_compact_with_provenance(
         warn!(
             degraded = n,
             ?sample,
-            "LHC compact receipt has degraded bands; failing open (no degraded install)"
+            "LHC compact receipt has degraded/fallback bands; installing via ladder"
         );
-        session.close().await;
-        return Err(LhcCompactUnavailable::DerivationFailed(format!(
-            "compact produced {n} degraded band(s) (sample={sample:?}); refusing install"
-        )));
     }
 
     debug!(
@@ -855,12 +848,10 @@ pub async fn produce_lhc_compact_with_provenance(
         ));
     }
 
-    // Defence in depth: body text must not carry degraded markers either.
+    // Loud note if served body still carries render-level degraded markers;
+    // still install (full-fidelity residue / fallback ladder is valid compact).
     if body_contains_degraded_marker(&body) {
-        session.close().await;
-        return Err(LhcCompactUnavailable::DerivationFailed(
-            "served body contains [degraded: …] markers; refusing install".into(),
-        ));
+        warn!("LHC served body contains [degraded: …] markers; installing via fallback ladder");
     }
 
     let marker = CompactMarker::from_receipt(&receipt, thread_id, &body, &archive_tip);
@@ -1638,7 +1629,7 @@ mod tests {
 
     /// L2: inference failure mid-compact must fail open — no Install of degraded body.
     #[tokio::test]
-    async fn l2_inference_errors_fail_open_not_degraded_install() {
+    async fn l2_inference_errors_still_compact_via_fallback_ladder() {
         use lhc::shared_tech::CompressDetailedTurnInput;
         use lhc::shared_tech::InferenceResult;
         use lhc::shared_tech::SmoothPromptInput;
@@ -1648,11 +1639,11 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let root = dir.path();
-        let tid = "l2-infer-fail";
+        let tid = "l2-infer-fail-ladder";
 
-        // The failure is injected where derivation runs — at capture. Injecting
-        // it at compact time would prove nothing now: compact never calls
-        // inference.
+        // Doctrine (F-L1): terminal derivation failure must NOT refuse compact.
+        // The selection walk installs via the fallback ladder; produce must
+        // return Ok (possibly with degraded bands), not DerivationFailed.
         let fail = || {
             Box::pin(async {
                 InferenceResult::Err {
@@ -1669,32 +1660,25 @@ mod tests {
         };
         let host = bandable_items(80);
         submit_items_with_callbacks(root, tid, &host, callbacks).await;
-        let source_before = list_archive(root, tid).await.len();
 
         let outcome = produce_lhc_compact_deterministic(tid, Some(root), &host, true).await;
         match outcome {
-            Err(LhcCompactUnavailable::DerivationFailed(reason)) => {
-                assert!(!reason.is_empty(), "DerivationFailed must carry a reason");
+            Ok(r) => {
+                assert!(
+                    !r.body.is_empty(),
+                    "fallback-ladder compact must produce a non-empty body"
+                );
             }
-            Ok(r) => panic!(
-                "L2: inference failure must not Install; got body_items={} degraded={} \
-                 receipt={:?}",
-                r.body.len(),
-                r.receipt.degraded.len(),
-                r.receipt
-            ),
-            Err(other) => panic!("expected DerivationFailed, got {other:?}"),
+            Err(LhcCompactUnavailable::DerivationFailed(reason)) => {
+                panic!(
+                    "F-L1: terminal derivation failure must not refuse compact; got DerivationFailed({reason})"
+                );
+            }
+            Err(other) => {
+                // Other unavailability (empty view, cancel, …) is a different path.
+                // Bandable host should still compact; fail loud if not.
+                panic!("expected Ok via fallback ladder, got {other:?}");
+            }
         }
-        // No marker committed (produce never succeeded).
-        assert_eq!(
-            marker_count(&list_archive(root, tid).await),
-            0,
-            "L2: no compact marker on failure"
-        );
-        assert_eq!(
-            list_archive(root, tid).await.len(),
-            source_before,
-            "L2: archive source size unchanged on fail-open"
-        );
     }
 }

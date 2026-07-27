@@ -102,7 +102,7 @@ use serde_json::Value;
 
 /// Documented capture gaps for the reverse map and display regeneration.
 pub const CAPTURE_GAPS: &[&str] = &[
-    "FunctionCall vs CustomToolCall: both forward-map to tool_call; reverse always emits FunctionCall",
+    "FunctionCall vs CustomToolCall: both forward-map to tool_call; reverse discriminates by recovered host ResponseItemId prefix (fc_→FunctionCall, ctc_→CustomToolCall). Outputs: fco_→FunctionCallOutput, ctco_→CustomToolCallOutput; call_id pairing carries kind when id missing. Unknown/unrepresentable id prefixes → id=None (provider remints) + gap_notes entry — never an invalid pairing (ctc_ on FunctionCall)",
     "FunctionCall.namespace / CustomToolCall.namespace: not stored on tool_call payload → always None",
     "Message.phase never stored → None; ResponseItemId recovered only from id-primary idempotency keys (synthetic: keys → None)",
     "Reasoning content[] vs summary[] vs encrypted_content: only text survives as summary SummaryText; encrypted_content always None → AgentReasoningRawContent never regenerated",
@@ -224,6 +224,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         &usage_totals,
         &rolled_back_turns,
         &mut out,
+        &mut gap_notes,
     );
 
     // Carry-forward non-derivable ends (NOT ThreadRolledBack — C1).
@@ -680,6 +681,17 @@ struct PendingImage {
     turn_id: String,
 }
 
+/// Host ResponseItem kind recovered for a tool call (call_id → kind).
+/// Used so tool_result can emit CustomToolCallOutput vs FunctionCallOutput
+/// when the result row has no recoverable id of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredToolCallKind {
+    Function,
+    Custom,
+    LocalShell,
+    Other,
+}
+
 fn emit_tail(
     tail: &[&SessionThreadViewEntry],
     messages_by_id: &HashMap<String, &MessageRecord>,
@@ -688,10 +700,12 @@ fn emit_tail(
     usage_totals: &HashMap<String, (TokenUsage, TokenUsage)>,
     rolled_back_turns: &HashSet<String>,
     out: &mut Vec<RolloutItem>,
+    gap_notes: &mut Vec<String>,
 ) {
     let mut opened: HashSet<String> = HashSet::new();
     let mut closed: HashSet<String> = HashSet::new();
     let mut pending_images: HashMap<String, PendingImage> = HashMap::new();
+    let mut tool_call_kinds: HashMap<String, RecoveredToolCallKind> = HashMap::new();
 
     for entry in tail {
         // C1: skip entries belonging to rolled-back turns.
@@ -789,6 +803,8 @@ fn emit_tail(
                         id_hint.as_deref(),
                         turn_id,
                         &mut pending_images,
+                        &mut tool_call_kinds,
+                        &mut *gap_notes,
                         out,
                     );
                     // H2: emit TokenCount after the LAST part of a usage-bearing
@@ -816,9 +832,8 @@ fn emit_tail(
                 }
             }
             SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(tr)) => {
-                let msg = tr
-                    .source_messages
-                    .first()
+                let source = tr.source_messages.first();
+                let msg = source
                     .and_then(|s| messages_by_id.get(&s.message_id))
                     .copied();
                 if msg.is_some_and(|m| rolled_back_turns.contains(&m.turn_id)) {
@@ -838,11 +853,20 @@ fn emit_tail(
                     push_response_with_twins(item, out, true);
                 } else {
                     let is_error = msg.and_then(stored_tool_is_error).or(tr.is_error);
+                    let id_hint = source.and_then(|s| {
+                        s.idempotency_key
+                            .as_deref()
+                            .and_then(parse_host_id_from_key)
+                    });
+                    let call_kind = tool_call_kinds.get(tr.tool_call_id.as_str()).copied();
                     let item = reverse_tool_result(
                         &tr.tool_call_id,
                         tr.tool_name.as_deref(),
                         &tr.content,
                         is_error,
+                        id_hint.as_deref(),
+                        call_kind,
+                        &mut *gap_notes,
                     );
                     push_response_with_twins(item, out, true);
                 }
@@ -1167,6 +1191,8 @@ fn reverse_assistant_part(
     id_hint: Option<&str>,
     turn_id: Option<&str>,
     pending_images: &mut HashMap<String, PendingImage>,
+    tool_call_kinds: &mut HashMap<String, RecoveredToolCallKind>,
+    gap_notes: &mut Vec<String>,
     out: &mut Vec<RolloutItem>,
 ) {
     match part.type_ {
@@ -1220,7 +1246,11 @@ fn reverse_assistant_part(
                 );
                 return;
             }
-            let item = reverse_tool_call(tool_name, tool_call_id, &arguments, id_hint);
+            let (item, kind) =
+                reverse_tool_call(tool_name, tool_call_id, &arguments, id_hint, gap_notes);
+            if !tool_call_id.is_empty() {
+                tool_call_kinds.insert(tool_call_id.to_string(), kind);
+            }
             push_response_with_twins(item, out, true);
         }
     }
@@ -1274,16 +1304,45 @@ fn complete_image_generation(
     }
 }
 
+/// Host ResponseItemId kind prefix (structural identity metadata).
+/// Longest-first so `ctco`/`fco` win over `ctc`/`fc`.
+fn host_id_kind_prefix(id: &str) -> Option<&'static str> {
+    const PREFIXES: &[&str] = &[
+        "ctco", "ctc", "fco", "fc", "lsh", "tsc", "tso", "ws", "ig", "msg", "rs", "amsg", "at",
+        "cmp",
+    ];
+    for p in PREFIXES {
+        if id == *p || id.starts_with(&format!("{p}_")) {
+            return Some(*p);
+        }
+    }
+    None
+}
+
+fn host_raw_input(arguments: &Map<String, Value>) -> String {
+    arguments
+        .get("__hostRaw")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let mut a = arguments.clone();
+            a.remove("__hostRaw");
+            serde_json::to_string(&Value::Object(a)).unwrap_or_else(|_| "{}".into())
+        })
+}
+
 fn reverse_tool_call(
     tool_name: &str,
     tool_call_id: &str,
     arguments: &Map<String, Value>,
     id_hint: Option<&str>,
-) -> ResponseItem {
-    let id = id_hint
-        .and_then(sanitize_id)
-        .map(ResponseItemId::from_server);
+    gap_notes: &mut Vec<String>,
+) -> (ResponseItem, RecoveredToolCallKind) {
+    let recovered = id_hint.and_then(sanitize_id);
+    let prefix = recovered.as_deref().and_then(host_id_kind_prefix);
     let call_id = call_id_string(tool_call_id);
+
+    // Name-based specialized tools take precedence when capture recorded them.
     match tool_name {
         "local_shell" => {
             let mut args = arguments.clone();
@@ -1300,24 +1359,52 @@ fn reverse_tool_call(
                     user: None,
                 }),
             );
-            ResponseItem::LocalShellCall {
-                id,
-                call_id: non_empty_opt(&call_id),
-                status: LocalShellStatus::Completed,
-                action,
-                internal_chat_message_metadata_passthrough: None,
-            }
+            let id = match prefix {
+                None | Some("lsh") => recovered.map(ResponseItemId::from_server),
+                Some(other) => {
+                    gap_notes.push(format!(
+                        "tool_call local_shell id prefix {other:?} unrepresentable with LocalShellCall; clearing id"
+                    ));
+                    None
+                }
+            };
+            return (
+                ResponseItem::LocalShellCall {
+                    id,
+                    call_id: non_empty_opt(&call_id),
+                    status: LocalShellStatus::Completed,
+                    action,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                RecoveredToolCallKind::LocalShell,
+            );
         }
         "web_search" => {
             let mut args = arguments.clone();
             args.remove("__hostRaw");
             let action = serde_json::from_value::<WebSearchAction>(Value::Object(args)).ok();
-            ResponseItem::WebSearchCall {
-                id: response_item_id_opt(tool_call_id),
-                status: Some("completed".into()),
-                action,
-                internal_chat_message_metadata_passthrough: None,
-            }
+            let id = match prefix {
+                None | Some("ws") => recovered
+                    .as_deref()
+                    .and_then(sanitize_id)
+                    .map(ResponseItemId::from_server)
+                    .or_else(|| response_item_id_opt(tool_call_id)),
+                Some(other) => {
+                    gap_notes.push(format!(
+                        "tool_call web_search id prefix {other:?} unrepresentable with WebSearchCall; clearing id"
+                    ));
+                    None
+                }
+            };
+            return (
+                ResponseItem::WebSearchCall {
+                    id,
+                    status: Some("completed".into()),
+                    action,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                RecoveredToolCallKind::Other,
+            );
         }
         "tool_search" => {
             let mut args = arguments.clone();
@@ -1328,33 +1415,73 @@ fn reverse_tool_call(
                         .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 })
                 .unwrap_or(Value::Object(args));
-            ResponseItem::ToolSearchCall {
-                id,
-                call_id: non_empty_opt(&call_id),
-                status: Some("completed".into()),
-                execution: String::new(),
-                arguments: arguments_value,
-                internal_chat_message_metadata_passthrough: None,
-            }
+            let id = match prefix {
+                None | Some("tsc") => recovered.map(ResponseItemId::from_server),
+                Some(other) => {
+                    gap_notes.push(format!(
+                        "tool_call tool_search id prefix {other:?} unrepresentable with ToolSearchCall; clearing id"
+                    ));
+                    None
+                }
+            };
+            return (
+                ResponseItem::ToolSearchCall {
+                    id,
+                    call_id: non_empty_opt(&call_id),
+                    status: Some("completed".into()),
+                    execution: String::new(),
+                    arguments: arguments_value,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                RecoveredToolCallKind::Other,
+            );
         }
-        _ => {
-            let raw = arguments
-                .get("__hostRaw")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let mut a = arguments.clone();
-                    a.remove("__hostRaw");
-                    serde_json::to_string(&Value::Object(a)).unwrap_or_else(|_| "{}".into())
-                });
+        _ => {}
+    }
+
+    // Generic tools: id prefix is the FunctionCall vs CustomToolCall discriminator.
+    let raw = host_raw_input(arguments);
+    match prefix {
+        Some("ctc") => (
+            ResponseItem::CustomToolCall {
+                id: recovered.map(ResponseItemId::from_server),
+                status: None,
+                call_id,
+                name: tool_name.to_string(),
+                namespace: None,
+                input: raw,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            RecoveredToolCallKind::Custom,
+        ),
+        Some("fc") | None => (
             ResponseItem::FunctionCall {
-                id,
+                id: recovered.map(ResponseItemId::from_server),
                 name: tool_name.to_string(),
                 namespace: None,
                 arguments: raw,
                 call_id,
                 internal_chat_message_metadata_passthrough: None,
-            }
+            },
+            RecoveredToolCallKind::Function,
+        ),
+        Some(other) => {
+            // Unrepresentable pairing (e.g. msg_/rs_ on a tool_call) — never
+            // emit FunctionCall wearing a non-fc id.
+            gap_notes.push(format!(
+                "tool_call id prefix {other:?} unrepresentable as FunctionCall/CustomToolCall; id=None"
+            ));
+            (
+                ResponseItem::FunctionCall {
+                    id: None,
+                    name: tool_name.to_string(),
+                    namespace: None,
+                    arguments: raw,
+                    call_id,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                RecoveredToolCallKind::Function,
+            )
         }
     }
 }
@@ -1364,9 +1491,14 @@ fn reverse_tool_result(
     tool_name: Option<&str>,
     content: &str,
     is_error: Option<bool>,
+    id_hint: Option<&str>,
+    call_kind: Option<RecoveredToolCallKind>,
+    gap_notes: &mut Vec<String>,
 ) -> ResponseItem {
     let name = tool_name.unwrap_or("");
     let call_id = call_id_string(tool_call_id);
+    let recovered = id_hint.and_then(sanitize_id);
+    let prefix = recovered.as_deref().and_then(host_id_kind_prefix);
 
     if name == "tool_search" {
         let tools = serde_json::from_str::<Vec<Value>>(content).unwrap_or_default();
@@ -1375,8 +1507,17 @@ fn reverse_tool_result(
         } else {
             "completed"
         };
+        let id = match prefix {
+            None | Some("tso") => recovered.map(ResponseItemId::from_server),
+            Some(other) => {
+                gap_notes.push(format!(
+                    "tool_result tool_search id prefix {other:?} unrepresentable with ToolSearchOutput; clearing id"
+                ));
+                None
+            }
+        };
         return ResponseItem::ToolSearchOutput {
-            id: None,
+            id,
             call_id: non_empty_opt(&call_id),
             status: status.into(),
             execution: String::new(),
@@ -1387,14 +1528,47 @@ fn reverse_tool_result(
 
     // M8: success reversed from stored isError (Some(false) → Some(true)).
     let success = is_error.map(|e| !e);
-    ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id,
-        output: FunctionCallOutputPayload {
-            body: FunctionCallOutputBody::Text(content.to_string()),
-            success,
-        },
-        internal_chat_message_metadata_passthrough: None,
+    let payload = FunctionCallOutputPayload {
+        body: FunctionCallOutputBody::Text(content.to_string()),
+        success,
+    };
+
+    // Prefer id prefix; fall back to paired call kind; default FunctionCallOutput.
+    let want_custom = match prefix {
+        Some("ctco") => true,
+        Some("fco") => false,
+        Some(other) => {
+            gap_notes.push(format!(
+                "tool_result id prefix {other:?} unrepresentable as fco/ctco; id=None, kind from call pairing"
+            ));
+            matches!(call_kind, Some(RecoveredToolCallKind::Custom))
+        }
+        None => matches!(call_kind, Some(RecoveredToolCallKind::Custom)),
+    };
+    let id = match prefix {
+        Some("ctco") | Some("fco") => recovered.map(ResponseItemId::from_server),
+        _ => None,
+    };
+
+    if want_custom {
+        ResponseItem::CustomToolCallOutput {
+            id,
+            call_id,
+            name: if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            },
+            output: payload,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    } else {
+        ResponseItem::FunctionCallOutput {
+            id,
+            call_id,
+            output: payload,
+            internal_chat_message_metadata_passthrough: None,
+        }
     }
 }
 

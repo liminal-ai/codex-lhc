@@ -1,6 +1,7 @@
 //! Crash-injection and generation-retention tests for atomic rollout rewrite.
 
 use super::*;
+use crate::estimate_response_items_tokens;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::CompactedItem;
@@ -200,6 +201,135 @@ fn history_from_materialized_is_bands_plus_native_tail() {
     ];
     let history = history_from_materialized_items(&items);
     assert_eq!(history, vec![band, tail]);
+}
+
+#[test]
+fn dual_format_history_picks_newest_compacted_only() {
+    // Old-shape: Compacted1 + tail1 + Compacted2 + tail2 → bands2 + tail2 only.
+    let band1 = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "band-v1".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let band2 = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "band-v2".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let after1 = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "after-c1".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let after2 = ResponseItem::Message {
+        id: None,
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText {
+            text: "after-c2".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta::default(),
+            git: None,
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "c1".into(),
+            replacement_history: Some(vec![band1]),
+            window_number: Some(1),
+            first_window_id: Some("f".into()),
+            previous_window_id: None,
+            window_id: Some("w1".into()),
+        }),
+        RolloutItem::ResponseItem(after1),
+        RolloutItem::Compacted(CompactedItem {
+            message: "c2".into(),
+            replacement_history: Some(vec![band2.clone()]),
+            window_number: Some(2),
+            first_window_id: Some("f".into()),
+            previous_window_id: Some("w1".into()),
+            window_id: Some("w2".into()),
+        }),
+        RolloutItem::ResponseItem(after2.clone()),
+    ];
+    let history = history_from_materialized_items(&items);
+    assert_eq!(history, vec![band2, after2]);
+    let text = format!("{history:?}");
+    assert!(
+        !text.contains("band-v1") && !text.contains("after-c1"),
+        "first generation must not leak: {text}"
+    );
+}
+
+#[test]
+fn fl4_model_context_estimate_like_for_like() {
+    // Body smaller or equal to rollout model-context → not pathology.
+    // Body larger → genuine growth (loud-fail candidate).
+    let band = ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "x".repeat(400), // ~100 tokens at char/4
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta::default(),
+            git: None,
+        }),
+        RolloutItem::Compacted(CompactedItem {
+            message: "m".into(),
+            replacement_history: Some(vec![band]),
+            window_number: Some(1),
+            first_window_id: Some("f".into()),
+            previous_window_id: None,
+            window_id: Some("w".into()),
+        }),
+    ];
+    let baseline = model_context_token_estimate_from_rollout_items(&items);
+    assert!(baseline > 0, "baseline must be positive");
+    let smaller = estimate_response_items_tokens(&[ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "tiny".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    assert!(
+        smaller <= baseline,
+        "smaller body is not pathology: {smaller} vs {baseline}"
+    );
+    let larger = estimate_response_items_tokens(&[ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![ContentItem::InputText {
+            text: "y".repeat(4000),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    assert!(
+        larger > baseline,
+        "larger body is pathology: {larger} vs {baseline}"
+    );
 }
 
 #[test]

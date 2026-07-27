@@ -697,6 +697,12 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
                 input.completed_at,
             );
             dispatch_turn_end(&slot, &turn_id, "aborted", facts);
+            // F-L3: flush before process can exit after SIGINT. Graceful
+            // interrupt delivers on_turn_abort then may shut down immediately;
+            // without an await here the capture worker may not land the row.
+            if let Some(handle) = slot.get() {
+                handle.flush().await;
+            }
         })
     }
 
