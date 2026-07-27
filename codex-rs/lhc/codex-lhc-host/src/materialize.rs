@@ -45,6 +45,7 @@
 //! | `ItemCompleted(Plan\|Sleep)` / `InterAgentCommunication{,Metadata}` | **Carried forward** | prior generation |
 //! | Review / patch / MCP / subagent ends | **Carried forward** when present | prior generation |
 //! | Transient (`Error`, `ExecCommandEnd`, collab, realtime, …) | **Dropped** | never persisted |
+//! | Fork compact-marker `runtime_note` | **Excluded** (model + display) | idempotency key namespace `codex:{tid}:compact_marker:…` — fork bookkeeping; boundary `Compacted` already records that a compact happened. Keys matched structurally ([`crate::is_compact_marker_idempotency_key`]), never by note text (law 6). Rows stay in the LHC record as provenance. |
 //!
 //! # Capture gaps (do not invent content)
 //!
@@ -91,6 +92,7 @@ use lhc::shared_tech::view::SessionAssistantPart;
 use lhc::shared_tech::view::SessionAssistantPartType;
 use lhc::shared_tech::view::SessionThreadView;
 use lhc::shared_tech::view::SessionThreadViewEntry;
+use lhc::shared_tech::view::SessionThreadViewEntrySource;
 use lhc::shared_tech::view::SessionThreadViewMessage;
 use lhc::shared_tech::view::SessionThreadViewRuntimeEntry;
 use lhc::turns::TurnRecord;
@@ -120,6 +122,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "TurnContextItem / previous_turn_settings: optional input (slice C wires post-boundary TurnContext). Without it, reconstruction leaves previous_turn_settings None and the reverse-scan early-exit at settings+context is disabled",
     "Pre-slice-A turns: outcome/timing/provider_usage absent → TurnComplete without timestamps; no TokenCount; cumulative totals undercount",
     "runtime_note shape: restored as user-role Message with stored payload text (no display twin); original host provenance (HostContext vs AgentMessage vs scaffolding) is lost",
+    "Fork compact-marker runtime_notes (idempotency key namespace codex:{tid}:compact_marker:…): excluded from model and display streams — fork bookkeeping, not conversation; stay in the LHC record; boundary Compacted is the compact signal. Matched by key segment only (law 6), never note text",
     "synthetic: call_id strings retained only so call/result pairs still match; never promoted to ResponseItemId",
     "Display twin order: ResponseItem then EventMsg twin (live append is twin-then-item on some paths; reconstruction does not care)",
 ];
@@ -696,6 +699,14 @@ fn emit_tail(
             continue;
         }
 
+        // F1 / law 6: fork compact-marker runtime notes are bookkeeping (key
+        // namespace codex:{tid}:compact_marker:…), not conversation. Exclude
+        // from model stream and display stream before turn open / emit.
+        // Matched on source idempotency key only — never note text.
+        if entry_is_fork_compact_marker(entry) {
+            continue;
+        }
+
         for mid in entry_message_ids(entry) {
             if let Some(msg) = messages_by_id.get(&mid) {
                 if rolled_back_turns.contains(&msg.turn_id) {
@@ -933,6 +944,33 @@ fn flush_all_pending_images(
             push_response_with_twins(item, out, true);
         }
     }
+}
+
+/// True when this view entry is sourced from a fork compact-marker runtime note
+/// (idempotency key in the `codex:{tid}:compact_marker:…` namespace).
+///
+/// Structural key match via the view's source join — never note body text.
+fn entry_is_fork_compact_marker(entry: &SessionThreadViewEntry) -> bool {
+    entry_source_keys(entry).any(crate::is_compact_marker_idempotency_key)
+}
+
+fn entry_source_keys(entry: &SessionThreadViewEntry) -> impl Iterator<Item = &str> {
+    let sources: &[SessionThreadViewEntrySource] = match entry {
+        SessionThreadViewEntry::Message(SessionThreadViewMessage::User(u)) => &u.source_messages,
+        SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(a)) => {
+            &a.source_messages
+        }
+        SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(tr)) => {
+            &tr.source_messages
+        }
+        SessionThreadViewEntry::Runtime(SessionThreadViewRuntimeEntry::ModelChange(m)) => {
+            &m.source_messages
+        }
+        SessionThreadViewEntry::Runtime(SessionThreadViewRuntimeEntry::ThinkingLevelChange(t)) => {
+            &t.source_messages
+        }
+    };
+    sources.iter().filter_map(|s| s.idempotency_key.as_deref())
 }
 
 fn entry_belongs_to_rolled_back(

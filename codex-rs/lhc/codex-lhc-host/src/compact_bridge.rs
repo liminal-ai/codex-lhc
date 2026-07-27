@@ -51,6 +51,27 @@ use crate::session::LhcSession;
 /// This is the only body construction path (not a host-side summarizer).
 pub const VIEW_MAP_SEAM_ID: &str = "llm_request_context_to_response_items/v1";
 
+/// Structural namespace segment of compact-marker idempotency keys.
+///
+/// Full key shape (minted in [`CompactMarker::from_receipt`]):
+/// `codex:{tid}:compact_marker:{tip}:{compact_point}:{covered_from}:{body_fp}`.
+///
+/// The materializer matches this segment — never note text — to exclude fork
+/// bookkeeping from model and display streams (law 6; F1 fix).
+pub const COMPACT_MARKER_KEY_SEGMENT: &str = "compact_marker";
+
+/// True when `key` is in the fork compact-marker bookkeeping namespace.
+///
+/// Structural identity only: `codex` / `{tid}` / [`COMPACT_MARKER_KEY_SEGMENT`]
+/// as the first three `:`-separated fields. Does **not** inspect note body text.
+pub fn is_compact_marker_idempotency_key(key: &str) -> bool {
+    let mut parts = key.splitn(4, ':');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some("codex"), Some(_tid), Some(COMPACT_MARKER_KEY_SEGMENT))
+    )
+}
+
 /// Result of an LHC compact production pass (before host write-back).
 ///
 /// Marker is **not** yet in the archive — call [`commit_compact_marker`] after
@@ -122,8 +143,11 @@ impl CompactMarker {
             }
             hasher_in
         };
+        // Namespace segment [`COMPACT_MARKER_KEY_SEGMENT`] is structural identity
+        // for the materializer (exclude from model/display streams — fork
+        // bookkeeping, not conversation). See [`is_compact_marker_idempotency_key`].
         let marker_key = format!(
-            "codex:{tid}:compact_marker:{tip}:{}:{}:{body_fp}",
+            "codex:{tid}:{COMPACT_MARKER_KEY_SEGMENT}:{tip}:{}:{}:{body_fp}",
             receipt.compact_point, receipt.covered_from
         );
         Self {

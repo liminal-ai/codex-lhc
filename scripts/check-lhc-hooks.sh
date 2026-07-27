@@ -5,21 +5,67 @@
 #
 # WHAT THIS SCRIPT ACTUALLY RUNS (keep in lockstep with FORK.md inventory —
 # Phase 3 lesson: a gate you haven't enumerated is a gate you haven't run):
-#   1. grep count of LHC-HOOK sentinels in core vs EXPECTED_HOOKS below
+#   0.  vendor submodule tree CLEAN (F12) — dirt in the certified port = fail.
+#       Checked at start AND end so fmt-churn / accidental vendor edits cannot
+#       slip through after later layers run.
+#   1.  grep count of LHC-HOOK sentinels in core vs EXPECTED_HOOKS below
 #   2a. cargo check -p codex-core -p codex-app-server -p codex-extension-api
 #       (the crates that *carry* the hooks — not just the adapter)
 #   2b. cargo test -p codex-lhc-host --lib
 #   2c. cargo test -p codex-lhc-host --features test-util --test certification
 #   2d. cargo test -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
+#   2d1b. cargo test -p codex-core --lib config_schema_matches_fixture
+#   2d2. cargo test compact_bridge + compact_lhc (capture→rebuild / arm)
 #   2e. cargo fmt --check for the adapter crate
-#   2f. dirty-submodule hard fail (F12): pin must match what we build
-#   3. golden presence under codex-rs/lhc/goldens/ (byte-checked by 2c)
-#   4. history-reset drill: apply patches/lhc/0*.patch at patches/lhc/BASE and
-#      require byte-identity with the live tree, plus full fork-file coverage
+#   2e2. cargo clippy -p codex-lhc-host --lib --no-deps (-D unused -D dead_code)
+#   3.  golden presence under codex-rs/lhc/goldens/ (byte-checked by 2c)
+#   4.  history-reset drill: apply patches/lhc/0*.patch at patches/lhc/BASE and
+#       require byte-identity with the live tree, plus full fork-file coverage
+#   5.  slice D certification (cargo test -p codex-core --lib slice_d_
+#       -- --test-threads=1): drill + dual-format + display + layer-2 matrix
+#   0'. vendor CLEAN re-check (end of run)
 set -u
 cd "$(dirname "$0")/.."
 command -v cargo >/dev/null 2>&1 || . "$HOME/.cargo/env" 2>/dev/null || true
 fail=0
+
+# ── Layer 0: vendor submodule CLEAN (F12) — also rechecked at end ──────
+vendor=codex-rs/lhc/vendor/long-horizon-context
+check_vendor_clean() {
+  local phase="$1"
+  if [ ! -d "$vendor/.git" ] && [ ! -f "$vendor/.git" ]; then
+    echo "TRIPWIRE vendor[$phase]: missing $vendor"
+    return 1
+  fi
+  # Fail on git error (not a repo, broken gitdir) — do not treat empty status as clean.
+  local vendor_status
+  if ! vendor_status=$(git -C "$vendor" status --porcelain 2>/tmp/lhc-vendor-git.err); then
+    echo "TRIPWIRE vendor[$phase]: git status failed in $vendor"
+    cat /tmp/lhc-vendor-git.err 2>/dev/null | head -10
+    return 1
+  fi
+  if [ -n "$vendor_status" ]; then
+    echo "TRIPWIRE vendor[$phase]: submodule working tree is DIRTY — certified port dirt is a fail"
+    echo "  (fmt-churn or accidental edit in vendor/ must be restored before green)"
+    echo "$vendor_status" | head -20
+    return 1
+  fi
+  local pin
+  if ! pin=$(git -C "$vendor" log -1 --format=%h 2>/tmp/lhc-vendor-git.err); then
+    echo "TRIPWIRE vendor[$phase]: git log failed in $vendor"
+    cat /tmp/lhc-vendor-git.err 2>/dev/null | head -10
+    return 1
+  fi
+  if [ -z "$pin" ]; then
+    echo "TRIPWIRE vendor[$phase]: empty pin from git log"
+    return 1
+  fi
+  echo "ok vendor[$phase]: CLEAN at $pin"
+  return 0
+}
+if ! check_vendor_clean start; then
+  fail=1
+fi
 
 # ── Layer 1: sentinel count ────────────────────────────────────────────
 EXPECTED_HOOKS=51
@@ -31,35 +77,6 @@ if [ "$found" -ne "$EXPECTED_HOOKS" ]; then
   fail=1
 else
   echo "ok sentinel: $found/$EXPECTED_HOOKS LHC-HOOK markers"
-fi
-
-# ── Layer 2f first: dirty submodule hard fail ──────────────────────────
-vendor=codex-rs/lhc/vendor/long-horizon-context
-if [ -d "$vendor/.git" ] || [ -f "$vendor/.git" ]; then
-  # Fail on git error (not a repo, broken gitdir) — do not treat empty status as clean.
-  if ! vendor_status=$(git -C "$vendor" status --porcelain 2>/tmp/lhc-vendor-git.err); then
-    echo "TRIPWIRE vendor: git status failed in $vendor"
-    cat /tmp/lhc-vendor-git.err 2>/dev/null | head -10
-    fail=1
-  elif [ -n "$vendor_status" ]; then
-    echo "TRIPWIRE vendor: submodule working tree is DIRTY — pin does not match what is built"
-    echo "$vendor_status" | head -20
-    fail=1
-  else
-    if ! pin=$(git -C "$vendor" log -1 --format=%h 2>/tmp/lhc-vendor-git.err); then
-      echo "TRIPWIRE vendor: git log failed in $vendor"
-      cat /tmp/lhc-vendor-git.err 2>/dev/null | head -10
-      fail=1
-    elif [ -z "$pin" ]; then
-      echo "TRIPWIRE vendor: empty pin from git log"
-      fail=1
-    else
-      echo "ok vendor: clean at $pin"
-    fi
-  fi
-else
-  echo "TRIPWIRE vendor: missing $vendor"
-  fail=1
 fi
 
 # ── Layer 2a: compile the crates that carry hooks ─────────────────────
@@ -131,7 +148,10 @@ else
   grep -E "^error|FAILED|panicked" -A5 /tmp/lhc-hook-bridge.log | head -40
   fail=1
 fi
-if cargo test -q -p codex-core --lib compact_lhc \
+# Filter is the `tests` submodule only — slice D lives in `slice_d_tests` and
+# is gated by layer 5 (so crash-injection failpoint races don't contaminate
+# the arm suite when both run under the broad `compact_lhc` substring).
+if cargo test -q -p codex-core --lib 'compact_lhc::tests::' \
     --manifest-path codex-rs/Cargo.toml >/tmp/lhc-hook-arm.log 2>&1; then
   echo "ok compact-arm: law1 write-back + law2 prefill + fail-open"
 else
@@ -262,6 +282,20 @@ else
   fail=1
 fi
 
+# ── Layer 5: slice D certification suite (drill + dual-format + L2 matrix) ─
+# The regenerate-and-resume drill plus dual-format, display consumers, and the
+# full layer-2 deterministic matrix. Serial threads avoid failpoint races
+# between crash-injection scenarios that share the global SWAP_FAILPOINT.
+if cargo test -q -p codex-core --lib slice_d_ \
+    --manifest-path codex-rs/Cargo.toml -- --test-threads=1 \
+    >/tmp/lhc-hook-drill.log 2>&1; then
+  echo "ok slice-d: drill + dual-format + display + layer-2 matrix"
+else
+  echo "TRIPWIRE slice-d: certification suite failed:"
+  grep -E "^error|FAILED|panicked" -A5 /tmp/lhc-hook-drill.log | head -40
+  fail=1
+fi
+
 pin=$(git -C codex-rs/lhc/vendor/long-horizon-context log -1 --format=%h 2>/dev/null)
 # Pin-drift check: a pin off the shared certified line is a PENDING
 # RECONCILIATION, not a resting state. This warns on every run (sync
@@ -291,6 +325,11 @@ else
   echo "SKIP pin-drift: shared branch unreachable (offline?)"
 fi
 [ -n "$pin" ] || fail=1
+
+# ── Layer 0' (end): vendor CLEAN re-check — catch fmt-churn mid-run ────
+if ! check_vendor_clean end; then
+  fail=1
+fi
 
 if [ "$fail" -eq 0 ]; then echo "ALL TRIPWIRES GREEN"; else echo "TRIPWIRES FAILED"; fi
 exit "$fail"

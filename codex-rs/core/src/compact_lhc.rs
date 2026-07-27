@@ -405,9 +405,10 @@ async fn install_lhc_compact_rewrite(
     }
     for item in &mut install_history {
         if item_stable_id(item).is_none()
-            && let Some(prefix) = item.id_prefix() {
-                item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
-            }
+            && let Some(prefix) = item.id_prefix()
+        {
+            item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
+        }
     }
     let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
     if assigned_ids.is_empty() {
@@ -589,9 +590,10 @@ async fn select_production_inference_callbacks(
     #[cfg(test)]
     {
         if let Ok(guard) = sess.services.lhc_test_inference.lock()
-            && let Some(cbs) = guard.as_ref() {
-                return Ok(cbs.clone());
-            }
+            && let Some(cbs) = guard.as_ref()
+        {
+            return Ok(cbs.clone());
+        }
     }
     crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
 }
@@ -925,3 +927,7 @@ pub(crate) async fn token_limit_reached(sess: &Session, turn_context: &TurnConte
 #[cfg(test)]
 #[path = "compact_lhc_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "compact_lhc_slice_d_tests.rs"]
+mod slice_d_tests;

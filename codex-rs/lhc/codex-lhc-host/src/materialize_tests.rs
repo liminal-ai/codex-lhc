@@ -1661,6 +1661,117 @@ fn banded_thread_with_tool_heavy_tail_preserves_native_kinds() {
 
 // ── M6 runtime notes ──────────────────────────────────────────────────────
 
+/// F1: fork compact-marker runtime notes are excluded from model + display
+/// streams by structural key match (codex:{tid}:compact_marker:…), not text.
+#[test]
+fn f1_compact_marker_runtime_note_excluded_from_model_and_display() {
+    use crate::COMPACT_MARKER_KEY_SEGMENT;
+    use crate::is_compact_marker_idempotency_key;
+
+    let marker_key = format!("codex:tid123:{COMPACT_MARKER_KEY_SEGMENT}:tip:1:0:fp");
+    assert!(is_compact_marker_idempotency_key(&marker_key));
+    assert!(!is_compact_marker_idempotency_key(
+        "codex:tid123:id:msg_1:digest:runtime_note"
+    ));
+
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("b"),
+            user_tail("m1", "live prompt"),
+            SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                // Body deliberately contains the marker text — exclusion must
+                // still fire only via the key, not this string.
+                content: "lhc_compact_marker {\"viewId\":\"v1\"}".into(),
+                source_messages: vec![SessionThreadViewEntrySource {
+                    message_id: "m-marker".into(),
+                    idempotency_key: Some(marker_key),
+                }],
+            })),
+            // Ordinary runtime note (no compact_marker key) still emits.
+            SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                content: "[runtime note] scaffolding".into(),
+                source_messages: vec![SessionThreadViewEntrySource {
+                    message_id: "m-rn".into(),
+                    idempotency_key: Some("codex:tid123:anon:abc:0:runtime_note".into()),
+                }],
+            })),
+        ],
+    };
+    let messages = [
+        msg(
+            "m-marker",
+            "t0",
+            MessageKind::RuntimeNote,
+            1,
+            "lhc_compact_marker {\"viewId\":\"v1\"}",
+            None,
+        ),
+        msg("m1", "t1", MessageKind::UserPrompt, 2, "live prompt", None),
+        msg(
+            "m-rn",
+            "t1",
+            MessageKind::RuntimeNote,
+            3,
+            "scaffolding",
+            None,
+        ),
+    ];
+    let turns = [
+        turn(
+            "t0",
+            0,
+            &["m-marker"],
+            Some(TurnOutcome::Completed),
+            None,
+            None,
+            None,
+        ),
+        turn(
+            "t1",
+            1,
+            &["m1", "m-rn"],
+            Some(TurnOutcome::Completed),
+            None,
+            None,
+            None,
+        ),
+    ];
+    let items = materialize(view, &messages, &turns, &[], None);
+    let tail = tail_response_items(&items);
+    let texts: Vec<String> = tail
+        .iter()
+        .filter_map(|r| match r {
+            ResponseItem::Message { content, .. } => Some(content_text(content)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("lhc_compact_marker")),
+        "compact-marker note must not enter model stream: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "scaffolding"),
+        "ordinary runtime_note still emits: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "live prompt"),
+        "live user prompt still emits: {texts:?}"
+    );
+    // No display twin for the excluded marker either.
+    let um: Vec<_> = items
+        .iter()
+        .filter_map(|i| match i {
+            RolloutItem::EventMsg(EventMsg::UserMessage(e)) => Some(e.message.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !um.iter().any(|t| t.contains("lhc_compact_marker")),
+        "compact-marker must not appear in display stream: {um:?}"
+    );
+}
+
 #[test]
 fn m6_runtime_note_uses_stored_text_no_display_twin() {
     let view = SessionThreadView {

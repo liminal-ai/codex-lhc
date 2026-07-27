@@ -42,7 +42,7 @@ One base for all seven; each fork-owned file in exactly one patch.
 | 0004-session-raw-item-hook | `core/src/session/mod.rs`, `core/src/session/lhc_capture_e2e_tests.rs`, `core/src/stream_events_utils.rs`, `core/src/compact.rs` |
 | 0005-app-server-dep | `app-server/Cargo.toml` |
 | 0006-app-server-install | `app-server/src/extensions.rs` |
-| 0007-lhc-compact-arm | `core/Cargo.toml`, `core/src/{compact_lhc.rs, compact_lhc_tests.rs, lhc_inference_bridge.rs, lib.rs}`, `core/src/session/{turn.rs, session.rs, tests.rs, lhc_band_shape_eval_tests.rs}`, `core/src/state/{session.rs, service.rs}`, `core/src/tasks/{compact.rs, lifecycle.rs, mod.rs}`, `rollout/src/recorder.rs`, `thread-store/src/live_thread.rs`, `thread-store/src/local/{mod.rs,live_writer.rs}` |
+| 0007-lhc-compact-arm | `core/Cargo.toml`, `core/src/{compact_lhc.rs, compact_lhc_tests.rs, compact_lhc_slice_d_tests.rs, lhc_inference_bridge.rs, lib.rs}`, `core/src/session/{turn.rs, session.rs, tests.rs, lhc_band_shape_eval_tests.rs}`, `core/src/state/{session.rs, service.rs}`, `core/src/tasks/{compact.rs, lifecycle.rs, mod.rs}`, `rollout/src/recorder.rs`, `thread-store/src/live_thread.rs`, `thread-store/src/local/{mod.rs,live_writer.rs}` |
 
 `core/Cargo.toml` and `core/src/compact.rs` each carry both their Chunk 1 and
 Chunk 2b deltas, because one base means one patch per file. `core/Cargo.toml`

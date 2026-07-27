@@ -157,7 +157,10 @@ async fn e2e_item_order_preserved_across_records() {
         texts.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
         "prompts must appear in original order by identity (no pre-sort)"
     );
-    let orders: Vec<i64> = events.iter().map(codex_lhc_host::EventRecord::event_order).collect();
+    let orders: Vec<i64> = events
+        .iter()
+        .map(codex_lhc_host::EventRecord::event_order)
+        .collect();
     assert!(
         orders.windows(2).all(|w| w[0] <= w[1]),
         "raw list_events order must be non-decreasing: {orders:?}"
@@ -932,4 +935,88 @@ async fn e2e_v5_turn_end_without_host_facts_still_records() {
     );
 
     handle.shutdown().await;
+}
+
+// ── Slice D: dual-format resume via production reconstruct ─────────────
+
+/// Pre-rework shape (appended Compacted records, no rewrite) still reconstructs
+/// correctly through the production reverse-scan path.
+#[tokio::test]
+async fn slice_d_dual_format_old_appended_via_production_resume() {
+    use codex_protocol::protocol::CompactedItem;
+    use codex_protocol::protocol::RolloutItem;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
+
+    fn user(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn assistant(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    let bands1 = vec![user("band-v1"), assistant("summary-v1")];
+    let bands2 = vec![user("band-v2"), assistant("summary-v2")];
+    let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                timestamp: "2026-01-01T00:00:00.000Z".into(),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::ResponseItem(user("pre-compact-user")),
+        RolloutItem::ResponseItem(assistant("pre-compact-asst")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "c1".into(),
+            replacement_history: Some(bands1),
+            window_number: Some(1),
+            first_window_id: Some("first".into()),
+            previous_window_id: None,
+            window_id: Some("win-1".into()),
+        }),
+        RolloutItem::ResponseItem(user("after-c1")),
+        RolloutItem::ResponseItem(assistant("reply-c1")),
+        RolloutItem::Compacted(CompactedItem {
+            message: "c2".into(),
+            replacement_history: Some(bands2.clone()),
+            window_number: Some(2),
+            first_window_id: Some("first".into()),
+            previous_window_id: Some("win-1".into()),
+            window_id: Some("win-2".into()),
+        }),
+        RolloutItem::ResponseItem(user("after-c2")),
+        RolloutItem::ResponseItem(assistant("reply-c2")),
+    ];
+
+    let (session, turn_context) = make_session_and_context().await;
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    let mut expected = bands2;
+    expected.push(user("after-c2"));
+    expected.push(assistant("reply-c2"));
+    assert_eq!(
+        reconstructed.history, expected,
+        "production resume must keep newest Compacted bands + post-boundary tail only"
+    );
+    let text = format!("{:?}", reconstructed.history);
+    assert!(
+        !text.contains("band-v1") && !text.contains("after-c1") && !text.contains("pre-compact"),
+        "first-generation content must not leak into production resume"
+    );
+    assert_eq!(reconstructed.window_number, 2);
 }
