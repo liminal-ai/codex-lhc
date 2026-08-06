@@ -180,6 +180,7 @@ fn all_variant_fixtures() -> Vec<(&'static str, ResponseItem, RawItemProvenance)
                 name: "read_file".into(),
                 namespace: None,
                 arguments: r#"{"path":"src/main.rs"}"#.into(),
+                encrypted_function_args: None,
                 call_id: "fc_1".into(),
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -406,6 +407,7 @@ async fn arguments_raw_byte_exact_round_trip() {
             name: "x".into(),
             namespace: None,
             arguments: (*raw).into(),
+            encrypted_function_args: None,
             call_id: format!("c{i}"),
             internal_chat_message_metadata_passthrough: None,
         };
@@ -670,6 +672,7 @@ async fn flag_off_installs_no_capture() {
             persistent_thread_state_available: false,
             environments: &environments,
             mcp_resource_client: None,
+            extension_metrics: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -700,6 +703,7 @@ async fn flag_on_captures_via_raw_item_contributor() {
             persistent_thread_state_available: false,
             environments: &environments,
             mcp_resource_client: None,
+            extension_metrics: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -749,6 +753,7 @@ async fn pre_open_items_are_buffered_not_dropped() {
             persistent_thread_state_available: false,
             environments: &environments,
             mcp_resource_client: None,
+            extension_metrics: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })
@@ -1038,6 +1043,7 @@ async fn config_change_emits_model_and_thinking_events() {
             persistent_thread_state_available: false,
             environments: &environments,
             mcp_resource_client: None,
+            extension_metrics: None,
             session_store: &session_store,
             thread_store: &thread_store,
         })

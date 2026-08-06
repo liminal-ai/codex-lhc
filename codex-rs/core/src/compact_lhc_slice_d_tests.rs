@@ -110,6 +110,7 @@ async fn install_lhc_and_enable(session: &mut Session, root: std::path::PathBuf)
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
             })
@@ -997,6 +998,7 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
                     name: "search".into(),
                     namespace: None,
                     arguments: format!(r#"{{"q":{}}}"#, serde_json::to_string(astral).unwrap()),
+                    encrypted_function_args: None,
                     call_id: "fc_adv".into(),
                     internal_chat_message_metadata_passthrough: None,
                 },

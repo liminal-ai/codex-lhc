@@ -68,7 +68,7 @@ if ! check_vendor_clean start; then
 fi
 
 # ── Layer 1: sentinel count ────────────────────────────────────────────
-EXPECTED_HOOKS=54
+EXPECTED_HOOKS=52
 found=$(grep -rl "LHC-HOOK" codex-rs --include="*.rs" --include="*.toml" 2>/dev/null \
         | grep -v "codex-rs/lhc/" | xargs -r grep -o "LHC-HOOK" | wc -l)
 if [ "$found" -ne "$EXPECTED_HOOKS" ]; then
@@ -151,7 +151,7 @@ fi
 # Filter is the `tests` submodule only — slice D lives in `slice_d_tests` and
 # is gated by layer 5 (so crash-injection failpoint races don't contaminate
 # the arm suite when both run under the broad `compact_lhc` substring).
-if cargo test -q -p codex-core --lib 'compact_lhc::tests::' \
+if RUST_MIN_STACK=8388608 cargo test -q -p codex-core --lib 'compact_lhc::tests::' \
     --manifest-path codex-rs/Cargo.toml >/tmp/lhc-hook-arm.log 2>&1; then
   echo "ok compact-arm: law1 write-back + law2 prefill + fail-open"
 else

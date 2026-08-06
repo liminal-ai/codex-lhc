@@ -57,6 +57,7 @@ async fn install_lhc_on_session(session: &mut Session, root: std::path::PathBuf)
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
             })
@@ -216,9 +217,8 @@ async fn e2e_core_id_assignment_is_restart_stable() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }];
-    let prepared = session
-        .prepare_conversation_items_for_history(&turn_context, &items)
-        .into_owned();
+    let (prepared, _) = session.prepare_conversation_items_for_history(&turn_context, &items);
+    let prepared = prepared.into_owned();
     let id_str = prepared[0]
         .id()
         .map(|i| i.as_str().to_string())
@@ -413,6 +413,7 @@ async fn e2e_panicking_raw_item_contributor_is_contained() {
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
             })
@@ -682,6 +683,7 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
         output_tokens: 33,
         reasoning_output_tokens: 4,
         total_tokens: 170,
+        codex_rollout_budget_units: None,
     };
     session
         .record_token_usage_info(&turn_context, Some(&per_call))

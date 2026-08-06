@@ -19,15 +19,15 @@ history preserved and rebuildable at full fidelity.
 
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified `lhc-rs-port` commits only** (gate-green at the pin).
-  Current pin: **`3663839`** (`lhc-rs-port-codex-pin` off `5399c41`).
-  That commit is the forced rusqlite 0.37→0.39 packaging change:
+  Current pin: **`a3deafd`** on `lhc-rs-port`. It includes the certified
+  rusqlite host-compat change (`614543a`, descendant of the original
+  `3663839` compatibility pin) and the band-walk brief-fallback repair:
   - codex-rs pins `libsqlite3-sys 0.37` (WAL-reset fix);
-  - rusqlite 0.37 needs `^0.35`, 0.39 needs `^0.37`;
-  - two majors with `links = "sqlite3"` cannot coexist;
-  - port gate on 3663839: GATE PASS, classified=496 passed=481 ignored=15
-    wrong=0 suspicious=0;
-  - **bundled SQLite moves 3.50.2 → 3.51.3** (real change, not
-    "packaging only"); it aligns LHC with the SQLite build codex-rs pins.
+  - the port accepts the compatible rusqlite 0.37–0.39 range, avoiding two
+    crates with `links = "sqlite3"`;
+  - **bundled SQLite is 3.51.3**, aligned with the SQLite build codex-rs pins;
+  - `a3deafd` carries the latest gate-passed Rust serving behavior from the
+    LHC source repo.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
@@ -245,13 +245,43 @@ Real exposure, measured on upstream over 30 days rather than assumed:
 | `core/src/tasks/compact.rs` | 2 | 1 (of 1) |
 | every other hooked file | ≤ 20 each | 0 |
 
-3 of 26 hook sites saw any churn in a month. The tiny-footprint mitigation is
-real; a sync after a *week or more* of gap has still never been rehearsed.
+3 of 26 hook sites saw any churn in a month. The tiny-footprint mitigation was
+then tested by the ten-day sync below.
+
+### Sync run 2026-08-06 — 349 upstream commits, six conflicts, green
+
+Merged `61a44880a8..f141dc77f0` after ten days of upstream work. Six files
+conflicted: `Cargo.lock`, `core/src/lib.rs`, `core/src/session/{mod.rs,session.rs,tests.rs}`,
+and `ext/extension-api/src/registry.rs`. The source conflicts were additive or
+upstream refactors around LHC touchpoints; `Cargo.lock` was regenerated.
+
+Upstream changes that required LHC work:
+
+- `ExtensionRegistryBuilder` now owns a registry directly; the raw-item
+  contributor moved into that shape. This removed two marker sites without
+  removing behavior, so the sentinel count changed from 54 to 52.
+- conversation-item preparation now returns image-preparation metadata;
+  provenance capture preserves that new analytics path.
+- `SessionTaskContext` was removed, so compact-arm tests now call the production
+  task interface directly.
+- lifecycle and usage inputs gained `extension_metrics` and
+  `codex_rollout_budget_units` fields.
+- function calls gained `encrypted_function_args`; LHC now stores the optional
+  value in `arguments.__hostEncryptedFunctionArgs` and restores it, including
+  the meaningful `Some(empty)` case.
+- image-generation completion gained transparent-background metadata; legacy
+  LHC materialization supplies `None` because that field is not in the LHC
+  record.
+
+The vendored Rust port advanced `614543a..a3deafd` (latest `lhc-rs` source
+change: band-walk brief-fallback repair). All tripwire layers passed, including
+98 adapter tests, the real Session seam, compact arm, certification, schema,
+patch reproduction at the new base, and the slice-D matrix.
 
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `61a44880a8`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `f141dc77f0`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing

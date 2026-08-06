@@ -1365,6 +1365,23 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
     );
 }
 
+#[test]
+fn function_call_preserves_present_empty_encrypted_args() {
+    let mut args = Map::new();
+    args.insert("__hostRaw".into(), json!("{}"));
+    args.insert("__hostEncryptedFunctionArgs".into(), json!([]));
+    let (item, kind) = reverse_tool_call("search", "call-1", &args, Some("fc_1"), &mut Vec::new());
+
+    assert_eq!(kind, RecoveredToolCallKind::Function);
+    assert!(matches!(
+        item,
+        ResponseItem::FunctionCall {
+            encrypted_function_args: Some(values),
+            ..
+        } if values.is_empty()
+    ));
+}
+
 /// Law 6: tool result routing by name only — content sniffer must not misroute.
 #[test]
 fn law6_function_result_with_image_shaped_body_stays_function_output() {

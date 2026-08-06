@@ -16,7 +16,7 @@
 //! | `Reasoning` summary/content | `assistant_thinking` | text |
 //! | `Reasoning` encrypted | `assistant_thinking` | encrypted bytes verbatim as `text` |
 //! | `LocalShellCall` | `tool_call` | by call_id |
-//! | `FunctionCall` | `tool_call` | args object; verbatim wire string in `arguments.__hostRaw` (payload-only; never `extra`) |
+//! | `FunctionCall` | `tool_call` | args object; verbatim wire string in `arguments.__hostRaw`; optional encrypted args in `arguments.__hostEncryptedFunctionArgs` (payload-only; never `extra`) |
 //! | `ToolSearchCall` | `tool_call` | |
 //! | `FunctionCallOutput` | `tool_result` | by call_id |
 //! | `CustomToolCall` | `tool_call` | wire input in `arguments.__hostRaw` |
@@ -189,12 +189,19 @@ pub fn map_item(
         ResponseItem::FunctionCall {
             name,
             arguments,
+            encrypted_function_args,
             call_id,
             id: _,
             namespace: _,
             internal_chat_message_metadata_passthrough: _,
         } => {
-            let args = parse_arguments_object(arguments);
+            let mut args = parse_arguments_object(arguments);
+            if let Some(encrypted_function_args) = encrypted_function_args {
+                args.insert(
+                    "__hostEncryptedFunctionArgs".into(),
+                    json!(encrypted_function_args),
+                );
+            }
             vec![tool_call_event(
                 thread_id, sid, &digest, occ, call_id, name, args,
             )]
@@ -941,6 +948,7 @@ mod tests {
             name: "x".into(),
             namespace: None,
             arguments: raw.into(),
+            encrypted_function_args: Some(Vec::new()),
             call_id: "c1".into(),
             internal_chat_message_metadata_passthrough: None,
         };
@@ -956,6 +964,11 @@ mod tests {
             Some(&json!(raw)),
             "verbatim wire string must land in arguments.__hostRaw"
         );
+        assert_eq!(
+            args.get("__hostEncryptedFunctionArgs"),
+            Some(&json!([])),
+            "Some(empty) is distinct from an absent encrypted-args field"
+        );
         assert!(
             events[0].input.extra.is_empty(),
             "extra must stay empty (H1)"
@@ -970,6 +983,7 @@ mod tests {
             name: "x".into(),
             namespace: None,
             arguments: raw.into(),
+            encrypted_function_args: None,
             call_id: "c2".into(),
             internal_chat_message_metadata_passthrough: None,
         };

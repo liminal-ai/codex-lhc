@@ -17,7 +17,7 @@ git submodule update --init --recursive
 
 The submodule is pinned to a specific certified commit
 (`codex-rs/lhc/vendor/long-horizon-context`, tracking branch
-`lhc-rs-port-codex-pin`). Do not bump it casually — the pin is part of the
+`lhc-rs-port`). Do not bump it casually — the pin is part of the
 fork's contract and the gate fails if the submodule tree is dirty.
 
 ## 2. Toolchain

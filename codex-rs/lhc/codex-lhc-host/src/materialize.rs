@@ -653,6 +653,7 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                     status: status.clone(),
                     revised_prompt: revised_prompt.clone(),
                     result: result.clone(),
+                    transparent_background: None,
                     saved_path: None,
                 },
             )));
@@ -1327,7 +1328,21 @@ fn host_raw_input(arguments: &Map<String, Value>) -> String {
         .unwrap_or_else(|| {
             let mut a = arguments.clone();
             a.remove("__hostRaw");
+            a.remove("__hostEncryptedFunctionArgs");
             serde_json::to_string(&Value::Object(a)).unwrap_or_else(|_| "{}".into())
+        })
+}
+
+fn host_encrypted_function_args(arguments: &Map<String, Value>) -> Option<Vec<String>> {
+    arguments
+        .get("__hostEncryptedFunctionArgs")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
         })
 }
 
@@ -1460,6 +1475,7 @@ fn reverse_tool_call(
                 name: tool_name.to_string(),
                 namespace: None,
                 arguments: raw,
+                encrypted_function_args: host_encrypted_function_args(arguments),
                 call_id,
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -1477,6 +1493,7 @@ fn reverse_tool_call(
                     name: tool_name.to_string(),
                     namespace: None,
                     arguments: raw,
+                    encrypted_function_args: host_encrypted_function_args(arguments),
                     call_id,
                     internal_chat_message_metadata_passthrough: None,
                 },

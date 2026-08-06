@@ -87,6 +87,7 @@ async fn install_lhc_and_enable(session: &mut Session, root: PathBuf) {
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
             })

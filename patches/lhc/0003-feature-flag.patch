@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 0e42e3e9aa..80a1f87195 100644
+index fd463f4af1..10be70de32 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -582,6 +582,9 @@
+@@ -591,6 +591,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,7 @@ index 0e42e3e9aa..80a1f87195 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -5132,6 +5135,9 @@
+@@ -5222,6 +5225,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -23,10 +23,10 @@ index 0e42e3e9aa..80a1f87195 100644
            "type": "boolean"
          },
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index 000f2c4bf4..0b689b5e48 100644
+index aaaa5b5a3a..6487fb46dc 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -254,6 +254,9 @@ pub enum Feature {
+@@ -268,6 +268,9 @@ pub enum Feature {
      PreventIdleSleep,
      /// Enable remote compaction v2 over the normal Responses API.
      RemoteCompactionV2,
@@ -36,7 +36,7 @@ index 000f2c4bf4..0b689b5e48 100644
      /// Use Agent Identity for ChatGPT-authenticated sessions.
      UseAgentIdentity,
      /// Enable workspace dependency support.
-@@ -1427,6 +1430,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1474,6 +1477,13 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },

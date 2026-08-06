@@ -30,7 +30,6 @@ use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::tasks::CompactTask;
 use crate::tasks::SessionTask;
-use crate::tasks::SessionTaskContext;
 use codex_lhc_host::InferenceCallbacks;
 use tokio_util::sync::CancellationToken;
 
@@ -103,6 +102,7 @@ async fn install_lhc_and_enable_with(
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
             })
@@ -678,12 +678,10 @@ async fn production_manual_ladder_invokes_lhc_arm() {
     let thread_id = handle.thread_id().to_string();
     let sess = Arc::new(session);
 
-    let turn_ext = Arc::new(ExtensionData::new(tc.sub_id.clone()));
-    let ctx = SessionTaskContext::new(Arc::clone(&sess), turn_ext);
     let task = Arc::new(CompactTask);
     let result = SessionTask::run(
         task,
-        Arc::new(ctx),
+        Arc::clone(&sess),
         Arc::new(tc),
         Vec::new(),
         CancellationToken::new(),
@@ -1950,14 +1948,13 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     let sess = Arc::new(session);
     let history_before = sess.clone_history().await.raw_items().to_vec();
 
-    let turn_ext = Arc::new(ExtensionData::new(tc.sub_id.clone()));
-    let ctx = SessionTaskContext::new(Arc::clone(&sess), turn_ext);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let task_session = Arc::clone(&sess);
     let task = tokio::spawn(async move {
         SessionTask::run(
             Arc::new(CompactTask),
-            Arc::new(ctx),
+            task_session,
             Arc::new(tc),
             Vec::new(),
             task_cancel,

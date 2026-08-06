@@ -25,7 +25,7 @@ with the working tree, plus that every fork-owned file under `codex-rs/`
 See FORK.md's touchpoint inventory for the authoritative file list, and
 FORK.md §History-reset recovery for the drill this series exists to serve.
 
-## Series (regenerated 2026-07-26 against `BASE` = `61a44880a8`)
+## Series (regenerated 2026-08-06 against `BASE` = `f141dc77f0`)
 
 `BASE` advances on every upstream sync — see FORK.md "Sync drill" step 4.
 Regenerate the *whole* series against the new base in the same commit as the
