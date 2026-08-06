@@ -248,9 +248,9 @@ Real exposure, measured on upstream over 30 days rather than assumed:
 3 of 26 hook sites saw any churn in a month. The tiny-footprint mitigation was
 then tested by the ten-day sync below.
 
-### Sync run 2026-08-06 — 349 upstream commits, six conflicts, green
+### Sync run 2026-08-06 — 350 upstream commits, six conflicts, green
 
-Merged `61a44880a8..f141dc77f0` after ten days of upstream work. Six files
+Merged `61a44880a8..aac9f84247` after ten days of upstream work. Six files
 conflicted: `Cargo.lock`, `core/src/lib.rs`, `core/src/session/{mod.rs,session.rs,tests.rs}`,
 and `ext/extension-api/src/registry.rs`. The source conflicts were additive or
 upstream refactors around LHC touchpoints; `Cargo.lock` was regenerated.
@@ -281,7 +281,7 @@ patch reproduction at the new base, and the slice-D matrix.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `f141dc77f0`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `aac9f84247`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing
