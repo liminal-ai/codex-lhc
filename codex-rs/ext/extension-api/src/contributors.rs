@@ -33,6 +33,7 @@ pub use raw_item::RawItemInput; // LHC-HOOK
 pub use raw_item::RawItemProvenance; // LHC-HOOK
 pub use skill_invocation::SkillInvocationInput;
 pub use skill_invocation::SkillInvocationKind;
+pub use thread_lifecycle::ThreadIdleCause;
 pub use thread_lifecycle::ThreadIdleInput;
 pub use thread_lifecycle::ThreadOriginator;
 pub use thread_lifecycle::ThreadResumeInput;

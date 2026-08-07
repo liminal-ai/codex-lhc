@@ -1,5 +1,5 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index 14e0aa32dc..1cc616e243 100644
+index 048d614a50..c5de040b7e 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
 @@ -15,6 +15,7 @@ use crate::ExtensionMetrics;
@@ -19,7 +19,7 @@ index 14e0aa32dc..1cc616e243 100644
 +pub use raw_item::RawItemProvenance; // LHC-HOOK
  pub use skill_invocation::SkillInvocationInput;
  pub use skill_invocation::SkillInvocationKind;
- pub use thread_lifecycle::ThreadIdleInput;
+ pub use thread_lifecycle::ThreadIdleCause;
 diff --git a/codex-rs/ext/extension-api/src/contributors/raw_item.rs b/codex-rs/ext/extension-api/src/contributors/raw_item.rs
 new file mode 100644
 index 0000000000..3b754efc03
@@ -134,7 +134,7 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index 8cae0e752b..77ff40e373 100644
+index 2f21380b0f..ae39a53c45 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
 @@ -43,6 +43,9 @@ pub use contributors::McpServerContributor;

@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index 2164737c21..d694577e3f 100644
+index a12874fea3..58601b0675 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -3755,6 +3755,14 @@ impl ThreadRequestProcessor {
+@@ -3820,6 +3820,14 @@ impl ThreadRequestProcessor {
          &self,
          stored_thread: StoredThread,
      ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
@@ -18,10 +18,10 @@ index 2164737c21..d694577e3f 100644
              let model_context = self
                  .thread_store
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index 0fc5d1a865..7f2489008b 100644
+index bb9292bf0d..3a960a0640 100644
 --- a/codex-rs/core/Cargo.toml
 +++ b/codex-rs/core/Cargo.toml
-@@ -50,6 +50,8 @@ codex-shell-command = { workspace = true }
+@@ -51,6 +51,8 @@ codex-shell-command = { workspace = true }
  codex-execpolicy = { workspace = true }
  codex-git-utils = { workspace = true }
  codex-hooks = { workspace = true }
@@ -30,7 +30,7 @@ index 0fc5d1a865..7f2489008b 100644
  codex-http-client = { workspace = true }
  codex-install-context = { workspace = true }
  codex-network-proxy = { workspace = true }
-@@ -138,6 +140,8 @@ codex-shell-escalation = { workspace = true }
+@@ -139,6 +141,8 @@ codex-shell-escalation = { workspace = true }
  [dev-dependencies]
  assert_cmd = { workspace = true }
  assert_matches = { workspace = true }
@@ -5459,7 +5459,7 @@ index 0000000000..bd9d354c19
 +    }
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index 4cecf46aed..495e1fbc61 100644
+index 4e030fe41e..f190289439 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
 @@ -20,12 +20,15 @@ pub use session::SteerInputError;
@@ -6239,10 +6239,10 @@ index 0000000000..31e49d7a5d
 +    );
 +}
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index e5de254b07..2572a7e0e6 100644
+index b043a83593..43f2b7a77d 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -1182,6 +1182,8 @@ impl Session {
+@@ -1202,6 +1202,8 @@ impl Session {
                      ),
                  ),
                  executed_tool_calls,
@@ -6250,12 +6250,12 @@ index e5de254b07..2572a7e0e6 100644
 +                lhc_test_inference: std::sync::Mutex::new(None),
                  code_mode_service: crate::tools::code_mode::CodeModeService::new(
                      Arc::clone(&code_mode_session_provider),
-                     &config.features,
+                     &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index b2d7a14105..13858a8e37 100644
+index 407db25c71..0f38fbef1d 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5821,6 +5821,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5825,6 +5825,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6263,8 +6263,8 @@ index b2d7a14105..13858a8e37 100644
 +        lhc_test_inference: std::sync::Mutex::new(None),
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
-             &config.features,
-@@ -8037,6 +8039,8 @@ where
+             &config.code_mode,
+@@ -8044,6 +8046,8 @@ where
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6272,12 +6272,12 @@ index b2d7a14105..13858a8e37 100644
 +        lhc_test_inference: std::sync::Mutex::new(None),
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
-             &config.features,
+             &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 16ef4e7d36..07ebfbe048 100644
+index 96ff9cf0d3..608aa38f2c 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -443,6 +443,7 @@ pub(crate) async fn run_turn(
+@@ -444,6 +444,7 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -6285,7 +6285,7 @@ index 16ef4e7d36..07ebfbe048 100644
                      )
                      .await
                      {
-@@ -1002,6 +1003,7 @@ async fn run_pre_sampling_compact(
+@@ -1007,6 +1008,7 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -6293,7 +6293,7 @@ index 16ef4e7d36..07ebfbe048 100644
          )
          .await?;
      }
-@@ -1084,6 +1086,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1089,6 +1091,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -6301,7 +6301,7 @@ index 16ef4e7d36..07ebfbe048 100644
          )
          .await?;
          return Ok(());
-@@ -1132,6 +1135,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1137,6 +1140,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -6309,7 +6309,7 @@ index 16ef4e7d36..07ebfbe048 100644
          )
          .await?;
      }
-@@ -1143,7 +1147,12 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1148,7 +1152,12 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -6323,7 +6323,7 @@ index 16ef4e7d36..07ebfbe048 100644
      sess: &Arc<Session>,
      step_context: Arc<StepContext>,
      fallback_step_context: Option<Arc<StepContext>>,
-@@ -1151,9 +1160,32 @@ async fn run_auto_compact(
+@@ -1156,9 +1165,32 @@ async fn run_auto_compact(
      initial_context_injection: InitialContextInjection,
      reason: CompactionReason,
      phase: CompactionPhase,
@@ -6357,10 +6357,10 @@ index 16ef4e7d36..07ebfbe048 100644
          // Compaction is the reset request, so force a new context window
          // instead of consuming a pending `new_context` tool request.
 diff --git a/codex-rs/core/src/state/service.rs b/codex-rs/core/src/state/service.rs
-index dd17a076c1..13b0df22b9 100644
+index 1e3cb00bca..303efe4899 100644
 --- a/codex-rs/core/src/state/service.rs
 +++ b/codex-rs/core/src/state/service.rs
-@@ -94,4 +94,9 @@ pub(crate) struct SessionServices {
+@@ -97,4 +97,9 @@ pub(crate) struct SessionServices {
      pub(crate) code_mode_service: CodeModeService,
      pub(crate) tool_search_handler_cache: ToolSearchHandlerCache,
      pub(crate) turn_environments: Arc<ThreadEnvironments>,
@@ -6371,10 +6371,10 @@ index dd17a076c1..13b0df22b9 100644
 +    pub(crate) lhc_test_inference: std::sync::Mutex<Option<codex_lhc_host::InferenceCallbacks>>,
  }
 diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
-index 28a08ef4d6..c7c1c46bac 100644
+index f0b4e9ccc6..d3233951ad 100644
 --- a/codex-rs/core/src/state/session.rs
 +++ b/codex-rs/core/src/state/session.rs
-@@ -43,6 +43,9 @@ pub(crate) struct SessionState {
+@@ -45,6 +45,9 @@ pub(crate) struct SessionState {
      pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
      granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
      next_turn_is_first: bool,
@@ -6384,7 +6384,7 @@ index 28a08ef4d6..c7c1c46bac 100644
  }
  
  impl SessionState {
-@@ -75,9 +78,18 @@ impl SessionState {
+@@ -78,9 +81,18 @@ impl SessionState {
              pending_session_start_sources: VecDeque::new(),
              granted_permissions_by_environment_id: HashMap::new(),
              next_turn_is_first: true,
@@ -6443,10 +6443,10 @@ index 1c7de737eb..593844ca59 100644
              crate::compact_token_budget::run_manual_compact_task(session, ctx).await?;
              return Ok(None);
 diff --git a/codex-rs/core/src/tasks/lifecycle.rs b/codex-rs/core/src/tasks/lifecycle.rs
-index 789955df13..e11f17217d 100644
+index 0af3127d95..50cc90d1b5 100644
 --- a/codex-rs/core/src/tasks/lifecycle.rs
 +++ b/codex-rs/core/src/tasks/lifecycle.rs
-@@ -13,12 +13,15 @@ impl Session {
+@@ -14,12 +14,15 @@ impl Session {
          token_usage_at_turn_start: &TokenUsage,
      ) {
          let collaboration_mode = turn_context.collaboration_mode();
@@ -6462,7 +6462,7 @@ index 789955df13..e11f17217d 100644
                      session_store: &self.services.session_extension_data,
                      thread_store: &self.services.thread_extension_data,
                      turn_store: turn_context.extension_data.as_ref(),
-@@ -27,10 +30,18 @@ impl Session {
+@@ -28,10 +31,18 @@ impl Session {
          }
      }
  
@@ -6482,7 +6482,7 @@ index 789955df13..e11f17217d 100644
                      session_store: &self.services.session_extension_data,
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
-@@ -46,6 +57,11 @@ impl Session {
+@@ -47,6 +58,11 @@ impl Session {
              return;
          }
  
@@ -6494,7 +6494,7 @@ index 789955df13..e11f17217d 100644
          for contributor in self.services.extensions.thread_lifecycle_contributors() {
              contributor
                  .on_thread_idle(codex_extension_api::ThreadIdleInput {
-@@ -60,11 +76,16 @@ impl Session {
+@@ -62,11 +78,16 @@ impl Session {
          &self,
          reason: TurnAbortReason,
          turn_store: &ExtensionData,
@@ -6512,10 +6512,10 @@ index 789955df13..e11f17217d 100644
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index bfd18ef09d..72e31470d1 100644
+index 75506c4e85..d71594aa4f 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
-@@ -480,12 +480,13 @@ impl Session {
+@@ -491,12 +491,13 @@ impl Session {
          let mut aborted_turn = false;
          let mut active_turn_to_clear = None;
          let mut turn_context = None;
@@ -6530,7 +6530,7 @@ index bfd18ef09d..72e31470d1 100644
              }
              if aborted_turn {
                  active_turn_to_clear = Some(active_turn);
-@@ -493,8 +494,16 @@ impl Session {
+@@ -504,8 +505,16 @@ impl Session {
          }
  
          if let Some(turn_context) = turn_context.as_deref() {
@@ -6549,7 +6549,7 @@ index bfd18ef09d..72e31470d1 100644
          }
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-@@ -529,12 +538,21 @@ impl Session {
+@@ -540,12 +549,21 @@ impl Session {
  
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -6576,9 +6576,9 @@ index bfd18ef09d..72e31470d1 100644
          }
          // Let interrupted tasks observe cancellation before dropping pending approvals, or an
          // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-@@ -765,8 +783,13 @@ impl Session {
-                 profile,
-             });
+@@ -779,8 +797,13 @@ impl Session {
+             ThreadIdleCause::Completed
+         };
          let event = if let Some(reason) = abort_reason {
 -            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
 -                .await;
@@ -6592,7 +6592,7 @@ index bfd18ef09d..72e31470d1 100644
              EventMsg::TurnAborted(TurnAbortedEvent {
                  turn_id: Some(turn_context.sub_id.clone()),
                  reason,
-@@ -780,8 +803,12 @@ impl Session {
+@@ -794,8 +817,12 @@ impl Session {
                  .time_to_first_token_ms()
                  .await;
              let error = turn_context.terminal_error.lock().await.clone();
@@ -6607,17 +6607,17 @@ index bfd18ef09d..72e31470d1 100644
              EventMsg::TurnComplete(TurnCompleteEvent {
                  turn_id: turn_context.sub_id.clone(),
                  last_agent_message,
-@@ -847,10 +874,22 @@ impl Session {
+@@ -861,10 +888,22 @@ impl Session {
              .await
      }
  
--    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
+-    async fn handle_task_abort(self: &Arc<Self>, mut task: RunningTask, reason: TurnAbortReason) {
 +    /// Abort a running task and emit `TurnAborted`. Returns host turn timing
 +    /// `(started_at, completed_at)` so lifecycle contributors can attach the
 +    /// same host facts the display event carries (schema v5).
 +    async fn handle_task_abort(
 +        self: &Arc<Self>,
-+        task: RunningTask,
++        mut task: RunningTask,
 +        reason: TurnAbortReason,
 +    ) -> (Option<i64>, Option<i64>) {
          let sub_id = task.turn_context.sub_id.clone();
@@ -6631,8 +6631,8 @@ index bfd18ef09d..72e31470d1 100644
 +            return (started_at, None);
          }
  
-         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-@@ -928,6 +967,7 @@ impl Session {
+         if let Some(sender) = task.input_persisted.take() {
+@@ -949,6 +988,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
              warn!("failed to flush rollout after emitting terminal turn event: {err}");
          }
@@ -6641,10 +6641,10 @@ index bfd18ef09d..72e31470d1 100644
  }
  
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index 95795c28d6..1fc3409852 100644
+index f30f1f86b9..e1fa71eebd 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
-@@ -1056,6 +1056,16 @@ impl ThreadManager {
+@@ -1092,6 +1092,16 @@ impl ThreadManager {
          &self,
          rollout_path: PathBuf,
      ) -> CodexResult<InitialHistory> {
@@ -6661,7 +6661,7 @@ index 95795c28d6..1fc3409852 100644
          let requested_rollout_path = rollout_path.clone();
          let stored_thread = self
              .state
-@@ -1827,6 +1837,19 @@ impl ThreadManagerState {
+@@ -1871,6 +1881,19 @@ impl ThreadManagerState {
      }
  }
  
@@ -6840,10 +6840,10 @@ index fc54cea8c4..c3549d463f 100644
      store: &LocalThreadStore,
      thread_id: ThreadId,
 diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
-index cb8e8d9699..209dd65d6f 100644
+index 9213acd5be..cd83c38892 100644
 --- a/codex-rs/thread-store/src/local/mod.rs
 +++ b/codex-rs/thread-store/src/local/mod.rs
-@@ -259,6 +259,11 @@ impl LocalThreadStore {
+@@ -260,6 +260,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
  

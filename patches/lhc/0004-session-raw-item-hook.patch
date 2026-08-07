@@ -1059,10 +1059,10 @@ index 0000000000..760c16ea4c
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 0117b596ff..6778766b84 100644
+index de33ce20d0..c9a251aed3 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1322,6 +1322,9 @@ impl Session {
+@@ -1334,6 +1334,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1072,7 +1072,7 @@ index 0117b596ff..6778766b84 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info.slug.as_str();
-@@ -1361,6 +1364,8 @@ impl Session {
+@@ -1373,6 +1376,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1081,7 +1081,7 @@ index 0117b596ff..6778766b84 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -2970,6 +2975,25 @@ impl Session {
+@@ -2996,6 +3001,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -1107,7 +1107,7 @@ index 0117b596ff..6778766b84 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, items);
-@@ -2991,7 +3015,8 @@ impl Session {
+@@ -3017,7 +3041,8 @@ impl Session {
                  });
          }
          self.persist_rollout_response_items(items).await;
@@ -1117,7 +1117,7 @@ index 0117b596ff..6778766b84 100644
      }
  
      pub(crate) async fn record_step_world_state_if_changed(
-@@ -3162,7 +3187,13 @@ impl Session {
+@@ -3188,7 +3213,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item),
          ])
          .await;
@@ -1132,7 +1132,7 @@ index 0117b596ff..6778766b84 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3244,7 +3275,7 @@ impl Session {
+@@ -3270,7 +3301,7 @@ impl Session {
      ) {
          let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
          let compacted_item = CompactedItem {
@@ -1141,7 +1141,7 @@ index 0117b596ff..6778766b84 100644
              replacement_history: Some(items.clone()),
              window_number: Some(metadata.window_number),
              first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-@@ -3264,6 +3295,10 @@ impl Session {
+@@ -3290,6 +3321,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1152,7 +1152,7 @@ index 0117b596ff..6778766b84 100644
          }
  
          self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3283,6 +3318,57 @@ impl Session {
+@@ -3309,6 +3344,57 @@ impl Session {
          }
      }
  
@@ -1210,7 +1210,7 @@ index 0117b596ff..6778766b84 100644
      async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
          let rollout_items: Vec<RolloutItem> = items
              .iter()
-@@ -3296,6 +3382,23 @@ impl Session {
+@@ -3322,6 +3408,23 @@ impl Session {
          self.features.enabled(feature)
      }
  
@@ -1234,7 +1234,7 @@ index 0117b596ff..6778766b84 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3331,7 +3434,42 @@ impl Session {
+@@ -3357,7 +3460,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1278,7 +1278,7 @@ index 0117b596ff..6778766b84 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3905,9 +4043,13 @@ impl Session {
+@@ -3924,9 +4062,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1295,7 +1295,7 @@ index 0117b596ff..6778766b84 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -3926,8 +4068,13 @@ impl Session {
+@@ -3945,8 +4087,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1311,7 +1311,7 @@ index 0117b596ff..6778766b84 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4171,3 +4318,14 @@ mod elicitation_holders_tests;
+@@ -4194,3 +4341,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
