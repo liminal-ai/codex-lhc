@@ -163,7 +163,7 @@ impl CaptureHandle {
     }
 
     /// Latch degraded and try to record a self-describing truncation note (H6).
-    fn latch_degraded(&self, kind: &str) {
+    pub(crate) fn latch_degraded(&self, kind: &str) {
         let n = self.note_drop(kind);
         if self.inner.degraded.swap(true, Ordering::SeqCst) {
             return; // already latched
