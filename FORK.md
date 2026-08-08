@@ -20,7 +20,7 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified `main` commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`8981bcb`** — the R1–R6 wave plus the identity-boundary
+  Current pin: **`e905cf4`** — the R1–R6 wave plus the identity-boundary
   session-view split (gate-green: TS 518 / rs 576). Previous: `65580ea`,
   the Fable-signed R1–R6 wave
   tip. It includes the certified
