@@ -20,10 +20,10 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified `main` commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`1c89ae4`** — R1–R6 plus the identity-boundary session-view
-  split, provider-only adjacent-row conflict tests, and thinking-level
-  flush-ordering coverage (gate-green: TS 521 / rs 579). Previous: `e905cf4`
-  (TS 519 / rs 577). It includes the certified
+  Current pin: **`dd251ec`** — adds retrieval byte_budget (byte-fitting
+  slices for byte-denominated host output limits), clean-tail token windows
+  (no split-char boundaries), and byte-bound sliver exemption (gate-green:
+  TS 526 / rs 584). Previous: `1c89ae4` (TS 521 / rs 579). It includes the certified
   rusqlite host-compat change (`614543a`, descendant of the original
   `3663839` compatibility pin) and the band-walk brief-fallback repair:
   - codex-rs pins `libsqlite3-sys 0.37` (WAL-reset fix);

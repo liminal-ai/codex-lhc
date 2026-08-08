@@ -57,24 +57,31 @@ const TOKEN_POLICY_MARGIN: i64 = 500;
 /// budget the SDK slices to directly (SDK tokens are real o200k tokens;
 /// BPE packs long runs token-cheap but byte-heavy, so tokens alone cannot
 /// bound bytes). One SDK call, receipts and impressions exact.
-fn budgets_for(policy: &TruncationPolicy, id_count: usize) -> (i64, f64) {
+fn budgets_for(policy: &TruncationPolicy, id_count: usize) -> Result<(i64, f64), String> {
     let overhead_tokens = FIXED_OVERHEAD_TOKENS + (id_count as i64) * PER_ID_OVERHEAD_TOKENS;
     let overhead_bytes = (overhead_tokens as usize) * 4;
     let (token_ceiling, byte_base) = match policy {
         // Tokens-mode: core passes ~4 bytes per policy token; stay under
         // the raw limit in both units.
-        TruncationPolicy::Tokens(limit) => {
-            let raw = *limit as i64;
-            ((raw - TOKEN_POLICY_MARGIN).max(512), (*limit) * 4)
-        }
+        TruncationPolicy::Tokens(limit) => ((*limit as i64) - TOKEN_POLICY_MARGIN, (*limit) * 4),
         // Bytes-mode: bytes bind; the fixed token budget stays.
         TruncationPolicy::Bytes(limit) => (i64::MAX, *limit),
     };
-    let token_budget = PULL_TOKEN_BUDGET
-        .min(token_ceiling.saturating_sub(overhead_tokens))
-        .max(256);
-    let byte_budget = byte_base.saturating_sub(overhead_bytes).max(1_024);
-    (token_budget, byte_budget as f64)
+    let token_budget = PULL_TOKEN_BUDGET.min(token_ceiling.saturating_sub(overhead_tokens));
+    let byte_budget = byte_base.saturating_sub(overhead_bytes);
+    // A floor that exceeded the live policy would let core silently
+    // middle-truncate the assembly (round-5 finding 3). When even a minimal
+    // useful serve cannot fit, refuse with the numbers — never floor past
+    // the policy.
+    if token_budget < 256 || byte_budget < 1_024 {
+        return Err(format!(
+            "this model's tool-output limit ({policy:?}) is too small for history \
+             retrieval — the envelope needs ~{overhead_bytes} bytes overhead for \
+             {id_count} id(s) plus room for content; raise tool_output_token_limit \
+             or use fewer ids"
+        ));
+    }
+    Ok((token_budget, byte_budget as f64))
 }
 
 /// Order-preserving dedupe — the SDK dedupes before its 32-id cap, so the
@@ -180,7 +187,8 @@ impl GetTurnsTool {
         let args = parse_retrieval_args(&call, IdKind::Turn)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
-        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len());
+        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len())
+            .map_err(FunctionCallError::RespondToModel)?;
         let options = RetrievalOptions {
             token_budget: Some(token_budget as f64),
             byte_budget: Some(byte_budget),
@@ -224,7 +232,8 @@ impl GetMessagesTool {
         let args = parse_retrieval_args(&call, IdKind::Message)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
-        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len());
+        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len())
+            .map_err(FunctionCallError::RespondToModel)?;
         let options = RetrievalOptions {
             token_budget: Some(token_budget as f64),
             byte_budget: Some(byte_budget),
@@ -731,11 +740,11 @@ mod tests {
     fn budgets_track_the_live_truncation_policy() {
         // gpt-5.6 shape: Tokens(10_000). Small pulls keep the full 8,000.
         let tokens_policy = TruncationPolicy::Tokens(10_000);
-        assert_eq!(budgets_for(&tokens_policy, 1).0, PULL_TOKEN_BUDGET);
-        assert_eq!(budgets_for(&tokens_policy, 5).0, PULL_TOKEN_BUDGET);
-        assert_eq!(budgets_for(&tokens_policy, 6).0, 7_818);
+        assert_eq!(budgets_for(&tokens_policy, 1).unwrap().0, PULL_TOKEN_BUDGET);
+        assert_eq!(budgets_for(&tokens_policy, 5).unwrap().0, PULL_TOKEN_BUDGET);
+        assert_eq!(budgets_for(&tokens_policy, 6).unwrap().0, 7_818);
         for n in 1..=32usize {
-            let (token_budget, byte_budget) = budgets_for(&tokens_policy, n);
+            let (token_budget, byte_budget) = budgets_for(&tokens_policy, n).unwrap();
             let overhead = FIXED_OVERHEAD_TOKENS + (n as i64) * PER_ID_OVERHEAD_TOKENS;
             assert!(token_budget >= 256, "n={n}: token budget collapsed");
             assert!(
@@ -749,12 +758,40 @@ mod tests {
         }
         // Bytes-mode (gpt-5.2 shape): bytes bind, token budget stays fixed.
         let bytes_policy = TruncationPolicy::Bytes(10_000);
-        let (token_budget, byte_budget) = budgets_for(&bytes_policy, 1);
+        let (token_budget, byte_budget) = budgets_for(&bytes_policy, 1).unwrap();
         assert_eq!(token_budget, PULL_TOKEN_BUDGET);
         assert_eq!(byte_budget as usize, 10_000 - (182 + 250) * 4);
-        // Tiny pathological policies floor, never go negative.
-        let (t, b) = budgets_for(&TruncationPolicy::Bytes(100), 32);
-        assert!(t >= 256 && b as usize >= 1_024);
+        // Tiny policies refuse with the numbers — a floor past the policy
+        // would let core silently truncate (round-5 finding 3).
+        assert!(budgets_for(&TruncationPolicy::Bytes(200), 1).is_err());
+        assert!(budgets_for(&TruncationPolicy::Tokens(50), 1).is_err());
+        assert!(budgets_for(&TruncationPolicy::Bytes(100), 32).is_err());
+    }
+
+    /// A policy too small for the envelope refuses BEFORE the SDK — clear
+    /// tool error, zero impression rows (round-5 finding 3).
+    #[tokio::test]
+    async fn tiny_policy_refuses_before_the_sdk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tid = "tiny-policy";
+        let slot = open_slot(root, tid).await;
+        seed_two_turns(&slot).await;
+        let before = impression_count(root, tid).await;
+
+        let tools = retrieval_tools(Arc::clone(&slot));
+        let get_turns = tools
+            .iter()
+            .find(|t| t.tool_name() == ToolName::plain(GET_TURNS_TOOL_NAME))
+            .unwrap();
+        let mut call = tool_call(GET_TURNS_TOOL_NAME, json!({ "ids": ["t1"] }));
+        call.truncation_policy = TruncationPolicy::Bytes(200);
+        let err = match get_turns.handle(call).await {
+            Ok(_) => panic!("tiny policy must refuse"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("too small"), "got: {err}");
+        assert_eq!(impression_count(root, tid).await, before);
     }
 
     #[tokio::test]
@@ -845,7 +882,9 @@ mod tests {
         let ids = dedupe_ids(vec!["t1".to_string(); 38]);
         assert_eq!(ids.len(), 1);
         assert_eq!(
-            budgets_for(&TruncationPolicy::Tokens(10_000), ids.len()).0,
+            budgets_for(&TruncationPolicy::Tokens(10_000), ids.len())
+                .unwrap()
+                .0,
             PULL_TOKEN_BUDGET
         );
         // Order preserved, later duplicates dropped.
@@ -899,7 +938,7 @@ mod tests {
             .await
             .expect("byte-dense pull must serve a byte-fit slice");
         let text = output_text(output);
-        let (_, byte_budget) = budgets_for(&TruncationPolicy::Bytes(64 * 1024), 1);
+        let (_, byte_budget) = budgets_for(&TruncationPolicy::Bytes(64 * 1024), 1).unwrap();
         assert!(
             text.len() <= byte_budget as usize + 4_096,
             "served assembly is {} bytes — core would truncate it",
