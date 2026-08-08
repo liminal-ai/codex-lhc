@@ -284,6 +284,18 @@ fn parse_retrieval_args(call: &ToolCall, kind: IdKind) -> Result<ParsedArgs, Fun
         FunctionCallError::RespondToModel("arguments must be a JSON object".into())
     })?;
 
+    // Published schema is additionalProperties: false with a non-null integer
+    // `from` — enforce it here so schema-invalid calls refuse BEFORE the SDK
+    // (zero impression rows on validation failure; A3 round-1 finding 1).
+    if let Some(unknown) = obj
+        .keys()
+        .find(|k| k.as_str() != "ids" && k.as_str() != "from")
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "unknown argument {unknown:?} — only ids (string[]) and from (integer ≥ 0) are accepted"
+        )));
+    }
+
     let ids_val = obj.get("ids").ok_or_else(|| {
         FunctionCallError::RespondToModel(format!(
             "ids must be a non-empty array of {} ids",
@@ -324,7 +336,13 @@ fn parse_retrieval_args(call: &ToolCall, kind: IdKind) -> Result<ParsedArgs, Fun
     }
 
     let from_token = match obj.get("from") {
-        None | Some(Value::Null) => 0,
+        None => 0,
+        Some(Value::Null) => {
+            return Err(FunctionCallError::RespondToModel(
+                "from must be an integer ≥ 0, not null — omit it to start from the beginning"
+                    .into(),
+            ));
+        }
         Some(v) => {
             // Integer ≥ 0 only — reject floats, negatives, non-numbers.
             let n = v.as_i64().or_else(|| {
@@ -696,6 +714,32 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.to_string().contains("from must be"), "got: {err}");
+
+        // Explicit null from — schema says non-null integer (round-1 finding 1).
+        let err = match get_turns
+            .handle(tool_call(
+                GET_TURNS_TOOL_NAME,
+                json!({ "ids": ["t1"], "from": null }),
+            ))
+            .await
+        {
+            Ok(_) => panic!("null from must refuse"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("not null"), "got: {err}");
+
+        // Unknown property — schema is additionalProperties: false.
+        let err = match get_turns
+            .handle(tool_call(
+                GET_TURNS_TOOL_NAME,
+                json!({ "ids": ["t1"], "budget": 4000 }),
+            ))
+            .await
+        {
+            Ok(_) => panic!("unknown property must refuse"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("unknown argument"), "got: {err}");
 
         let after = impression_count(root, tid).await;
         assert_eq!(
