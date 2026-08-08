@@ -145,6 +145,21 @@ async fn pre_open_identity_change_replays_in_order() {
     );
 }
 
+/// Counts only the test's own buffered payloads (text "x"); the degradation
+/// truncation note also materializes as a user-role Message and must not count.
+fn is_buffered_payload(item: &codex_protocol::protocol::RolloutItem) -> bool {
+    use codex_protocol::models::ContentItem;
+    match item {
+        codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::Message {
+            role,
+            content,
+            ..
+        }) if role == "user" => content
+            .iter()
+            .any(|c| matches!(c, ContentItem::InputText { text } if text == "x")),
+        _ => false,
+    }
+}
 /// Pre-open overflow (beyond PRE_OPEN_CAP) latches the capture degraded at
 /// handoff — dropped early commands (possibly an identity update) mean the
 /// record can no longer be trusted.
@@ -172,4 +187,79 @@ async fn pre_open_overflow_degrades_capture() {
         "overflowed pre-open buffer must degrade the capture"
     );
     handle.shutdown().await;
+
+    // Latch-before-replay proof: the buffered survivors must NOT have been
+    // persisted. The old latch-after-replay behavior also ended degraded but
+    // wrote the survivors first — black-box check via regenerate.
+    let path = dir.path().join("overflow.jsonl");
+    let persisted = match regenerate_rollout_from_thread(
+        &path,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Missing,
+        None,
+    )
+    .await
+    {
+        Ok(_) => parse_rollout_items(&path)
+            .unwrap_or_default()
+            .iter()
+            .filter(|item| is_buffered_payload(item))
+            .count(),
+        // An empty/unmaterializable thread also proves nothing was persisted.
+        Err(_) => 0,
+    };
+    assert_eq!(
+        persisted, 0,
+        "degraded handoff must not persist buffered survivors"
+    );
+}
+
+/// Exactly PRE_OPEN_CAP buffered commands is NOT overflow: the handoff stays
+/// healthy and every survivor replays into the record.
+#[tokio::test]
+async fn pre_open_exact_cap_stays_healthy_and_replays_all() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "pre-open-exact-cap-tid";
+    let slot = LhcCaptureSlot::new();
+    for i in 0..PRE_OPEN_CAP {
+        let dropped = slot.buffer_or_handle(PendingCmd::Persist {
+            item: user_msg("x", &format!("u{i}")),
+            provenance: RawItemProvenance::UserPrompt,
+        });
+        assert!(dropped.is_none(), "push {i} must buffer, not hand off");
+    }
+    let handle = open_handle(
+        &root,
+        tid,
+        ModelIdentity::new("openai", "gpt-a", ModelIdentity::RESPONSES_API),
+    )
+    .await;
+    slot.set_and_flush(handle.clone());
+    assert!(
+        !handle.is_degraded(),
+        "exactly PRE_OPEN_CAP commands must not degrade the capture"
+    );
+    handle.shutdown().await;
+
+    let path = dir.path().join("exact-cap.jsonl");
+    regenerate_rollout_from_thread(
+        &path,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Missing,
+        None,
+    )
+    .await
+    .expect("regen exact-cap");
+    let persisted = parse_rollout_items(&path)
+        .unwrap()
+        .iter()
+        .filter(|item| is_buffered_payload(item))
+        .count();
+    assert_eq!(
+        persisted, PRE_OPEN_CAP,
+        "healthy handoff must replay every buffered survivor"
+    );
 }

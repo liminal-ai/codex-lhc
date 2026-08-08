@@ -319,17 +319,10 @@ impl LhcCaptureSlot {
     /// drained queue after the final pass, and no direct send can overtake a
     /// buffered one. Lock order (pending → handle) matches `buffer_or_handle`.
     fn set_and_flush(&self, handle: CaptureHandle) {
-        // Overflow check FIRST: if early commands were dropped (possibly an
-        // identity update), replaying the survivors could tag output with
-        // stale identity. Latch degraded before any replay — the record is
-        // already incomplete and self-describes the truncation.
-        if self.pending_overflow.load(Ordering::SeqCst) {
-            handle.latch_degraded("pre_open_overflow");
-            warn!(
-                dropped = self.pending_dropped.load(Ordering::Relaxed),
-                "LHC: pre-open buffer overflowed; capture degraded before replay"
-            );
-        }
+        // Overflow latches degraded BEFORE any replay (first drain pass
+        // rechecks under the lock): if commands were dropped — possibly an
+        // identity update — replaying survivors could tag output with stale
+        // identity, so persists must already be no-ops.
         let mut publishable = Some(handle);
         loop {
             let pending = {
@@ -337,6 +330,14 @@ impl LhcCaptureSlot {
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Recheck under the drain lock every pass: a producer can
+                // overflow DURING replay, after the entry check — the handle
+                // must never publish healthy over dropped commands.
+                if self.pending_overflow.load(Ordering::SeqCst)
+                    && let Some(h) = publishable.as_ref()
+                {
+                    h.latch_degraded("pre_open_overflow");
+                }
                 if q.is_empty() {
                     // Final pass: publish while still holding the pending
                     // lock — concurrent buffer_or_handle callers block on
