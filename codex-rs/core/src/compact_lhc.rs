@@ -87,6 +87,7 @@ pub(crate) enum LhcCompactAttempt {
 pub async fn reconcile_rollout_before_history_load(
     rollout_path: &std::path::Path,
     thread_id: &str,
+    live_identity: Option<codex_lhc_host::ModelIdentity>,
 ) {
     let path = rollout_path.to_path_buf();
     let tid = thread_id.to_string();
@@ -109,6 +110,7 @@ pub async fn reconcile_rollout_before_history_load(
                 path.as_path(),
                 &tid,
                 Some(root.as_path()),
+                live_identity,
             ));
             let _ = tx.send(Ok((outcome, path, tid)));
         });
@@ -506,7 +508,18 @@ async fn install_lhc_compact_rewrite(
         },
         world_state: world_state_value,
         turn_context: reference_context_item.clone(),
-        live_identity: None,
+        // Live identity from the same label sources capture uses
+        // (config.model / config.model_provider_id), so same-identity replay
+        // actually re-emits encrypted reasoning (R2 host gate).
+        live_identity: Some(codex_lhc_host::ModelIdentity::new(
+            turn_context.config.model_provider_id.clone(),
+            turn_context
+                .config
+                .model
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            codex_lhc_host::ModelIdentity::RESPONSES_API,
+        )),
     });
 
     for note in &materialize_result.gap_notes {

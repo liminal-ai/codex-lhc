@@ -124,7 +124,7 @@ where
     // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default OFF).
     // TUI and exec both ride the in-process app-server, so this site covers the main frontends.
     // Model/thinking labels feed the free ConfigContributor seam (G1 / F15).
-    codex_lhc_host::install(
+    codex_lhc_host::install_with_provider_label(
         &mut builder,
         |config: &Config| config.features.enabled(codex_features::Feature::LhcCapture),
         |config: &Config| {
@@ -133,6 +133,7 @@ where
                 .clone()
                 .unwrap_or_else(|| "unknown".to_string())
         },
+        |config: &Config| config.model_provider_id.clone(),
         |config: &Config| {
             config
                 .model_reasoning_effort

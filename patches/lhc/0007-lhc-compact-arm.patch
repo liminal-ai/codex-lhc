@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index a12874fea3..58601b0675 100644
+index a12874fea3..d772ba157c 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -3820,6 +3820,14 @@ impl ThreadRequestProcessor {
+@@ -3820,6 +3820,27 @@ impl ThreadRequestProcessor {
          &self,
          stored_thread: StoredThread,
      ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
@@ -11,7 +11,20 @@ index a12874fea3..58601b0675 100644
 +        // serves coherent history. Fail-open when the thread is unavailable.
 +        if let Some(path) = stored_thread.rollout_path.as_ref() {
 +            let tid = stored_thread.thread_id.to_string();
-+            codex_core::reconcile_rollout_before_history_load(path.as_path(), &tid).await;
++            let live_identity = codex_lhc_host::ModelIdentity::new(
++                self.config.model_provider_id.clone(),
++                self.config
++                    .model
++                    .clone()
++                    .unwrap_or_else(|| "unknown".to_string()),
++                codex_lhc_host::ModelIdentity::RESPONSES_API,
++            );
++            codex_core::reconcile_rollout_before_history_load(
++                path.as_path(),
++                &tid,
++                Some(live_identity),
++            )
++            .await;
 +        }
 +
          if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
@@ -41,10 +54,10 @@ index 7e6e4576d0..3bed2e79e0 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..9aa7f006fc
+index 0000000000..6790d6c347
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,1051 @@
+@@ -0,0 +1,1064 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -134,6 +147,7 @@ index 0000000000..9aa7f006fc
 +pub async fn reconcile_rollout_before_history_load(
 +    rollout_path: &std::path::Path,
 +    thread_id: &str,
++    live_identity: Option<codex_lhc_host::ModelIdentity>,
 +) {
 +    let path = rollout_path.to_path_buf();
 +    let tid = thread_id.to_string();
@@ -156,6 +170,7 @@ index 0000000000..9aa7f006fc
 +                path.as_path(),
 +                &tid,
 +                Some(root.as_path()),
++                live_identity,
 +            ));
 +            let _ = tx.send(Ok((outcome, path, tid)));
 +        });
@@ -553,7 +568,18 @@ index 0000000000..9aa7f006fc
 +        },
 +        world_state: world_state_value,
 +        turn_context: reference_context_item.clone(),
-+        live_identity: None,
++        // Live identity from the same label sources capture uses
++        // (config.model / config.model_provider_id), so same-identity replay
++        // actually re-emits encrypted reasoning (R2 host gate).
++        live_identity: Some(codex_lhc_host::ModelIdentity::new(
++            turn_context.config.model_provider_id.clone(),
++            turn_context
++                .config
++                .model
++                .clone()
++                .unwrap_or_else(|| "unknown".to_string()),
++            codex_lhc_host::ModelIdentity::RESPONSES_API,
++        )),
 +    });
 +
 +    for note in &materialize_result.gap_notes {
@@ -6646,27 +6672,73 @@ index 3cf2907b42..613f9dee2d 100644
  }
  
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index 3c92f8a44f..95366437ce 100644
+index 3c92f8a44f..147161da9d 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
-@@ -1094,6 +1094,16 @@ impl ThreadManager {
+@@ -914,7 +914,9 @@ impl ThreadManager {
+         parent_trace: Option<W3cTraceContext>,
+         client_mcp_extensions: ClientMcpExtensions,
+     ) -> CodexResult<NewThread> {
+-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
++        let initial_history = self
++            .initial_history_from_rollout_path(rollout_path, &config)
++            .await?;
+         Box::pin(self.resume_thread_with_history(
+             config,
+             initial_history,
+@@ -988,7 +990,9 @@ impl ThreadManager {
+         client_mcp_extensions: ClientMcpExtensions,
+     ) -> CodexResult<NewThread> {
+         let agent_control = self.agent_control_for_config(&config);
+-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
++        let initial_history = self
++            .initial_history_from_rollout_path(rollout_path, &config)
++            .await?;
+         let (session_source, thread_source) = initial_history
+             .get_resumed_session_sources()
+             .unwrap_or_else(|| (self.state.session_source.clone(), None));
+@@ -1078,7 +1082,9 @@ impl ThreadManager {
+         S: Into<ForkSnapshot>,
+     {
+         let snapshot = snapshot.into();
+-        let history = self.initial_history_from_rollout_path(path).await?;
++        let history = self
++            .initial_history_from_rollout_path(path, &config)
++            .await?;
+         self.fork_thread_from_history(
+             snapshot,
+             config,
+@@ -1093,7 +1099,29 @@ impl ThreadManager {
+     async fn initial_history_from_rollout_path(
          &self,
          rollout_path: PathBuf,
++        config: &Config,
      ) -> CodexResult<InitialHistory> {
 +        // LHC-HOOK: startup reconciliation before history load (slice E).
 +        // Prefer regenerating MISSING/CORRUPT/STALE projections from the LHC
 +        // thread so resume serves a coherent file. Fail-open if no thread.
 +        if let Some(thread_id) = thread_id_hint_from_rollout_path(&rollout_path) {
++            // Live identity from the resuming/forking config — the model that
++            // will consume the regenerated rollout (R2 signature gate).
++            let live_identity = codex_lhc_host::ModelIdentity::new(
++                config.model_provider_id.clone(),
++                config
++                    .model
++                    .clone()
++                    .unwrap_or_else(|| "unknown".to_string()),
++                codex_lhc_host::ModelIdentity::RESPONSES_API,
++            );
 +            crate::compact_lhc::reconcile_rollout_before_history_load(
 +                rollout_path.as_path(),
 +                &thread_id,
++                Some(live_identity),
 +            )
 +            .await;
 +        }
          let requested_rollout_path = rollout_path.clone();
          let stored_thread = self
              .state
-@@ -1873,6 +1883,19 @@ impl ThreadManagerState {
+@@ -1873,6 +1901,19 @@ impl ThreadManagerState {
      }
  }
  

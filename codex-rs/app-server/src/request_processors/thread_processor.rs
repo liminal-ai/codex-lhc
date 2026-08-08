@@ -3825,7 +3825,20 @@ impl ThreadRequestProcessor {
         // serves coherent history. Fail-open when the thread is unavailable.
         if let Some(path) = stored_thread.rollout_path.as_ref() {
             let tid = stored_thread.thread_id.to_string();
-            codex_core::reconcile_rollout_before_history_load(path.as_path(), &tid).await;
+            let live_identity = codex_lhc_host::ModelIdentity::new(
+                self.config.model_provider_id.clone(),
+                self.config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                codex_lhc_host::ModelIdentity::RESPONSES_API,
+            );
+            codex_core::reconcile_rollout_before_history_load(
+                path.as_path(),
+                &tid,
+                Some(live_identity),
+            )
+            .await;
         }
 
         if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {

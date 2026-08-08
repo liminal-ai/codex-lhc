@@ -914,7 +914,9 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
+        let initial_history = self
+            .initial_history_from_rollout_path(rollout_path, &config)
+            .await?;
         Box::pin(self.resume_thread_with_history(
             config,
             initial_history,
@@ -988,7 +990,9 @@ impl ThreadManager {
         client_mcp_extensions: ClientMcpExtensions,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&config);
-        let initial_history = self.initial_history_from_rollout_path(rollout_path).await?;
+        let initial_history = self
+            .initial_history_from_rollout_path(rollout_path, &config)
+            .await?;
         let (session_source, thread_source) = initial_history
             .get_resumed_session_sources()
             .unwrap_or_else(|| (self.state.session_source.clone(), None));
@@ -1078,7 +1082,9 @@ impl ThreadManager {
         S: Into<ForkSnapshot>,
     {
         let snapshot = snapshot.into();
-        let history = self.initial_history_from_rollout_path(path).await?;
+        let history = self
+            .initial_history_from_rollout_path(path, &config)
+            .await?;
         self.fork_thread_from_history(
             snapshot,
             config,
@@ -1093,14 +1099,26 @@ impl ThreadManager {
     async fn initial_history_from_rollout_path(
         &self,
         rollout_path: PathBuf,
+        config: &Config,
     ) -> CodexResult<InitialHistory> {
         // LHC-HOOK: startup reconciliation before history load (slice E).
         // Prefer regenerating MISSING/CORRUPT/STALE projections from the LHC
         // thread so resume serves a coherent file. Fail-open if no thread.
         if let Some(thread_id) = thread_id_hint_from_rollout_path(&rollout_path) {
+            // Live identity from the resuming/forking config — the model that
+            // will consume the regenerated rollout (R2 signature gate).
+            let live_identity = codex_lhc_host::ModelIdentity::new(
+                config.model_provider_id.clone(),
+                config
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                codex_lhc_host::ModelIdentity::RESPONSES_API,
+            );
             crate::compact_lhc::reconcile_rollout_before_history_load(
                 rollout_path.as_path(),
                 &thread_id,
+                Some(live_identity),
             )
             .await;
         }

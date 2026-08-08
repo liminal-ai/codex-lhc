@@ -224,7 +224,7 @@ async fn reconcile_missing_regenerates_file() {
     let path = dir.path().join("sessions").join("rollout-missing.jsonl");
     assert!(!path.exists());
 
-    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path())).await;
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
     match outcome {
         ReconcileOutcome::Regenerated {
             trigger: RolloutReconcileTrigger::Missing,
@@ -265,7 +265,7 @@ async fn reconcile_corrupt_regenerates_file() {
     let path = dir.path().join("rollout-corrupt.jsonl");
     std::fs::write(&path, "this is not jsonl\n{{{\n").unwrap();
 
-    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path())).await;
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
     match outcome {
         ReconcileOutcome::Regenerated {
             trigger: RolloutReconcileTrigger::Corrupt,
@@ -327,6 +327,7 @@ async fn reconcile_stale_regenerates_when_lhc_compact_ahead() {
         tid,
         Some(root.as_path()),
         RolloutReconcileTrigger::Stale,
+        None,
     )
     .await
     .expect("regenerate stale");
@@ -355,6 +356,7 @@ async fn reconcile_thread_unavailable_leaves_file_alone() {
         &path,
         "no-such-thread-zzzz",
         Some(dir.path().join("empty-lhc").as_path()),
+        None,
     )
     .await;
     assert_eq!(
@@ -379,5 +381,122 @@ fn mutation_demo_normalization_pollution_detection() {
     assert!(
         !is_native_append_polluted(&single_boundary_items(1)),
         "mutation: pure single-boundary must keep the NoReduction guard path"
+    );
+}
+
+// ── R2 signature round-trip (genuine capture → storage → materialize) ──────
+
+/// End-to-end identity gate: a Reasoning item with encrypted_content captured
+/// through the REAL capture path (with identity) must re-emit its
+/// encrypted_content when regenerated with a matching live identity, and
+/// suppress it (None) under a mismatched identity. Hand-built views don't
+/// cover this — the whole loop runs here.
+#[tokio::test]
+async fn encrypted_reasoning_round_trip_identity_gate() {
+    use crate::capture::spawn_capture_with_identity;
+    use crate::mapping::ModelIdentity;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "sig-round-trip-tid";
+    let identity = ModelIdentity::new("openai", "gpt-test", ModelIdentity::RESPONSES_API);
+
+    let derivation = LateBoundCallbacks::new();
+    derivation.seed(lhc_inference_callbacks(false).unwrap());
+    let handle = spawn_capture_with_identity(
+        tid,
+        None,
+        Some(root.clone()),
+        derivation,
+        Some(identity.clone()),
+    )
+    .await
+    .expect("capture");
+    handle.persist(&user("please think", "u1"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("rs_rt".into())),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("ROUND_TRIP_CIPHERTEXT".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        RawItemProvenance::ModelOutput,
+    );
+    handle.persist(&assistant("done", "a1"), RawItemProvenance::ModelOutput);
+    handle.flush().await;
+    assert!(
+        handle
+            .drain_settled(std::time::Duration::from_secs(120))
+            .await,
+        "seed must settle"
+    );
+    handle.shutdown().await;
+
+    let encrypted_of = |items: &[RolloutItem]| -> Option<Option<String>> {
+        items.iter().find_map(|item| match item {
+            RolloutItem::ResponseItem(ResponseItem::Reasoning {
+                encrypted_content, ..
+            }) => Some(encrypted_content.clone()),
+            _ => None,
+        })
+    };
+
+    // Matching live identity → ciphertext re-emitted.
+    let path = dir.path().join("sessions").join("rt-match.jsonl");
+    regenerate_rollout_from_thread(
+        &path,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Missing,
+        Some(identity.clone()),
+    )
+    .await
+    .expect("regenerate match");
+    let items = parse_rollout_items(&path).expect("parse match");
+    assert_eq!(
+        encrypted_of(&items),
+        Some(Some("ROUND_TRIP_CIPHERTEXT".into())),
+        "matching identity must re-emit encrypted_content"
+    );
+
+    // Mismatched live identity → suppressed.
+    let path2 = dir.path().join("sessions").join("rt-mismatch.jsonl");
+    regenerate_rollout_from_thread(
+        &path2,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Missing,
+        Some(ModelIdentity::new(
+            "openai",
+            "gpt-other",
+            ModelIdentity::RESPONSES_API,
+        )),
+    )
+    .await
+    .expect("regenerate mismatch");
+    let items2 = parse_rollout_items(&path2).expect("parse mismatch");
+    assert_eq!(
+        encrypted_of(&items2),
+        Some(None),
+        "mismatched identity must suppress encrypted_content"
+    );
+
+    // No live identity (conservative default) → suppressed.
+    let path3 = dir.path().join("sessions").join("rt-none.jsonl");
+    regenerate_rollout_from_thread(
+        &path3,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Missing,
+        None,
+    )
+    .await
+    .expect("regenerate none");
+    let items3 = parse_rollout_items(&path3).expect("parse none");
+    assert_eq!(
+        encrypted_of(&items3),
+        Some(None),
+        "absent live identity must suppress encrypted_content"
     );
 }

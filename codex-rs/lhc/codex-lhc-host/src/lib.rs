@@ -80,6 +80,7 @@ pub use idempotency::turn_end_key;
 pub use install::LhcCaptureSlot;
 pub use install::LhcTurnId;
 pub use install::install;
+pub use install::install_with_provider_label;
 pub use mapping::ACTOR_ASSISTANT;
 pub use mapping::ACTOR_SYSTEM;
 pub use mapping::ACTOR_TOOL;

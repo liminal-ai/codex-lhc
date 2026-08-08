@@ -223,6 +223,7 @@ pub async fn reconcile_rollout_at_path(
     path: &Path,
     thread_id: &str,
     root: Option<&Path>,
+    live_identity: Option<crate::mapping::ModelIdentity>,
 ) -> ReconcileOutcome {
     let lhc_point = read_thread_compact_point(thread_id, root).await;
     if lhc_point.is_none() {
@@ -240,7 +241,7 @@ pub async fn reconcile_rollout_at_path(
         return ReconcileOutcome::Unchanged { reason: "ok" };
     };
 
-    match regenerate_rollout_from_thread(path, thread_id, root, trigger).await {
+    match regenerate_rollout_from_thread(path, thread_id, root, trigger, live_identity).await {
         Ok(items) => {
             info!(
                 path = %path.display(),
@@ -272,6 +273,7 @@ pub async fn regenerate_rollout_from_thread(
     thread_id: &str,
     root: Option<&Path>,
     trigger: RolloutReconcileTrigger,
+    live_identity: Option<crate::mapping::ModelIdentity>,
 ) -> Result<usize, String> {
     let root_buf = root
         .map(Path::to_path_buf)
@@ -357,7 +359,7 @@ pub async fn regenerate_rollout_from_thread(
         },
         world_state: None,
         turn_context: None,
-        live_identity: None,
+        live_identity,
     });
 
     for note in &result.gap_notes {

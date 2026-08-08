@@ -1285,7 +1285,7 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
                 "m3",
                 "ig_1",
                 "image_generation",
-                r#"{"status":"completed","result":"base64...","revisedPrompt":"a cat"}"#,
+                r#"{"status":"completed","result":"base64…","revisedPrompt":"a cat"}"#,
                 None,
             ),
         ],
@@ -1298,7 +1298,7 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
             "t1",
             3,
             "ig_1",
-            r#"{"status":"completed","result":"base64...","revisedPrompt":"a cat"}"#,
+            r#"{"status":"completed","result":"base64…","revisedPrompt":"a cat"}"#,
             false,
         ),
     ];
@@ -1321,7 +1321,7 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
     assert!(tail.iter().any(|r| matches!(
         r,
         ResponseItem::ImageGenerationCall { status, result, .. }
-            if status == "completed" && result == "base64..."
+            if status == "completed" && result == "base64…"
     )));
     let end_count = items
         .iter()
@@ -1464,7 +1464,7 @@ fn law6_function_result_with_image_shaped_body_stays_function_output() {
 
 #[test]
 fn fl2_ctc_id_round_trips_as_custom_tool_call_with_id() {
-    // Host id `ctc_...` recovered from id-primary idempotency key must reverse
+    // Host id `ctc_…` recovered from id-primary idempotency key must reverse
     // as CustomToolCall (input from stored arguments), not FunctionCall.
     let call_id = "call_WzQWJPGLgp4UwPLYaxiCYvGu";
     let host_id = "ctc_0695851a6456c30b016a66a651de78819c887458ac0e8029a7";
@@ -1915,7 +1915,7 @@ fn banded_thread_with_tool_heavy_tail_preserves_native_kinds() {
 // ── M6 runtime notes ──────────────────────────────────────────────────────
 
 /// F1: fork compact-marker runtime notes are excluded from model + display
-/// streams by structural key match (codex:{tid}:compact_marker:...), not text.
+/// streams by structural key match (codex:{tid}:compact_marker:…), not text.
 #[test]
 fn f1_compact_marker_runtime_note_excluded_from_model_and_display() {
     use crate::COMPACT_MARKER_KEY_SEGMENT;

@@ -820,12 +820,35 @@ impl<C: Send + Sync + 'static> ConfigContributor<C> for LhcExtension<C> {
         let new_model = (self.model_label)(new_config);
         let previous_level = (self.thinking_level_label)(previous_config);
         let new_level = (self.thinking_level_label)(new_config);
-        if previous_model == new_model && previous_level == new_level {
+        let previous_provider = (self.provider_label)(previous_config);
+        let new_provider = (self.provider_label)(new_config);
+        if previous_model == new_model
+            && previous_level == new_level
+            && previous_provider == new_provider
+        {
             return;
         }
         let Some(slot) = thread_store.get::<LhcCaptureSlot>() else {
             return;
         };
+        // Keep R2 signature provenance current: any model/provider change
+        // refreshes the capture identity so replay gating compares against
+        // what actually produced later thinking. (A change racing the async
+        // open keeps the open-time identity; accepted.)
+        if (previous_model != new_model || previous_provider != new_provider)
+            && let Some(handle) = slot.get()
+        {
+            handle.set_identity(ModelIdentity::new(
+                new_provider,
+                new_model.clone(),
+                ModelIdentity::RESPONSES_API,
+            ));
+        }
+        // Provider-only changes refresh identity above but are not a
+        // model/thinking record event.
+        if previous_model == new_model && previous_level == new_level {
+            return;
+        }
         let cmd = PendingCmd::ModelOrThinkingChange {
             previous_model: previous_model.clone(),
             new_model: new_model.clone(),
