@@ -192,7 +192,10 @@ async fn pre_open_overflow_degrades_capture() {
     // persisted. The old latch-after-replay behavior also ended degraded but
     // wrote the survivors first — black-box check via regenerate.
     let path = dir.path().join("overflow.jsonl");
-    let persisted = match regenerate_rollout_from_thread(
+    // Both operations MUST succeed: an error here would otherwise mask
+    // persisted survivors (round-6 finding 1). The degraded thread still
+    // materializes — it holds the truncation note.
+    regenerate_rollout_from_thread(
         &path,
         tid,
         Some(root.as_path()),
@@ -200,15 +203,12 @@ async fn pre_open_overflow_degrades_capture() {
         None,
     )
     .await
-    {
-        Ok(_) => parse_rollout_items(&path)
-            .unwrap_or_default()
-            .iter()
-            .filter(|item| is_buffered_payload(item))
-            .count(),
-        // An empty/unmaterializable thread also proves nothing was persisted.
-        Err(_) => 0,
-    };
+    .expect("regen overflow thread");
+    let persisted = parse_rollout_items(&path)
+        .expect("parse overflow rollout")
+        .iter()
+        .filter(|item| is_buffered_payload(item))
+        .count();
     assert_eq!(
         persisted, 0,
         "degraded handoff must not persist buffered survivors"
