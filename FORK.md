@@ -18,8 +18,9 @@ history preserved and rebuildable at full fidelity.
 ## Layout
 
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
-  **certified `lhc-rs-port` commits only** (gate-green at the pin).
-  Current pin: **`65580ea`** on `lhc-rs-port`, the Fable-signed R1–R6 wave
+  **certified `main` commits only** (gate-green at the pin; the historical
+  `lhc-rs-port` working branch was retired into `main` 2026-08-08).
+  Current pin: **`65580ea`**, the Fable-signed R1–R6 wave
   tip. It includes the certified
   rusqlite host-compat change (`614543a`, descendant of the original
   `3663839` compatibility pin) and the band-walk brief-fallback repair:
