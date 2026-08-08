@@ -19,15 +19,17 @@ history preserved and rebuildable at full fidelity.
 
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified `lhc-rs-port` commits only** (gate-green at the pin).
-  Current pin: **`a3deafd`** on `lhc-rs-port`. It includes the certified
+  Current pin: **`65580ea`** on `lhc-rs-port`, the Fable-signed R1–R6 wave
+  tip. It includes the certified
   rusqlite host-compat change (`614543a`, descendant of the original
   `3663839` compatibility pin) and the band-walk brief-fallback repair:
   - codex-rs pins `libsqlite3-sys 0.37` (WAL-reset fix);
   - the port accepts the compatible rusqlite 0.37–0.39 range, avoiding two
     crates with `links = "sqlite3"`;
   - **bundled SQLite is 3.51.3**, aligned with the SQLite build codex-rs pins;
-  - `a3deafd` carries the latest gate-passed Rust serving behavior from the
-    LHC source repo.
+  - `65580ea` carries the signed retrieval/serving wave and the shared
+    capture-totality special-token fix (`f274cea`, replacing the temporary
+    side-branch hotfix pin `c136899`).
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
