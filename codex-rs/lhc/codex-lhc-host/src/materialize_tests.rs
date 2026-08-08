@@ -729,7 +729,7 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
     );
 }
 
-/// Duplicate prompt text: dropped "yes" then live "yes" - live must survive.
+/// Duplicate prompt text: dropped "yes" then live "yes" — live must survive.
 #[test]
 fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
     // Prior: t-drop "yes", RolledBack{1}, t-live "yes".
@@ -860,7 +860,7 @@ fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
     );
 }
 
-/// Alignment mismatch -> exclude nothing + loud gap note.
+/// Alignment mismatch → exclude nothing + loud gap note.
 #[test]
 fn c1_alignment_mismatch_excludes_nothing_and_logs_gap() {
     let prior = vec![
@@ -1203,7 +1203,7 @@ fn h2_cumulative_excludes_rollback_excluded_turns() {
     };
     let messages = [
         msg("m-rb", "t-rb", MessageKind::UserPrompt, 10, "gone", None),
-        // Rolled-back turn carried 1000 tokens - must not inflate live total.
+        // Rolled-back turn carried 1000 tokens — must not inflate live total.
         msg(
             "m-rb-a",
             "t-rb",
@@ -1317,7 +1317,7 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
         .iter()
         .filter(|r| matches!(r, ResponseItem::ImageGenerationCall { .. }))
         .count();
-    assert_eq!(ig_count, 1, "paired -> exactly one ImageGenerationCall");
+    assert_eq!(ig_count, 1, "paired → exactly one ImageGenerationCall");
     assert!(tail.iter().any(|r| matches!(
         r,
         ResponseItem::ImageGenerationCall { status, result, .. }
@@ -1401,13 +1401,13 @@ fn function_call_preserves_present_empty_encrypted_args() {
     ));
 }
 
-/// Law 6: tool result routing by name only - content sniffer must not misroute.
+/// Law 6: tool result routing by name only — content sniffer must not misroute.
 #[test]
 fn law6_function_result_with_image_shaped_body_stays_function_output() {
     let mut args = Map::new();
     args.insert("q".into(), json!("x"));
     args.insert("__hostRaw".into(), json!("{\"q\":\"x\"}"));
-    // Body looks like an image_generation tool_result payload - must NOT sniffer-route.
+    // Body looks like an image_generation tool_result payload — must NOT sniffer-route.
     let body = r#"{"status":"completed","result":"not-an-image","revisedPrompt":"trap"}"#;
 
     let view = SessionThreadView {
@@ -1460,7 +1460,7 @@ fn law6_function_result_with_image_shaped_body_stays_function_output() {
     );
 }
 
-// ── F-L2: ctc_ / ctco_ id prefix -> CustomToolCall kind (never FunctionCall) ─
+// ── F-L2: ctc_ / ctco_ id prefix → CustomToolCall kind (never FunctionCall) ─
 
 #[test]
 fn fl2_ctc_id_round_trips_as_custom_tool_call_with_id() {
@@ -1555,7 +1555,7 @@ fn fl2_ctc_id_round_trips_as_custom_tool_call_with_id() {
 
 #[test]
 fn fl2_unrepresentable_id_prefix_clears_id_with_gap() {
-    // msg_ prefix on a tool_call is unrepresentable as FunctionCall/Custom -
+    // msg_ prefix on a tool_call is unrepresentable as FunctionCall/Custom —
     // reverse must clear id (provider remints) and record a gap note.
     let call_id = "call_bad";
     let host_id = "msg_should_not_be_on_tool_call";
@@ -1610,7 +1610,7 @@ fn fl2_unrepresentable_id_prefix_clears_id_with_gap() {
 #[test]
 fn fl2_mutation_demo_ctc_must_not_become_function_call() {
     // Mutation target: if reverse always emitted FunctionCall, this would
-    // pair a ctc_ id with FunctionCall - the live-cert 400 class of bug.
+    // pair a ctc_ id with FunctionCall — the live-cert 400 class of bug.
     let call_id = "call_mut";
     let host_id = "ctc_mutation_probe_id";
     let key = format!("codex:t:id:{host_id}:d:tool_call:{call_id}");
@@ -1701,7 +1701,7 @@ fn h4_open_turn_emits_no_turn_complete() {
 /// next turn's TurnStarted (not in an end-of-file sweep after it).
 #[test]
 fn h4_closed_turn_with_memberless_gap_closes_before_next_started() {
-    // t1 members: m1, m2 - but view only has m1 (user). m2 never appears ->
+    // t1 members: m1, m2 — but view only has m1 (user). m2 never appears →
     // maybe_close_turn_if_last never fires. Opening t2 must close t1 first.
     let view = SessionThreadView {
         thread_id: "t".into(),
@@ -1817,7 +1817,7 @@ fn h5_first_user_message_is_true_first_prompt_not_band_text() {
     assert_eq!(first_um, Some("the real first prompt"));
     assert!(!first_um.unwrap().contains("[context ·"));
 
-    // Band text is in the model stream as ResponseItem only - no UserMessage twin.
+    // Band text is in the model stream as ResponseItem only — no UserMessage twin.
     let band_twins: Vec<_> = items
         .iter()
         .filter_map(|i| match i {
@@ -1933,7 +1933,7 @@ fn f1_compact_marker_runtime_note_excluded_from_model_and_display() {
             band_entry("b"),
             user_tail("m1", "live prompt"),
             SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
-                // Body deliberately contains the marker text - exclusion must
+                // Body deliberately contains the marker text — exclusion must
                 // still fire only via the key, not this string.
                 content: "lhc_compact_marker {\"viewId\":\"v1\"}".into(),
                 source_messages: vec![SessionThreadViewEntrySource {
@@ -2233,7 +2233,7 @@ fn tool_search_call_and_output_and_empty_tools_fallback() {
             if id == "ts_1" && tools.len() == 1 && status == "completed"
     )));
 
-    // Non-array body -> unwrap_or_default empty tools vec.
+    // Non-array body → unwrap_or_default empty tools vec.
     let view2 = SessionThreadView {
         thread_id: "t".into(),
         entries: vec![
@@ -2315,7 +2315,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
 
     let prior = vec![
         RolloutItem::SessionMeta(empty_meta()),
-        RolloutItem::ResponseItem(user_text_message("old prompt - must not copy")),
+        RolloutItem::ResponseItem(user_text_message("old prompt — must not copy")),
         RolloutItem::Compacted(CompactedItem {
             message: "old compact".into(),
             replacement_history: Some(vec![user_text_message("old hist")]),
@@ -2335,7 +2335,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
             }),
             rate_limits: None,
         })),
-        // Transient - must drop.
+        // Transient — must drop.
         RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
             message: "boom".into(),
             codex_error_info: None,

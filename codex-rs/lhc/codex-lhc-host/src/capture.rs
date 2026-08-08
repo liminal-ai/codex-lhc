@@ -236,7 +236,17 @@ impl CaptureHandle {
         if self.inner.degraded.load(Ordering::Relaxed) {
             return;
         }
-        let _ = self.inner.tx.try_send(CaptureCmd::SetIdentity { identity });
+        match self.inner.tx.try_send(CaptureCmd::SetIdentity { identity }) {
+            Ok(()) => {}
+            // Stale provenance is an integrity fault — same discipline as
+            // persist: a lost identity update degrades the capture.
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.latch_degraded("identity_full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.latch_degraded("identity_closed");
+            }
+        }
     }
 
     /// Non-blocking model/thinking change. Suppresses no-ops at the call site;
@@ -664,6 +674,24 @@ async fn worker_loop(
                 }
             }
             CaptureCmd::SetIdentity { identity } => {
+                // Flush model output buffered under the OLD identity first —
+                // otherwise pending old-model ciphertext would be mapped and
+                // tagged with the new identity (validator P1, 2026-08-08).
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                {
+                    warn!(thread_id = %thread_id, %err, "LHC: pre-identity-change flush failed");
+                }
                 live_identity = identity;
             }
             CaptureCmd::RuntimeNote { text, key_suffix } => {

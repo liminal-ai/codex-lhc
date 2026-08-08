@@ -107,6 +107,9 @@ enum PendingCmd {
     ProviderUsage {
         usage: codex_protocol::protocol::TokenUsage,
     },
+    SetIdentity {
+        identity: ModelIdentity,
+    },
     TurnEnd {
         turn_id: String,
         reason: String,
@@ -339,6 +342,9 @@ impl LhcCaptureSlot {
                 }
                 PendingCmd::ProviderUsage { usage } => {
                     handle.provider_usage(&usage);
+                }
+                PendingCmd::SetIdentity { identity } => {
+                    handle.set_identity(identity);
                 }
                 PendingCmd::TurnEnd {
                     turn_id,
@@ -833,16 +839,20 @@ impl<C: Send + Sync + 'static> ConfigContributor<C> for LhcExtension<C> {
         };
         // Keep R2 signature provenance current: any model/provider change
         // refreshes the capture identity so replay gating compares against
-        // what actually produced later thinking. (A change racing the async
-        // open keeps the open-time identity; accepted.)
-        if (previous_model != new_model || previous_provider != new_provider)
-            && let Some(handle) = slot.get()
-        {
-            handle.set_identity(ModelIdentity::new(
+        // what actually produced later thinking. Pre-open changes buffer and
+        // replay in order once the handle opens.
+        if previous_model != new_model || previous_provider != new_provider {
+            let identity = ModelIdentity::new(
                 new_provider,
                 new_model.clone(),
                 ModelIdentity::RESPONSES_API,
-            ));
+            );
+            let cmd = PendingCmd::SetIdentity {
+                identity: identity.clone(),
+            };
+            if let Some(handle) = slot.buffer_or_handle(cmd) {
+                handle.set_identity(identity);
+            }
         }
         // Provider-only changes refresh identity above but are not a
         // model/thinking record event.
