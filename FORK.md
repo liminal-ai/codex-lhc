@@ -98,7 +98,9 @@ round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing
 a legitimate combination; fork-owned and *not in any patch* is not. Row 26 is
 the same pattern (impl details under a sentinel-bearing LiveThread API).
 
-Expected markers: **54** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **52** (`EXPECTED_HOOKS` in the tripwire script).
+Was 54 before the 2026-08-06 upstream sync removed two marker sites while
+preserving the raw-item contributor behavior (see the sync record below).
 Was 51 before slice E (startup reconciliation); +3 for reconcile entry +
 thread_manager history-load seam + app-server resume history-load seam.
 Was 47 before slice C (rollout rewrite); +4 for recorder reopen, LiveThread
@@ -281,7 +283,7 @@ patch reproduction at the new base, and the slice-D matrix.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `aac9f84247`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `a7dcd20d38`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing
