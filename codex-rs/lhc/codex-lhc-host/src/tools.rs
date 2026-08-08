@@ -33,6 +33,31 @@ use crate::session::thread_file_path;
 /// Fixed per-call token budget (TS `PULL_TOKEN_BUDGET` / format module).
 pub const PULL_TOKEN_BUDGET: i64 = format::PULL_TOKEN_BUDGET;
 
+/// codex-core middle-truncates every FunctionCallOutput recorded to history
+/// at the model's truncation_policy (`context_manager/history.rs` process_item,
+/// policy × 1.2 serialization allowance; gpt-5.6 family sets 10,000 in
+/// models.json). A truncated assembly would silently break the verbatim
+/// envelope/continuation contract — the footer's `from` would skip content
+/// core removed. So the ASSEMBLED output must stay under the raw policy:
+/// bodies budget shrinks with id count so worst-case assembly ≤ 9,500.
+const MAX_ASSEMBLED_OUTPUT_TOKENS: i64 = 9_500;
+
+/// Worst-case non-body tokens per requested id, from the SDK's analytic
+/// component table (`retrieval/format.rs`): unserved echo line 240 dominates
+/// served (separator + section wrap + footer ≈ 207); rounded up.
+const PER_ID_OVERHEAD_TOKENS: i64 = 250;
+
+/// Envelope open/close + first separator, from the same table (85 + 97).
+const FIXED_OVERHEAD_TOKENS: i64 = 182;
+
+/// Bodies budget for one call: the fixed 8,000 unless the id count's
+/// worst-case overhead would push the assembly past the enforcement
+/// ceiling. Monotone in id count; ≥ 1,318 even at the SDK's 32-id cap.
+fn bounded_budget(id_count: usize) -> i64 {
+    let overhead = FIXED_OVERHEAD_TOKENS + (id_count as i64) * PER_ID_OVERHEAD_TOKENS;
+    PULL_TOKEN_BUDGET.min(MAX_ASSEMBLED_OUTPUT_TOKENS - overhead)
+}
+
 pub const GET_TURNS_TOOL_NAME: &str = "get_turns";
 pub const GET_MESSAGES_TOOL_NAME: &str = "get_messages";
 
@@ -126,7 +151,7 @@ impl GetTurnsTool {
         let args = parse_retrieval_args(&call, IdKind::Turn)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let options = RetrievalOptions {
-            token_budget: Some(PULL_TOKEN_BUDGET as f64),
+            token_budget: Some(bounded_budget(args.ids.len()) as f64),
             from_token: Some(args.from_token as f64),
             surface: Some(GET_TURNS_TOOL_NAME.to_string()),
         };
@@ -168,7 +193,7 @@ impl GetMessagesTool {
         let args = parse_retrieval_args(&call, IdKind::Message)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let options = RetrievalOptions {
-            token_budget: Some(PULL_TOKEN_BUDGET as f64),
+            token_budget: Some(bounded_budget(args.ids.len()) as f64),
             from_token: Some(args.from_token as f64),
             surface: Some(GET_MESSAGES_TOOL_NAME.to_string()),
         };
@@ -663,6 +688,30 @@ mod tests {
                 output.text_content().expect("text body").to_string()
             }
             other => panic!("unexpected response item: {other:?}"),
+        }
+    }
+
+    fn assert_bounded(id_count: usize, expected: i64) {
+        assert_eq!(bounded_budget(id_count), expected, "id_count={id_count}");
+    }
+
+    /// Worst-case assembly (bodies + fixed + per-id overhead) must stay ≤
+    /// 9,500 for every id count the SDK admits, and small pulls keep the
+    /// full 8,000 bodies budget.
+    #[test]
+    fn bounded_budget_keeps_assembly_under_core_truncation() {
+        assert_bounded(1, PULL_TOKEN_BUDGET);
+        assert_bounded(5, PULL_TOKEN_BUDGET);
+        assert_bounded(6, 7_818);
+        assert_bounded(32, 1_318);
+        for n in 1..=32usize {
+            let budget = bounded_budget(n);
+            assert!(budget >= 1_318, "n={n}: budget {budget} collapsed");
+            let worst = budget + FIXED_OVERHEAD_TOKENS + (n as i64) * PER_ID_OVERHEAD_TOKENS;
+            assert!(
+                worst <= MAX_ASSEMBLED_OUTPUT_TOKENS,
+                "n={n}: worst-case assembly {worst} exceeds ceiling"
+            );
         }
     }
 
