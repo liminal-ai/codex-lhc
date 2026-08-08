@@ -50,12 +50,50 @@ const PER_ID_OVERHEAD_TOKENS: i64 = 250;
 /// Envelope open/close + first separator, from the same table (85 + 97).
 const FIXED_OVERHEAD_TOKENS: i64 = 182;
 
+/// codex-core's truncation counts "tokens" as bytes/4 (`utils/string/
+/// truncate.rs` approx_bytes_for_tokens): the 10,000-token policy × 1.2
+/// allowance passes at most 48,000 bytes untouched. SDK tokens are real
+/// o200k tokens, so compression-heavy content (repeated log lines) can be
+/// few tokens but many bytes — the token bound alone cannot bound bytes.
+/// Assembled output is therefore also checked in BYTES; margin under 48k.
+const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 38_000;
+
 /// Bodies budget for one call: the fixed 8,000 unless the id count's
 /// worst-case overhead would push the assembly past the enforcement
 /// ceiling. Monotone in id count; ≥ 1,318 even at the SDK's 32-id cap.
 fn bounded_budget(id_count: usize) -> i64 {
     let overhead = FIXED_OVERHEAD_TOKENS + (id_count as i64) * PER_ID_OVERHEAD_TOKENS;
     PULL_TOKEN_BUDGET.min(MAX_ASSEMBLED_OUTPUT_TOKENS - overhead)
+}
+
+/// Order-preserving dedupe — the SDK dedupes before its 32-id cap, so the
+/// host budget must count unique ids or duplicates shrink valid calls
+/// (38 copies of one id would drive the budget negative).
+fn dedupe_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// Ratio-derived budget shrink for the byte-check retry: scale the token
+/// budget by the byte overage (with a 0.9 margin), floored at the SDK's
+/// 256-token partial-serve minimum.
+fn shrunk_budget_for_bytes(budget: i64, assembled_bytes: usize) -> i64 {
+    let scaled =
+        (budget as f64) * (MAX_ASSEMBLED_OUTPUT_BYTES as f64) / (assembled_bytes as f64) * 0.9;
+    (scaled as i64).max(256)
+}
+
+/// Terminal refusal when even the shrunk retry stays over the byte ceiling
+/// — never truncate an assembly (that would break the continuation
+/// contract); tell the model how to narrow the request instead.
+fn byte_density_refusal(what: &str) -> String {
+    format!(
+        "recalled {what} are unusually byte-dense for this host's output limit \
+         ({MAX_ASSEMBLED_OUTPUT_BYTES} bytes) — request fewer ids per call, or \
+         walk one id with successive from: offsets"
+    )
 }
 
 pub const GET_TURNS_TOOL_NAME: &str = "get_turns";
@@ -150,41 +188,62 @@ impl GetTurnsTool {
     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_retrieval_args(&call, IdKind::Turn)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
-        let options = RetrievalOptions {
-            token_budget: Some(bounded_budget(args.ids.len()) as f64),
-            from_token: Some(args.from_token as f64),
-            surface: Some(GET_TURNS_TOOL_NAME.to_string()),
-        };
-        // LHC SQLite transactions are !Send (thread-local instance seam). Run
-        // on a current-thread runtime inside spawn_blocking so the ToolExecutor
-        // future stays Send for the multi-thread host runtime.
-        let ids = args.ids;
-        let receipt = run_lhc_blocking(move || async move {
-            retrieval::get_turns(thread_ref, &ids, Some(options)).await
-        })
-        .await?;
-        let receipt = match receipt {
-            OpResult::Ok { value } => value,
-            OpResult::Err { error } => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "get_turns failed: {}",
-                    error.reason
-                )));
+        let ids = dedupe_ids(args.ids);
+        let mut budget = bounded_budget(ids.len());
+        // Byte-check loop: one ratio-derived shrink retry when compression-
+        // heavy content is token-cheap but byte-heavy (core truncates on
+        // bytes/4). The rare retry writes a second impression call — honest:
+        // two SDK serves happened, the host discarded the oversized one.
+        for attempt in 0..2 {
+            let options = RetrievalOptions {
+                token_budget: Some(budget as f64),
+                from_token: Some(args.from_token as f64),
+                surface: Some(GET_TURNS_TOOL_NAME.to_string()),
+            };
+            // LHC SQLite transactions are !Send (thread-local instance seam).
+            // Run on a current-thread runtime inside spawn_blocking so the
+            // ToolExecutor future stays Send for the multi-thread runtime.
+            let call_ids = ids.clone();
+            let call_ref = thread_ref.clone();
+            let receipt = run_lhc_blocking(move || async move {
+                retrieval::get_turns(call_ref, &call_ids, Some(options)).await
+            })
+            .await?;
+            let receipt = match receipt {
+                OpResult::Ok { value } => value,
+                OpResult::Err { error } => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "get_turns failed: {}",
+                        error.reason
+                    )));
+                }
+            };
+            let mut sections = Vec::with_capacity(receipt.served.len());
+            let mut footers = Vec::new();
+            for turn in &receipt.served {
+                sections.push(format::turn_section(&turn.text));
+                if let Some(footer) =
+                    format::section_footer(GET_TURNS_TOOL_NAME, &turn.turn_id, turn.slice.as_ref())
+                {
+                    footers.push(footer);
+                }
             }
-        };
-        let mut sections = Vec::with_capacity(receipt.served.len());
-        let mut footers = Vec::new();
-        for turn in &receipt.served {
-            sections.push(format::turn_section(&turn.text));
-            if let Some(footer) =
-                format::section_footer(GET_TURNS_TOOL_NAME, &turn.turn_id, turn.slice.as_ref())
-            {
-                footers.push(footer);
+            let text = format::assemble_result(
+                GET_TURNS_TOOL_NAME,
+                &sections,
+                &footers,
+                &receipt.unserved,
+            );
+            if text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES {
+                return Ok(Box::new(TextToolOutput::new(text)));
+            }
+            if attempt == 0 {
+                budget = shrunk_budget_for_bytes(budget, text.len());
             }
         }
-        let text =
-            format::assemble_result(GET_TURNS_TOOL_NAME, &sections, &footers, &receipt.unserved);
-        Ok(Box::new(TextToolOutput::new(text)))
+        Err(FunctionCallError::RespondToModel(byte_density_refusal(
+            "turns",
+        )))
     }
 }
 
@@ -192,44 +251,58 @@ impl GetMessagesTool {
     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_retrieval_args(&call, IdKind::Message)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
-        let options = RetrievalOptions {
-            token_budget: Some(bounded_budget(args.ids.len()) as f64),
-            from_token: Some(args.from_token as f64),
-            surface: Some(GET_MESSAGES_TOOL_NAME.to_string()),
-        };
-        let ids = args.ids;
-        let receipt = run_lhc_blocking(move || async move {
-            retrieval::get_messages(thread_ref, &ids, Some(options)).await
-        })
-        .await?;
-        let receipt = match receipt {
-            OpResult::Ok { value } => value,
-            OpResult::Err { error } => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "get_messages failed: {}",
-                    error.reason
-                )));
+        let ids = dedupe_ids(args.ids);
+        let mut budget = bounded_budget(ids.len());
+        // Byte-check loop — see GetTurnsTool::handle_call.
+        for attempt in 0..2 {
+            let options = RetrievalOptions {
+                token_budget: Some(budget as f64),
+                from_token: Some(args.from_token as f64),
+                surface: Some(GET_MESSAGES_TOOL_NAME.to_string()),
+            };
+            let call_ids = ids.clone();
+            let call_ref = thread_ref.clone();
+            let receipt = run_lhc_blocking(move || async move {
+                retrieval::get_messages(call_ref, &call_ids, Some(options)).await
+            })
+            .await?;
+            let receipt = match receipt {
+                OpResult::Ok { value } => value,
+                OpResult::Err { error } => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "get_messages failed: {}",
+                        error.reason
+                    )));
+                }
+            };
+            let mut sections = Vec::with_capacity(receipt.served.len());
+            let mut footers = Vec::new();
+            for message in &receipt.served {
+                sections.push(format::message_section(&message.message_id, &message.text));
+                if let Some(footer) = format::section_footer(
+                    GET_MESSAGES_TOOL_NAME,
+                    &message.message_id,
+                    message.slice.as_ref(),
+                ) {
+                    footers.push(footer);
+                }
             }
-        };
-        let mut sections = Vec::with_capacity(receipt.served.len());
-        let mut footers = Vec::new();
-        for message in &receipt.served {
-            sections.push(format::message_section(&message.message_id, &message.text));
-            if let Some(footer) = format::section_footer(
+            let text = format::assemble_result(
                 GET_MESSAGES_TOOL_NAME,
-                &message.message_id,
-                message.slice.as_ref(),
-            ) {
-                footers.push(footer);
+                &sections,
+                &footers,
+                &receipt.unserved,
+            );
+            if text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES {
+                return Ok(Box::new(TextToolOutput::new(text)));
+            }
+            if attempt == 0 {
+                budget = shrunk_budget_for_bytes(budget, text.len());
             }
         }
-        let text = format::assemble_result(
-            GET_MESSAGES_TOOL_NAME,
-            &sections,
-            &footers,
-            &receipt.unserved,
-        );
-        Ok(Box::new(TextToolOutput::new(text)))
+        Err(FunctionCallError::RespondToModel(byte_density_refusal(
+            "messages",
+        )))
     }
 }
 
@@ -795,6 +868,77 @@ mod tests {
             after, 0,
             "validation failures must not call the SDK (no impression rows)"
         );
+    }
+
+    #[test]
+    fn dedupe_and_shrink_helpers() {
+        // 38 copies of one id must budget as one id, not go negative.
+        let ids = dedupe_ids(vec!["t1".to_string(); 38]);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(bounded_budget(ids.len()), PULL_TOKEN_BUDGET);
+        // Order preserved, later duplicates dropped.
+        let ids = dedupe_ids(vec!["t2".into(), "t1".into(), "t2".into(), "t3".into()]);
+        assert_eq!(ids, vec!["t2".to_string(), "t1".into(), "t3".into()]);
+        // Shrink is ratio-proportional with margin, floored at 256.
+        assert_eq!(shrunk_budget_for_bytes(8_000, 76_000), 3_600);
+        assert_eq!(shrunk_budget_for_bytes(300, 10_000_000), 256);
+    }
+
+    /// Compression-heavy content (long token-cheap byte-heavy runs) must
+    /// never leave the handler over the byte ceiling — core would middle-
+    /// truncate it after the SDK computed continuation receipts.
+    #[tokio::test]
+    async fn byte_dense_content_stays_under_output_ceiling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let tid = "byte-dense";
+        let slot = open_slot(root, tid).await;
+        let handle = slot.get().expect("handle");
+        handle.persist(
+            &msg("user", "dump the log", "u1"),
+            RawItemProvenance::UserPrompt,
+        );
+        // ~400KB of '=' runs: BPE packs long runs into few tokens, so this
+        // is token-cheap but byte-heavy — the exact core-truncation hazard.
+        let dense = "=".repeat(400_000);
+        handle.persist(
+            &msg("assistant", &dense, "a1"),
+            RawItemProvenance::ModelOutput,
+        );
+        handle.turn_end(
+            "host-turn-1",
+            "completed",
+            TurnEndFacts {
+                outcome: Some("completed"),
+                outcome_reason: None,
+                started_at: None,
+                ended_at: None,
+            },
+        );
+        handle.flush().await;
+
+        let tools = retrieval_tools(Arc::clone(&slot));
+        let get_turns = tools
+            .iter()
+            .find(|t| t.tool_name() == ToolName::plain(GET_TURNS_TOOL_NAME))
+            .unwrap();
+        match get_turns
+            .handle(tool_call(GET_TURNS_TOOL_NAME, json!({ "ids": ["t1"] })))
+            .await
+        {
+            Ok(output) => {
+                let text = output_text(output);
+                assert!(
+                    text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES,
+                    "served assembly is {} bytes — core would truncate it",
+                    text.len()
+                );
+            }
+            Err(err) => {
+                // Terminal refusal is acceptable; silent oversize is not.
+                assert!(err.to_string().contains("byte-dense"), "got: {err}");
+            }
+        }
     }
 
     #[tokio::test]
