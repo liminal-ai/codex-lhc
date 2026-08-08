@@ -24,6 +24,7 @@ use tracing::warn;
 
 use crate::idempotency::OccurrenceTracker;
 use crate::mapping::MappedEvent;
+use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
 use crate::mapping::attach_provider_usage;
 use crate::mapping::map_item;
@@ -61,6 +62,14 @@ enum CaptureCmd {
         new_model: String,
         previous_level: String,
         new_level: String,
+        /// Provider id for thinking-signature provenance (optional).
+        provider: Option<String>,
+        /// API wire id (e.g. "responses"); defaults to RESPONSES_API when None.
+        api: Option<String>,
+    },
+    /// Set live model identity used for R2 thinking-signature capture.
+    SetIdentity {
+        identity: ModelIdentity,
     },
     Flush(oneshot::Sender<()>),
     /// Wait, bounded, for the background scheduler to finish draining this
@@ -222,6 +231,14 @@ impl CaptureHandle {
         }
     }
 
+    /// Set live model identity for R2 thinking-signature capture.
+    pub fn set_identity(&self, identity: ModelIdentity) {
+        if self.inner.degraded.load(Ordering::Relaxed) {
+            return;
+        }
+        let _ = self.inner.tx.try_send(CaptureCmd::SetIdentity { identity });
+    }
+
     /// Non-blocking model/thinking change. Suppresses no-ops at the call site;
     /// still safe if both sides match (mapper emits zero events).
     pub fn model_or_thinking_change(
@@ -246,6 +263,8 @@ impl CaptureHandle {
             new_model: new_model.to_string(),
             previous_level: previous_level.to_string(),
             new_level: new_level.to_string(),
+            provider: None,
+            api: None,
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -418,6 +437,17 @@ pub async fn spawn_capture(
     root: Option<PathBuf>,
     derivation: crate::inference::LateBoundCallbacks,
 ) -> Option<CaptureHandle> {
+    spawn_capture_with_identity(thread_id, cwd, root, derivation, None).await
+}
+
+/// Spawn capture with an initial model identity for R2 signature provenance.
+pub async fn spawn_capture_with_identity(
+    thread_id: &str,
+    cwd: Option<&str>,
+    root: Option<PathBuf>,
+    derivation: crate::inference::LateBoundCallbacks,
+    initial_identity: Option<ModelIdentity>,
+) -> Option<CaptureHandle> {
     // Background mode derives on this session, so its callbacks are what lands
     // in the durable record — never the deterministic ones (J1).
     let (session, tracker) =
@@ -459,6 +489,7 @@ pub async fn spawn_capture(
                         thread_id_owned,
                         degraded_worker,
                         derivation,
+                        initial_identity.unwrap_or_default(),
                     )
                     .await;
                 });
@@ -489,6 +520,7 @@ async fn worker_loop(
     thread_id: String,
     degraded: Arc<AtomicBool>,
     derivation: crate::inference::LateBoundCallbacks,
+    mut live_identity: ModelIdentity,
 ) {
     #[cfg(any(test, feature = "test-util"))]
     let mut crash_after: Option<usize> = None;
@@ -512,6 +544,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -528,6 +561,7 @@ async fn worker_loop(
                     &item,
                     provenance,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -546,6 +580,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     provider_usage.as_ref(),
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -567,6 +602,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -585,6 +621,8 @@ async fn worker_loop(
                 new_model,
                 previous_level,
                 new_level,
+                provider,
+                api,
             } => {
                 if let Err(err) = flush_pending_model_output(
                     &mut session,
@@ -593,6 +631,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -600,6 +639,15 @@ async fn worker_loop(
                     && err == "crash"
                 {
                     return;
+                }
+                // Keep signature provenance in lockstep with the live model.
+                if previous_model != new_model {
+                    live_identity.model = Some(new_model.clone());
+                    if let Some(p) = provider {
+                        live_identity.provider = Some(p);
+                    }
+                    live_identity.api =
+                        Some(api.unwrap_or_else(|| ModelIdentity::RESPONSES_API.to_string()));
                 }
                 let events = map_model_or_thinking_change(
                     &thread_id,
@@ -614,6 +662,9 @@ async fn worker_loop(
                 if let Err(err) = submit_mapped(&mut session, &events).await {
                     warn!(thread_id = %thread_id, %err, "LHC: model/thinking change failed");
                 }
+            }
+            CaptureCmd::SetIdentity { identity } => {
+                live_identity = identity;
             }
             CaptureCmd::RuntimeNote { text, key_suffix } => {
                 let event = map_runtime_note(&thread_id, &text, &key_suffix);
@@ -634,6 +685,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -687,6 +739,7 @@ async fn worker_loop(
                     &degraded,
                     &mut pending_model_output,
                     None,
+                    &live_identity,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -706,6 +759,7 @@ async fn worker_loop(
         &degraded,
         &mut pending_model_output,
         None,
+        &live_identity,
         #[cfg(any(test, feature = "test-util"))]
         &mut crash_after,
     )
@@ -720,6 +774,7 @@ async fn flush_pending_model_output(
     degraded: &AtomicBool,
     pending: &mut Vec<(ResponseItem, RawItemProvenance)>,
     provider_usage: Option<&Map<String, Value>>,
+    identity: &ModelIdentity,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
     if pending.is_empty() {
@@ -735,6 +790,7 @@ async fn flush_pending_model_output(
             &item,
             provenance,
             provider_usage,
+            identity,
             #[cfg(any(test, feature = "test-util"))]
             crash_after,
         )
@@ -751,12 +807,18 @@ async fn persist_item(
     item: &ResponseItem,
     provenance: RawItemProvenance,
     provider_usage: Option<&Map<String, Value>>,
+    identity: &ModelIdentity,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
     // Contain map_item panics so one bad item cannot kill the worker (H9).
     let mut local = tracker.clone();
+    let id_ref = if identity.is_complete() {
+        Some(identity)
+    } else {
+        None
+    };
     let mapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        map_item(thread_id, item, provenance, &mut local)
+        map_item(thread_id, item, provenance, &mut local, id_ref)
     }));
     let mut events = match mapped {
         Ok(events) => {

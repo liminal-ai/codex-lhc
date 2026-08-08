@@ -86,6 +86,7 @@ pub use mapping::ACTOR_TOOL;
 pub use mapping::ACTOR_USER;
 pub use mapping::HARNESS;
 pub use mapping::MappedEvent;
+pub use mapping::ModelIdentity;
 pub use mapping::TurnEndFacts;
 pub use mapping::attach_provider_usage;
 pub use mapping::map_item;

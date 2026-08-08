@@ -506,6 +506,7 @@ async fn install_lhc_compact_rewrite(
         },
         world_state: world_state_value,
         turn_context: reference_context_item.clone(),
+        live_identity: None,
     });
 
     for note in &materialize_result.gap_notes {

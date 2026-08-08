@@ -357,6 +357,7 @@ pub async fn regenerate_rollout_from_thread(
         },
         world_state: None,
         turn_context: None,
+        live_identity: None,
     });
 
     for note in &result.gap_notes {

@@ -611,7 +611,7 @@ pub async fn import_host_items_into_archive(
             }
             _ => RawItemProvenance::HostContext,
         };
-        let mapped = map_item(&session.thread_id, item, provenance, &mut tracker);
+        let mapped = map_item(&session.thread_id, item, provenance, &mut tracker, None);
         if mapped.is_empty() {
             continue;
         }

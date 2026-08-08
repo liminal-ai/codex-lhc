@@ -37,7 +37,7 @@
 //! | `TokenCount` | **Regenerated** | `last` = per-call `provider_usage`; `total` = cumulative sum up to that call |
 //! | `UserMessage` (first) | **Regenerated display-only** from the thread's true first `user_prompt` (not band text) | messages record |
 //! | `UserMessage` / `AgentMessage` / `AgentReasoning` (tail) | **Regenerated** from native tail ResponseItems | model stream tail |
-//! | `AgentReasoningRawContent` | **Not emitted** | reverse never recovers `encrypted_content` (gap) |
+//! | `AgentReasoningRawContent` | **Conditional** | encrypted_content re-emitted when stored identity matches live model (R2) |
 //! | `ThreadSettingsApplied` / `ThreadGoalUpdated` | **Carried forward** | prior generation |
 //! | `ThreadRolledBack` | **Applied, not carried** | prior markers drop those user turns from the tail; no marker in the rebuilt file |
 //! | `ContextCompacted` | **Regenerated** | once at the boundary after `Compacted` |
@@ -51,6 +51,7 @@
 //!
 //! See [`CAPTURE_GAPS`]. Missing host facts degrade honestly.
 
+use crate::mapping::ModelIdentity;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
@@ -105,7 +106,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "FunctionCall vs CustomToolCall: both forward-map to tool_call; reverse discriminates by recovered host ResponseItemId prefix (fc_→FunctionCall, ctc_→CustomToolCall). Outputs: fco_→FunctionCallOutput, ctco_→CustomToolCallOutput; call_id pairing carries kind when id missing. Unknown/unrepresentable id prefixes → id=None (provider remints) + gap_notes entry — never an invalid pairing (ctc_ on FunctionCall)",
     "FunctionCall.namespace / CustomToolCall.namespace: not stored on tool_call payload → always None",
     "Message.phase never stored → None; ResponseItemId recovered only from id-primary idempotency keys (synthetic: keys → None)",
-    "Reasoning content[] vs summary[] vs encrypted_content: only text survives as summary SummaryText; encrypted_content always None → AgentReasoningRawContent never regenerated",
+    "Reasoning content[] vs summary[] vs encrypted_content: text + signature stored on assistant_thinking; encrypted_content re-emitted only when stored provider/model/api match live_identity (R2 host identity gate); mismatch or missing identity → encrypted_content None",
     "LocalShellCall.status / WebSearchCall.status / ToolSearchCall.execution+status: defaulted (Completed / completed / empty)",
     "ImageGenerationCall: paired call+result → one complete item; unpaired call → status=unknown result=\"\"",
     "ToolSearchOutput.tools JSON / status: parsed from tool_result content when possible; status from stored isError",
@@ -150,6 +151,9 @@ pub struct MaterializeInput<'a> {
     /// Optional post-boundary `TurnContext` for `previous_turn_settings` recovery.
     /// Slice C supplies the live session's latest context; `None` leaves the gap.
     pub turn_context: Option<TurnContextItem>,
+    /// When set and matching the stored assistant provider/model/api, reverse
+    /// maps restore `encrypted_content` from the thinking signature.
+    pub live_identity: Option<ModelIdentity>,
 }
 
 /// Output of [`materialize_rollout`]: items plus any loud degradation notes.
@@ -223,6 +227,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         input.turns,
         &usage_totals,
         &rolled_back_turns,
+        input.live_identity.as_ref(),
         &mut out,
         &mut gap_notes,
     );
@@ -598,7 +603,7 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
             }
         }
         ResponseItem::Reasoning { summary, .. } => {
-            // encrypted_content is never recovered → no AgentReasoningRawContent (L14).
+            // encrypted_content re-emitted only on identity match (R2); else None.
             let summary_text = summary
                 .iter()
                 .map(|s| match s {
@@ -700,6 +705,7 @@ fn emit_tail(
     all_turns: &[TurnRecord],
     usage_totals: &HashMap<String, (TokenUsage, TokenUsage)>,
     rolled_back_turns: &HashSet<String>,
+    live_identity: Option<&ModelIdentity>,
     out: &mut Vec<RolloutItem>,
     gap_notes: &mut Vec<String>,
 ) {
@@ -798,11 +804,18 @@ fn emit_tail(
                             .and_then(parse_host_id_from_key)
                     });
                     let turn_id = msg.map(|m| m.turn_id.as_str());
+                    let stored_identity = ModelIdentity {
+                        provider: a.provider.clone(),
+                        model: a.model.clone(),
+                        api: a.api.clone(),
+                    };
                     reverse_assistant_part(
                         part,
                         msg,
                         id_hint.as_deref(),
                         turn_id,
+                        &stored_identity,
+                        live_identity,
                         &mut pending_images,
                         &mut tool_call_kinds,
                         &mut *gap_notes,
@@ -1191,6 +1204,8 @@ fn reverse_assistant_part(
     msg: Option<&MessageRecord>,
     id_hint: Option<&str>,
     turn_id: Option<&str>,
+    stored_identity: &ModelIdentity,
+    live_identity: Option<&ModelIdentity>,
     pending_images: &mut HashMap<String, PendingImage>,
     tool_call_kinds: &mut HashMap<String, RecoveredToolCallKind>,
     gap_notes: &mut Vec<String>,
@@ -1212,18 +1227,36 @@ fn reverse_assistant_part(
         }
         SessionAssistantPartType::Thinking => {
             let text = part.thinking.as_deref().unwrap_or("");
-            if text.is_empty() {
+            let signature = part.thinking_signature.as_deref().filter(|s| !s.is_empty());
+            // Signature-only thinking is not a husk — still emit for identity-gated
+            // encrypted_content re-emit (R2). Empty text + no signature is a husk.
+            if text.is_empty() && signature.is_none() {
                 return;
             }
+            // Identity-match: re-emit encrypted_content only when stored capture
+            // identity matches the live session model. Missing either side → None.
+            let encrypted_content = match (signature, live_identity) {
+                (Some(sig), Some(live))
+                    if stored_identity.is_complete() && stored_identity.matches(live) =>
+                {
+                    Some(sig.to_string())
+                }
+                _ => None,
+            };
+            let summary = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![ReasoningItemReasoningSummary::SummaryText {
+                    text: text.to_string(),
+                }]
+            };
             let item = ResponseItem::Reasoning {
                 id: id_hint
                     .and_then(sanitize_id)
                     .map(ResponseItemId::from_server),
-                summary: vec![ReasoningItemReasoningSummary::SummaryText {
-                    text: text.to_string(),
-                }],
+                summary,
                 content: None,
-                encrypted_content: None,
+                encrypted_content,
                 internal_chat_message_metadata_passthrough: None,
             };
             push_response_with_twins(item, out, true);

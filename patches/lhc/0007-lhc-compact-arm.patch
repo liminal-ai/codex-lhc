@@ -41,10 +41,10 @@ index 7e6e4576d0..3bed2e79e0 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..df0f88adc0
+index 0000000000..9aa7f006fc
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,1050 @@
+@@ -0,0 +1,1051 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -553,6 +553,7 @@ index 0000000000..df0f88adc0
 +        },
 +        world_state: world_state_value,
 +        turn_context: reference_context_item.clone(),
++        live_identity: None,
 +    });
 +
 +    for note in &materialize_result.gap_notes {
@@ -1097,10 +1098,10 @@ index 0000000000..df0f88adc0
 +mod slice_d_tests;
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..6fe5b9ff48
+index 0000000000..b9ace24dc5
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1381 @@
+@@ -0,0 +1,1384 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -1476,6 +1477,7 @@ index 0000000000..6fe5b9ff48
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
++        live_identity: None,
 +    });
 +    assert!(
 +        compacted_count(&materialized.items) == 1,
@@ -2204,6 +2206,7 @@ index 0000000000..6fe5b9ff48
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
++        live_identity: None,
 +    });
 +
 +    for point in [
@@ -2425,6 +2428,7 @@ index 0000000000..6fe5b9ff48
 +            boundary,
 +            world_state: None,
 +            turn_context: None,
++            live_identity: None,
 +        });
 +        assert_eq!(compacted_count(&result.items), 1);
 +        atomic_rewrite_rollout(&rollout_path, &result.items).expect("swap zero-tail");

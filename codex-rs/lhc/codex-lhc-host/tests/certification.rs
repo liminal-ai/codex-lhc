@@ -316,7 +316,7 @@ async fn mapping_goldens_round_trip_and_match_fixtures() {
 
     for (name, item, provenance) in all_variant_fixtures() {
         let mut tracker = OccurrenceTracker::new();
-        let mapped = map_item("golden-thread", &item, provenance, &mut tracker);
+        let mapped = map_item("golden-thread", &item, provenance, &mut tracker, None);
 
         // Round-trip through real LhcSession and read stored rows back.
         let tid = format!("golden-rt-{name}");
@@ -560,7 +560,7 @@ async fn crash_partial_submit_then_retry_no_double() {
         result: "b64".into(),
         internal_chat_message_metadata_passthrough: None,
     };
-    // Reasoning: 2 events, same kind (assistant_thinking) with part suffixes.
+    // Reasoning: 1 event — summary text + encrypted_content as signature (R2).
     let reasoning_item = ResponseItem::Reasoning {
         id: Some(ResponseItemId::from_server("rs_multi".into())),
         summary: vec![ReasoningItemReasoningSummary::SummaryText {
@@ -573,7 +573,7 @@ async fn crash_partial_submit_then_retry_no_double() {
 
     for (label, item, expected) in [
         ("image", image_item, 2usize),
-        ("reasoning", reasoning_item, 2usize),
+        ("reasoning", reasoning_item, 1usize),
     ] {
         // Parameterize over injection points 0, 1, 2 (before / between / after-all).
         for after in [0usize, 1, 2] {

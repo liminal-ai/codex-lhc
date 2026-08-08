@@ -14,7 +14,7 @@
 //! | `Message` role=developer/system | not captured | Host scaffolding meta |
 //! | `AgentMessage` | `runtime_note` | author/recipient/parts folded into `text` |
 //! | `Reasoning` summary/content | `assistant_thinking` | text |
-//! | `Reasoning` encrypted | `assistant_thinking` | encrypted bytes verbatim as `text` |
+//! | `Reasoning` encrypted | `assistant_thinking` | `signature` + provider/model/api (R2) |
 //! | `LocalShellCall` | `tool_call` | by call_id |
 //! | `FunctionCall` | `tool_call` | args object; verbatim wire string in `arguments.__hostRaw`; optional encrypted args in `arguments.__hostEncryptedFunctionArgs` (payload-only; never `extra`) |
 //! | `ToolSearchCall` | `tool_call` | |
@@ -62,6 +62,46 @@ pub const ACTOR_TOOL: &str = "tool";
 pub const ACTOR_SYSTEM: &str = "system";
 pub const HARNESS: &str = "codex";
 
+/// Codex Responses API wire identity for thinking-signature provenance.
+///
+/// Rides `assistant_thinking` payload fields so materialization can re-emit
+/// `encrypted_content` only when the live model matches the capture-time
+/// identity (host identity-match suppression).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModelIdentity {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api: Option<String>,
+}
+
+impl ModelIdentity {
+    /// Default host API for Responses encrypted reasoning.
+    pub const RESPONSES_API: &'static str = "responses";
+
+    pub fn new(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        api: impl Into<String>,
+    ) -> Self {
+        Self {
+            provider: Some(provider.into()),
+            model: Some(model.into()),
+            api: Some(api.into()),
+        }
+    }
+
+    pub fn matches(&self, other: &ModelIdentity) -> bool {
+        self.provider == other.provider && self.model == other.model && self.api == other.api
+    }
+
+    /// True when all three identity fields are present (comparable).
+    pub fn is_complete(&self) -> bool {
+        self.provider.as_ref().is_some_and(|s| !s.is_empty())
+            && self.model.as_ref().is_some_and(|s| !s.is_empty())
+            && self.api.as_ref().is_some_and(|s| !s.is_empty())
+    }
+}
+
 /// One mapped LHC event ready for `message_events`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappedEvent {
@@ -69,11 +109,15 @@ pub struct MappedEvent {
 }
 
 /// Map a single `ResponseItem` into zero or more LHC events.
+///
+/// `identity` is the live session model (provider/model/api). Required for
+/// R2 thinking-signature capture on `Reasoning.encrypted_content`.
 pub fn map_item(
     thread_id: &str,
     item: &ResponseItem,
     provenance: RawItemProvenance,
     tracker: &mut OccurrenceTracker,
+    identity: Option<&ModelIdentity>,
 ) -> Vec<MappedEvent> {
     // Test-util: deliberate panic for a single fixture text so certification
     // can prove the worker catch_unwind continues (H9/I3). Content-keyed so
@@ -164,6 +208,7 @@ pub fn map_item(
             summary,
             content.as_deref(),
             encrypted_content.as_deref(),
+            identity,
         ),
         ResponseItem::LocalShellCall {
             call_id,
@@ -628,42 +673,66 @@ fn map_reasoning(
     summary: &[ReasoningItemReasoningSummary],
     content: Option<&[ReasoningItemContent]>,
     encrypted_content: Option<&str>,
+    identity: Option<&ModelIdentity>,
 ) -> Vec<MappedEvent> {
     let mut out = Vec::new();
     let summary_text = reasoning_summary_text(summary, content);
-    let has_encrypted = encrypted_content.is_some_and(|s| !s.is_empty());
+    let signature = encrypted_content.filter(|s| !s.is_empty());
 
-    if !summary_text.is_empty() {
-        let part = if has_encrypted { Some("summary") } else { None };
-        out.push(text_event(
+    // PI-style: one assistant_thinking event carries text + optional signature
+    // + provider/model/api. Signature-only (empty text) is still captured so
+    // resume can round-trip encrypted reasoning to the same model.
+    if !summary_text.is_empty() || signature.is_some() {
+        out.push(thinking_event(
             thread_id,
             sid,
             digest,
             occ,
-            "assistant_thinking",
-            ACTOR_ASSISTANT,
             &summary_text,
-            part,
-        ));
-    }
-    if let Some(enc) = encrypted_content.filter(|s| !s.is_empty()) {
-        let part = if summary_text.is_empty() {
-            None
-        } else {
-            Some("encrypted")
-        };
-        out.push(text_event(
-            thread_id,
-            sid,
-            digest,
-            occ,
-            "assistant_thinking",
-            ACTOR_ASSISTANT,
-            enc,
-            part,
+            signature,
+            identity,
         ));
     }
     out
+}
+
+/// Build an `assistant_thinking` event: text + optional R2 signature + identity.
+fn thinking_event(
+    thread_id: &str,
+    sid: Option<&str>,
+    digest: &str,
+    occ: u64,
+    text: &str,
+    signature: Option<&str>,
+    identity: Option<&ModelIdentity>,
+) -> MappedEvent {
+    let key = item_event_key(thread_id, sid, digest, occ, "assistant_thinking", None);
+    let mut payload = Map::new();
+    payload.insert("text".into(), json!(text));
+    if let Some(sig) = signature {
+        payload.insert("signature".into(), json!(sig));
+    }
+    if let Some(id) = identity {
+        if let Some(p) = id.provider.as_ref().filter(|s| !s.is_empty()) {
+            payload.insert("provider".into(), json!(p));
+        }
+        if let Some(m) = id.model.as_ref().filter(|s| !s.is_empty()) {
+            payload.insert("model".into(), json!(m));
+        }
+        if let Some(a) = id.api.as_ref().filter(|s| !s.is_empty()) {
+            payload.insert("api".into(), json!(a));
+        }
+    }
+    MappedEvent {
+        input: MessageEventInput {
+            event_kind: "assistant_thinking".to_string(),
+            idempotency_key: Some(key),
+            actor: ACTOR_ASSISTANT.to_string(),
+            harness: HARNESS.to_string(),
+            payload,
+            extra: Map::new(),
+        },
+    }
 }
 
 fn reasoning_summary_text(
@@ -901,7 +970,13 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::UserPrompt, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::UserPrompt,
+            &mut tracker(),
+            None,
+        );
         assert_eq!(events[0].input.event_kind, "user_prompt");
     }
 
@@ -916,7 +991,13 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::HostContext, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::HostContext,
+            &mut tracker(),
+            None,
+        );
         assert_eq!(events[0].input.event_kind, "runtime_note");
     }
 
@@ -932,8 +1013,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
         let mut t = tracker();
-        let e1 = map_item("t", &item, RawItemProvenance::UserPrompt, &mut t);
-        let e2 = map_item("t", &item, RawItemProvenance::UserPrompt, &mut t);
+        let e1 = map_item("t", &item, RawItemProvenance::UserPrompt, &mut t, None);
+        let e2 = map_item("t", &item, RawItemProvenance::UserPrompt, &mut t, None);
         assert_eq!(
             e1[0].input.idempotency_key, e2[0].input.idempotency_key,
             "restart re-presentation of same ResponseItemId must collide"
@@ -952,7 +1033,13 @@ mod tests {
             call_id: "c1".into(),
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::ModelOutput, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::ModelOutput,
+            &mut tracker(),
+            None,
+        );
         let args = events[0]
             .input
             .payload
@@ -987,7 +1074,13 @@ mod tests {
             call_id: "c2".into(),
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::ModelOutput, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::ModelOutput,
+            &mut tracker(),
+            None,
+        );
         let args = events[0]
             .input
             .payload
@@ -1010,7 +1103,13 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::UserPrompt, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::UserPrompt,
+            &mut tracker(),
+            None,
+        );
         let text = events[0]
             .input
             .payload
@@ -1028,6 +1127,7 @@ mod tests {
     #[test]
     fn reasoning_encrypted_passthrough() {
         let secret = "enc-blob-verbatim-Ω";
+        let identity = ModelIdentity::new("openai", "gpt-test", ModelIdentity::RESPONSES_API);
         let item = ResponseItem::Reasoning {
             id: Some(ResponseItemId::from_server("r1".into())),
             summary: vec![],
@@ -1035,9 +1135,67 @@ mod tests {
             encrypted_content: Some(secret.into()),
             internal_chat_message_metadata_passthrough: None,
         };
-        let events = map_item("t", &item, RawItemProvenance::ModelOutput, &mut tracker());
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::ModelOutput,
+            &mut tracker(),
+            Some(&identity),
+        );
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].input.payload.get("text"), Some(&json!(secret)));
+        assert_eq!(events[0].input.event_kind, "assistant_thinking");
+        // R2: encrypted_content lands in signature, not text.
+        assert_eq!(events[0].input.payload.get("text"), Some(&json!("")));
+        assert_eq!(
+            events[0].input.payload.get("signature"),
+            Some(&json!(secret))
+        );
+        assert_eq!(
+            events[0].input.payload.get("provider"),
+            Some(&json!("openai"))
+        );
+        assert_eq!(
+            events[0].input.payload.get("model"),
+            Some(&json!("gpt-test"))
+        );
+        assert_eq!(
+            events[0].input.payload.get("api"),
+            Some(&json!(ModelIdentity::RESPONSES_API))
+        );
+    }
+
+    #[test]
+    fn reasoning_summary_plus_encrypted_is_single_event() {
+        let identity = ModelIdentity::new("openai", "gpt-test", ModelIdentity::RESPONSES_API);
+        let item = ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("r2".into())),
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: "think aloud".into(),
+            }],
+            content: None,
+            encrypted_content: Some("sig-bytes".into()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::ModelOutput,
+            &mut tracker(),
+            Some(&identity),
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "PI-style: one thinking event with text+signature"
+        );
+        assert_eq!(
+            events[0].input.payload.get("text"),
+            Some(&json!("think aloud"))
+        );
+        assert_eq!(
+            events[0].input.payload.get("signature"),
+            Some(&json!("sig-bytes"))
+        );
     }
 
     #[test]
@@ -1099,7 +1257,13 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        let mut events = map_item("t", &item, RawItemProvenance::ModelOutput, &mut tracker());
+        let mut events = map_item(
+            "t",
+            &item,
+            RawItemProvenance::ModelOutput,
+            &mut tracker(),
+            None,
+        );
         assert_eq!(events.len(), 1);
         let usage = json!({"input_tokens": 11, "output_tokens": 3})
             .as_object()
@@ -1122,8 +1286,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
         let mut t = tracker();
-        let e1 = map_item("t", &item, RawItemProvenance::ModelOutput, &mut t);
-        let e2 = map_item("t", &item, RawItemProvenance::ModelOutput, &mut t);
+        let e1 = map_item("t", &item, RawItemProvenance::ModelOutput, &mut t, None);
+        let e2 = map_item("t", &item, RawItemProvenance::ModelOutput, &mut t, None);
         assert_eq!(e1.len(), 2);
         assert_eq!(e1[0].input.idempotency_key, e2[0].input.idempotency_key);
         assert_eq!(e1[1].input.idempotency_key, e2[1].input.idempotency_key);

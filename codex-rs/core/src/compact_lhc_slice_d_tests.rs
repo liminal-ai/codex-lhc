@@ -373,6 +373,7 @@ async fn slice_d_regenerate_and_resume_drill() {
         boundary,
         world_state: None,
         turn_context: None,
+        live_identity: None,
     });
     assert!(
         compacted_count(&materialized.items) == 1,
@@ -1101,6 +1102,7 @@ async fn slice_d_l2_crash_injection_full_stack() {
         boundary,
         world_state: None,
         turn_context: None,
+        live_identity: None,
     });
 
     for point in [
@@ -1322,6 +1324,7 @@ async fn slice_d_l2_empty_edge_cases() {
             boundary,
             world_state: None,
             turn_context: None,
+            live_identity: None,
         });
         assert_eq!(compacted_count(&result.items), 1);
         atomic_rewrite_rollout(&rollout_path, &result.items).expect("swap zero-tail");

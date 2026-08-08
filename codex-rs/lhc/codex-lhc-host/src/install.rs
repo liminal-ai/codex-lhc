@@ -51,8 +51,9 @@ use lhc::shared_tech::InferenceCallbacks;
 
 use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
-use crate::capture::spawn_capture;
+use crate::capture::spawn_capture_with_identity;
 use crate::gating::lhc_root;
+use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
 use crate::mapping::unix_secs_to_iso;
 
@@ -428,9 +429,34 @@ pub fn install<C>(
 ) where
     C: Send + Sync + 'static,
 {
+    // Default provider label: "openai" (Responses). Hosts that need a
+    // different provider can use install_with_provider_label.
+    install_with_provider_label(
+        registry,
+        lhc_enabled,
+        model_label,
+        |_c| "openai".to_string(),
+        thinking_level_label,
+        cwd,
+    );
+}
+
+/// Like [`install`], but with an explicit provider id for thinking-signature
+/// provenance (R2).
+pub fn install_with_provider_label<C>(
+    registry: &mut ExtensionRegistryBuilder<C>,
+    lhc_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+    model_label: impl Fn(&C) -> String + Send + Sync + 'static,
+    provider_label: impl Fn(&C) -> String + Send + Sync + 'static,
+    thinking_level_label: impl Fn(&C) -> String + Send + Sync + 'static,
+    cwd: impl Fn(&C) -> Option<String> + Send + Sync + 'static,
+) where
+    C: Send + Sync + 'static,
+{
     let extension = Arc::new(LhcExtension {
         enabled: Arc::new(lhc_enabled),
         model_label: Arc::new(model_label),
+        provider_label: Arc::new(provider_label),
         thinking_level_label: Arc::new(thinking_level_label),
         cwd: Arc::new(cwd),
         root_override: None,
@@ -476,6 +502,7 @@ pub fn install_with_root_and_labels<C>(
     let extension = Arc::new(LhcExtension {
         enabled: Arc::new(lhc_enabled),
         model_label: Arc::new(model_label),
+        provider_label: Arc::new(|_c| "openai".to_string()),
         thinking_level_label: Arc::new(thinking_level_label),
         cwd: Arc::new(cwd),
         root_override: Some(root),
@@ -490,6 +517,7 @@ pub fn install_with_root_and_labels<C>(
 struct LhcExtension<C> {
     enabled: Arc<dyn Fn(&C) -> bool + Send + Sync>,
     model_label: Arc<dyn Fn(&C) -> String + Send + Sync>,
+    provider_label: Arc<dyn Fn(&C) -> String + Send + Sync>,
     thinking_level_label: Arc<dyn Fn(&C) -> String + Send + Sync>,
     cwd: Arc<dyn Fn(&C) -> Option<String> + Send + Sync>,
     root_override: Option<PathBuf>,
@@ -502,7 +530,13 @@ impl<C: Sync> LhcExtension<C> {
 }
 
 /// Schedule a background open; never blocks the caller on SQLite (F17).
-fn schedule_open(slot: Arc<LhcCaptureSlot>, thread_id: String, cwd: Option<String>, root: PathBuf) {
+fn schedule_open(
+    slot: Arc<LhcCaptureSlot>,
+    thread_id: String,
+    cwd: Option<String>,
+    root: PathBuf,
+    initial_identity: Option<ModelIdentity>,
+) {
     if slot
         .opening
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -525,11 +559,12 @@ fn schedule_open(slot: Arc<LhcCaptureSlot>, thread_id: String, cwd: Option<Strin
                     return;
                 }
             };
-            let handle = rt.block_on(spawn_capture(
+            let handle = rt.block_on(spawn_capture_with_identity(
                 &thread_id,
                 cwd.as_deref(),
                 Some(root),
                 derivation,
+                initial_identity,
             ));
             match handle {
                 Some(h) => {
@@ -584,8 +619,11 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
             let thread_id = input.thread_store.level_id().to_string();
             let root = self.root();
             let cwd = (self.cwd)(input.config);
+            let model = (self.model_label)(input.config);
+            let provider = (self.provider_label)(input.config);
+            let identity = ModelIdentity::new(provider, model, ModelIdentity::RESPONSES_API);
             // Fire-and-forget open — Session construction continues immediately.
-            schedule_open(slot, thread_id, cwd, root);
+            schedule_open(slot, thread_id, cwd, root, Some(identity));
         })
     }
 
