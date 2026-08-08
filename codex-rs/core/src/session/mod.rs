@@ -103,6 +103,7 @@ use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
 use codex_protocol::openai_models::ModelInfo;
@@ -621,6 +622,46 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        let trusted_guardian_reviewer =
+            crate::guardian::is_guardian_reviewer_source(&session_source)
+                && !matches!(conversation_history, InitialHistory::Resumed(_));
+        if config
+            .config_layer_stack
+            .requirements()
+            .auto_review_required_for_model(&model)
+            && !trusted_guardian_reviewer
+        {
+            let config = Arc::make_mut(&mut config);
+            if matches!(
+                config.legacy_sandbox_policy(),
+                SandboxPolicy::DangerFullAccess
+            ) {
+                let permission_profile = PermissionProfile::workspace_write();
+                config
+                    .permissions
+                    .set_permission_profile(permission_profile.clone())
+                    .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+                if let Some(network) = config.permissions.network.as_ref() {
+                    config.permissions.network = Some(
+                        network
+                            .recompute_for_permission_profile(&permission_profile)
+                            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?,
+                    );
+                }
+            }
+            config
+                .permissions
+                .approval_policy
+                .set(AskForApproval::OnRequest)
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            config
+                .config_layer_stack
+                .requirements()
+                .approvals_reviewer
+                .can_set(&ApprovalsReviewer::AutoReview)
+                .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        }
         if allow_provider_model_fallback
             && let Some(requested_model) = config.model.as_ref()
             && model != *requested_model
@@ -708,6 +749,7 @@ impl Session {
             metrics_service_name,
             app_server_client_name: None,
             app_server_client_version: None,
+            trusted_guardian_reviewer,
             session_source,
             history_mode,
             forked_from_thread_id,
@@ -717,6 +759,9 @@ impl Session {
             dynamic_tools,
             user_shell_override,
         };
+        session_configuration
+            .validate_auto_review_requirement()
+            .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
 
         // Generate a unique ID for the lifetime of this session.
         let session_source_clone = session_configuration.session_source.clone();
@@ -1263,6 +1308,7 @@ impl Session {
         let state = self.state.lock().await;
         BaseInstructions {
             text: state.session_configuration.base_instructions.clone(),
+            provenance: state.base_instructions_provenance.clone(),
         }
     }
 
@@ -1701,7 +1747,7 @@ impl Session {
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         self.schedule_mcp_prewarm();
         let environments = self.services.turn_environments.snapshot().await;
-        let hooks = build_hooks_for_config(
+        let hooks_config = build_hooks_config(
             config.as_ref(),
             self.services.plugins_manager.as_ref(),
             environments.single_local_environment(),
@@ -1715,6 +1761,7 @@ impl Session {
             &state.session_configuration.original_config_do_not_use,
             &config,
         ) {
+            let hooks = self.hooks().reconfigured(hooks_config);
             self.services.hooks.store(Arc::new(hooks));
         }
     }
@@ -4304,12 +4351,12 @@ pub(crate) fn emit_subagent_session_started(
     });
 }
 
-/// Builds the hook engine for one config snapshot, including any enabled plugin hooks.
-async fn build_hooks_for_config(
+/// Builds hook configuration for one config snapshot, including any enabled plugin hooks.
+async fn build_hooks_config(
     config: &Config,
     plugins_manager: &PluginsManager,
     environment: Option<&TurnEnvironment>,
-) -> Hooks {
+) -> HooksConfig {
     let (hook_shell_program, hook_shell_argv) = environment
         .and_then(|environment| environment.shell.as_ref())
         .map(|shell| {
@@ -4323,7 +4370,7 @@ async fn build_hooks_for_config(
     let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
     let plugin_hook_sources = plugin_outcome.effective_plugin_hook_sources();
     let plugin_hook_load_warnings = plugin_outcome.effective_plugin_hook_warnings();
-    Hooks::new(HooksConfig {
+    HooksConfig {
         legacy_notify_argv: config.notify.clone(),
         feature_enabled: config.features.enabled(Feature::CodexHooks),
         bypass_hook_trust: config.bypass_hook_trust,
@@ -4332,7 +4379,7 @@ async fn build_hooks_for_config(
         plugin_hook_load_warnings,
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
-    })
+    }
 }
 
 #[cfg(test)]

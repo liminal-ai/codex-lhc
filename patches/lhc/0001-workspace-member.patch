@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index c3ad0d023d..7026f7781e 100644
+index 8ce32222e2..0062365f92 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -70,6 +70,8 @@ members = [
+@@ -69,6 +69,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,7 +11,7 @@ index c3ad0d023d..7026f7781e 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -209,6 +211,8 @@ codex-git-utils = { path = "git-utils" }
+@@ -207,6 +209,8 @@ codex-git-utils = { path = "git-utils" }
  codex-hooks = { path = "hooks" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }
@@ -20,3 +20,21 @@ index c3ad0d023d..7026f7781e 100644
  codex-lmstudio = { path = "lmstudio" }
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
+diff --git a/codex-rs/code-mode-runtime/Cargo.toml b/codex-rs/code-mode-runtime/Cargo.toml
+index e3708b657e..78670b945d 100644
+--- a/codex-rs/code-mode-runtime/Cargo.toml
++++ b/codex-rs/code-mode-runtime/Cargo.toml
+@@ -21,7 +21,12 @@ serde_json = { workspace = true }
+ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+ tokio-util = { workspace = true, features = ["rt"] }
+ tracing = { workspace = true }
+-v8 = { workspace = true, features = ["v8_enable_sandbox"] }
++# Local-build workaround (G-hook, 2026-08-08): rusty_v8 150.4.0 publishes no
++# x86_64-linux prebuilt for the sandbox variant (404), and building V8 from
++# source is impractical here. The plain release prebuilt exists, so the
++# sandbox feature is dropped for local builds. Revert when upstream's pin
++# gains a published sandbox prebuilt.
++v8 = { workspace = true }
+ 
+ [dev-dependencies]
+ pretty_assertions = { workspace = true }

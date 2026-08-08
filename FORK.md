@@ -91,12 +91,14 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 28 | `core/src/compact_lhc.rs` | startup reconciliation entry before history load (slice E) | (with 0007) |
 | 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
+| 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
-round 9 — see §History-reset recovery R3. Fork-owned and not sentinel-bearing is
-a legitimate combination; fork-owned and *not in any patch* is not. Row 26 is
-the same pattern (impl details under a sentinel-bearing LiveThread API).
+round 9 — see §History-reset recovery R3. Row 31 is likewise non-sentinel build
+policy and is covered by 0001. Fork-owned and not sentinel-bearing is a
+legitimate combination; fork-owned and *not in any patch* is not. Row 26 is the
+same pattern (impl details under a sentinel-bearing LiveThread API).
 
 Expected markers: **52** (`EXPECTED_HOOKS` in the tripwire script).
 Was 54 before the 2026-08-06 upstream sync removed two marker sites while
@@ -283,7 +285,7 @@ patch reproduction at the new base, and the slice-D matrix.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `a7dcd20d38`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `3aae5d885b`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing

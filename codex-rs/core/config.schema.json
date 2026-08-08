@@ -486,6 +486,9 @@
             "code_mode_host": {
               "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
             },
+            "code_mode_interrupt": {
+              "type": "boolean"
+            },
             "code_mode_only": {
               "type": "boolean"
             },
@@ -565,6 +568,9 @@
               "type": "boolean"
             },
             "guardian_approval": {
+              "type": "boolean"
+            },
+            "guardian_reuse_parent_compaction": {
               "type": "boolean"
             },
             "guardianv2": {
@@ -3222,8 +3228,8 @@
           "description": "Fail the turn when multiple tools share the same effective name.",
           "type": "boolean"
         },
-        "include_tool_metadata": {
-          "description": "Include authoritative tool information in request metadata.",
+        "turn_metadata_includes_tool_info": {
+          "description": "Include authoritative tool information in per-turn request metadata.",
           "type": "boolean"
         }
       },
@@ -5151,6 +5157,9 @@
         "code_mode_host": {
           "$ref": "#/definitions/FeatureToml_for_CodeModeHostConfigToml"
         },
+        "code_mode_interrupt": {
+          "type": "boolean"
+        },
         "code_mode_only": {
           "type": "boolean"
         },
@@ -5230,6 +5239,9 @@
           "type": "boolean"
         },
         "guardian_approval": {
+          "type": "boolean"
+        },
+        "guardian_reuse_parent_compaction": {
           "type": "boolean"
         },
         "guardianv2": {

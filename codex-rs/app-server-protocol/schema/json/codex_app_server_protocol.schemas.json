@@ -7385,6 +7385,29 @@
         ],
         "type": "string"
       },
+      "AutoReviewRequirements": {
+        "properties": {
+          "ignoreRules": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "requiredOnModels": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "BrowserUseRequirements": {
         "properties": {
           "disableAutoReview": {
@@ -8789,6 +8812,16 @@
             "type": [
               "array",
               "null"
+            ]
+          },
+          "autoReview": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/AutoReviewRequirements"
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "browserUse": {
@@ -11760,6 +11793,14 @@
           },
           "eventName": {
             "$ref": "#/definitions/v2/HookEventName"
+          },
+          "executionMode": {
+            "allOf": [
+              {
+                "$ref": "#/definitions/v2/HookExecutionMode"
+              }
+            ],
+            "default": "sync"
           },
           "handlerType": {
             "$ref": "#/definitions/v2/HookHandlerType"
@@ -17737,6 +17778,52 @@
           "status"
         ],
         "title": "SendAddCreditsNudgeEmailResponse",
+        "type": "object"
+      },
+      "ServerDiagnosticsGauge": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "value"
+        ],
+        "type": "object"
+      },
+      "ServerDiagnosticsProcess": {
+        "properties": {
+          "id": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "physicalFootprintBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "residentMemoryBytes": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
         "type": "object"
       },
       "ServerRequestResolvedNotification": {

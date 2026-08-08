@@ -237,6 +237,7 @@ pub(crate) fn derivation_prompt(text: &str) -> Prompt {
         // LHC-HOOK: never `..Default::default()` for this field — see above.
         base_instructions: codex_protocol::models::BaseInstructions {
             text: String::new(),
+            provenance: None,
         },
         tools: Vec::new(),
         parallel_tool_calls: false,

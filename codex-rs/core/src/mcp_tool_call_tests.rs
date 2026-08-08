@@ -22,7 +22,6 @@ use codex_config::types::AppsConfigToml;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_features::Features;
-use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::PermissionProfile;
@@ -203,20 +202,18 @@ print({hook_output:?})
         hook_list.hooks,
     );
 
-    session
-        .services
-        .hooks
-        .store(Arc::new(Hooks::new(HooksConfig {
-            feature_enabled: true,
-            config_layer_stack: Some(trusted_config_layer_stack),
-            shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
-            shell_args: if cfg!(windows) {
-                Vec::new()
-            } else {
-                vec!["-c".to_string()]
-            },
-            ..HooksConfig::default()
-        })));
+    let hooks = session.hooks().reconfigured(HooksConfig {
+        feature_enabled: true,
+        config_layer_stack: Some(trusted_config_layer_stack),
+        shell_program: (!cfg!(windows)).then_some("/bin/sh".to_string()),
+        shell_args: if cfg!(windows) {
+            Vec::new()
+        } else {
+            vec!["-c".to_string()]
+        },
+        ..HooksConfig::default()
+    });
+    session.services.hooks.store(Arc::new(hooks));
 
     log_path.to_path_buf()
 }
@@ -1052,6 +1049,7 @@ async fn mcp_tool_call_request_meta_includes_turn_metadata_for_custom_server() {
     assert_eq!(
         meta,
         serde_json::json!({
+            "callId": "call-custom",
             crate::X_CODEX_TURN_METADATA_HEADER: expected_turn_metadata,
         })
     );
@@ -1147,6 +1145,7 @@ async fn plugin_mcp_tool_call_request_meta_includes_plugin_id() {
     assert_eq!(
         build_mcp_tool_call_request_meta(&turn_context, "sample", "call-plugin", Some(&metadata),),
         Some(serde_json::json!({
+            "callId": "call-plugin",
             crate::X_CODEX_TURN_METADATA_HEADER: expected_turn_metadata,
             MCP_TOOL_PLUGIN_ID_META_KEY: "sample@test",
         }))
@@ -1292,6 +1291,7 @@ async fn codex_apps_tool_call_request_meta_includes_turn_metadata_and_codex_apps
             Some(&metadata),
         ),
         Some(serde_json::json!({
+            "callId": "call_abc123xyz789",
             crate::X_CODEX_TURN_METADATA_HEADER: expected_turn_metadata,
             MCP_TOOL_CODEX_APPS_META_KEY: {
                 "call_id": "call_abc123xyz789",
@@ -1319,6 +1319,7 @@ async fn codex_apps_tool_call_request_meta_includes_call_id_without_existing_cod
             /*metadata*/ None,
         ),
         Some(serde_json::json!({
+            "callId": "call_abc123xyz789",
             crate::X_CODEX_TURN_METADATA_HEADER: expected_turn_metadata,
             MCP_TOOL_CODEX_APPS_META_KEY: {
                 "call_id": "call_abc123xyz789",

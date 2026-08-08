@@ -25,7 +25,7 @@ with the working tree, plus that every fork-owned file under `codex-rs/`
 See FORK.md's touchpoint inventory for the authoritative file list, and
 FORK.md §History-reset recovery for the drill this series exists to serve.
 
-## Series (regenerated 2026-08-07 against `BASE` = `a7dcd20d38`)
+## Series (regenerated 2026-08-08 against `BASE` = `3aae5d885b`)
 
 `BASE` advances on every upstream sync — see FORK.md "Sync drill" step 4.
 Regenerate the *whole* series against the new base in the same commit as the
@@ -36,7 +36,7 @@ One base for all seven; each fork-owned file in exactly one patch.
 
 | Patch | Files |
 |-------|-------|
-| 0001-workspace-member | `codex-rs/Cargo.toml` |
+| 0001-workspace-member | `codex-rs/Cargo.toml`, `code-mode-runtime/Cargo.toml` (local V8 artifact workaround) |
 | 0002-raw-item-contributor | `ext/extension-api/{contributors.rs, contributors/raw_item.rs, contributors/turn_lifecycle.rs, lib.rs, registry.rs}`, `ext/goal/tests/goal_extension_backend.rs` (turn timing fields on lifecycle inputs) |
 | 0003-feature-flag | `features/src/lib.rs`, `core/config.schema.json` |
 | 0004-session-raw-item-hook | `core/src/session/mod.rs`, `core/src/session/lhc_capture_e2e_tests.rs`, `core/src/stream_events_utils.rs`, `core/src/compact.rs` |

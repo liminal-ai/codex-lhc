@@ -478,6 +478,14 @@ client_request_definitions! {
         response: v1::InitializeResponse,
     },
 
+    #[experimental("server/diagnostics")]
+    /// Read content-free, process-local diagnostics.
+    ServerDiagnostics => "server/diagnostics" {
+        params: v2::ServerDiagnosticsParams,
+        serialization: None,
+        response: v2::ServerDiagnosticsResponse,
+    },
+
     /// NEW APIs
     // Thread lifecycle
     // Uses `inspect_params` because only some fields are experimental.
@@ -1171,7 +1179,7 @@ client_request_definitions! {
     },
     ExternalAgentConfigDetect => "externalAgentConfig/detect" {
         params: v2::ExternalAgentConfigDetectParams,
-        serialization: global("config"),
+        serialization: global("external-agent-detect"),
         response: v2::ExternalAgentConfigDetectResponse,
     },
     ExternalAgentConfigImport => "externalAgentConfig/import" {

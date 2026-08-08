@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index 0bd41f0968..795a113190 100644
+index 32ad4ea903..12868fa69d 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
-@@ -48,6 +48,8 @@ codex-extension-api = { workspace = true }
+@@ -49,6 +49,8 @@ codex-extension-api = { workspace = true }
  codex-external-agent-migration = { workspace = true }
  codex-features = { workspace = true }
  codex-goal-extension = { workspace = true }
