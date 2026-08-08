@@ -16,6 +16,7 @@ mod materialize;
 mod rollout_reconcile;
 mod rollout_swap;
 mod session;
+mod tools;
 
 pub use band_shape::BandShapeItem;
 pub use band_shape::BandShapeReport;
@@ -79,6 +80,8 @@ pub use idempotency::thinking_level_change_key;
 pub use idempotency::turn_end_key;
 pub use install::LhcCaptureSlot;
 pub use install::LhcTurnId;
+pub use install::LiveRetrievalThread;
+pub use install::RetrievalLifecycleError;
 pub use install::install;
 pub use install::install_with_provider_label;
 pub use mapping::ACTOR_ASSISTANT;

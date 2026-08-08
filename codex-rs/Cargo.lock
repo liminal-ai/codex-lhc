@@ -3393,6 +3393,7 @@ dependencies = [
  "chrono",
  "codex-extension-api",
  "codex-protocol",
+ "codex-utils-output-truncation",
  "lhc",
  "pretty_assertions",
  "serde",

@@ -35,6 +35,9 @@ use codex_extension_api::ThreadResumeInput;
 use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
 use codex_extension_api::TokenUsageContributor;
+use codex_extension_api::ToolCall;
+use codex_extension_api::ToolContributor;
+use codex_extension_api::ToolExecutor;
 use codex_extension_api::TurnAbortInput;
 use codex_extension_api::TurnErrorInput;
 use codex_extension_api::TurnLifecycleContributor;
@@ -125,6 +128,37 @@ enum PendingCmd {
 /// write-backs (H3). Current-body ids/digests are **never** capped (L3).
 pub const SESSION_DERIVED_CAP: usize = 512;
 
+/// Why resolving a live retrieval thread from the capture slot failed.
+///
+/// Validation failures never reach this path — they refuse before any SDK
+/// open. Lifecycle failures also write zero impression rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetrievalLifecycleError {
+    /// Slot exists but the async open has not published a handle yet.
+    NotOpen,
+    /// Background open failed permanently.
+    OpenFailed,
+    /// Thread stop already ran; capture worker is shutting down / gone.
+    Shutdown,
+}
+
+impl RetrievalLifecycleError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NotOpen => "LHC thread is not open yet (capture still starting)",
+            Self::OpenFailed => "LHC capture failed to open; retrieval unavailable",
+            Self::Shutdown => "LHC capture has shut down; retrieval unavailable",
+        }
+    }
+}
+
+/// Live thread identity for retrieval: thread id + LHC root (file path).
+#[derive(Debug, Clone)]
+pub struct LiveRetrievalThread {
+    pub thread_id: String,
+    pub root: PathBuf,
+}
+
 /// Per-thread capture slot: handle is filled asynchronously after start.
 /// Items arriving before open are buffered and flushed when the handle lands.
 pub struct LhcCaptureSlot {
@@ -134,6 +168,8 @@ pub struct LhcCaptureSlot {
     pending_dropped: AtomicU64,
     opening: AtomicBool,
     open_failed: AtomicBool,
+    /// Set when `on_thread_stop` begins — retrieval must refuse after this.
+    stopped: AtomicBool,
     /// Pinned provenance for the **current** installed body (+ durable reseed).
     /// Never subject to [`SESSION_DERIVED_CAP`] eviction (L3).
     pinned_ids: Mutex<HashSet<String>>,
@@ -152,7 +188,9 @@ pub struct LhcCaptureSlot {
 }
 
 impl LhcCaptureSlot {
-    fn new() -> Self {
+    /// Construct an empty slot (tests / internal). Production inserts via
+    /// `on_thread_start`.
+    pub(crate) fn new() -> Self {
         Self {
             handle: Mutex::new(None),
             pending: Mutex::new(VecDeque::new()),
@@ -160,12 +198,43 @@ impl LhcCaptureSlot {
             pending_dropped: AtomicU64::new(0),
             opening: AtomicBool::new(false),
             open_failed: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             pinned_ids: Mutex::new(HashSet::new()),
             pinned_digests: Mutex::new(HashSet::new()),
             superseded_ids: Mutex::new(HashSet::new()),
             superseded_digests: Mutex::new(HashSet::new()),
             derivation_callbacks: crate::inference::LateBoundCallbacks::new(),
         }
+    }
+
+    /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.
+    pub(crate) fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// Resolve the live capture thread for retrieval tools.
+    ///
+    /// Does not open SQLite — only inspects slot lifecycle state and the
+    /// published handle's thread id / root. Callers open via
+    /// [`crate::session::thread_file_path`] + `ThreadRef::file_path`.
+    pub fn resolve_for_retrieval(&self) -> Result<LiveRetrievalThread, RetrievalLifecycleError> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(RetrievalLifecycleError::Shutdown);
+        }
+        if self.open_failed.load(Ordering::SeqCst) {
+            return Err(RetrievalLifecycleError::OpenFailed);
+        }
+        let Some(handle) = self.get() else {
+            return Err(RetrievalLifecycleError::NotOpen);
+        };
+        let root = handle
+            .root()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(lhc_root);
+        Ok(LiveRetrievalThread {
+            thread_id: handle.thread_id().to_string(),
+            root,
+        })
     }
 
     /// Install the production derivation callbacks the capture session's
@@ -490,7 +559,10 @@ pub fn install_with_provider_label<C>(
     registry.turn_lifecycle_contributor(extension.clone());
     registry.token_usage_contributor(extension.clone());
     registry.raw_item_contributor(extension.clone());
-    registry.config_contributor(extension);
+    registry.config_contributor(extension.clone());
+    // Retrieval tools (get_turns / get_messages) — same LhcCapture gate as the
+    // slot: tools() only contributes when the slot is present.
+    registry.tool_contributor(extension);
 }
 
 /// Test helper: install with a forced LHC root directory.
@@ -536,7 +608,8 @@ pub fn install_with_root_and_labels<C>(
     registry.turn_lifecycle_contributor(extension.clone());
     registry.token_usage_contributor(extension.clone());
     registry.raw_item_contributor(extension.clone());
-    registry.config_contributor(extension);
+    registry.config_contributor(extension.clone());
+    registry.tool_contributor(extension);
 }
 
 struct LhcExtension<C> {
@@ -671,12 +744,30 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
 
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>()
-                && let Some(handle) = slot.get()
-            {
-                shutdown_capture_send(handle).await;
+            if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() {
+                // Refuse retrieval before the worker teardown so tools cannot
+                // race a half-shutdown channel/session.
+                slot.mark_stopped();
+                if let Some(handle) = slot.get() {
+                    shutdown_capture_send(handle).await;
+                }
             }
         })
+    }
+}
+
+impl<C: Send + Sync + 'static> ToolContributor for LhcExtension<C> {
+    fn tools(
+        &self,
+        _session_store: &ExtensionData,
+        thread_store: &ExtensionData,
+    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+        // Same gate as capture: slot is only inserted when LhcCapture is on at
+        // thread start. No slot → no retrieval tools.
+        let Some(slot) = thread_store.get::<LhcCaptureSlot>() else {
+            return Vec::new();
+        };
+        crate::tools::retrieval_tools(slot)
     }
 }
 
