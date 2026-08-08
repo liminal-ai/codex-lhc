@@ -18,6 +18,7 @@ use codex_extension_api::ToolSpec;
 use codex_extension_api::parse_tool_input_schema;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
+use codex_utils_output_truncation::TruncationPolicy;
 use lhc::OpResult;
 use lhc::RetrievalOptions;
 use lhc::ThreadRef;
@@ -33,15 +34,6 @@ use crate::session::thread_file_path;
 /// Fixed per-call token budget (TS `PULL_TOKEN_BUDGET` / format module).
 pub const PULL_TOKEN_BUDGET: i64 = format::PULL_TOKEN_BUDGET;
 
-/// codex-core middle-truncates every FunctionCallOutput recorded to history
-/// at the model's truncation_policy (`context_manager/history.rs` process_item,
-/// policy × 1.2 serialization allowance; gpt-5.6 family sets 10,000 in
-/// models.json). A truncated assembly would silently break the verbatim
-/// envelope/continuation contract — the footer's `from` would skip content
-/// core removed. So the ASSEMBLED output must stay under the raw policy:
-/// bodies budget shrinks with id count so worst-case assembly ≤ 9,500.
-const MAX_ASSEMBLED_OUTPUT_TOKENS: i64 = 9_500;
-
 /// Worst-case non-body tokens per requested id, from the SDK's analytic
 /// component table (`retrieval/format.rs`): unserved echo line 240 dominates
 /// served (separator + section wrap + footer ≈ 207); rounded up.
@@ -50,20 +42,39 @@ const PER_ID_OVERHEAD_TOKENS: i64 = 250;
 /// Envelope open/close + first separator, from the same table (85 + 97).
 const FIXED_OVERHEAD_TOKENS: i64 = 182;
 
-/// codex-core's truncation counts "tokens" as bytes/4 (`utils/string/
-/// truncate.rs` approx_bytes_for_tokens): the 10,000-token policy × 1.2
-/// allowance passes at most 48,000 bytes untouched. SDK tokens are real
-/// o200k tokens, so compression-heavy content (repeated log lines) can be
-/// few tokens but many bytes — the token bound alone cannot bound bytes.
-/// Assembled output is therefore also checked in BYTES; margin under 48k.
-const MAX_ASSEMBLED_OUTPUT_BYTES: usize = 38_000;
+/// Safety margin under a tokens-mode policy: assembly must land below the
+/// RAW policy limit (core's ×1.2 serialization allowance is extra margin).
+const TOKEN_POLICY_MARGIN: i64 = 500;
 
-/// Bodies budget for one call: the fixed 8,000 unless the id count's
-/// worst-case overhead would push the assembly past the enforcement
-/// ceiling. Monotone in id count; ≥ 1,318 even at the SDK's 32-id cap.
-fn bounded_budget(id_count: usize) -> i64 {
-    let overhead = FIXED_OVERHEAD_TOKENS + (id_count as i64) * PER_ID_OVERHEAD_TOKENS;
-    PULL_TOKEN_BUDGET.min(MAX_ASSEMBLED_OUTPUT_TOKENS - overhead)
+/// codex-core middle-truncates every FunctionCallOutput recorded to history
+/// at the model's truncation policy (`context_manager/history.rs`
+/// process_item, ×1.2 serialization allowance), counting "tokens" as
+/// bytes/4 (`utils/string/truncate.rs`). A truncated assembly would
+/// silently break the verbatim envelope/continuation contract — the
+/// footer's `from` would skip content core removed. So the whole assembly
+/// must fit the LIVE policy of the calling turn in BOTH units: bodies get
+/// a token budget shrunk by worst-case receipt overhead, plus a byte
+/// budget the SDK slices to directly (SDK tokens are real o200k tokens;
+/// BPE packs long runs token-cheap but byte-heavy, so tokens alone cannot
+/// bound bytes). One SDK call, receipts and impressions exact.
+fn budgets_for(policy: &TruncationPolicy, id_count: usize) -> (i64, f64) {
+    let overhead_tokens = FIXED_OVERHEAD_TOKENS + (id_count as i64) * PER_ID_OVERHEAD_TOKENS;
+    let overhead_bytes = (overhead_tokens as usize) * 4;
+    let (token_ceiling, byte_base) = match policy {
+        // Tokens-mode: core passes ~4 bytes per policy token; stay under
+        // the raw limit in both units.
+        TruncationPolicy::Tokens(limit) => {
+            let raw = *limit as i64;
+            ((raw - TOKEN_POLICY_MARGIN).max(512), (*limit) * 4)
+        }
+        // Bytes-mode: bytes bind; the fixed token budget stays.
+        TruncationPolicy::Bytes(limit) => (i64::MAX, *limit),
+    };
+    let token_budget = PULL_TOKEN_BUDGET
+        .min(token_ceiling.saturating_sub(overhead_tokens))
+        .max(256);
+    let byte_budget = byte_base.saturating_sub(overhead_bytes).max(1_024);
+    (token_budget, byte_budget as f64)
 }
 
 /// Order-preserving dedupe — the SDK dedupes before its 32-id cap, so the
@@ -74,26 +85,6 @@ fn dedupe_ids(ids: Vec<String>) -> Vec<String> {
     ids.into_iter()
         .filter(|id| seen.insert(id.clone()))
         .collect()
-}
-
-/// Ratio-derived budget shrink for the byte-check retry: scale the token
-/// budget by the byte overage (with a 0.9 margin), floored at the SDK's
-/// 256-token partial-serve minimum.
-fn shrunk_budget_for_bytes(budget: i64, assembled_bytes: usize) -> i64 {
-    let scaled =
-        (budget as f64) * (MAX_ASSEMBLED_OUTPUT_BYTES as f64) / (assembled_bytes as f64) * 0.9;
-    (scaled as i64).max(256)
-}
-
-/// Terminal refusal when even the shrunk retry stays over the byte ceiling
-/// — never truncate an assembly (that would break the continuation
-/// contract); tell the model how to narrow the request instead.
-fn byte_density_refusal(what: &str) -> String {
-    format!(
-        "recalled {what} are unusually byte-dense for this host's output limit \
-         ({MAX_ASSEMBLED_OUTPUT_BYTES} bytes) — request fewer ids per call, or \
-         walk one id with successive from: offsets"
-    )
 }
 
 pub const GET_TURNS_TOOL_NAME: &str = "get_turns";
@@ -189,61 +180,42 @@ impl GetTurnsTool {
         let args = parse_retrieval_args(&call, IdKind::Turn)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
-        let mut budget = bounded_budget(ids.len());
-        // Byte-check loop: one ratio-derived shrink retry when compression-
-        // heavy content is token-cheap but byte-heavy (core truncates on
-        // bytes/4). The rare retry writes a second impression call — honest:
-        // two SDK serves happened, the host discarded the oversized one.
-        for attempt in 0..2 {
-            let options = RetrievalOptions {
-                token_budget: Some(budget as f64),
-                from_token: Some(args.from_token as f64),
-                surface: Some(GET_TURNS_TOOL_NAME.to_string()),
-            };
-            // LHC SQLite transactions are !Send (thread-local instance seam).
-            // Run on a current-thread runtime inside spawn_blocking so the
-            // ToolExecutor future stays Send for the multi-thread runtime.
-            let call_ids = ids.clone();
-            let call_ref = thread_ref.clone();
-            let receipt = run_lhc_blocking(move || async move {
-                retrieval::get_turns(call_ref, &call_ids, Some(options)).await
-            })
-            .await?;
-            let receipt = match receipt {
-                OpResult::Ok { value } => value,
-                OpResult::Err { error } => {
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "get_turns failed: {}",
-                        error.reason
-                    )));
-                }
-            };
-            let mut sections = Vec::with_capacity(receipt.served.len());
-            let mut footers = Vec::new();
-            for turn in &receipt.served {
-                sections.push(format::turn_section(&turn.text));
-                if let Some(footer) =
-                    format::section_footer(GET_TURNS_TOOL_NAME, &turn.turn_id, turn.slice.as_ref())
-                {
-                    footers.push(footer);
-                }
+        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len());
+        let options = RetrievalOptions {
+            token_budget: Some(token_budget as f64),
+            byte_budget: Some(byte_budget),
+            from_token: Some(args.from_token as f64),
+            surface: Some(GET_TURNS_TOOL_NAME.to_string()),
+        };
+        // LHC SQLite transactions are !Send (thread-local instance seam).
+        // Run on a current-thread runtime inside spawn_blocking so the
+        // ToolExecutor future stays Send for the multi-thread runtime.
+        let receipt = run_lhc_blocking(move || async move {
+            retrieval::get_turns(thread_ref, &ids, Some(options)).await
+        })
+        .await?;
+        let receipt = match receipt {
+            OpResult::Ok { value } => value,
+            OpResult::Err { error } => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "get_turns failed: {}",
+                    error.reason
+                )));
             }
-            let text = format::assemble_result(
-                GET_TURNS_TOOL_NAME,
-                &sections,
-                &footers,
-                &receipt.unserved,
-            );
-            if text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES {
-                return Ok(Box::new(TextToolOutput::new(text)));
-            }
-            if attempt == 0 {
-                budget = shrunk_budget_for_bytes(budget, text.len());
+        };
+        let mut sections = Vec::with_capacity(receipt.served.len());
+        let mut footers = Vec::new();
+        for turn in &receipt.served {
+            sections.push(format::turn_section(&turn.text));
+            if let Some(footer) =
+                format::section_footer(GET_TURNS_TOOL_NAME, &turn.turn_id, turn.slice.as_ref())
+            {
+                footers.push(footer);
             }
         }
-        Err(FunctionCallError::RespondToModel(byte_density_refusal(
-            "turns",
-        )))
+        let text =
+            format::assemble_result(GET_TURNS_TOOL_NAME, &sections, &footers, &receipt.unserved);
+        Ok(Box::new(TextToolOutput::new(text)))
     }
 }
 
@@ -252,57 +224,45 @@ impl GetMessagesTool {
         let args = parse_retrieval_args(&call, IdKind::Message)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
-        let mut budget = bounded_budget(ids.len());
-        // Byte-check loop — see GetTurnsTool::handle_call.
-        for attempt in 0..2 {
-            let options = RetrievalOptions {
-                token_budget: Some(budget as f64),
-                from_token: Some(args.from_token as f64),
-                surface: Some(GET_MESSAGES_TOOL_NAME.to_string()),
-            };
-            let call_ids = ids.clone();
-            let call_ref = thread_ref.clone();
-            let receipt = run_lhc_blocking(move || async move {
-                retrieval::get_messages(call_ref, &call_ids, Some(options)).await
-            })
-            .await?;
-            let receipt = match receipt {
-                OpResult::Ok { value } => value,
-                OpResult::Err { error } => {
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "get_messages failed: {}",
-                        error.reason
-                    )));
-                }
-            };
-            let mut sections = Vec::with_capacity(receipt.served.len());
-            let mut footers = Vec::new();
-            for message in &receipt.served {
-                sections.push(format::message_section(&message.message_id, &message.text));
-                if let Some(footer) = format::section_footer(
-                    GET_MESSAGES_TOOL_NAME,
-                    &message.message_id,
-                    message.slice.as_ref(),
-                ) {
-                    footers.push(footer);
-                }
+        let (token_budget, byte_budget) = budgets_for(&call.truncation_policy, ids.len());
+        let options = RetrievalOptions {
+            token_budget: Some(token_budget as f64),
+            byte_budget: Some(byte_budget),
+            from_token: Some(args.from_token as f64),
+            surface: Some(GET_MESSAGES_TOOL_NAME.to_string()),
+        };
+        let receipt = run_lhc_blocking(move || async move {
+            retrieval::get_messages(thread_ref, &ids, Some(options)).await
+        })
+        .await?;
+        let receipt = match receipt {
+            OpResult::Ok { value } => value,
+            OpResult::Err { error } => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "get_messages failed: {}",
+                    error.reason
+                )));
             }
-            let text = format::assemble_result(
+        };
+        let mut sections = Vec::with_capacity(receipt.served.len());
+        let mut footers = Vec::new();
+        for message in &receipt.served {
+            sections.push(format::message_section(&message.message_id, &message.text));
+            if let Some(footer) = format::section_footer(
                 GET_MESSAGES_TOOL_NAME,
-                &sections,
-                &footers,
-                &receipt.unserved,
-            );
-            if text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES {
-                return Ok(Box::new(TextToolOutput::new(text)));
-            }
-            if attempt == 0 {
-                budget = shrunk_budget_for_bytes(budget, text.len());
+                &message.message_id,
+                message.slice.as_ref(),
+            ) {
+                footers.push(footer);
             }
         }
-        Err(FunctionCallError::RespondToModel(byte_density_refusal(
-            "messages",
-        )))
+        let text = format::assemble_result(
+            GET_MESSAGES_TOOL_NAME,
+            &sections,
+            &footers,
+            &receipt.unserved,
+        );
+        Ok(Box::new(TextToolOutput::new(text)))
     }
 }
 
@@ -764,28 +724,37 @@ mod tests {
         }
     }
 
-    fn assert_bounded(id_count: usize, expected: i64) {
-        assert_eq!(bounded_budget(id_count), expected, "id_count={id_count}");
-    }
-
-    /// Worst-case assembly (bodies + fixed + per-id overhead) must stay ≤
-    /// 9,500 for every id count the SDK admits, and small pulls keep the
-    /// full 8,000 bodies budget.
+    /// Policy-derived budgets: worst-case assembly (bodies + overhead) must
+    /// fit the live truncation policy in both units, for every id count the
+    /// SDK admits and both policy modes.
     #[test]
-    fn bounded_budget_keeps_assembly_under_core_truncation() {
-        assert_bounded(1, PULL_TOKEN_BUDGET);
-        assert_bounded(5, PULL_TOKEN_BUDGET);
-        assert_bounded(6, 7_818);
-        assert_bounded(32, 1_318);
+    fn budgets_track_the_live_truncation_policy() {
+        // gpt-5.6 shape: Tokens(10_000). Small pulls keep the full 8,000.
+        let tokens_policy = TruncationPolicy::Tokens(10_000);
+        assert_eq!(budgets_for(&tokens_policy, 1).0, PULL_TOKEN_BUDGET);
+        assert_eq!(budgets_for(&tokens_policy, 5).0, PULL_TOKEN_BUDGET);
+        assert_eq!(budgets_for(&tokens_policy, 6).0, 7_818);
         for n in 1..=32usize {
-            let budget = bounded_budget(n);
-            assert!(budget >= 1_318, "n={n}: budget {budget} collapsed");
-            let worst = budget + FIXED_OVERHEAD_TOKENS + (n as i64) * PER_ID_OVERHEAD_TOKENS;
+            let (token_budget, byte_budget) = budgets_for(&tokens_policy, n);
+            let overhead = FIXED_OVERHEAD_TOKENS + (n as i64) * PER_ID_OVERHEAD_TOKENS;
+            assert!(token_budget >= 256, "n={n}: token budget collapsed");
             assert!(
-                worst <= MAX_ASSEMBLED_OUTPUT_TOKENS,
-                "n={n}: worst-case assembly {worst} exceeds ceiling"
+                token_budget + overhead <= 10_000 - TOKEN_POLICY_MARGIN,
+                "n={n}: token worst case exceeds policy"
+            );
+            assert!(
+                byte_budget as usize + (overhead as usize) * 4 <= 40_000,
+                "n={n}: byte worst case exceeds policy bytes"
             );
         }
+        // Bytes-mode (gpt-5.2 shape): bytes bind, token budget stays fixed.
+        let bytes_policy = TruncationPolicy::Bytes(10_000);
+        let (token_budget, byte_budget) = budgets_for(&bytes_policy, 1);
+        assert_eq!(token_budget, PULL_TOKEN_BUDGET);
+        assert_eq!(byte_budget as usize, 10_000 - (182 + 250) * 4);
+        // Tiny pathological policies floor, never go negative.
+        let (t, b) = budgets_for(&TruncationPolicy::Bytes(100), 32);
+        assert!(t >= 256 && b as usize >= 1_024);
     }
 
     #[tokio::test]
@@ -871,17 +840,17 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_and_shrink_helpers() {
+    fn dedupe_preserves_order_and_protects_the_budget() {
         // 38 copies of one id must budget as one id, not go negative.
         let ids = dedupe_ids(vec!["t1".to_string(); 38]);
         assert_eq!(ids.len(), 1);
-        assert_eq!(bounded_budget(ids.len()), PULL_TOKEN_BUDGET);
+        assert_eq!(
+            budgets_for(&TruncationPolicy::Tokens(10_000), ids.len()).0,
+            PULL_TOKEN_BUDGET
+        );
         // Order preserved, later duplicates dropped.
         let ids = dedupe_ids(vec!["t2".into(), "t1".into(), "t2".into(), "t3".into()]);
         assert_eq!(ids, vec!["t2".to_string(), "t1".into(), "t3".into()]);
-        // Shrink is ratio-proportional with margin, floored at 256.
-        assert_eq!(shrunk_budget_for_bytes(8_000, 76_000), 3_600);
-        assert_eq!(shrunk_budget_for_bytes(300, 10_000_000), 256);
     }
 
     /// Compression-heavy content (long token-cheap byte-heavy runs) must
@@ -922,23 +891,24 @@ mod tests {
             .iter()
             .find(|t| t.tool_name() == ToolName::plain(GET_TURNS_TOOL_NAME))
             .unwrap();
-        match get_turns
+        // The test policy is Bytes(64KiB); the SDK byte-fits the slice in
+        // ONE call — a served result under the policy-derived allowance,
+        // with a token-denominated continuation receipt.
+        let output = get_turns
             .handle(tool_call(GET_TURNS_TOOL_NAME, json!({ "ids": ["t1"] })))
             .await
-        {
-            Ok(output) => {
-                let text = output_text(output);
-                assert!(
-                    text.len() <= MAX_ASSEMBLED_OUTPUT_BYTES,
-                    "served assembly is {} bytes — core would truncate it",
-                    text.len()
-                );
-            }
-            Err(err) => {
-                // Terminal refusal is acceptable; silent oversize is not.
-                assert!(err.to_string().contains("byte-dense"), "got: {err}");
-            }
-        }
+            .expect("byte-dense pull must serve a byte-fit slice");
+        let text = output_text(output);
+        let (_, byte_budget) = budgets_for(&TruncationPolicy::Bytes(64 * 1024), 1);
+        assert!(
+            text.len() <= byte_budget as usize + 4_096,
+            "served assembly is {} bytes — core would truncate it",
+            text.len()
+        );
+        assert!(
+            text.contains("[from,to)") || text.contains("from:") || text.contains("get_turns"),
+            "continuation guidance missing"
+        );
     }
 
     #[tokio::test]

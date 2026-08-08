@@ -27,6 +27,7 @@ required-features = ["test-util"]
 chrono = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
+codex-utils-output-truncation = { workspace = true }
 lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
@@ -35,7 +36,6 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros
 tracing = { workspace = true }
 
 [dev-dependencies]
-codex-utils-output-truncation = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
