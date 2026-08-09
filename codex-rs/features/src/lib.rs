@@ -275,7 +275,7 @@ pub enum Feature {
     PreventIdleSleep,
     /// Enable remote compaction v2 over the normal Responses API.
     RemoteCompactionV2,
-    /// Enable LHC long-horizon capture (parallel SQLite record; default off).
+    /// Enable LHC long-horizon capture (parallel SQLite record; product default on).
     // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
     LhcCapture,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
@@ -1508,12 +1508,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         stage: Stage::Stable,
         default_enabled: true,
     },
-    // LHC-HOOK 3/8: FeatureSpec for LhcCapture (default OFF).
+    // LHC-HOOK 3/8: FeatureSpec for LhcCapture (default ON in the product fork).
     FeatureSpec {
         id: Feature::LhcCapture,
         key: "lhc_capture",
-        stage: Stage::UnderDevelopment,
-        default_enabled: false,
+        stage: Stage::Stable,
+        default_enabled: true,
     },
     FeatureSpec {
         id: Feature::UseAgentIdentity,

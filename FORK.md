@@ -69,7 +69,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 |---|------|---------|-------|
 | 1 | `codex-rs/Cargo.toml` | workspace member + path dep for `lhc/codex-lhc-host` | `0001-workspace-member` |
 | 2 | `ext/extension-api` | additive `RawItemContributor` / `RawItemProvenance` + registry | `0002-raw-item-contributor` |
-| 3 | `features/src/lib.rs` | `Feature::LhcCapture` (default OFF) | `0003-feature-flag` |
+| 3 | `features/src/lib.rs` | `Feature::LhcCapture` (product default ON) | `0003-feature-flag` |
 | 4 | `core/src/session/mod.rs` | provenance-carrying record path + `send_raw_response_items` fan-out + e2e module | `0004-session-raw-item-hook` |
 | 4a | `ext/extension-api/src/contributors/turn_lifecycle.rs` | turn start/stop/abort inputs carry optional host `started_at`/`completed_at` (schema v5 timing) | (with 0002) |
 | 4b | `core/src/tasks/lifecycle.rs` + `tasks/mod.rs` | pass host turn timestamps into turn lifecycle emitters; abort path returns timing from `handle_task_abort` | (with 0007) |
@@ -435,13 +435,15 @@ changes) that arrive before the handle is ready are **buffered** (same cap
 as the capture queue) and flushed on open. Prefer a complete session
 opening over silent loss of the first user prompt.
 
-## Flag-off semantics
+## Feature-gate semantics
 
-With `Feature::LhcCapture` default OFF: `on_thread_start` returns immediately
-and does not open a worker or insert a slot. Contributors remain registered
-(one `Box::pin` ready-future per raw-item batch is ~cheap); **no LHC I/O,
-no SQLite, no mapping**. Not bit-identical registration to upstream empty
-registry, but no LHC code path that touches durable state.
+The product fork defaults `Feature::LhcCapture` ON because LHC is the product,
+not an optional build flavor. With the feature explicitly OFF,
+`on_thread_start` returns immediately and does not open a worker or insert a
+slot. Contributors remain registered (one `Box::pin` ready-future per raw-item
+batch is ~cheap); **no LHC I/O, no SQLite, no mapping**. This is not
+bit-identical registration to an upstream empty registry, but no LHC code path
+touches durable state.
 
 ## Turn abort / SIGINT capture (slice A + F-L3 live-cert)
 

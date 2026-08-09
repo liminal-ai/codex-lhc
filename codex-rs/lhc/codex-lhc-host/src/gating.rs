@@ -1,7 +1,8 @@
 //! Feature gate and LHC storage root for Codex capture.
 //!
 //! Production enablement is the `Feature::LhcCapture` config.toml flag
-//! (default OFF). Tests may override the storage root via `CODEX_LHC_ROOT`.
+//! (default ON in the product fork). Tests may override the storage root via
+//! `CODEX_LHC_ROOT`.
 
 use std::path::PathBuf;
 

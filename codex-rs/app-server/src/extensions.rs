@@ -121,7 +121,7 @@ where
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
-    // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default OFF).
+    // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default ON).
     // TUI and exec both ride the in-process app-server, so this site covers the main frontends.
     // Model/thinking labels feed the free ConfigContributor seam (G1 / F15).
     codex_lhc_host::install_with_provider_label(
@@ -138,7 +138,7 @@ where
             config
                 .model_reasoning_effort
                 .as_ref()
-                .map(|e| e.to_string())
+                .map(std::string::ToString::to_string)
                 .unwrap_or_else(|| "none".to_string())
         },
         |config: &Config| Some(config.cwd.to_string_lossy().into_owned()),
@@ -324,16 +324,14 @@ mod tests {
     /// so an empty list means `codex_lhc_host::install` was dropped or no-oped.
     ///
     /// Feature gating is runtime on the contributor (not registry shape):
-    /// flag OFF → no `LhcCaptureSlot`; flag ON → slot present.
+    /// flag ON → slot present; explicit OFF → no `LhcCaptureSlot`.
     #[tokio::test]
     async fn thread_extensions_registers_lhc_raw_item_contributor() -> anyhow::Result<()> {
         use crate::extensions::guardian_agent_spawner;
         use codex_core::config::ConfigOverrides;
         use codex_core::init_state_db;
-        use codex_core::thread_store_from_config;
         use codex_exec_server::EnvironmentManager;
         use codex_extension_api::NoopExtensionEventSink;
-        use codex_extension_api::ThreadLifecycleContributor as _;
         use codex_extension_api::ThreadStartInput;
         use codex_login::AuthManager;
         use codex_login::CodexAuth;
@@ -363,7 +361,6 @@ mod tests {
         let state_db = init_state_db(&config)
             .await
             .expect("state db for thread_extensions test");
-        let thread_store = thread_store_from_config(&config, Some(state_db.clone()));
         let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
         let executor_skill_provider: Arc<dyn codex_skills_extension::SkillProvider> = Arc::new(
             codex_skills_extension::ExecutorSkillProvider::new_with_restriction_product(
@@ -386,7 +383,7 @@ mod tests {
                 executor_skill_provider,
                 git_attribution_base_url: config.chatgpt_base_url.clone(),
                 http_client_factory: config.http_client_factory(),
-                thread_store: Arc::clone(&thread_store),
+                queue_store: None,
             },
         );
 
@@ -395,9 +392,9 @@ mod tests {
             "thread_extensions must register LHC raw-item contributor (install missing or no-op)"
         );
 
-        // Runtime flag OFF (default): on_thread_start must not open a capture slot.
-        let session_store = codex_extension_api::ExtensionData::new("s-lhc-flag-off");
-        let thread_store_data = codex_extension_api::ExtensionData::new("t-lhc-flag-off");
+        // Runtime flag ON (default): slot is installed.
+        let session_store = codex_extension_api::ExtensionData::new("s-lhc-default-on");
+        let thread_store_data = codex_extension_api::ExtensionData::new("t-lhc-default-on");
         let environments = [];
         let source = SessionSource::Exec;
         for c in registry.thread_lifecycle_contributors() {
@@ -407,6 +404,7 @@ mod tests {
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
+                extension_metrics: None,
                 session_store: &session_store,
                 thread_store: &thread_store_data,
             })
@@ -415,17 +413,17 @@ mod tests {
         assert!(
             thread_store_data
                 .get::<codex_lhc_host::LhcCaptureSlot>()
-                .is_none(),
-            "LhcCapture default OFF must not install a capture slot"
+                .is_some(),
+            "LhcCapture default ON must install a capture slot"
         );
 
-        // Runtime flag ON: slot is installed.
+        // Explicit runtime flag OFF: no slot is installed.
         config
             .features
-            .set_enabled(codex_features::Feature::LhcCapture, true)
-            .expect("enable LhcCapture");
-        let session_store_on = codex_extension_api::ExtensionData::new("s-lhc-flag-on");
-        let thread_store_on = codex_extension_api::ExtensionData::new("t-lhc-flag-on");
+            .set_enabled(codex_features::Feature::LhcCapture, false)
+            .expect("disable LhcCapture");
+        let session_store_off = codex_extension_api::ExtensionData::new("s-lhc-flag-off");
+        let thread_store_off = codex_extension_api::ExtensionData::new("t-lhc-flag-off");
         for c in registry.thread_lifecycle_contributors() {
             c.on_thread_start(ThreadStartInput {
                 config: &config,
@@ -433,16 +431,17 @@ mod tests {
                 persistent_thread_state_available: false,
                 environments: &environments,
                 mcp_resource_client: None,
-                session_store: &session_store_on,
-                thread_store: &thread_store_on,
+                extension_metrics: None,
+                session_store: &session_store_off,
+                thread_store: &thread_store_off,
             })
             .await;
         }
         assert!(
-            thread_store_on
+            thread_store_off
                 .get::<codex_lhc_host::LhcCaptureSlot>()
-                .is_some(),
-            "LhcCapture ON must install a capture slot via the registered contributor"
+                .is_none(),
+            "LhcCapture OFF must not install a capture slot"
         );
 
         Ok(())
