@@ -38,7 +38,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             kind: windows
           - label: macos-aarch64
-            runner: blacksmith-12vcpu-macos-26
+            runner: macos-15
             platform: macos-aarch64
             target: aarch64-apple-darwin
             kind: unix
