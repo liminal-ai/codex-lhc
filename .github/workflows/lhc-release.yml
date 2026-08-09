@@ -67,6 +67,18 @@ jobs:
           test "$VERSION" = "$cargo_version"
 
       - uses: ./.github/actions/setup-ci
+        if: matrix.kind != 'windows'
+      - name: Configure Windows build paths
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $target = Join-Path $env:RUNNER_TEMP "ct"
+          New-Item $target -ItemType Directory -Force | Out-Null
+          "CARGO_TARGET_DIR=$target" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+        if: matrix.kind == 'windows'
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
           targets: ${{ matrix.target }}
