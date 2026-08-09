@@ -36,7 +36,7 @@ One base for all seven; each fork-owned file in exactly one patch.
 
 | Patch | Files |
 |-------|-------|
-| 0001-workspace-member | `codex-rs/Cargo.toml`, `code-mode-runtime/Cargo.toml` (local V8 artifact workaround) |
+| 0001-workspace-member | `codex-rs/Cargo.toml`, `code-mode-runtime/Cargo.toml` (local V8 artifact workaround), `cli/Cargo.toml` (product release identity) |
 | 0002-raw-item-contributor | `ext/extension-api/{contributors.rs, contributors/raw_item.rs, contributors/turn_lifecycle.rs, lib.rs, registry.rs}`, `ext/goal/tests/goal_extension_backend.rs` (turn timing fields on lifecycle inputs) |
 | 0003-feature-flag | `features/src/lib.rs`, `core/config.schema.json` |
 | 0004-session-raw-item-hook | `core/src/session/mod.rs`, `core/src/session/lhc_capture_e2e_tests.rs`, `core/src/stream_events_utils.rs`, `core/src/compact.rs` |

@@ -56,6 +56,9 @@ jobs:
           expected="$(tr -d '[:space:]' < lhc-release/VERSION)"
           [[ "$version" == "$expected" ]] \
             || { echo "requested $version, source declares $expected" >&2; exit 1; }
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/cli/Cargo.toml)"
+          [[ "$version" == "$cargo_version" ]] \
+            || { echo "requested $version, codex-cli declares $cargo_version" >&2; exit 1; }
           if [[ "${{ inputs.publish }}" == "true" && "${GITHUB_REF_NAME}" != "lhc" ]]; then
             echo "publishing is restricted to the lhc product branch" >&2
             exit 1
@@ -87,6 +90,7 @@ jobs:
           install -m 0755 codex-rs/target/release/codex "$stage/bin/codex"
           install -m 0755 codex-rs/target/release/codex-code-mode-host \
             "$stage/bin/codex-code-mode-host"
+          strip "$stage/bin/codex" "$stage/bin/codex-code-mode-host"
           source_commit="$(git rev-parse HEAD)"
           upstream_commit="$(tr -d '[:space:]' < patches/lhc/BASE)"
           lhc_commit="$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)"

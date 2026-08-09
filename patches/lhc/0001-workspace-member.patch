@@ -20,6 +20,18 @@ index 8ce32222e2..0062365f92 100644
  codex-lmstudio = { path = "lmstudio" }
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
+diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
+index 0fe910d272..dfb5db7476 100644
+--- a/codex-rs/cli/Cargo.toml
++++ b/codex-rs/cli/Cargo.toml
+@@ -1,6 +1,6 @@
+ [package]
+ name = "codex-cli"
+-version.workspace = true
++version = "0.1.0"
+ edition.workspace = true
+ license.workspace = true
+ build = "build.rs"
 diff --git a/codex-rs/code-mode-runtime/Cargo.toml b/codex-rs/code-mode-runtime/Cargo.toml
 index e3708b657e..78670b945d 100644
 --- a/codex-rs/code-mode-runtime/Cargo.toml

@@ -100,11 +100,13 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
 | 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
+| 32 | `cli/Cargo.toml` | Codex-LHC product release version reported by `codex --version` | `0001-workspace-member` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
 round 9 — see §History-reset recovery R3. Row 31 is likewise non-sentinel build
-policy and is covered by 0001. Fork-owned and not sentinel-bearing is a
+policy and is covered by 0001. Row 32 is the fork release identity and is also
+non-sentinel policy. Fork-owned and not sentinel-bearing is a
 legitimate combination; fork-owned and *not in any patch* is not. Row 26 is the
 same pattern (impl details under a sentinel-bearing LiveThread API).
 
