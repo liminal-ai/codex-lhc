@@ -1,0 +1,122 @@
+name: Promote Codex LHC release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release SemVer"
+        required: true
+        default: "0.1.0"
+        type: string
+      candidate_run_id:
+        description: "Successful Codex LHC candidate run id"
+        required: true
+        type: string
+      smoke_run_id:
+        description: "Successful Daytona smoke run id for that candidate"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: write
+
+concurrency:
+  group: codex-lhc-promote-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote exact tested candidate
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 30
+    environment: production
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Verify candidate and smoke workflow identities
+        id: identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+        run: |
+          set -euo pipefail
+          candidate="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
+          smoke="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SMOKE_RUN_ID")"
+          test "$(jq -r .conclusion <<<"$candidate")" = success
+          test "$(jq -r .path <<<"$candidate")" = .github/workflows/lhc-release.yml
+          test "$(jq -r .conclusion <<<"$smoke")" = success
+          test "$(jq -r .path <<<"$smoke")" = .github/workflows/lhc-smoke-daytona.yml
+          candidate_sha="$(jq -r .head_sha <<<"$candidate")"
+          test "$candidate_sha" = "$(jq -r .head_sha <<<"$smoke")"
+          echo "source_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-lhc-v${{ inputs.version }}-candidate
+          path: candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - name: Reverify exact candidate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          manifest = json.loads(Path('candidate/release-manifest.json').read_text())
+          assert manifest['release'] == os.environ['VERSION']
+          assert manifest['buildRunId'] == os.environ['CANDIDATE_RUN_ID']
+          assert manifest['sourceCommit'] == os.environ['SOURCE_SHA']
+          assert len(manifest['artifacts']) == 4
+          PY
+          for artifact in candidate/codex-lhc-v* candidate/install.sh candidate/install.ps1 candidate/release-manifest.json candidate/SHA256SUMS; do
+            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --source-digest "$SOURCE_SHA" >/dev/null
+          done
+      - name: Write release notes
+        env:
+          VERSION: ${{ inputs.version }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+        run: |
+          cat > RELEASE_NOTES.md <<EOF
+          ## Codex + LHC v${VERSION}
+
+          First release of the maintained Codex fork with LHC long-horizon
+          context, stable turn/message IDs, and direct retrieval.
+
+          Built for Linux x86-64, Windows x86-64, macOS Apple Silicon, and
+          macOS Intel. Linux and Windows passed disposable Daytona install/run/
+          uninstall smoke tests. macOS smoke testing is not yet certified.
+
+          - Candidate workflow: ${CANDIDATE_RUN_ID}
+          - Daytona smoke workflow: ${SMOKE_RUN_ID}
+          - LHC thread schema: v6
+          - Capture: enabled by default
+
+          This is not an official OpenAI release. Verify release-manifest.json,
+          SHA256SUMS, and GitHub artifact attestations before installation.
+          EOF
+      - name: Publish GitHub release without rebuilding
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Codex + LHC v${{ inputs.version }}
+          target_commitish: ${{ steps.identity.outputs.source_sha }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            candidate/codex-lhc-v*
+            candidate/install.sh
+            candidate/install.ps1
+            candidate/release-manifest.json
+            candidate/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: false

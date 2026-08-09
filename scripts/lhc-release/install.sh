@@ -6,6 +6,7 @@ PREFIX="${CODEX_LHC_PREFIX:-${HOME}/.local}"
 STORE="${CODEX_LHC_INSTALL_ROOT:-${XDG_DATA_HOME:-${HOME}/.local/share}/codex-lhc}"
 VERSION="${CODEX_LHC_VERSION:-}"
 NAME="${CODEX_LHC_NAME:-}"
+ASSET_DIR="${CODEX_LHC_ASSET_DIR:-}"
 UNINSTALL=0
 
 usage() {
@@ -18,6 +19,7 @@ Usage: install.sh [OPTIONS]
   --name NAME          Command name (default: codex, or codex-lhc if codex exists)
   --prefix DIR         Command prefix (default: ~/.local)
   --install-root DIR   Versioned package storage
+  --asset-dir DIR      Install from a validated local candidate directory
   --uninstall          Remove the selected command and managed package store
   -h, --help           Show this help
 
@@ -36,6 +38,7 @@ while [ "$#" -gt 0 ]; do
     --name) [ "$#" -ge 2 ] || die "--name requires a value"; NAME=$2; shift 2 ;;
     --prefix) [ "$#" -ge 2 ] || die "--prefix requires a value"; PREFIX=$2; shift 2 ;;
     --install-root) [ "$#" -ge 2 ] || die "--install-root requires a value"; STORE=$2; shift 2 ;;
+    --asset-dir) [ "$#" -ge 2 ] || die "--asset-dir requires a value"; ASSET_DIR=$2; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown option: $1" ;;
@@ -82,9 +85,14 @@ if [ "$UNINSTALL" -eq 1 ]; then
   exit 0
 fi
 
-command -v curl >/dev/null 2>&1 || die "curl is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"
-command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+  sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  die "sha256sum or shasum is required"
+fi
 
 if [ -z "$VERSION" ]; then
   metadata=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")
@@ -100,7 +108,9 @@ esac
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) PLATFORM=linux-x86_64 ;;
-  *) die "v${VERSION} supports Linux x86_64 only; build from source on this platform" ;;
+  Darwin:arm64|Darwin:aarch64) PLATFORM=macos-aarch64 ;;
+  Darwin:x86_64|Darwin:amd64) PLATFORM=macos-x86_64 ;;
+  *) die "v${VERSION} does not provide an artifact for $(uname -s):$(uname -m)" ;;
 esac
 
 ASSET="codex-lhc-v${VERSION}-${PLATFORM}.tar.gz"
@@ -109,11 +119,19 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/codex-lhc-install.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
 
 say "Downloading Codex + LHC v${VERSION} (${PLATFORM})..."
-curl -fsSL "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"
-curl -fsSL "${BASE}/SHA256SUMS" -o "${TMP}/SHA256SUMS"
+if [ -n "$ASSET_DIR" ]; then
+  [ -f "$ASSET_DIR/$ASSET" ] || die "candidate directory is missing $ASSET"
+  [ -f "$ASSET_DIR/SHA256SUMS" ] || die "candidate directory is missing SHA256SUMS"
+  cp "$ASSET_DIR/$ASSET" "${TMP}/${ASSET}"
+  cp "$ASSET_DIR/SHA256SUMS" "${TMP}/SHA256SUMS"
+else
+  command -v curl >/dev/null 2>&1 || die "curl is required"
+  curl -fsSL "${BASE}/${ASSET}" -o "${TMP}/${ASSET}"
+  curl -fsSL "${BASE}/SHA256SUMS" -o "${TMP}/SHA256SUMS"
+fi
 expected=$(awk -v name="$ASSET" '$2 == name { print $1 }' "${TMP}/SHA256SUMS")
 [ -n "$expected" ] || die "SHA256SUMS does not list $ASSET"
-actual=$(sha256sum "${TMP}/${ASSET}" | awk '{print $1}')
+actual=$(sha256_file "${TMP}/${ASSET}")
 [ "$actual" = "$expected" ] || die "checksum mismatch for $ASSET"
 
 mkdir -p "$STORE/versions" "$BIN_DIR"

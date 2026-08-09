@@ -1,11 +1,6 @@
-# Build and optionally publish the Codex + LHC product release.
-#
-# The first release lane is intentionally Linux x86_64 only. Run once with
-# publish=false, validate the retained artifact, then rerun the same commit with
-# publish=true. macOS and Windows join this matrix only after their install and
-# uninstall paths have equivalent production-path coverage.
-
-name: Codex LHC release
+# Build an immutable Codex-LHC release candidate. Publishing is a separate
+# workflow and must consume these exact artifacts after Daytona smoke tests.
+name: Codex LHC candidate
 
 on:
   workflow_dispatch:
@@ -15,26 +10,43 @@ on:
         required: true
         default: "0.1.0"
         type: string
-      publish:
-        description: "Create the vX.Y.Z GitHub Release after validation"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
 
 concurrency:
-  group: codex-lhc-release-${{ inputs.version }}
+  group: codex-lhc-candidate-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  build-linux:
-    name: Build and exercise Linux x86_64
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
-    outputs:
-      version: ${{ steps.release.outputs.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: blacksmith-32vcpu-ubuntu-2404
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            kind: unix
+          - label: windows-x86_64
+            runner: blacksmith-32vcpu-windows-2025
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            kind: windows
+          - label: macos-aarch64
+            runner: blacksmith-12vcpu-macos-26
+            platform: macos-aarch64
+            target: aarch64-apple-darwin
+            kind: unix
+          - label: macos-x86_64
+            runner: macos-15-intel
+            platform: macos-x86_64
+            target: x86_64-apple-darwin
+            kind: unix
     steps:
       - name: Checkout product source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -43,167 +55,142 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Resolve and validate release identity
-        id: release
+      - name: Validate release identity
         shell: bash
         env:
-          REQUESTED_VERSION: ${{ inputs.version }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          version="${REQUESTED_VERSION#v}"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] \
-            || { echo "invalid SemVer: $version" >&2; exit 1; }
-          expected="$(tr -d '[:space:]' < lhc-release/VERSION)"
-          [[ "$version" == "$expected" ]] \
-            || { echo "requested $version, source declares $expected" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          test "$VERSION" = "$(tr -d '[:space:]' < lhc-release/VERSION)"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/cli/Cargo.toml)"
-          [[ "$version" == "$cargo_version" ]] \
-            || { echo "requested $version, codex-cli declares $cargo_version" >&2; exit 1; }
-          if [[ "${{ inputs.publish }}" == "true" && "${GITHUB_REF_NAME}" != "lhc" ]]; then
-            echo "publishing is restricted to the lhc product branch" >&2
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          test "$VERSION" = "$cargo_version"
 
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Test installer in isolated roots
+      - name: Test POSIX installer
+        if: matrix.platform == 'linux-x86_64'
         run: python3 scripts/lhc-release/test_install.py
 
+      - name: Test Windows installer
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: ./scripts/lhc-release/test_install.ps1
+
       - name: Build release binaries
+        shell: bash
         working-directory: codex-rs
         env:
-          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-        run: cargo build --release --locked -p codex-cli -p codex-code-mode-host
-
-      - name: Assemble and verify release payload
-        id: package
-        shell: bash
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
+          LIBSQLITE3_FLAGS: ${{ matrix.kind == 'windows' && 'SQLITE_DISABLE_INTRINSIC' || '' }}
         run: |
           set -euo pipefail
-          asset="codex-lhc-v${VERSION}-linux-x86_64.tar.gz"
+          cargo build --release --locked --target '${{ matrix.target }}' \
+            -p codex-cli -p codex-code-mode-host
+
+      - name: Package Unix candidate
+        if: matrix.kind == 'unix'
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
           stage="dist/payload"
           mkdir -p "$stage/bin"
-          install -m 0755 codex-rs/target/release/codex "$stage/bin/codex"
-          install -m 0755 codex-rs/target/release/codex-code-mode-host \
-            "$stage/bin/codex-code-mode-host"
+          release_dir="$CARGO_TARGET_DIR/$TARGET/release"
+          install -m 0755 "$release_dir/codex" "$stage/bin/codex"
+          install -m 0755 "$release_dir/codex-code-mode-host" "$stage/bin/codex-code-mode-host"
           strip "$stage/bin/codex" "$stage/bin/codex-code-mode-host"
-          source_commit="$(git rev-parse HEAD)"
-          upstream_commit="$(tr -d '[:space:]' < patches/lhc/BASE)"
-          lhc_commit="$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)"
-          cat > "$stage/release-manifest.json" <<EOF
-          {
-            "product": "codex-lhc",
-            "release_version": "${VERSION}",
-            "platform": "linux-x86_64",
-            "source_commit": "${source_commit}",
-            "upstream_commit": "${upstream_commit}",
-            "lhc_sdk_commit": "${lhc_commit}",
-            "capture_default": "on"
-          }
-          EOF
-          cat > "$stage/codex-package.json" <<EOF
-          {
-            "layoutVersion": 1,
-            "version": "${VERSION}",
-            "target": "x86_64-unknown-linux-gnu",
-            "variant": "codex-lhc",
-            "entrypoint": "bin/codex"
-          }
-          EOF
           cp LICENSE "$stage/LICENSE"
-          cp "$stage/release-manifest.json" dist/release-manifest.json
-          tar -C "$stage" -czf "dist/$asset" .
-          install -m 0755 scripts/lhc-release/install.sh dist/install.sh
-          (cd dist && sha256sum "$asset" install.sh release-manifest.json > SHA256SUMS)
-          dist/payload/bin/codex --version
-          dist/payload/bin/codex-code-mode-host --help >/dev/null
-          tar -tzf "dist/$asset"
-          (cd dist && sha256sum -c SHA256SUMS)
-          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          printf '{"product":"codex-lhc","release":"%s","platform":"%s"}\n' \
+            "$VERSION" "$PLATFORM" > "$stage/release-manifest.json"
+          tar -C "$stage" -czf "dist/codex-lhc-v${VERSION}-${PLATFORM}.tar.gz" .
+          "$stage/bin/codex" --version
+          "$stage/bin/codex-code-mode-host" --help >/dev/null
 
-      - name: Upload validated release candidate
+      - name: Package Windows candidate
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = "dist\payload"
+          New-Item "$stage\bin" -ItemType Directory -Force | Out-Null
+          $releaseDir = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET\release"
+          Copy-Item "$releaseDir\codex.exe" "$stage\bin\codex.exe"
+          Copy-Item "$releaseDir\codex-code-mode-host.exe" "$stage\bin\codex-code-mode-host.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          @{ product = "codex-lhc"; release = $env:VERSION; platform = $env:PLATFORM } |
+            ConvertTo-Json | Set-Content "$stage\release-manifest.json"
+          Compress-Archive "$stage\*" "dist\codex-lhc-v$env:VERSION-$env:PLATFORM.zip"
+          & "$stage\bin\codex.exe" --version
+          & "$stage\bin\codex-code-mode-host.exe" --help | Out-Null
+
+      - name: Upload platform candidate
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: codex-lhc-v${{ steps.release.outputs.version }}-linux-x86_64
-          path: |
-            dist/${{ steps.package.outputs.asset }}
-            dist/install.sh
-            dist/release-manifest.json
-            dist/SHA256SUMS
+          name: codex-lhc-${{ matrix.platform }}
+          path: dist/codex-lhc-v${{ inputs.version }}-*
           if-no-files-found: error
           retention-days: 14
 
-  publish:
-    name: Publish v${{ needs.build-linux.outputs.version }}
-    needs: build-linux
-    if: inputs.publish
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+  candidate:
+    name: Assemble and attest candidate
+    needs: build
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
     permissions:
-      contents: write
+      actions: read
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - name: Checkout release notes source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
           submodules: recursive
-
-      - name: Download validated release candidate
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: codex-lhc-v${{ needs.build-linux.outputs.version }}-linux-x86_64
-          path: dist
-
-      - name: Reverify and write release notes
-        shell: bash
+          pattern: codex-lhc-*
+          path: candidate
+          merge-multiple: true
+      - name: Generate release manifest and checksums
         env:
-          VERSION: ${{ needs.build-linux.outputs.version }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          (cd dist && sha256sum -c SHA256SUMS)
-          source_commit="$(git rev-parse HEAD)"
-          lhc_commit="$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)"
-          cat > RELEASE_NOTES.md <<EOF
-          ## Codex + LHC v${VERSION}
-
-          First Linux x86_64 release of the maintained Codex fork with LHC
-          long-horizon context, stable turn/message IDs, and direct
-          get_turns / get_messages retrieval.
-
-          - Product source: ${source_commit}
-          - LHC SDK: ${lhc_commit}
-          - Capture: enabled by default; disable lhc_capture only for troubleshooting
-          - Platform: Linux x86_64 (Ubuntu 24.04/glibc build)
-
-          LHC preserves full transcripts and derived views. Long sessions can
-          use substantially more disk space than stock Codex.
-
-          ### Install
-
-          install.sh installs as codex when no Codex command exists,
-          otherwise as codex-lhc. Use --name for another command.
-
-              curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/download/v${VERSION}/install.sh
-              sh install.sh --version ${VERSION}
-
-          This is not an official OpenAI release. See SHA256SUMS and
-          release-manifest.json for artifact identity and provenance.
-          EOF
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+          install -m 0755 scripts/lhc-release/install.sh candidate/install.sh
+          install -m 0644 scripts/lhc-release/install.ps1 candidate/install.ps1
+          python3 scripts/lhc-release/make_manifest.py \
+            --dist candidate \
+            --version "$VERSION" \
+            --source-commit "$(git rev-parse HEAD)" \
+            --upstream-commit "$(tr -d '[:space:]' < patches/lhc/BASE)" \
+            --lhc-sdk-commit "$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)" \
+            --run-id "$GITHUB_RUN_ID"
+          (cd candidate && sha256sum -c SHA256SUMS)
+          python3 -m json.tool candidate/release-manifest.json >/dev/null
+      - name: Attest candidate files
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.1.0
         with:
-          tag_name: v${{ needs.build-linux.outputs.version }}
-          name: Codex + LHC v${{ needs.build-linux.outputs.version }}
-          target_commitish: ${{ github.sha }}
-          body_path: RELEASE_NOTES.md
-          files: |
-            dist/codex-lhc-v${{ needs.build-linux.outputs.version }}-linux-x86_64.tar.gz
-            dist/install.sh
-            dist/release-manifest.json
-            dist/SHA256SUMS
-          fail_on_unmatched_files: true
-          generate_release_notes: false
+          subject-path: |
+            candidate/codex-lhc-v*
+            candidate/install.sh
+            candidate/install.ps1
+            candidate/release-manifest.json
+            candidate/SHA256SUMS
+      - name: Upload immutable candidate
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-v${{ inputs.version }}-candidate
+          path: candidate/*
+          if-no-files-found: error
+          retention-days: 30
