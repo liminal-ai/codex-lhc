@@ -106,7 +106,7 @@ or ask the user to restate the past.
 | Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
 | Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
 | Failure behavior | If LHC cannot safely build a view, Codex falls through to its native compaction ladder |
-| Current default | Opt-in with `lhc_capture = true`; see the [install guide](INSTALL.md) |
+| Current default | Capture on; set `lhc_capture = false` only for troubleshooting |
 
 ## What this fork is not
 
@@ -124,7 +124,7 @@ or ask the user to restate the past.
 |---|---|
 | **`lhc`** (default) | Product: Codex + LHC |
 | **`main`** | Upstream mirror only |
-| **Fork releases** | No prebuilt binaries yet — [build from source](INSTALL.md) |
+| **Fork releases** | SemVer releases beginning with Linux x86_64 v0.1.0 |
 
 ## Where to go next
 
@@ -222,7 +222,8 @@ file. Provenance is carried explicitly (a typed `RawItemProvenance`, not
 inferred from content) so LHC's own derived output can never be mistaken for
 source material and re-ingested.
 
-Gated by `Feature::LhcCapture` (config key `lhc_capture`), **default off**.
+Gated by `Feature::LhcCapture` (config key `lhc_capture`), **default on in this
+product fork**. It can still be disabled explicitly for troubleshooting.
 
 **2. The compaction ladder** — Codex already tries several compaction
 strategies in order. The fork inserts an LHC arm at the front of that
@@ -276,5 +277,5 @@ different here."
 Capture, background derivation, banded compact/write-back, resume, and stable-ID
 retrieval are integrated and gated. The full tripwire covers the host seams,
 the certified SDK, rollout reconstruction, model-visible retrieval output,
-and patch reproduction. Capture remains off by default in current builds and
-must be enabled explicitly; see [Install & use](INSTALL.md).
+and patch reproduction. Capture is on by default in product releases; see
+[Install & use](INSTALL.md) for storage, side-by-side, and disable guidance.

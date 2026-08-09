@@ -1,15 +1,67 @@
 # Install & use
 
-Build and run **this fork** from source: Codex with long-horizon context (LHC).
-Official Codex installers and prebuilt `openai/codex` releases do **not**
-include it.
+Install or build **this fork**: Codex with long-horizon context (LHC). Official
+Codex installers and `openai/codex` releases do **not** include it.
 
 See [`README.md`](README.md) for what the fork is; [`../FORK.md`](../FORK.md)
 for the maintenance contract.
 
 ---
 
-## 1. Clone the product branch with the LHC submodule
+## Release install (Linux x86_64)
+
+v0.1.0 establishes the first release lane. Download the installer from the
+release you intend to install, inspect it, then run it:
+
+```bash
+curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/download/v0.1.0/install.sh
+sh install.sh --version 0.1.0
+```
+
+The default command name is deliberate:
+
+| Existing command | Installed command |
+|---|---|
+| no `codex` found | `codex` — Codex + LHC becomes the primary Codex |
+| `codex` already exists | `codex-lhc` — stock and LHC builds remain side by side |
+
+Choose another name or prefix explicitly:
+
+```bash
+sh install.sh --version 0.1.0 --name codex-memory
+sh install.sh --version 0.1.0 --prefix /opt/codex-lhc
+```
+
+Re-running the installer updates the managed package and prints both the fork
+version transition and the newly installed LHC SDK commit. It does not replace
+an unrelated command. Uninstall the selected managed command with:
+
+```bash
+sh install.sh --name codex-lhc --uninstall
+```
+
+Uninstall removes only installer-owned packages and command links. It preserves
+`~/.codex` and LHC archives.
+
+For v0.1.0, **re-running this fork installer is the supported update path**.
+Do not use upstream's `codex update`: that channel belongs to official OpenAI
+builds and cannot preserve the LHC integration. A fork-aware in-product updater
+is release follow-up work; it must report both the Codex-LHC version and LHC SDK
+pin before it replaces anything.
+
+> **Disk usage:** LHC retains the full transcript plus derived views in local
+> SQLite archives. Long-running sessions can use substantially more disk space
+> than stock Codex. The default archive root is `~/.codex/lhc/`; set
+> `CODEX_LHC_ROOT` to place it on another volume.
+
+Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
+fork source commit, upstream base, LHC SDK commit, target, and capture default.
+The initial prebuilt lane is Ubuntu 24.04/glibc on Linux x86_64. Other systems
+should build from source for now.
+
+## Build from source
+
+### 1. Clone the product branch with the LHC submodule
 
 ```bash
 git clone --recurse-submodules https://github.com/liminal-ai/codex-lhc.git
@@ -27,7 +79,7 @@ The SDK lives at `codex-rs/lhc/vendor/long-horizon-context` and is pinned to a
 specific certified commit. Do not retarget it casually: the pin is part of the
 fork contract, and the gate fails if the submodule tree is dirty.
 
-## 2. Toolchain
+### 2. Toolchain
 
 Rust is pinned by `codex-rs/rust-toolchain.toml` to **1.95.0** with
 `clippy`, `rustfmt`, and `rust-src`. With `rustup` installed the correct
@@ -37,7 +89,7 @@ toolchain is selected automatically inside `codex-rs/`.
 just install       # rustup show active-toolchain + cargo fetch
 ```
 
-## 3. Build
+### 3. Build
 
 ```bash
 cd codex-rs
@@ -53,21 +105,22 @@ Run the source-built binary directly:
 ./target/release/codex
 ```
 
-## 4. Enable LHC
+### 4. LHC default and troubleshooting
 
-LHC capture is behind a runtime feature flag, **off by default**. Enable it
-in `~/.codex/config.toml`:
+LHC capture is **on by default** in this product fork. Disable it only to
+isolate a storage or integration problem:
 
 ```toml
 [features]
-lhc_capture = true
+lhc_capture = false
 ```
 
 The flag can also be set per-profile.
 
-With the flag off, the build behaves as upstream Codex.
+With the flag off, no LHC worker or SQLite archive is opened and native Codex
+compaction remains available.
 
-## 5. Use retrieval
+### 5. Use retrieval
 
 With capture active, long-horizon views expose stable turn and message IDs in
 the model's context. Codex can call two direct tools when compressed history
@@ -83,7 +136,7 @@ live LHC thread when capture starts and are unavailable when capture is off or
 the archive failed to open. Large results provide a continuation offset so the
 model can fetch the next bounded slice.
 
-## 6. Storage
+### 6. Storage
 
 Per-thread SQLite files, plus a registry, are written to:
 
@@ -93,7 +146,7 @@ Per-thread SQLite files, plus a registry, are written to:
 
 Override with `CODEX_LHC_ROOT`.
 
-## 7. Verify the fork is intact
+### 7. Verify the fork is intact
 
 ```bash
 ./scripts/check-lhc-hooks.sh

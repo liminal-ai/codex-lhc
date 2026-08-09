@@ -22,8 +22,10 @@
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the
 >   shared engine and design.
 >
-> No prebuilt fork releases yet — use this source tree. Official Codex
-> installers and `openai/codex` releases do **not** include LHC.
+> Fork releases begin with **v0.1.0 for Linux x86_64**. The installer chooses
+> `codex` when no Codex command exists and `codex-lhc` for a side-by-side
+> install; see [Install & use](lhc-docs/INSTALL.md). Official Codex installers
+> and `openai/codex` releases do **not** include LHC.
 >
 > Everything below is upstream's README.
 
