@@ -31,7 +31,6 @@ def main() -> None:
         timeout=float(os.environ.get("DAYTONA_CREATE_TIMEOUT", "240")),
     )
     print(f"OK: created Linux sandbox {sandbox.id}")
-    deleted = False
     try:
         remote = "/tmp/codex-lhc-candidate"
         expect_success(sandbox.process.exec(f"mkdir -p {remote}"), "create candidate directory")
@@ -67,11 +66,8 @@ def main() -> None:
         )
         print("SMOKE_PASS linux")
     finally:
-        daytona.delete(sandbox)
-        deleted = True
+        daytona.delete(sandbox, timeout=120, wait=True)
         print(f"OK: deleted Linux sandbox {sandbox.id}")
-        if not deleted:
-            fail("Linux sandbox cleanup failed")
 
 
 if __name__ == "__main__":

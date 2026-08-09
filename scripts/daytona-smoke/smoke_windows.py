@@ -65,7 +65,7 @@ def main() -> None:
         )
         print("SMOKE_PASS windows")
     finally:
-        daytona.delete(sandbox)
+        daytona.delete(sandbox, timeout=120, wait=True)
         print(f"OK: deleted Windows sandbox {sandbox.id}")
 
 
