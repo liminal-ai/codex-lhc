@@ -12,8 +12,11 @@ history preserved and rebuildable at full fidelity.
 - Fork work lives on **`lhc`** (default branch). `main` tracks upstream.
 - Never run any self-update path on this checkout — it is a git-tracked
   source build.
-- Plan of record: `docs/lhc-rs-port/phase4-codex-integration-brief.md` in
-  the long-horizon-context repo (mission, chunks, seam map, laws, cast).
+- Current law is this file, the touchpoint inventory below, and the enforced
+  tripwire. The LHC repo's
+  `docs/lhc-rs-port/phase4-codex-integration-brief.md` is retained as historical
+  implementation context; it predates certified retrieval and is no longer a
+  plan of record.
 
 ## Layout
 

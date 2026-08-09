@@ -1,18 +1,34 @@
 # codex-lhc — what this fork is
 
-A fork of [`openai/codex`](https://github.com/openai/codex) that replaces
-Codex's native context compaction with
-[LHC](https://github.com/liminal-ai/long-horizon-context) (Long Horizon
-Context).
+**Codex + LHC** is a maintained fork of
+[`openai/codex`](https://github.com/openai/codex) with better long-horizon
+context management.
+
+It keeps the **full transcript** of a session and serves **long-horizon
+views**: recent work stays verbatim, older work is progressively compressed,
+and the transition between them is a smooth ramp rather than one destructive
+summary boundary. The goal is coherent, crisp work across histories on the
+order of **tens of millions of tokens**, not only until the first context
+window fills.
+
+Every compressed span remains addressable. Stable turn and message IDs let
+Codex pull the high-fidelity source back with `get_turns` and `get_messages`
+when a thin view only sketches something it needs.
+
+The shared engine is
+[**LHC (Long Horizon Context)**](https://github.com/liminal-ai/long-horizon-context).
+This repository is its Codex host.
 
 This page is for someone deciding whether the fork is interesting: what
 problem it attacks, the LHC concepts you need to read the code, and how LHC
 is wired into Codex. For the maintenance contract — touchpoint inventory,
 laws, tripwire, sync and recovery drills — see [`FORK.md`](../FORK.md).
 
+Install: [Install & use](INSTALL.md).
+
 ---
 
-## The problem
+## Why it matters
 
 An agent's context window is finite, so every long session eventually has to
 throw something away. The usual answer is to summarize the older part of the
@@ -23,6 +39,11 @@ sharply somewhere in the first day of work.
 
 The result is memory with a cliff. Everything up to the compact is sharp,
 everything before it is a paragraph, and nothing in between.
+
+This fork's bet is simple: **retain the trail, show a ramp, and pull exact
+evidence on demand**. It is plausible if you already feel the cliff in
+multi-day work; it is skippable if you only run short, self-contained
+sessions.
 
 ## What LHC does instead
 
@@ -52,6 +73,70 @@ full record is still there underneath and every band is rebuildable from it.
 
 ---
 
+## Pull exact history when the view is too thin
+
+A reversible memory system needs more than retained bytes. It has to leave
+addresses in the working context and make following them cheap.
+
+LHC labels archived turns and messages with stable IDs such as `t37` and
+`m5232`. Codex gets two direct, bounded tools:
+
+- **`get_turns`** returns one or more complete historical turns, including
+  their message IDs and roles.
+- **`get_messages`** returns the exact original content of specific messages.
+  Oversized results use an explicit continuation offset instead of silently
+  dropping the rest.
+
+Results are wrapped as historical material, so old prompts are evidence under
+discussion rather than fresh instructions. IDs survive compaction because
+they belong to the durable record, not to a particular rendered view.
+
+In this fork's own long certification and stewardship threads, that changed
+the recovery pattern materially: after compaction, Codex could reopen an old
+validator exchange by turn ID, then pull the exact original message when the
+turn rendering was not enough. It did not have to trust a regenerated summary
+or ask the user to restate the past.
+
+## What you get in practice
+
+| Capability | What it means |
+|---|---|
+| Full transcript | The durable record remains underneath every working view |
+| Fidelity ramp | Oldest material is brief; recent work keeps texture; the live tail is verbatim |
+| Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
+| Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
+| Failure behavior | If LHC cannot safely build a view, Codex falls through to its native compaction ladder |
+| Current default | Opt-in with `lhc_capture = true`; see the [install guide](INSTALL.md) |
+
+## What this fork is not
+
+- It is not an official OpenAI release channel.
+- It is not a second cloud memory service or a vector-search layer that
+  replaces the transcript; the event record remains the source of truth.
+- It is not a promise that every short session improves. Stock Codex remains
+  the clean comparison when long-horizon continuity is irrelevant.
+- It is not a rewrite of Codex. The host integration stays deliberately thin
+  and is carried through regular upstream merges.
+
+## Branches and releases
+
+| Branch or channel | Role |
+|---|---|
+| **`lhc`** (default) | Product: Codex + LHC |
+| **`main`** | Upstream mirror only |
+| **Fork releases** | No prebuilt binaries yet — [build from source](INSTALL.md) |
+
+## Where to go next
+
+| You want… | Go to |
+|---|---|
+| Build, enable, and verify | [Install & use](INSTALL.md) |
+| Understand the engine | [LHC project](https://github.com/liminal-ai/long-horizon-context) and its [onboard docs](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard) |
+| Maintain or sync the fork | [`FORK.md`](../FORK.md) |
+| Use stock Codex | The upstream README below the [fork banner](../README.md), or [`openai/codex`](https://github.com/openai/codex) |
+
+---
+
 ## LHC concepts worth knowing
 
 Enough to read the integration. Full treatment in the LHC repo's
@@ -72,6 +157,10 @@ markers. LHC records these into the thread.
 **Turns and chunks.** A turn is one full exchange: a prompt plus everything
 that follows it. Chunks are groups of turns, and they are what the summary
 bands are built over.
+
+**Stable addresses.** Turns and messages receive IDs in the durable record.
+Rendered views keep those IDs visible so retrieval can move from a broad turn
+to one exact message without loading unrelated history.
 
 **Derivation.** The stored output of re-representing existing content — a
 smoothed prompt, a turn compression, a chunk summary — attached to its
@@ -125,7 +214,7 @@ Core touchpoints never contain LHC logic. They call into the adapter crate
 and nothing else. Every one is marked with an `LHC-HOOK` comment and listed
 in `FORK.md`'s touchpoint inventory; the tripwire counts them.
 
-### Two seams
+### Three seams
 
 **1. Capture** — Codex's raw response items fan out to the adapter, which
 maps them into LHC intake events and records them into the thread's SQLite
@@ -146,6 +235,13 @@ ladder exactly as before. Every failure path — derivation not ready,
 inference failure, no token reduction achieved, cancellation — fails open.
 There is no path that produces placeholder or partial content: LHC either
 delivers a real banded body or gets out of the way.
+
+**3. Retrieval** — while capture is active, the extension registry exposes
+`get_turns` and `get_messages` as direct typed tools. They resolve the current
+thread from the live capture slot, validate IDs strictly, deduplicate in
+request order, call the SDK, and return its bounded historical envelope
+verbatim. Served and unserved outcomes are recorded as retrieval impressions;
+invalid calls do not create false impressions.
 
 ### Derivation inference
 
@@ -177,8 +273,8 @@ different here."
 
 ## Status
 
-Working and gated, with the capture flag off by default. The compaction arm
-is verified offline end-to-end and has been exercised against live models.
-Known open items — including derivation *quality* on the pinned model, which
-has been proven to run but not yet judged for output quality — are recorded
-in `codex-rs/lhc/CHUNK3-CERTIFICATION.md` rather than left implicit.
+Capture, background derivation, banded compact/write-back, resume, and stable-ID
+retrieval are integrated and gated. The full tripwire covers the host seams,
+the certified SDK, rollout reconstruction, model-visible retrieval output,
+and patch reproduction. Capture remains off by default in current builds and
+must be enabled explicitly; see [Install & use](INSTALL.md).

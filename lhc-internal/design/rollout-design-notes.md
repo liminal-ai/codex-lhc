@@ -4,9 +4,10 @@ Working notes, not a spec. It records what the problem is, what was found in
 the code, and the direction currently favoured, so the next person does not
 have to rediscover it.
 
-**As-built state** — what actually runs today — is in [`../FORK.md`](../FORK.md)
+**As-built state** — what actually runs today — is in
+[`../../FORK.md`](../../FORK.md)
 (touchpoint inventory, laws, tripwire) and
-[`../codex-rs/lhc/CHUNK3-CERTIFICATION.md`](../codex-rs/lhc/CHUNK3-CERTIFICATION.md)
+[`../../codex-rs/lhc/CHUNK3-CERTIFICATION.md`](../../codex-rs/lhc/CHUNK3-CERTIFICATION.md)
 (what is verified and what is not). Nothing described here is built yet; the
 compact arm currently appends through `replace_compacted_history` and works.
 

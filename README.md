@@ -1,19 +1,29 @@
-> **(This is a fork of [`openai/codex`](https://github.com/openai/codex).)**
+> **This is a maintained fork of
+> [`openai/codex`](https://github.com/openai/codex).**
 >
-> It replaces Codex's native context compaction with
-> [LHC](https://github.com/liminal-ai/long-horizon-context) (Long Horizon
-> Context). Every session is captured into a durable per-thread SQLite
-> record, and what the model sees is a *rendering* of that record built as a
-> ramp of fidelity — recent work verbatim, older work progressively
-> summarized — rather than a summary that replaces the original. History is
-> never destroyed, so any band can be rebuilt at any time. The effect is
-> context that degrades over days and weeks instead of falling off a cliff
-> at the first compact.
+> **Codex + LHC** keeps the full transcript of a session and serves
+> **long-horizon views** with a smooth fidelity ramp: recent work verbatim,
+> older work progressively compressed, and the original record preserved
+> underneath. The ambition is coherent, crisp work across histories on the
+> scale of **tens of millions of tokens**, not only until the first context
+> cliff.
+>
+> Compressed spans carry stable turn and message IDs. When a thin view is not
+> enough, Codex can call **`get_turns`** or **`get_messages`** to pull the
+> high-fidelity source back into the working context by ID.
+>
+> Built on [**LHC (Long Horizon Context)**](https://github.com/liminal-ai/long-horizon-context).
+> Product branch **`lhc`**; **`main`** tracks upstream only.
 >
 > - [**What this fork is**](lhc-docs/README.md) — purpose, LHC concepts, and
 >   how it is integrated.
-> - [**Install**](lhc-docs/INSTALL.md) — build, configure, and verify from
+> - [**Install & use**](lhc-docs/INSTALL.md) — build, configure, and verify from
 >   source.
+> - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the
+>   shared engine and design.
+>
+> No prebuilt fork releases yet — use this source tree. Official Codex
+> installers and `openai/codex` releases do **not** include LHC.
 >
 > Everything below is upstream's README.
 
