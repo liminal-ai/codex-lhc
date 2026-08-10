@@ -38,16 +38,14 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
-/// Injectable failpoints for crash-injection tests (`cfg(test)` / `test-util`).
-///
-/// Values match [`SwapFailpoint`] discriminants. `0` = no injection.
-/// Guarded by [`SWAP_FAILPOINT_LOCK`] so parallel tests cannot race the atomic.
+// Injectable failpoints for crash-injection tests (`cfg(test)` / `test-util`).
+//
+// Values match [`SwapFailpoint`] discriminants. `0` = no injection.
+// Thread-local so parallel tests cannot inject failures into unrelated swaps.
 #[cfg(any(test, feature = "test-util"))]
-pub static SWAP_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-/// Serializes failpoint arming across tests (global atomic).
-#[cfg(any(test, feature = "test-util"))]
-pub static SWAP_FAILPOINT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+std::thread_local! {
+    static SWAP_FAILPOINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 
 /// Crash-injection points between atomic-swap steps.
 #[repr(u8)]
@@ -229,45 +227,41 @@ pub fn parse_rollout_items(path: &Path) -> std::io::Result<Vec<RolloutItem>> {
     Ok(items)
 }
 
-/// RAII arm for a swap failpoint. Holds the global lock and clears on drop.
+/// RAII arm for a thread-scoped swap failpoint. Restores the previous value.
 #[cfg(any(test, feature = "test-util"))]
 pub struct SwapFailpointGuard {
-    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: u8,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl SwapFailpointGuard {
     pub fn arm(point: SwapFailpoint) -> Self {
-        let lock = SWAP_FAILPOINT_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        SWAP_FAILPOINT.store(point as u8, std::sync::atomic::Ordering::SeqCst);
-        Self { _lock: lock }
+        let previous = SWAP_FAILPOINT.with(|slot| slot.replace(point as u8));
+        Self { previous }
     }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl Drop for SwapFailpointGuard {
     fn drop(&mut self) {
-        SWAP_FAILPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
+        SWAP_FAILPOINT.with(|slot| slot.set(self.previous));
     }
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_swap_failpoint(point: SwapFailpoint) {
-    SWAP_FAILPOINT.store(point as u8, std::sync::atomic::Ordering::SeqCst);
+    SWAP_FAILPOINT.with(|slot| slot.set(point as u8));
 }
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn clear_swap_failpoint() {
-    SWAP_FAILPOINT.store(0, std::sync::atomic::Ordering::SeqCst);
+    SWAP_FAILPOINT.with(|slot| slot.set(0));
 }
 
 fn maybe_fail(point: SwapFailpoint) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-util"))]
     {
-        let active =
-            SwapFailpoint::from_u8(SWAP_FAILPOINT.load(std::sync::atomic::Ordering::SeqCst));
+        let active = SWAP_FAILPOINT.with(|slot| SwapFailpoint::from_u8(slot.get()));
         if active == point && active != SwapFailpoint::None {
             return Err(IoError::other(format!(
                 "injected swap failpoint: {point:?}"

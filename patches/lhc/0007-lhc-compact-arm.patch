@@ -1122,7 +1122,7 @@ new file mode 100644
 index 0000000000..b9ace24dc5
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1384 @@
+@@ -0,0 +1,1383 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -1186,9 +1186,8 @@ index 0000000000..b9ace24dc5
 +    codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic offline callbacks")
 +}
 +
-+/// Hold the global swap failpoint lock disarmed — required whenever a test
-+/// may call `atomic_rewrite_rollout` (including via the compact arm) so a
-+/// concurrent crash-injection test cannot leave an armed failpoint.
++/// Explicitly disarm the current test thread while it performs a clean swap.
++/// The guard restores any enclosing thread-scoped failpoint on drop.
 +fn hold_swap_clean() -> SwapFailpointGuard {
 +    SwapFailpointGuard::arm(SwapFailpoint::None)
 +}

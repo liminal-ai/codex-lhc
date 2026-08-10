@@ -61,9 +61,8 @@ fn deterministic_callbacks() -> InferenceCallbacks {
     codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic offline callbacks")
 }
 
-/// Hold the global swap failpoint lock disarmed — required whenever a test
-/// may call `atomic_rewrite_rollout` (including via the compact arm) so a
-/// concurrent crash-injection test cannot leave an armed failpoint.
+/// Explicitly disarm the current test thread while it performs a clean swap.
+/// The guard restores any enclosing thread-scoped failpoint on drop.
 fn hold_swap_clean() -> SwapFailpointGuard {
     SwapFailpointGuard::arm(SwapFailpoint::None)
 }

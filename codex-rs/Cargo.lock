@@ -8882,6 +8882,7 @@ version = "0.1.0"
 dependencies = [
  "fancy-regex 0.17.0",
  "futures",
+ "getrandom 0.3.4",
  "indexmap 2.14.0",
  "regex",
  "rusqlite",
