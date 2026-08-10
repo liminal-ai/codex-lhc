@@ -10,12 +10,12 @@ for the maintenance contract.
 
 ## Release install (Linux x86_64)
 
-v0.1.0 establishes the first release lane. Download the installer from the
+v0.2.0 is the current release lane. Download the installer from the
 release you intend to install, inspect it, then run it:
 
 ```bash
-curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/download/v0.1.0/install.sh
-sh install.sh --version 0.1.0
+curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/download/v0.2.0/install.sh
+sh install.sh --version 0.2.0
 ```
 
 The default command name is deliberate:
@@ -28,8 +28,8 @@ The default command name is deliberate:
 Choose another name or prefix explicitly:
 
 ```bash
-sh install.sh --version 0.1.0 --name codex-memory
-sh install.sh --version 0.1.0 --prefix /opt/codex-lhc
+sh install.sh --version 0.2.0 --name codex-memory
+sh install.sh --version 0.2.0 --prefix /opt/codex-lhc
 ```
 
 Re-running the installer updates the managed package and prints both the fork
@@ -43,7 +43,7 @@ sh install.sh --name codex-lhc --uninstall
 Uninstall removes only installer-owned packages and command links. It preserves
 `~/.codex` and LHC archives.
 
-For v0.1.0, **re-running this fork installer is the supported update path**.
+For v0.2.0, **re-running this fork installer is the supported update path**.
 Do not use upstream's `codex update`: that channel belongs to official OpenAI
 builds and cannot preserve the LHC integration. A fork-aware in-product updater
 is release follow-up work; it must report both the Codex-LHC version and LHC SDK

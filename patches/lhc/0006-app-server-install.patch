@@ -1,12 +1,12 @@
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index df0daaee38..005dcaa6cd 100644
+index df0daaee38..597ebe783c 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
 @@ -121,6 +121,28 @@ where
                  .enabled(codex_features::Feature::SkillSearch),
          },
      );
-+    // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default ON).
++    // LHC-HOOK: register default-on LHC capture; lhc_capture=false is the kill switch.
 +    // TUI and exec both ride the in-process app-server, so this site covers the main frontends.
 +    // Model/thinking labels feed the free ConfigContributor seam (G1 / F15).
 +    codex_lhc_host::install_with_provider_label(

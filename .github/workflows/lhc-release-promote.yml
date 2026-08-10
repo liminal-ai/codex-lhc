@@ -6,7 +6,7 @@ on:
       version:
         description: "Release SemVer"
         required: true
-        default: "0.1.0"
+        default: "0.2.0"
         type: string
       candidate_run_id:
         description: "Successful Codex LHC candidate run id"
@@ -86,8 +86,9 @@ jobs:
           cat > RELEASE_NOTES.md <<EOF
           ## Codex + LHC v${VERSION}
 
-          First release of the maintained Codex fork with LHC long-horizon
-          context, stable turn/message IDs, and direct retrieval.
+          Codex-LHC 0.2.0 runs LHC capture by default with no enable flags,
+          preserving long-horizon context, stable turn/message IDs, and direct
+          retrieval. Set lhc_capture=false only as an explicit kill switch.
 
           Built for Linux x86-64, Windows x86-64, and macOS Apple Silicon.
           Linux passed a disposable Daytona install/run/uninstall smoke test.

@@ -124,13 +124,13 @@ or ask the user to restate the past.
 |---|---|
 | **`lhc`** (default) | Product: Codex + LHC |
 | **`main`** | Upstream mirror only |
-| **Fork releases** | SemVer releases beginning with Linux x86_64 v0.1.0 |
+| **Fork releases** | SemVer releases; current release v0.2.0 |
 
 ## Where to go next
 
 | You want… | Go to |
 |---|---|
-| Build, enable, and verify | [Install & use](INSTALL.md) |
+| Build, run, and verify | [Install & use](INSTALL.md) |
 | Understand the engine | [LHC project](https://github.com/liminal-ai/long-horizon-context) and its [onboard docs](https://github.com/liminal-ai/long-horizon-context/tree/main/docs/onboard) |
 | Maintain or sync the fork | [`FORK.md`](../FORK.md) |
 | Use stock Codex | The upstream README below the [fork banner](../README.md), or [`openai/codex`](https://github.com/openai/codex) |
@@ -222,8 +222,8 @@ file. Provenance is carried explicitly (a typed `RawItemProvenance`, not
 inferred from content) so LHC's own derived output can never be mistaken for
 source material and re-ingested.
 
-Gated by `Feature::LhcCapture` (config key `lhc_capture`), **default on in this
-product fork**. It can still be disabled explicitly for troubleshooting.
+LHC capture is **on by default in this product fork**. The single kill switch
+is `lhc_capture = false`, reserved for troubleshooting.
 
 **2. The compaction ladder** — Codex already tries several compaction
 strategies in order. The fork inserts an LHC arm at the front of that

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 
 from daytona import CreateSandboxFromSnapshotParams, Daytona, FileUpload
 
@@ -9,12 +10,15 @@ from common import expect_success, fail, require_candidate, require_key
 def main() -> None:
     require_key()
     candidate = require_candidate()
-    version = os.environ.get("CODEX_LHC_VERSION", "0.1.0")
+    version = os.environ.get("CODEX_LHC_VERSION", "0.2.0")
     archive = candidate / f"codex-lhc-v{version}-linux-x86_64.tar.gz"
+    capture_probe = Path(__file__).resolve().parents[1] / "check-lhc-default-capture.py"
     required = [archive, candidate / "install.sh", candidate / "SHA256SUMS", candidate / "release-manifest.json"]
     for path in required:
         if not path.is_file():
             fail(f"candidate is missing {path.name}")
+    if not capture_probe.is_file():
+        fail(f"smoke checkout is missing {capture_probe}")
 
     daytona = Daytona()
     sandbox = daytona.create(
@@ -36,6 +40,7 @@ def main() -> None:
         expect_success(sandbox.process.exec(f"mkdir -p {remote}"), "create candidate directory")
         sandbox.fs.upload_files(
             [FileUpload(source=str(path), destination=f"{remote}/{path.name}") for path in required]
+            + [FileUpload(source=str(capture_probe), destination=f"{remote}/{capture_probe.name}")]
         )
         command = (
             f"HOME=/tmp/lhc-home CODEX_HOME=/tmp/lhc-data CODEX_LHC_ROOT=/tmp/lhc-data/lhc "
@@ -48,6 +53,13 @@ def main() -> None:
         expect_success(
             sandbox.process.exec(f"/tmp/lhc-packages/versions/{version}/bin/codex-code-mode-host --help >/tmp/host-help.txt"),
             "code-mode host --help",
+        )
+        expect_success(
+            sandbox.process.exec(
+                f"python3 {remote}/{capture_probe.name} --binary /tmp/lhc-prefix/bin/codex-lhc-smoke",
+                timeout=120,
+            ),
+            "bare installed Codex captures a complete LHC turn",
         )
         expect_success(sandbox.process.exec("mkdir -p /tmp/lhc-data/lhc && echo preserve >/tmp/lhc-data/lhc/smoke-marker"), "create data marker")
         expect_success(

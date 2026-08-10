@@ -11,6 +11,8 @@
 #   1.  grep count of LHC-HOOK sentinels in core vs EXPECTED_HOOKS below
 #   2a. cargo check -p codex-core -p codex-app-server -p codex-extension-api
 #       (the crates that *carry* the hooks — not just the adapter)
+#   2a1. build the real codex CLI, run bare `codex exec`, and require a thread
+#        database containing the captured user and assistant messages
 #   2b. cargo test -p codex-lhc-host --lib
 #   2c. cargo test -p codex-lhc-host --features test-util --test certification
 #   2d. cargo test -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
@@ -88,6 +90,21 @@ if cargo check -q -p codex-core -p codex-app-server -p codex-extension-api \
 else
   echo "TRIPWIRE check: hooked crates failed to compile — first errors:"
   grep -E "^error" -A5 /tmp/lhc-hook-check.log | head -40
+  fail=1
+fi
+
+# ── Layer 2a1: product default must be true in the executable ─────────
+# This intentionally exercises `codex exec` without `--enable lhc_capture`.
+# A directory-only assertion missed the stale-binary failure this prevents.
+if cargo build -q -p codex-cli --manifest-path codex-rs/Cargo.toml \
+    >/tmp/lhc-hook-bare-build.log 2>&1 \
+    && scripts/check-lhc-default-capture.py \
+        --binary codex-rs/target/debug/codex \
+        >/tmp/lhc-hook-bare-capture.log 2>&1; then
+  cat /tmp/lhc-hook-bare-capture.log
+else
+  echo "TRIPWIRE bare-exec: default LHC capture did not persist a complete turn:"
+  cat /tmp/lhc-hook-bare-build.log /tmp/lhc-hook-bare-capture.log 2>/dev/null | tail -60
   fail=1
 fi
 

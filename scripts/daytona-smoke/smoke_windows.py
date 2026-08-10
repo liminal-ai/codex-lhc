@@ -9,7 +9,7 @@ from common import expect_success, fail, require_candidate, require_key
 def main() -> None:
     require_key()
     candidate = require_candidate()
-    version = os.environ.get("CODEX_LHC_VERSION", "0.1.0")
+    version = os.environ.get("CODEX_LHC_VERSION", "0.2.0")
     archive = candidate / f"codex-lhc-v{version}-windows-x86_64.zip"
     required = [archive, candidate / "install.ps1", candidate / "SHA256SUMS", candidate / "release-manifest.json"]
     for path in required:
