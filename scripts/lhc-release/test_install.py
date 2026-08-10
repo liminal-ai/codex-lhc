@@ -5,6 +5,7 @@ import hashlib
 import http.server
 import os
 from pathlib import Path
+import platform
 import shutil
 import socketserver
 import subprocess
@@ -17,7 +18,19 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/lhc-release/install.sh"
 VERSION = (ROOT / "lhc-release/VERSION").read_text(encoding="utf-8").strip()
-ASSET = f"codex-lhc-v{VERSION}-linux-x86_64.tar.gz"
+
+
+def native_unix_platform() -> str:
+    system = platform.system()
+    machine = platform.machine().lower()
+    if system == "Linux" and machine in {"x86_64", "amd64"}:
+        return "linux-x86_64"
+    if system == "Darwin" and machine in {"arm64", "aarch64"}:
+        return "macos-aarch64"
+    raise RuntimeError(f"unsupported POSIX installer fixture host: {system} {machine}")
+
+
+ASSET = f"codex-lhc-v{VERSION}-{native_unix_platform()}.tar.gz"
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):

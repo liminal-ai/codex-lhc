@@ -96,6 +96,9 @@ fn dual_compacted_polluted() -> Vec<RolloutItem> {
 }
 
 fn write_items(path: &Path, items: &[RolloutItem]) {
+    // Every clean rewrite must hold the same lock as crash-injection tests;
+    // otherwise a parallel test can leak its process-global failpoint here.
+    let _guard = crate::SwapFailpointGuard::arm(crate::SwapFailpoint::None);
     // atomic_rewrite creates parent-relative temp next to path; file may be new.
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
