@@ -331,6 +331,9 @@ fn fsync_dir(dir: &Path) -> std::io::Result<()> {
             }
             Ok(())
         }
+        // std::fs::File cannot open a directory on native Windows. Directory
+        // fsync is explicitly best-effort here; the file was already flushed.
+        Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         Err(err) => Err(err),
     }
 }

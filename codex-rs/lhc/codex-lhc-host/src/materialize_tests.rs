@@ -2288,7 +2288,8 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
     use codex_protocol::protocol::ThreadSettingsSnapshot;
 
     let thread_id = ThreadId::default();
-    let cwd = serde_json::from_value(json!("/tmp")).expect("AbsolutePathBuf");
+    let cwd = serde_json::from_value(json!(std::env::current_dir().expect("current directory")))
+        .expect("AbsolutePathBuf");
     let settings = EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
         thread_settings: ThreadSettingsSnapshot {
             model: "gpt-settings".into(),
@@ -2454,7 +2455,7 @@ fn m9_optional_turn_context_emitted_when_provided() {
     };
     // Build a minimal TurnContext via serde to avoid constructing every field.
     let ctx: TurnContextItem = serde_json::from_value(json!({
-        "cwd": "/",
+        "cwd": std::env::current_dir().expect("current directory"),
         "approval_policy": "never",
         "sandbox_policy": {"type": "danger-full-access"},
         "model": "gpt-test",
