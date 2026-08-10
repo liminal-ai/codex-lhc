@@ -8,14 +8,14 @@ for the maintenance contract.
 
 ---
 
-## Release install (Linux x86_64)
+## Release install (Linux x86_64, Windows x86_64, macOS Apple Silicon)
 
-v0.2.0 is the current release lane. Download the installer from the
-release you intend to install, inspect it, then run it:
+Download the installer from the latest published release, inspect it, then
+run it. The installer resolves that same release when `--version` is omitted:
 
 ```bash
-curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/download/v0.2.0/install.sh
-sh install.sh --version 0.2.0
+curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh
+sh install.sh
 ```
 
 The default command name is deliberate:
@@ -28,8 +28,8 @@ The default command name is deliberate:
 Choose another name or prefix explicitly:
 
 ```bash
-sh install.sh --version 0.2.0 --name codex-memory
-sh install.sh --version 0.2.0 --prefix /opt/codex-lhc
+sh install.sh --name codex-memory
+sh install.sh --prefix /opt/codex-lhc
 ```
 
 Re-running the installer updates the managed package and prints both the fork
@@ -43,7 +43,8 @@ sh install.sh --name codex-lhc --uninstall
 Uninstall removes only installer-owned packages and command links. It preserves
 `~/.codex` and LHC archives.
 
-For v0.2.0, **re-running this fork installer is the supported update path**.
+For published releases, **re-running this fork installer is the supported
+update path**.
 Do not use upstream's `codex update`: that channel belongs to official OpenAI
 builds and cannot preserve the LHC integration. A fork-aware in-product updater
 is release follow-up work; it must report both the Codex-LHC version and LHC SDK
@@ -56,8 +57,16 @@ pin before it replaces anything.
 
 Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
 fork source commit, upstream base, LHC SDK commit, target, and capture default.
-The initial prebuilt lane is Ubuntu 24.04/glibc on Linux x86_64. Other systems
-should build from source for now.
+Prebuilt archives are published for Ubuntu 24.04/glibc on Linux x86_64,
+Windows x86_64, and Apple Silicon macOS. `install.sh` selects Linux or macOS;
+Windows uses `install.ps1`:
+
+```powershell
+Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Intel macOS and other architectures should build from source for now.
 
 ## Build from source
 

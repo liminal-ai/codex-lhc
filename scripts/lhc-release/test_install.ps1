@@ -6,14 +6,14 @@ $release = Join-Path $root "release"
 $payload = Join-Path $root "payload"
 $prefix = Join-Path $root "prefix"
 $store = Join-Path $root "store"
-$version = "0.2.0"
+$version = (Get-Content (Join-Path $PSScriptRoot "..\..\lhc-release\VERSION") -Raw).Trim()
 $asset = "codex-lhc-v$version-windows-x86_64.zip"
 
 try {
     New-Item (Join-Path $payload "bin") -ItemType Directory -Force | Out-Null
     Copy-Item "$env:SystemRoot\System32\where.exe" (Join-Path $payload "bin\codex.exe")
     Copy-Item "$env:SystemRoot\System32\where.exe" (Join-Path $payload "bin\codex-code-mode-host.exe")
-    Set-Content (Join-Path $payload "release-manifest.json") '{"release":"0.2.0","lhcSdkCommit":"fixture"}'
+    Set-Content (Join-Path $payload "release-manifest.json") "{`"release`":`"$version`",`"lhcSdkCommit`":`"fixture`"}"
     New-Item $release -ItemType Directory -Force | Out-Null
     Compress-Archive (Join-Path $payload "*") (Join-Path $release $asset)
     $digest = (Get-FileHash (Join-Path $release $asset) -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -10,7 +10,10 @@ from common import expect_success, fail, require_candidate, require_key
 def main() -> None:
     require_key()
     candidate = require_candidate()
-    version = os.environ.get("CODEX_LHC_VERSION", "0.2.0")
+    source_version = (
+        Path(__file__).resolve().parents[2] / "lhc-release/VERSION"
+    ).read_text(encoding="utf-8").strip()
+    version = os.environ.get("CODEX_LHC_VERSION", source_version)
     archive = candidate / f"codex-lhc-v{version}-linux-x86_64.tar.gz"
     capture_probe = Path(__file__).resolve().parents[1] / "check-lhc-default-capture.py"
     required = [archive, candidate / "install.sh", candidate / "SHA256SUMS", candidate / "release-manifest.json"]

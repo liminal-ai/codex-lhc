@@ -16,7 +16,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts/lhc-release/install.sh"
-VERSION = "0.2.0"
+VERSION = (ROOT / "lhc-release/VERSION").read_text(encoding="utf-8").strip()
 ASSET = f"codex-lhc-v{VERSION}-linux-x86_64.tar.gz"
 
 
@@ -37,7 +37,7 @@ class InstallTest(unittest.TestCase):
             path.write_text("#!/bin/sh\nprintf '%s\\n' fixture\n", encoding="utf-8")
             path.chmod(0o755)
         (payload / "release-manifest.json").write_text(
-            '{"release_version":"0.2.0","lhc_sdk_commit":"test-pin"}\n',
+            f'{{"release_version":"{VERSION}","lhc_sdk_commit":"test-pin"}}\n',
             encoding="utf-8",
         )
         release.mkdir()
@@ -119,7 +119,7 @@ class InstallTest(unittest.TestCase):
 
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("v0.2.0 -> v0.2.0", result.stdout)
+        self.assertIn(f"v{VERSION} -> v{VERSION}", result.stdout)
         self.assertTrue(command.is_symlink())
 
         result = self.run_installer("--uninstall")

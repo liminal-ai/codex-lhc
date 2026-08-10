@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
 
 from daytona import CreateSandboxFromSnapshotParams, Daytona, FileUpload
 
@@ -9,12 +10,18 @@ from common import expect_success, fail, require_candidate, require_key
 def main() -> None:
     require_key()
     candidate = require_candidate()
-    version = os.environ.get("CODEX_LHC_VERSION", "0.2.0")
+    source_version = (
+        Path(__file__).resolve().parents[2] / "lhc-release/VERSION"
+    ).read_text(encoding="utf-8").strip()
+    version = os.environ.get("CODEX_LHC_VERSION", source_version)
     archive = candidate / f"codex-lhc-v{version}-windows-x86_64.zip"
+    capture_probe = Path(__file__).resolve().parents[1] / "check-lhc-default-capture.py"
     required = [archive, candidate / "install.ps1", candidate / "SHA256SUMS", candidate / "release-manifest.json"]
     for path in required:
         if not path.is_file():
             fail(f"candidate is missing {path.name}")
+    if not capture_probe.is_file():
+        fail(f"smoke checkout is missing {capture_probe}")
 
     daytona = Daytona()
     sandbox = daytona.create(
@@ -36,6 +43,7 @@ def main() -> None:
         expect_success(sandbox.process.exec(f'powershell -NoProfile -Command "New-Item -Force -ItemType Directory \'{remote}\' | Out-Null"'), "create candidate directory")
         sandbox.fs.upload_files(
             [FileUpload(source=str(path), destination=rf"{remote}\{path.name}") for path in required]
+            + [FileUpload(source=str(capture_probe), destination=rf"{remote}\{capture_probe.name}")]
         )
         install = (
             "powershell -NoProfile -ExecutionPolicy Bypass -File "
@@ -48,6 +56,14 @@ def main() -> None:
         expect_success(
             sandbox.process.exec(rf"cmd /c C:\codex-lhc-packages\versions\{version}\bin\codex-code-mode-host.exe --help > C:\host-help.txt"),
             "code-mode host --help",
+        )
+        expect_success(
+            sandbox.process.exec(
+                rf"python {remote}\{capture_probe.name} --binary "
+                rf"C:\codex-lhc-packages\versions\{version}\bin\codex.exe",
+                timeout=120,
+            ),
+            "bare installed Codex captures a complete LHC turn",
         )
         expect_success(sandbox.process.exec(r'powershell -NoProfile -Command "New-Item -Force -ItemType Directory C:\codex-lhc-data | Out-Null; Set-Content C:\codex-lhc-data\smoke-marker preserve"'), "create data marker")
         uninstall = (

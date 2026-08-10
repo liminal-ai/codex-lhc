@@ -1,0 +1,119 @@
+name: Codex LHC platform readiness
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/lhc-platform-readiness.yml"
+      - "codex-rs/**"
+      - "scripts/check-lhc-default-capture.py"
+      - "scripts/lhc-release/**"
+      - "lhc-release/VERSION"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codex-lhc-platform-readiness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  readiness:
+    name: Readiness ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            runner: blacksmith-32vcpu-ubuntu-2404
+            kind: unix
+          - label: windows-x86_64
+            runner: blacksmith-32vcpu-windows-2025
+            kind: windows
+          - label: macos-aarch64
+            runner: blacksmith-12vcpu-macos-15
+            kind: unix
+    steps:
+      - name: Checkout product source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Check hooked crates
+        working-directory: codex-rs
+        run: cargo check --locked -p codex-core -p codex-app-server -p codex-extension-api
+
+      - name: Test LHC host library
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-lhc-host --lib
+
+      - name: Test LHC host certification
+        working-directory: codex-rs
+        env:
+          UPDATE_LHC_GOLDENS: ""
+        run: cargo test --locked -p codex-lhc-host --features test-util --test certification
+
+      - name: Test session capture seam
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-core --lib lhc_capture_e2e
+
+      - name: Test config schema fixture
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-core --lib config_schema_matches_fixture
+
+      - name: Test compact bridge
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-lhc-host --lib compact_bridge
+
+      - name: Test compact arm
+        working-directory: codex-rs
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test --locked -p codex-core --lib "compact_lhc::tests::"
+
+      - name: Test resume and regeneration matrix
+        working-directory: codex-rs
+        run: cargo test --locked -p codex-core --lib slice_d_ -- --test-threads=1
+
+      - name: Build native debug executables
+        working-directory: codex-rs
+        run: cargo build --locked -p codex-cli -p codex-code-mode-host
+
+      - name: Prove default capture (Unix)
+        if: matrix.kind == 'unix'
+        run: >-
+          python3 scripts/check-lhc-default-capture.py
+          --binary "$CARGO_TARGET_DIR/debug/codex"
+
+      - name: Prove default capture (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:CARGO_TARGET_DIR "debug\codex.exe"
+          python scripts/check-lhc-default-capture.py --binary $binary
+
+      - name: Prove code-mode host starts (Unix)
+        if: matrix.kind == 'unix'
+        run: |
+          "$CARGO_TARGET_DIR/debug/codex-code-mode-host" --help
+
+      - name: Prove code-mode host starts (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: '& (Join-Path $env:CARGO_TARGET_DIR "debug\codex-code-mode-host.exe") --help'
+
+      - name: Test POSIX installer
+        if: matrix.kind == 'unix'
+        run: python3 scripts/lhc-release/test_install.py
+
+      - name: Test Windows installer
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: ./scripts/lhc-release/test_install.ps1

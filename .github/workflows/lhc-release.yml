@@ -8,7 +8,7 @@ on:
       version:
         description: "SemVer without the v prefix"
         required: true
-        default: "0.2.0"
+        default: "0.2.1"
         type: string
 
 permissions:
@@ -97,13 +97,22 @@ jobs:
           cargo build --release --locked --target '${{ matrix.target }}' \
             -p codex-cli -p codex-code-mode-host
 
-      - name: Verify bare Codex captures to LHC by default
-        if: matrix.platform == 'linux-x86_64'
+      - name: Verify bare Codex captures to LHC by default (Unix)
+        if: matrix.kind == 'unix'
         env:
           TARGET: ${{ matrix.target }}
         run: >-
           python3 scripts/check-lhc-default-capture.py
           --binary "$CARGO_TARGET_DIR/$TARGET/release/codex"
+
+      - name: Verify bare Codex captures to LHC by default (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $binary = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET\release\codex.exe"
+          python scripts/check-lhc-default-capture.py --binary $binary
 
       - name: Package Unix candidate
         if: matrix.kind == 'unix'

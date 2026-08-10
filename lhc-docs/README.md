@@ -124,7 +124,7 @@ or ask the user to restate the past.
 |---|---|
 | **`lhc`** (default) | Product: Codex + LHC |
 | **`main`** | Upstream mirror only |
-| **Fork releases** | SemVer releases; current release v0.2.0 |
+| **Fork releases** | SemVer releases; see [GitHub Releases](https://github.com/liminal-ai/codex-lhc/releases/latest) for the current version |
 
 ## Where to go next
 
