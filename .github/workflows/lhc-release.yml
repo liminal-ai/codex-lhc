@@ -154,15 +154,13 @@ jobs:
           retention-days: 14
 
   candidate:
-    name: Assemble and attest candidate
+    name: Assemble candidate
     needs: build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
       actions: read
       contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -190,15 +188,6 @@ jobs:
             --run-id "$GITHUB_RUN_ID"
           (cd candidate && sha256sum -c SHA256SUMS)
           python3 -m json.tool candidate/release-manifest.json >/dev/null
-      - name: Attest candidate files
-        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.1.0
-        with:
-          subject-path: |
-            candidate/codex-lhc-v*
-            candidate/install.sh
-            candidate/install.ps1
-            candidate/release-manifest.json
-            candidate/SHA256SUMS
       - name: Upload immutable candidate
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

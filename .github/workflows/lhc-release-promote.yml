@@ -19,7 +19,6 @@ on:
 
 permissions:
   actions: read
-  attestations: read
   contents: write
 
 concurrency:
@@ -78,9 +77,6 @@ jobs:
           assert manifest['sourceCommit'] == os.environ['SOURCE_SHA']
           assert len(manifest['artifacts']) == 4
           PY
-          for artifact in candidate/codex-lhc-v* candidate/install.sh candidate/install.ps1 candidate/release-manifest.json candidate/SHA256SUMS; do
-            gh attestation verify "$artifact" --repo "$GITHUB_REPOSITORY" --source-digest "$SOURCE_SHA" >/dev/null
-          done
       - name: Write release notes
         env:
           VERSION: ${{ inputs.version }}
@@ -94,16 +90,16 @@ jobs:
           context, stable turn/message IDs, and direct retrieval.
 
           Built for Linux x86-64, Windows x86-64, macOS Apple Silicon, and
-          macOS Intel. Linux and Windows passed disposable Daytona install/run/
-          uninstall smoke tests. macOS smoke testing is not yet certified.
+          macOS Intel. Linux passed a disposable Daytona install/run/uninstall
+          smoke test. Windows and macOS smoke testing is not yet certified.
 
           - Candidate workflow: ${CANDIDATE_RUN_ID}
           - Daytona smoke workflow: ${SMOKE_RUN_ID}
           - LHC thread schema: v6
           - Capture: enabled by default
 
-          This is not an official OpenAI release. Verify release-manifest.json,
-          SHA256SUMS, and GitHub artifact attestations before installation.
+          This is not an official OpenAI release. Verify release-manifest.json
+          and SHA256SUMS before installation.
           EOF
       - name: Publish GitHub release without rebuilding
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
