@@ -437,10 +437,11 @@ changes) that arrive before the handle is ready are **buffered** (same cap
 as the capture queue) and flushed on open. Prefer a complete session
 opening over silent loss of the first user prompt.
 
-## Feature-gate semantics
+## Kill-switch semantics
 
-The product fork defaults `Feature::LhcCapture` ON because LHC is the product,
-not an optional build flavor. With the feature explicitly OFF,
+The product fork runs LHC by default because LHC is the product, not an
+optional build flavor. The single kill switch is `lhc_capture = false`. With
+that switch set,
 `on_thread_start` returns immediately and does not open a worker or insert a
 slot. Contributors remain registered (one `Box::pin` ready-future per raw-item
 batch is ~cheap); **no LHC I/O, no SQLite, no mapping**. This is not

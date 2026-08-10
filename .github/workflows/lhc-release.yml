@@ -77,6 +77,11 @@ jobs:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         run: cargo build --release --locked -p codex-cli -p codex-code-mode-host
 
+      - name: Verify bare Codex captures to LHC by default
+        run: >-
+          python3 scripts/check-lhc-default-capture.py
+          --binary codex-rs/target/release/codex
+
       - name: Assemble and verify release payload
         id: package
         shell: bash

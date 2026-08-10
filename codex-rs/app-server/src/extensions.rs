@@ -121,7 +121,7 @@ where
                 .enabled(codex_features::Feature::SkillSearch),
         },
     );
-    // LHC-HOOK: register LHC capture (gated by Feature::LhcCapture, default ON).
+    // LHC-HOOK: register default-on LHC capture; lhc_capture=false is the kill switch.
     // TUI and exec both ride the in-process app-server, so this site covers the main frontends.
     // Model/thinking labels feed the free ConfigContributor seam (G1 / F15).
     codex_lhc_host::install_with_provider_label(
