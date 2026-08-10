@@ -38,14 +38,9 @@ jobs:
             target: x86_64-pc-windows-msvc
             kind: windows
           - label: macos-aarch64
-            runner: macos-15
+            runner: blacksmith-12vcpu-macos-15
             platform: macos-aarch64
             target: aarch64-apple-darwin
-            kind: unix
-          - label: macos-x86_64
-            runner: macos-15-intel
-            platform: macos-x86_64
-            target: x86_64-apple-darwin
             kind: unix
     steps:
       - name: Checkout product source

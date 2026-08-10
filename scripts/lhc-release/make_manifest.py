@@ -33,7 +33,6 @@ def main() -> None:
         "linux-x86_64",
         "windows-x86_64",
         "macos-aarch64",
-        "macos-x86_64",
     }
     artifacts = []
     found = set()

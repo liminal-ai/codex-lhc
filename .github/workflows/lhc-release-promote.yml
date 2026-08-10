@@ -75,7 +75,7 @@ jobs:
           assert manifest['release'] == os.environ['VERSION']
           assert manifest['buildRunId'] == os.environ['CANDIDATE_RUN_ID']
           assert manifest['sourceCommit'] == os.environ['SOURCE_SHA']
-          assert len(manifest['artifacts']) == 4
+          assert len(manifest['artifacts']) == 3
           PY
       - name: Write release notes
         env:
@@ -89,9 +89,10 @@ jobs:
           First release of the maintained Codex fork with LHC long-horizon
           context, stable turn/message IDs, and direct retrieval.
 
-          Built for Linux x86-64, Windows x86-64, macOS Apple Silicon, and
-          macOS Intel. Linux passed a disposable Daytona install/run/uninstall
-          smoke test. Windows and macOS smoke testing is not yet certified.
+          Built for Linux x86-64, Windows x86-64, and macOS Apple Silicon.
+          Linux passed a disposable Daytona install/run/uninstall smoke test.
+          Windows and macOS smoke testing is not yet certified. Intel macOS is
+          not distributed as a prebuilt artifact.
 
           - Candidate workflow: ${CANDIDATE_RUN_ID}
           - Daytona smoke workflow: ${SMOKE_RUN_ID}

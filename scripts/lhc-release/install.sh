@@ -109,7 +109,6 @@ esac
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) PLATFORM=linux-x86_64 ;;
   Darwin:arm64|Darwin:aarch64) PLATFORM=macos-aarch64 ;;
-  Darwin:x86_64|Darwin:amd64) PLATFORM=macos-x86_64 ;;
   *) die "v${VERSION} does not provide an artifact for $(uname -s):$(uname -m)" ;;
 esac
 
