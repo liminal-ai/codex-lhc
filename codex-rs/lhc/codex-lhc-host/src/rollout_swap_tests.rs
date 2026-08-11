@@ -143,6 +143,7 @@ fn failpoint_post_new_rename_pre_reopen_leaves_new_active_parseable() {
 }
 
 #[test]
+#[cfg(unix)]
 fn read_only_dir_leaves_old_authoritative() {
     let _guard = SwapFailpointGuard::arm(SwapFailpoint::None);
     let dir = tempdir().unwrap();
