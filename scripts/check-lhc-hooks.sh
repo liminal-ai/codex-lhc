@@ -12,7 +12,8 @@
 #   2a. cargo check -p codex-core -p codex-app-server -p codex-extension-api
 #       (the crates that *carry* the hooks — not just the adapter)
 #   2a1. build the real codex CLI, run bare `codex exec`, and require a thread
-#        database containing the captured user and assistant messages
+#        database containing the captured user and assistant messages plus a
+#        closed completed turn, with bounded process exit
 #   2b. cargo test -p codex-lhc-host --lib
 #   2c. cargo test -p codex-lhc-host --features test-util --test certification
 #   2d. cargo test -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)

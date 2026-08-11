@@ -40,6 +40,49 @@ pub const CAPTURE_QUEUE_CAP: usize = 1024;
 /// Slots available to normal traffic; last slot reserved for truncation note.
 const CAPTURE_USER_CAP: usize = CAPTURE_QUEUE_CAP - 1;
 
+/// After the caller's durability deadline expires while the queue is full,
+/// give the worker one short, separate chance to receive an unacknowledged
+/// shutdown command. This cannot turn an unknown result into success, but it
+/// avoids leaving an otherwise healthy worker alive on a long-lived host.
+#[cfg(not(test))]
+const SHUTDOWN_ENQUEUE_CLEANUP_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const SHUTDOWN_ENQUEUE_CLEANUP_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureShutdownFailure {
+    EnqueueTimedOut,
+    WorkerClosed,
+    AcknowledgementTimedOut,
+    AcknowledgementDropped,
+    PersistenceFailed,
+    RuntimeUnavailable,
+}
+
+impl CaptureShutdownFailure {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::EnqueueTimedOut => "enqueue_timed_out",
+            Self::WorkerClosed => "worker_closed",
+            Self::AcknowledgementTimedOut => "acknowledgement_timed_out",
+            Self::AcknowledgementDropped => "acknowledgement_dropped",
+            Self::PersistenceFailed => "persistence_failed",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureShutdownResult {
+    Persisted,
+    Failed(CaptureShutdownFailure),
+}
+
+#[derive(Default)]
+struct CaptureDurability {
+    failed: bool,
+}
+
 enum CaptureCmd {
     Persist {
         item: ResponseItem,
@@ -102,7 +145,7 @@ enum CaptureCmd {
         text: String,
         key_suffix: String,
     },
-    Shutdown(Option<oneshot::Sender<()>>),
+    Shutdown(Option<oneshot::Sender<CaptureShutdownResult>>),
 }
 
 struct CaptureShared {
@@ -378,6 +421,40 @@ impl CaptureHandle {
         let _ = rx.await;
     }
 
+    pub(crate) async fn shutdown_bounded(
+        self,
+        timeout: std::time::Duration,
+    ) -> CaptureShutdownResult {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (tx, rx) = oneshot::channel();
+        match tokio::time::timeout_at(deadline, self.inner.tx.send(CaptureCmd::Shutdown(Some(tx))))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                return CaptureShutdownResult::Failed(CaptureShutdownFailure::WorkerClosed);
+            }
+            Err(_) => {
+                let cleanup = CaptureCmd::Shutdown(/*ack*/ None);
+                let _ = tokio::time::timeout(
+                    SHUTDOWN_ENQUEUE_CLEANUP_BOUND,
+                    self.inner.tx.send(cleanup),
+                )
+                .await;
+                return CaptureShutdownResult::Failed(CaptureShutdownFailure::EnqueueTimedOut);
+            }
+        }
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                CaptureShutdownResult::Failed(CaptureShutdownFailure::AcknowledgementDropped)
+            }
+            Err(_) => {
+                CaptureShutdownResult::Failed(CaptureShutdownFailure::AcknowledgementTimedOut)
+            }
+        }
+    }
+
     pub fn dropped_count(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }
@@ -539,6 +616,7 @@ async fn worker_loop(
     // can carry providerUsage on the same event (schema v5 / D3) without
     // reordering relative to thinking/tool_call siblings.
     let mut pending_model_output: Vec<(ResponseItem, RawItemProvenance)> = Vec::new();
+    let mut durability = CaptureDurability::default();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -555,6 +633,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -572,6 +651,7 @@ async fn worker_loop(
                     provenance,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -591,6 +671,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     provider_usage.as_ref(),
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -613,6 +694,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -623,6 +705,7 @@ async fn worker_loop(
                 }
                 let event = map_turn_end(&thread_id, &turn_id, &reason, &facts);
                 if let Err(err) = submit_mapped(&mut session, &[event]).await {
+                    durability.failed = true;
                     warn!(thread_id = %thread_id, %err, "LHC: turn_end failed");
                 }
             }
@@ -642,6 +725,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -670,6 +754,7 @@ async fn worker_loop(
                     continue;
                 }
                 if let Err(err) = submit_mapped(&mut session, &events).await {
+                    durability.failed = true;
                     warn!(thread_id = %thread_id, %err, "LHC: model/thinking change failed");
                 }
             }
@@ -685,6 +770,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -697,6 +783,7 @@ async fn worker_loop(
             CaptureCmd::RuntimeNote { text, key_suffix } => {
                 let event = map_runtime_note(&thread_id, &text, &key_suffix);
                 if let Err(err) = submit_mapped(&mut session, &[event]).await {
+                    durability.failed = true;
                     warn!(thread_id = %thread_id, %err, "LHC: degraded note failed");
                 }
             }
@@ -714,6 +801,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
@@ -768,14 +856,26 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
                 .await;
-                close_capture_session(session, &derivation).await;
+                // Everything ahead of Shutdown has now crossed the SDK submit
+                // boundary, including the final pending model output. Report
+                // that intake durability before best-effort derivation settle:
+                // close may consume its full five-second allowance, but its
+                // durable work queue is replayable and is not part of this
+                // acknowledgment contract.
                 if let Some(ack) = ack {
-                    let _ = ack.send(());
+                    let result = if durability.failed || degraded.load(Ordering::SeqCst) {
+                        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed)
+                    } else {
+                        CaptureShutdownResult::Persisted
+                    };
+                    let _ = ack.send(result);
                 }
+                close_capture_session(session, &derivation).await;
                 return;
             }
         }
@@ -788,6 +888,7 @@ async fn worker_loop(
         &mut pending_model_output,
         None,
         &live_identity,
+        &mut durability,
         #[cfg(any(test, feature = "test-util"))]
         &mut crash_after,
     )
@@ -803,6 +904,7 @@ async fn flush_pending_model_output(
     pending: &mut Vec<(ResponseItem, RawItemProvenance)>,
     provider_usage: Option<&Map<String, Value>>,
     identity: &ModelIdentity,
+    durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
     if pending.is_empty() {
@@ -819,6 +921,7 @@ async fn flush_pending_model_output(
             provenance,
             provider_usage,
             identity,
+            durability,
             #[cfg(any(test, feature = "test-util"))]
             crash_after,
         )
@@ -836,6 +939,7 @@ async fn persist_item(
     provenance: RawItemProvenance,
     provider_usage: Option<&Map<String, Value>>,
     identity: &ModelIdentity,
+    durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
     // Contain map_item panics so one bad item cannot kill the worker (H9).
@@ -866,6 +970,7 @@ async fn persist_item(
                 %msg,
                 "LHC: map_item panicked; dropping item, worker continues"
             );
+            durability.failed = true;
             return Ok(());
         }
     };
@@ -898,6 +1003,7 @@ async fn persist_item(
         return Err("crash".into());
     }
     if let Err(err) = submit_mapped(session, &events).await {
+        durability.failed = true;
         warn!(thread_id = %thread_id, %err, "LHC: persist failed");
         if session.capture_disabled {
             degraded.store(true, Ordering::SeqCst);

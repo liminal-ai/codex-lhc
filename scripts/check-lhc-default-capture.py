@@ -15,9 +15,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROMPT = "lhc-default-capture-probe-user"
 REPLY = "lhc-default-capture-probe-assistant"
+EXEC_EXIT_BOUND_SECONDS = 30
+POST_TURN_EXIT_BOUND_SECONDS = 12
 
 
 class ResponsesHandler(BaseHTTPRequestHandler):
+    response_completed = threading.Event()
+    response_completed_at: float | None = None
+
     def log_message(self, _format: str, *_args: object) -> None:
         pass
 
@@ -68,16 +73,31 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self.wfile.flush()
+        type(self).response_completed_at = time.monotonic()
+        type(self).response_completed.set()
 
 
-def captured_contents(database: Path) -> list[str]:
+def captured_state(database: Path) -> tuple[list[str], list[str], int]:
     with sqlite3.connect(database, timeout=1) as connection:
-        return [
+        contents = [
             row[0]
             for row in connection.execute(
                 "SELECT content FROM message_block ORDER BY message_id, block_index"
             )
         ]
+        event_kinds = [
+            row[0]
+            for row in connection.execute(
+                "SELECT event_kind FROM event ORDER BY event_order"
+            )
+        ]
+        completed_turns = connection.execute(
+            "SELECT COUNT(*) FROM turns "
+            "WHERE status = 'closed' AND outcome = 'completed' "
+            "AND closed_at_event_order IS NOT NULL"
+        ).fetchone()[0]
+        return contents, event_kinds, completed_turns
 
 
 def main() -> None:
@@ -134,14 +154,40 @@ def main() -> None:
                     "CODEX_LHC_ROOT": str(lhc_root),
                 }
             )
-            result = subprocess.run(
-                command,
-                env=environment,
-                capture_output=True,
-                text=True,
-                timeout=60,
-                check=False,
-            )
+            started = time.monotonic()
+            try:
+                result = subprocess.run(
+                    command,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=EXEC_EXIT_BOUND_SECONDS,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise SystemExit(
+                    "bare codex exec exceeded the total process safety timeout\n"
+                    f"timeout: {EXEC_EXIT_BOUND_SECONDS}s\n"
+                    f"stdout:\n{error.stdout or ''}\n"
+                    f"stderr:\n{error.stderr or ''}"
+                ) from error
+            elapsed = time.monotonic() - started
+            completed_at = ResponsesHandler.response_completed_at
+            if not ResponsesHandler.response_completed.is_set() or completed_at is None:
+                raise SystemExit(
+                    "bare codex exec exited without the deterministic response.completed marker\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}"
+                )
+            post_turn_elapsed = time.monotonic() - completed_at
+            if post_turn_elapsed > POST_TURN_EXIT_BOUND_SECONDS:
+                raise SystemExit(
+                    "bare codex exec exceeded the post-turn shutdown bound\n"
+                    f"elapsed: {post_turn_elapsed:.2f}s\n"
+                    f"bound: {POST_TURN_EXIT_BOUND_SECONDS}s\n"
+                    f"stdout:\n{result.stdout}\n"
+                    f"stderr:\n{result.stderr}"
+                )
             if result.returncode != 0:
                 raise SystemExit(
                     "bare codex exec failed\n"
@@ -149,35 +195,30 @@ def main() -> None:
                     f"stderr:\n{result.stderr}"
                 )
 
-            deadline = time.monotonic() + 10
-            databases: list[Path] = []
-            contents: list[str] = []
-            while time.monotonic() < deadline:
-                databases = sorted((lhc_root / "threads").glob("*.sqlite"))
-                try:
-                    contents = [
-                        content
-                        for database in databases
-                        for content in captured_contents(database)
-                    ]
-                except sqlite3.Error:
-                    contents = []
-                if any(PROMPT in content for content in contents) and any(
-                    REPLY in content for content in contents
-                ):
-                    break
-                time.sleep(0.1)
-            else:
+            databases = sorted((lhc_root / "threads").glob("*.sqlite"))
+            states = [captured_state(database) for database in databases]
+            contents = [content for state in states for content in state[0]]
+            event_kinds = [kind for state in states for kind in state[1]]
+            completed_turns = sum(state[2] for state in states)
+            if not (
+                any(PROMPT in content for content in contents)
+                and any(REPLY in content for content in contents)
+                and "turn_end" in event_kinds
+                and completed_turns > 0
+            ):
                 raise SystemExit(
-                    "bare codex exec did not capture both messages\n"
+                    "bare codex exec exited without a durable completed turn\n"
                     f"thread databases: {[str(path) for path in databases]}\n"
                     f"captured blocks: {contents}\n"
+                    f"event kinds: {event_kinds}\n"
+                    f"completed turns: {completed_turns}\n"
                     f"stdout:\n{result.stdout}\n"
                     f"stderr:\n{result.stderr}"
                 )
             print(
-                "ok bare-exec: default LHC capture wrote a thread database "
-                "containing user and assistant messages"
+                "ok bare-exec: bounded exit persisted prompt, assistant, "
+                f"turn_end, and completed turn in {elapsed:.2f}s total, "
+                f"{post_turn_elapsed:.2f}s after response.completed"
             )
     finally:
         server.shutdown()

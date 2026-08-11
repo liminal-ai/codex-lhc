@@ -54,6 +54,8 @@ use lhc::shared_tech::InferenceCallbacks;
 
 use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
+use crate::capture::CaptureShutdownFailure;
+use crate::capture::CaptureShutdownResult;
 use crate::capture::spawn_capture_with_identity;
 use crate::gating::lhc_root;
 use crate::mapping::ModelIdentity;
@@ -677,9 +679,19 @@ fn schedule_open(
         });
 }
 
-async fn shutdown_capture_send(handle: CaptureHandle) {
+#[cfg(not(test))]
+const CAPTURE_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(test)]
+const CAPTURE_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(not(test))]
+const NATIVE_SHUTDOWN_REPLY_BOUND: std::time::Duration = std::time::Duration::from_secs(12);
+#[cfg(test)]
+const NATIVE_SHUTDOWN_REPLY_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+async fn shutdown_capture_send(handle: CaptureHandle) -> CaptureShutdownResult {
+    let thread_id = handle.thread_id().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-    let _ = std::thread::Builder::new()
+    let spawn = std::thread::Builder::new()
         .name("lhc-shutdown".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -687,18 +699,74 @@ async fn shutdown_capture_send(handle: CaptureHandle) {
                 .build()
             {
                 Ok(rt) => rt,
-                Err(_) => {
-                    let _ = tx.send(());
+                Err(err) => {
+                    error!(?err, "LHC: failed to create capture shutdown runtime");
+                    let _ = tx.send(CaptureShutdownResult::Failed(
+                        CaptureShutdownFailure::RuntimeUnavailable,
+                    ));
                     return;
                 }
             };
-            rt.block_on(async move {
-                handle.flush().await;
-                handle.shutdown().await;
-            });
-            let _ = tx.send(());
+            let result = rt.block_on(handle.shutdown_bounded(CAPTURE_SHUTDOWN_BOUND));
+            let _ = tx.send(result);
         });
-    let _ = rx.await;
+    if let Err(err) = spawn {
+        error!(
+            thread_id = %thread_id,
+            ?err,
+            durability = "unknown",
+            telemetry_event = "lhc.capture_shutdown_durability_unknown",
+            "LHC: failed to spawn capture shutdown thread; process exit will continue"
+        );
+        return CaptureShutdownResult::Failed(CaptureShutdownFailure::RuntimeUnavailable);
+    }
+    let result = match tokio::time::timeout(NATIVE_SHUTDOWN_REPLY_BOUND, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            error!(
+                thread_id = %thread_id,
+                failure = "native_reply_dropped",
+                durability = "unknown",
+                telemetry_event = "lhc.capture_shutdown_durability_unknown",
+                "LHC: capture shutdown thread dropped its reply; process exit will continue"
+            );
+            return CaptureShutdownResult::Failed(CaptureShutdownFailure::AcknowledgementDropped);
+        }
+        Err(_) => {
+            error!(
+                thread_id = %thread_id,
+                failure = "native_reply_timed_out",
+                durability = "unknown",
+                telemetry_event = "lhc.capture_shutdown_durability_unknown",
+                "LHC: capture shutdown thread timed out; process exit will continue"
+            );
+            return CaptureShutdownResult::Failed(CaptureShutdownFailure::AcknowledgementTimedOut);
+        }
+    };
+    match result {
+        CaptureShutdownResult::Persisted => {
+            debug!(thread_id = %thread_id, "LHC: capture shutdown persisted");
+        }
+        CaptureShutdownResult::Failed(failure @ CaptureShutdownFailure::PersistenceFailed) => {
+            error!(
+                thread_id = %thread_id,
+                failure = failure.as_str(),
+                durability = "failed",
+                telemetry_event = "lhc.capture_shutdown_persistence_failed",
+                "LHC: capture shutdown found a known persistence failure; process exit will continue"
+            );
+        }
+        CaptureShutdownResult::Failed(failure) => {
+            error!(
+                thread_id = %thread_id,
+                failure = failure.as_str(),
+                durability = "unknown",
+                telemetry_event = "lhc.capture_shutdown_durability_unknown",
+                "LHC: capture shutdown failed; process exit will continue"
+            );
+        }
+    }
+    result
 }
 
 impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C> {
@@ -1283,3 +1351,7 @@ mod tests {
 #[cfg(test)]
 #[path = "install_pre_open_tests.rs"]
 mod install_pre_open_tests;
+
+#[cfg(test)]
+#[path = "install_shutdown_tests.rs"]
+mod install_shutdown_tests;
