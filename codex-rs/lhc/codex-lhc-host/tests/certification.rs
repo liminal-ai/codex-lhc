@@ -386,7 +386,11 @@ async fn mapping_goldens_round_trip_and_match_fixtures() {
         let expected = std::fs::read_to_string(&path).unwrap_or_else(|err| {
             panic!("missing golden {path:?}: {err}. Run with UPDATE_LHC_GOLDENS=1");
         });
-        assert_eq!(expected.trim(), body.trim(), "golden mismatch for {name}");
+        let expected_json: serde_json::Value =
+            serde_json::from_str(&expected).expect("golden must be valid JSON");
+        let actual_json: serde_json::Value =
+            serde_json::from_str(&body).expect("rendered golden must be valid JSON");
+        assert_eq!(expected_json, actual_json, "golden mismatch for {name}");
     }
 }
 
