@@ -5562,7 +5562,7 @@ index 0000000000..ec49dd1d75
 +    }
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index b4aebe4a3c..d30ad6cb8f 100644
+index 816af473d7..f751890e89 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
 @@ -20,11 +20,14 @@ pub use session::SteerInputError;
@@ -6373,10 +6373,10 @@ index bfe89311fe..b319bb7cd5 100644
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index 08327d38d0..0eca25cb8a 100644
+index 3a9cec895b..72abf62791 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5897,6 +5897,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5895,6 +5895,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6385,7 +6385,7 @@ index 08327d38d0..0eca25cb8a 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
-@@ -8153,6 +8155,8 @@ where
+@@ -8151,6 +8153,8 @@ where
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6395,10 +6395,10 @@ index 08327d38d0..0eca25cb8a 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index e5dad1af6f..39d736a90a 100644
+index bef1dd3398..cf7d0d0ce7 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -462,6 +462,7 @@ pub(crate) async fn run_turn(
+@@ -461,6 +461,7 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -6406,7 +6406,7 @@ index e5dad1af6f..39d736a90a 100644
                      )
                      .await
                      {
-@@ -1028,6 +1029,7 @@ async fn run_pre_sampling_compact(
+@@ -1019,6 +1020,7 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -6414,7 +6414,7 @@ index e5dad1af6f..39d736a90a 100644
          )
          .await?;
      }
-@@ -1110,6 +1112,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1101,6 +1103,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -6422,7 +6422,7 @@ index e5dad1af6f..39d736a90a 100644
          )
          .await?;
          return Ok(());
-@@ -1158,6 +1161,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1149,6 +1152,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -6430,7 +6430,7 @@ index e5dad1af6f..39d736a90a 100644
          )
          .await?;
      }
-@@ -1169,7 +1173,12 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1160,7 +1164,12 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -6444,7 +6444,7 @@ index e5dad1af6f..39d736a90a 100644
      sess: &Arc<Session>,
      step_context: Arc<StepContext>,
      fallback_step_context: Option<Arc<StepContext>>,
-@@ -1177,9 +1186,32 @@ async fn run_auto_compact(
+@@ -1168,9 +1177,32 @@ async fn run_auto_compact(
      initial_context_injection: InitialContextInjection,
      reason: CompactionReason,
      phase: CompactionPhase,
@@ -6633,10 +6633,10 @@ index 0af3127d95..50cc90d1b5 100644
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index d4aa3a7256..e27493f0e7 100644
+index 3418ba83c1..91cb1c10e2 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
-@@ -496,12 +496,13 @@ impl Session {
+@@ -484,12 +484,13 @@ impl Session {
          let mut aborted_turn = false;
          let mut active_turn_to_clear = None;
          let mut turn_context = None;
@@ -6651,7 +6651,7 @@ index d4aa3a7256..e27493f0e7 100644
              }
              if aborted_turn {
                  active_turn_to_clear = Some(active_turn);
-@@ -509,8 +510,16 @@ impl Session {
+@@ -497,8 +498,16 @@ impl Session {
          }
  
          if let Some(turn_context) = turn_context.as_deref() {
@@ -6670,7 +6670,7 @@ index d4aa3a7256..e27493f0e7 100644
          }
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-@@ -545,12 +554,21 @@ impl Session {
+@@ -533,12 +542,21 @@ impl Session {
  
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -6697,7 +6697,7 @@ index d4aa3a7256..e27493f0e7 100644
          }
          // Let interrupted tasks observe cancellation before dropping pending approvals, or an
          // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-@@ -795,8 +813,13 @@ impl Session {
+@@ -766,8 +784,13 @@ impl Session {
              ThreadIdleCause::Completed
          };
          let event = if let Some(reason) = abort_reason {
@@ -6713,7 +6713,7 @@ index d4aa3a7256..e27493f0e7 100644
              EventMsg::TurnAborted(TurnAbortedEvent {
                  turn_id: Some(turn_context.sub_id.clone()),
                  reason,
-@@ -810,8 +833,12 @@ impl Session {
+@@ -781,8 +804,12 @@ impl Session {
                  .time_to_first_token_ms()
                  .await;
              let error = turn_context.terminal_error.lock().await.clone();
@@ -6728,17 +6728,17 @@ index d4aa3a7256..e27493f0e7 100644
              EventMsg::TurnComplete(TurnCompleteEvent {
                  turn_id: turn_context.sub_id.clone(),
                  last_agent_message,
-@@ -877,10 +904,22 @@ impl Session {
+@@ -848,10 +875,22 @@ impl Session {
              .await
      }
  
--    async fn handle_task_abort(self: &Arc<Self>, mut task: RunningTask, reason: TurnAbortReason) {
+-    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
 +    /// Abort a running task and emit `TurnAborted`. Returns host turn timing
 +    /// `(started_at, completed_at)` so lifecycle contributors can attach the
 +    /// same host facts the display event carries (schema v5).
 +    async fn handle_task_abort(
 +        self: &Arc<Self>,
-+        mut task: RunningTask,
++        task: RunningTask,
 +        reason: TurnAbortReason,
 +    ) -> (Option<i64>, Option<i64>) {
          let sub_id = task.turn_context.sub_id.clone();
@@ -6752,8 +6752,8 @@ index d4aa3a7256..e27493f0e7 100644
 +            return (started_at, None);
          }
  
-         if let Some(sender) = task.input_persisted.take() {
-@@ -977,6 +1016,7 @@ impl Session {
+         trace!(task_kind = ?task.kind, sub_id, "aborting running task");
+@@ -941,6 +980,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
              warn!("failed to flush rollout after emitting terminal turn event: {err}");
          }
@@ -6849,10 +6849,10 @@ index d5297df04f..b59d2737ae 100644
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
-index 189488bc2d..046a1bdf4e 100644
+index 11ce48b5bf..7423c9ffe9 100644
 --- a/codex-rs/rollout/src/recorder.rs
 +++ b/codex-rs/rollout/src/recorder.rs
-@@ -122,6 +122,14 @@ enum RolloutCmd {
+@@ -131,6 +131,14 @@ enum RolloutCmd {
      Flush {
          ack: oneshot::Sender<std::io::Result<()>>,
      },
@@ -6867,7 +6867,7 @@ index 189488bc2d..046a1bdf4e 100644
      Shutdown {
          ack: oneshot::Sender<std::io::Result<()>>,
      },
-@@ -979,6 +987,28 @@ impl RolloutRecorder {
+@@ -1002,6 +1010,28 @@ impl RolloutRecorder {
          })?
      }
  
@@ -6896,7 +6896,7 @@ index 189488bc2d..046a1bdf4e 100644
      pub async fn load_rollout_items(
          path: &Path,
      ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-@@ -1681,6 +1711,30 @@ impl RolloutWriterState {
+@@ -1686,6 +1716,30 @@ impl RolloutWriterState {
          self.write_pending_with_recovery("flush").await
      }
  
@@ -6919,7 +6919,7 @@ index 189488bc2d..046a1bdf4e 100644
 +            file: tokio::fs::File::from_std(file),
 +        });
 +        self.ordinal_state = ordinal_state;
-+        self.deferred_log_file_info = None;
++        self.deferred_creation = false;
 +        self.last_logged_error = None;
 +        Ok(())
 +    }

@@ -1073,7 +1073,7 @@ index 0000000000..086351b058
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 5cfd3e9f49..ba83630bfd 100644
+index 3b51352b72..f27d69fe88 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -1380,6 +1380,9 @@ impl Session {
@@ -1326,7 +1326,7 @@ index 5cfd3e9f49..ba83630bfd 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4267,3 +4415,14 @@ mod elicitation_holders_tests;
+@@ -4263,3 +4411,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
