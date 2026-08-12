@@ -1073,7 +1073,7 @@ index 0000000000..086351b058
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 3b51352b72..f27d69fe88 100644
+index 5dd12bc91b..c6d5fee913 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -1380,6 +1380,9 @@ impl Session {
@@ -1095,7 +1095,7 @@ index 3b51352b72..f27d69fe88 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3061,6 +3066,25 @@ impl Session {
+@@ -3027,6 +3032,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -1121,7 +1121,7 @@ index 3b51352b72..f27d69fe88 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, items);
-@@ -3082,7 +3106,8 @@ impl Session {
+@@ -3048,7 +3072,8 @@ impl Session {
                  });
          }
          self.persist_rollout_response_items(items).await;
@@ -1131,7 +1131,7 @@ index 3b51352b72..f27d69fe88 100644
      }
  
      pub(crate) async fn record_step_world_state_if_changed(
-@@ -3253,7 +3278,13 @@ impl Session {
+@@ -3219,7 +3244,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1146,7 +1146,7 @@ index 3b51352b72..f27d69fe88 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3337,7 +3368,7 @@ impl Session {
+@@ -3303,7 +3334,7 @@ impl Session {
              Self::assign_missing_response_item_id(&mut envelope.item);
          }
          let compacted_item = CompactedItem {
@@ -1155,7 +1155,7 @@ index 3b51352b72..f27d69fe88 100644
              replacement_history: Some(items.clone()),
              window_number: Some(metadata.window_number),
              first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-@@ -3357,6 +3388,10 @@ impl Session {
+@@ -3323,6 +3354,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1166,7 +1166,7 @@ index 3b51352b72..f27d69fe88 100644
          }
  
          self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3376,6 +3411,58 @@ impl Session {
+@@ -3342,6 +3377,58 @@ impl Session {
          }
      }
  
@@ -1225,7 +1225,7 @@ index 3b51352b72..f27d69fe88 100644
      async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
          let rollout_items: Vec<RolloutItem> = items
              .iter()
-@@ -3390,6 +3477,23 @@ impl Session {
+@@ -3356,6 +3443,23 @@ impl Session {
          self.features.enabled(feature)
      }
  
@@ -1249,7 +1249,7 @@ index 3b51352b72..f27d69fe88 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3425,7 +3529,42 @@ impl Session {
+@@ -3391,7 +3495,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1293,7 +1293,7 @@ index 3b51352b72..f27d69fe88 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3995,9 +4134,13 @@ impl Session {
+@@ -3961,9 +4100,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1310,7 +1310,7 @@ index 3b51352b72..f27d69fe88 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -4017,8 +4160,13 @@ impl Session {
+@@ -3983,8 +4126,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1326,7 +1326,7 @@ index 3b51352b72..f27d69fe88 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4263,3 +4411,14 @@ mod elicitation_holders_tests;
+@@ -4229,3 +4377,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

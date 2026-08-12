@@ -1,5 +1,5 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 9d9816fce7..53810f81fa 100644
+index 05528ce3f1..3292ddcf97 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
 @@ -609,6 +609,9 @@
@@ -12,7 +12,7 @@ index 9d9816fce7..53810f81fa 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -5248,6 +5251,9 @@
+@@ -5251,6 +5254,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -23,7 +23,7 @@ index 9d9816fce7..53810f81fa 100644
            "type": "boolean"
          },
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index 0977e7d7f5..12ce8475e5 100644
+index 31cb6afe37..a9159172c7 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
 @@ -279,6 +279,9 @@ pub enum Feature {
@@ -33,10 +33,10 @@ index 0977e7d7f5..12ce8475e5 100644
 +    /// Enable LHC long-horizon capture (parallel SQLite record; product default on).
 +    // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
 +    LhcCapture,
+     /// Retain client-authored developer messages across compacted context windows.
+     RetainClientDeveloperMessages,
      /// Use Agent Identity for ChatGPT-authenticated sessions.
-     UseAgentIdentity,
-     /// Enable workspace dependency support.
-@@ -1454,6 +1457,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1456,6 +1459,13 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },
@@ -48,5 +48,5 @@ index 0977e7d7f5..12ce8475e5 100644
 +        default_enabled: true,
 +    },
      FeatureSpec {
-         id: Feature::UseAgentIdentity,
-         key: "use_agent_identity",
+         id: Feature::RetainClientDeveloperMessages,
+         key: "retain_client_developer_messages",

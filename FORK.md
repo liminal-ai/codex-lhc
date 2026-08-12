@@ -303,6 +303,13 @@ change: band-walk brief-fallback repair). All tripwire layers passed, including
 98 adapter tests, the real Session seam, compact arm, certification, schema,
 patch reproduction at the new base, and the slice-D matrix.
 
+### Sync run 2026-08-12 — LIM-40 (~13 commits)
+
+`16fbfe55..1ad43978` class: merged `upstream/main` into `lhc`. Conflict:
+`features/src/lib.rs` — kept `Feature::LhcCapture` (fork default on) and
+upstream `RetainClientDeveloperMessages`. `patches/lhc/BASE` advanced to
+`1ad4397821…`; full series regenerated. Tripwire in following commit.
+
 ### Sync run 2026-08-12 — 108 upstream commits, two conflicts, green
 
 Merged `3aae5d885b..16fbfe5574`. Conflicts were limited to `core/src/lib.rs`
