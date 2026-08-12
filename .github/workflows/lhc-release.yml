@@ -70,7 +70,7 @@ jobs:
           install -m 0755 "$release_dir/codex-code-mode-host" "$stage/bin/codex-code-mode-host"
           strip "$stage/bin/codex" "$stage/bin/codex-code-mode-host"
           cp LICENSE "$stage/LICENSE"
-          lhc_sdk_commit="$(git -C lhc/vendor/long-horizon-context rev-parse HEAD)"
+          lhc_sdk_commit="$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)"
           printf '{"product":"codex-lhc","release":"%s","platform":"%s","lhcSdkCommit":"%s","lhcThreadSchema":6}\n' \
             "$VERSION" "$PLATFORM" "$lhc_sdk_commit" > "$stage/release-manifest.json"
           tar -C "$stage" -czf "dist/codex-lhc-v${VERSION}-${PLATFORM}.tar.gz" .
