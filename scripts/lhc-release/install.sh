@@ -108,8 +108,7 @@ esac
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) PLATFORM=linux-x86_64 ;;
-  Darwin:arm64|Darwin:aarch64) PLATFORM=macos-aarch64 ;;
-  *) die "v${VERSION} does not provide an artifact for $(uname -s):$(uname -m)" ;;
+  *) die "v${VERSION} publishes a prebuilt artifact for Linux x86-64 only; build from source on $(uname -s):$(uname -m)" ;;
 esac
 
 ASSET="codex-lhc-v${VERSION}-${PLATFORM}.tar.gz"
@@ -166,7 +165,7 @@ ln -sfn "$STORE/current/bin/codex" "$LINK"
 printf '%s\n' "$VERSION" > "$STORE/installed-version"
 printf '%s\n' "$NAME" > "$STORE/installed-name"
 
-lhc_pin=$(sed -n 's/.*"lhc_sdk_commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST/release-manifest.json" | head -1)
+lhc_pin=$(sed -n 's/.*"lhcSdkCommit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST/release-manifest.json" | head -1)
 say "Installed Codex + LHC: v${old_version} -> v${VERSION}"
 [ -z "$lhc_pin" ] || say "LHC engine updated to ${lhc_pin}."
 say "Command: $LINK"

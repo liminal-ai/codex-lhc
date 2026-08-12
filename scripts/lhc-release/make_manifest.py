@@ -29,11 +29,7 @@ def main() -> None:
         if path.name.startswith(f"codex-lhc-v{args.version}-")
         and path.suffix in {".gz", ".zip"}
     )
-    expected = {
-        "linux-x86_64",
-        "windows-x86_64",
-        "macos-aarch64",
-    }
+    expected = {"linux-x86_64"}
     artifacts = []
     found = set()
     prefix = f"codex-lhc-v{args.version}-"

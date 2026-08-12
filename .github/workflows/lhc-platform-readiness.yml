@@ -124,7 +124,7 @@ jobs:
         run: '& (Join-Path $env:CARGO_TARGET_DIR "debug\codex-code-mode-host.exe") --help'
 
       - name: Test POSIX installer
-        if: matrix.kind == 'unix'
+        if: matrix.label == 'linux-x86_64'
         run: python3 scripts/lhc-release/test_install.py
 
       - name: Test Windows installer

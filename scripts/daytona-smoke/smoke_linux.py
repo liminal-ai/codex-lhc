@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 from pathlib import Path
 
 from daytona import CreateSandboxFromSnapshotParams, Daytona, FileUpload
@@ -11,12 +12,21 @@ def main() -> None:
     require_key()
     candidate = require_candidate()
     source_version = (
-        Path(__file__).resolve().parents[2] / "lhc-release/VERSION"
-    ).read_text(encoding="utf-8").strip()
+        (Path(__file__).resolve().parents[2] / "lhc-release/VERSION")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
     version = os.environ.get("CODEX_LHC_VERSION", source_version)
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z.-]+)?", version):
+        fail(f"invalid CODEX_LHC_VERSION: {version}")
     archive = candidate / f"codex-lhc-v{version}-linux-x86_64.tar.gz"
     capture_probe = Path(__file__).resolve().parents[1] / "check-lhc-default-capture.py"
-    required = [archive, candidate / "install.sh", candidate / "SHA256SUMS", candidate / "release-manifest.json"]
+    required = [
+        archive,
+        candidate / "install.sh",
+        candidate / "SHA256SUMS",
+        candidate / "release-manifest.json",
+    ]
     for path in required:
         if not path.is_file():
             fail(f"candidate is missing {path.name}")
@@ -40,10 +50,20 @@ def main() -> None:
     print(f"OK: created Linux sandbox {sandbox.id}")
     try:
         remote = "/tmp/codex-lhc-candidate"
-        expect_success(sandbox.process.exec(f"mkdir -p {remote}"), "create candidate directory")
+        expect_success(
+            sandbox.process.exec(f"mkdir -p {remote}"), "create candidate directory"
+        )
         sandbox.fs.upload_files(
-            [FileUpload(source=str(path), destination=f"{remote}/{path.name}") for path in required]
-            + [FileUpload(source=str(capture_probe), destination=f"{remote}/{capture_probe.name}")]
+            [
+                FileUpload(source=str(path), destination=f"{remote}/{path.name}")
+                for path in required
+            ]
+            + [
+                FileUpload(
+                    source=str(capture_probe),
+                    destination=f"{remote}/{capture_probe.name}",
+                )
+            ]
         )
         command = (
             f"HOME=/tmp/lhc-home CODEX_HOME=/tmp/lhc-data CODEX_LHC_ROOT=/tmp/lhc-data/lhc "
@@ -51,20 +71,30 @@ def main() -> None:
             f"--prefix /tmp/lhc-prefix --install-root /tmp/lhc-packages --asset-dir {remote}"
         )
         expect_success(sandbox.process.exec(command, timeout=180), "Linux install")
-        expect_success(sandbox.process.exec("/tmp/lhc-prefix/bin/codex-lhc-smoke --version"), "codex --version")
-        expect_success(sandbox.process.exec("/tmp/lhc-prefix/bin/codex-lhc-smoke --help >/tmp/codex-help.txt"), "codex --help")
         expect_success(
-            sandbox.process.exec(f"/tmp/lhc-packages/versions/{version}/bin/codex-code-mode-host --help >/tmp/host-help.txt"),
+            sandbox.process.exec("/tmp/lhc-prefix/bin/codex-lhc-smoke --version"),
+            "codex --version",
+        )
+        expect_success(
+            sandbox.process.exec(
+                "/tmp/lhc-prefix/bin/codex-lhc-smoke --help >/tmp/codex-help.txt"
+            ),
+            "codex --help",
+        )
+        expect_success(
+            sandbox.process.exec(
+                f"/tmp/lhc-packages/versions/{version}/bin/codex-code-mode-host --help >/tmp/host-help.txt"
+            ),
             "code-mode host --help",
         )
         expect_success(
             sandbox.process.exec(
-                f"python3 {remote}/{capture_probe.name} --binary /tmp/lhc-prefix/bin/codex-lhc-smoke",
+                f"python3 {remote}/{capture_probe.name} --binary /tmp/lhc-prefix/bin/codex-lhc-smoke "
+                "--lhc-root /tmp/lhc-data/lhc",
                 timeout=120,
             ),
             "bare installed Codex captures a complete LHC turn",
         )
-        expect_success(sandbox.process.exec("mkdir -p /tmp/lhc-data/lhc && echo preserve >/tmp/lhc-data/lhc/smoke-marker"), "create data marker")
         expect_success(
             sandbox.process.exec(
                 "HOME=/tmp/lhc-home sh /tmp/codex-lhc-candidate/install.sh --name codex-lhc-smoke "
@@ -75,9 +105,10 @@ def main() -> None:
         expect_success(
             sandbox.process.exec(
                 "test ! -e /tmp/lhc-prefix/bin/codex-lhc-smoke && "
-                "test ! -e /tmp/lhc-packages && test -f /tmp/lhc-data/lhc/smoke-marker"
+                "test ! -e /tmp/lhc-packages && "
+                "test $(find /tmp/lhc-data/lhc/threads -name '*.sqlite' -type f | wc -l) -ge 1"
             ),
-            "Linux cleanup and data preservation",
+            "Linux cleanup and captured archive preservation",
         )
         print("SMOKE_PASS linux")
     finally:

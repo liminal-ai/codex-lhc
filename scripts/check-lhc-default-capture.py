@@ -107,6 +107,11 @@ def main() -> None:
         type=Path,
         default=Path("codex-rs/target/release/codex"),
     )
+    parser.add_argument(
+        "--lhc-root",
+        type=Path,
+        help="persist the probe database at this path instead of inside the temporary root",
+    )
     args = parser.parse_args()
     binary = args.binary.resolve()
     if not binary.is_file():
@@ -120,7 +125,8 @@ def main() -> None:
             root = Path(temp)
             home = root / "home"
             codex_home = root / "codex-home"
-            lhc_root = root / "lhc"
+            lhc_root = args.lhc_root.resolve() if args.lhc_root else root / "lhc"
+            lhc_root.mkdir(parents=True, exist_ok=True)
             cwd = root / "cwd"
             home.mkdir()
             codex_home.mkdir()

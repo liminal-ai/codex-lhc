@@ -8,7 +8,7 @@ for the maintenance contract.
 
 ---
 
-## Release install (Linux x86_64, Windows x86_64, macOS Apple Silicon)
+## Release install (Linux x86-64)
 
 Download the installer from the latest published release, inspect it, then
 run it. The installer resolves that same release when `--version` is omitted:
@@ -57,16 +57,10 @@ pin before it replaces anything.
 
 Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
 fork source commit, upstream base, LHC SDK commit, target, and capture default.
-Prebuilt archives are published for Ubuntu 24.04/glibc on Linux x86_64,
-Windows x86_64, and Apple Silicon macOS. `install.sh` selects Linux or macOS;
-Windows uses `install.ps1`:
-
-```powershell
-Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1 -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1
-```
-
-Intel macOS and other architectures should build from source for now.
+The current release lane publishes a prebuilt Ubuntu 24.04/glibc Linux x86-64
+archive only. Windows x86-64 and Apple Silicon macOS remain native source and
+readiness targets, but are not currently published as prebuilt artifacts.
+Build from source on those platforms and on other architectures.
 
 ## Build from source
 

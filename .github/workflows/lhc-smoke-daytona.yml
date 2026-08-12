@@ -52,81 +52,24 @@ jobs:
           CODEX_LHC_VERSION: ${{ inputs.version }}
           DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
         run: python scripts/daytona-smoke/smoke_linux.py
-
-  smoke-windows:
-    name: Smoke Windows
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 45
-    environment: staging
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-        with:
-          python-version: "3.12"
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: codex-lhc-v${{ inputs.version }}-candidate
-          path: candidate
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ inputs.candidate_run_id }}
-      - name: Verify candidate checksums
-        run: |
-          set -euo pipefail
-          (cd candidate && sha256sum -c SHA256SUMS)
-      - name: Install Daytona SDK
-        run: pip install --requirement scripts/daytona-smoke/requirements.txt
-      - name: Run smoke
+      - name: Record qualification evidence
         env:
-          CODEX_LHC_CANDIDATE_DIR: ${{ github.workspace }}/candidate
-          CODEX_LHC_VERSION: ${{ inputs.version }}
-          DAYTONA_API_KEY: ${{ secrets.DAYTONA_API_KEY }}
-        run: python scripts/daytona-smoke/smoke_windows.py
-
-  smoke-macos:
-    name: Smoke macOS Apple Silicon
-    runs-on: blacksmith-12vcpu-macos-15
-    timeout-minutes: 30
-    environment: staging
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: codex-lhc-v${{ inputs.version }}-candidate
-          path: candidate
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ inputs.candidate_run_id }}
-      - name: Install, capture, and uninstall exact candidate
-        env:
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           VERSION: ${{ inputs.version }}
         run: |
-          set -euo pipefail
-          (cd candidate && shasum -a 256 -c SHA256SUMS)
-          root="$(mktemp -d "${RUNNER_TEMP}/codex-lhc-smoke.XXXXXX")"
-          trap 'rm -rf "$root"' EXIT
-          mkdir -p "$root/home" "$root/data/lhc"
-          HOME="$root/home" sh candidate/install.sh \
-            --version "$VERSION" \
-            --name codex-lhc-smoke \
-            --prefix "$root/prefix" \
-            --install-root "$root/packages" \
-            --asset-dir candidate
-          "$root/prefix/bin/codex-lhc-smoke" --version
-          "$root/prefix/bin/codex-lhc-smoke" --help >"$root/codex-help.txt"
-          "$root/packages/versions/$VERSION/bin/codex-code-mode-host" --help \
-            >"$root/host-help.txt"
-          python3 scripts/check-lhc-default-capture.py \
-            --binary "$root/prefix/bin/codex-lhc-smoke"
-          printf '%s\n' preserve >"$root/data/lhc/smoke-marker"
-          HOME="$root/home" sh candidate/install.sh \
-            --name codex-lhc-smoke \
-            --prefix "$root/prefix" \
-            --install-root "$root/packages" \
-            --uninstall
-          test ! -e "$root/prefix/bin/codex-lhc-smoke"
-          test ! -e "$root/packages"
-          test -f "$root/data/lhc/smoke-marker"
-          echo "SMOKE_PASS macos-aarch64"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path("qualification.json").write_text(json.dumps({
+              "candidate_run_id": os.environ["CANDIDATE_RUN_ID"],
+              "version": os.environ["VERSION"],
+              "result": "passed",
+              "platform": "linux-x86_64",
+          }, indent=2) + "\n")
+          PY
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-qualification-${{ inputs.candidate_run_id }}
+          path: qualification.json
+          if-no-files-found: error
+          retention-days: 30

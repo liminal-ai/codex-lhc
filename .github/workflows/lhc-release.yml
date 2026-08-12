@@ -1,5 +1,5 @@
-# Build an immutable Codex-LHC release candidate. Publishing is a separate
-# workflow and must consume these exact artifacts after Daytona smoke tests.
+# Build one immutable Linux Codex-LHC candidate. Publishing is a separate
+# protected workflow and must consume these exact artifacts after smoke.
 name: Codex LHC candidate
 
 on:
@@ -19,29 +19,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.label }}
-    runs-on: ${{ matrix.runner }}
+  build-linux:
+    name: Build linux-x86_64
+    runs-on: blacksmith-32vcpu-ubuntu-2404
     timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: linux-x86_64
-            runner: blacksmith-32vcpu-ubuntu-2404
-            platform: linux-x86_64
-            target: x86_64-unknown-linux-gnu
-            kind: unix
-          - label: windows-x86_64
-            runner: blacksmith-32vcpu-windows-2025
-            platform: windows-x86_64
-            target: x86_64-pc-windows-msvc
-            kind: windows
-          - label: macos-aarch64
-            runner: blacksmith-12vcpu-macos-15
-            platform: macos-aarch64
-            target: aarch64-apple-darwin
-            kind: unix
+    env:
+      PLATFORM: linux-x86_64
+      TARGET: x86_64-unknown-linux-gnu
     steps:
       - name: Checkout product source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -49,9 +33,7 @@ jobs:
           persist-credentials: false
           submodules: recursive
           fetch-depth: 0
-
       - name: Validate release identity
-        shell: bash
         env:
           VERSION: ${{ inputs.version }}
         run: |
@@ -60,67 +42,25 @@ jobs:
           test "$VERSION" = "$(tr -d '[:space:]' < lhc-release/VERSION)"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/cli/Cargo.toml)"
           test "$VERSION" = "$cargo_version"
-
       - uses: ./.github/actions/setup-ci
-        if: matrix.kind != 'windows'
-      - name: Configure Windows build paths
-        if: matrix.kind == 'windows'
-        shell: pwsh
-        run: |
-          git config --global core.longpaths true
-          $target = Join-Path $env:RUNNER_TEMP "ct"
-          New-Item $target -ItemType Directory -Force | Out-Null
-          "CARGO_TARGET_DIR=$target" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
-        if: matrix.kind == 'windows'
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Test POSIX installer
-        if: matrix.platform == 'linux-x86_64'
+          targets: x86_64-unknown-linux-gnu
+      - name: Test Linux installer
         run: python3 scripts/lhc-release/test_install.py
-
-      - name: Test Windows installer
-        if: matrix.kind == 'windows'
-        shell: pwsh
-        run: ./scripts/lhc-release/test_install.ps1
-
       - name: Build release binaries
-        shell: bash
         working-directory: codex-rs
-        env:
-          LIBSQLITE3_FLAGS: ${{ matrix.kind == 'windows' && 'SQLITE_DISABLE_INTRINSIC' || '' }}
         run: |
           set -euo pipefail
-          cargo build --release --locked --target '${{ matrix.target }}' \
+          cargo build --release --locked --target "$TARGET" \
             -p codex-cli -p codex-code-mode-host
-
-      - name: Verify bare Codex captures to LHC by default (Unix)
-        if: matrix.kind == 'unix'
-        env:
-          TARGET: ${{ matrix.target }}
+      - name: Verify bare Codex captures to LHC by default
         run: >-
           python3 scripts/check-lhc-default-capture.py
           --binary "$CARGO_TARGET_DIR/$TARGET/release/codex"
-
-      - name: Verify bare Codex captures to LHC by default (Windows)
-        if: matrix.kind == 'windows'
-        shell: pwsh
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          $binary = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET\release\codex.exe"
-          python scripts/check-lhc-default-capture.py --binary $binary
-
-      - name: Package Unix candidate
-        if: matrix.kind == 'unix'
-        shell: bash
+      - name: Package Linux candidate
         env:
           VERSION: ${{ inputs.version }}
-          PLATFORM: ${{ matrix.platform }}
-          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           stage="dist/payload"
@@ -130,44 +70,23 @@ jobs:
           install -m 0755 "$release_dir/codex-code-mode-host" "$stage/bin/codex-code-mode-host"
           strip "$stage/bin/codex" "$stage/bin/codex-code-mode-host"
           cp LICENSE "$stage/LICENSE"
-          printf '{"product":"codex-lhc","release":"%s","platform":"%s"}\n' \
-            "$VERSION" "$PLATFORM" > "$stage/release-manifest.json"
+          lhc_sdk_commit="$(git -C lhc/vendor/long-horizon-context rev-parse HEAD)"
+          printf '{"product":"codex-lhc","release":"%s","platform":"%s","lhcSdkCommit":"%s","lhcThreadSchema":6}\n' \
+            "$VERSION" "$PLATFORM" "$lhc_sdk_commit" > "$stage/release-manifest.json"
           tar -C "$stage" -czf "dist/codex-lhc-v${VERSION}-${PLATFORM}.tar.gz" .
           "$stage/bin/codex" --version
           "$stage/bin/codex-code-mode-host" --help >/dev/null
-
-      - name: Package Windows candidate
-        if: matrix.kind == 'windows'
-        shell: pwsh
-        env:
-          VERSION: ${{ inputs.version }}
-          PLATFORM: ${{ matrix.platform }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $stage = "dist\payload"
-          New-Item "$stage\bin" -ItemType Directory -Force | Out-Null
-          $releaseDir = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET\release"
-          Copy-Item "$releaseDir\codex.exe" "$stage\bin\codex.exe"
-          Copy-Item "$releaseDir\codex-code-mode-host.exe" "$stage\bin\codex-code-mode-host.exe"
-          Copy-Item LICENSE "$stage\LICENSE"
-          @{ product = "codex-lhc"; release = $env:VERSION; platform = $env:PLATFORM } |
-            ConvertTo-Json | Set-Content "$stage\release-manifest.json"
-          Compress-Archive "$stage\*" "dist\codex-lhc-v$env:VERSION-$env:PLATFORM.zip"
-          & "$stage\bin\codex.exe" --version
-          & "$stage\bin\codex-code-mode-host.exe" --help | Out-Null
-
-      - name: Upload platform candidate
+      - name: Upload Linux candidate
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: codex-lhc-${{ matrix.platform }}
-          path: dist/codex-lhc-v${{ inputs.version }}-*
+          name: codex-lhc-linux-x86_64
+          path: dist/codex-lhc-v${{ inputs.version }}-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 14
 
   candidate:
-    name: Assemble candidate
-    needs: build
+    name: Assemble immutable candidate
+    needs: build-linux
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
@@ -181,16 +100,14 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: codex-lhc-*
+          name: codex-lhc-linux-x86_64
           path: candidate
-          merge-multiple: true
       - name: Generate release manifest and checksums
         env:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           install -m 0755 scripts/lhc-release/install.sh candidate/install.sh
-          install -m 0644 scripts/lhc-release/install.ps1 candidate/install.ps1
           python3 scripts/lhc-release/make_manifest.py \
             --dist candidate \
             --version "$VERSION" \
