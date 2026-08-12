@@ -49,6 +49,7 @@ codex-models-manager = { workspace = true }
 codex-shell-command = { workspace = true }
 codex-execpolicy = { workspace = true }
 codex-git-utils = { workspace = true }
+codex-history = { workspace = true }
 codex-hooks = { workspace = true }
 # LHC-HOOK: fork-only LHC capture + compact bridge adapter.
 codex-lhc-host = { workspace = true }

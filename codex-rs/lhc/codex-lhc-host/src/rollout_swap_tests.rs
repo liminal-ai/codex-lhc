@@ -2,10 +2,10 @@
 
 use super::*;
 use crate::estimate_response_items_tokens;
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use pretty_assertions::assert_eq;
@@ -20,26 +20,32 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
             },
             git: None,
         }),
-        RolloutItem::ResponseItem(ResponseItem::Message {
-            id: None,
-            role: "user".into(),
-            content: vec![ContentItem::InputText {
-                text: format!("hello {tag}"),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        }),
-        RolloutItem::Compacted(CompactedItem {
-            message: format!("boundary-{tag}"),
-            replacement_history: Some(vec![ResponseItem::Message {
+        RolloutItem::ResponseItem(
+            ResponseItem::Message {
                 id: None,
                 role: "user".into(),
                 content: vec![ContentItem::InputText {
-                    text: format!("band {tag}"),
+                    text: format!("hello {tag}"),
                 }],
                 phase: None,
                 internal_chat_message_metadata_passthrough: None,
-            }]),
+            }
+            .into(),
+        ),
+        RolloutItem::Compacted(CompactedItem {
+            message: format!("boundary-{tag}"),
+            replacement_history: Some(vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: format!("band {tag}"),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ]),
             window_number: Some(1),
             first_window_id: Some("first".into()),
             previous_window_id: None,
@@ -189,16 +195,16 @@ fn history_from_materialized_is_bands_plus_native_tail() {
         }),
         // Pre-boundary band stream item (ignored for install history — only
         // Compacted.replacement_history is the base).
-        RolloutItem::ResponseItem(band.clone()),
+        RolloutItem::ResponseItem(band.clone().into()),
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
-            replacement_history: Some(vec![band.clone()]),
+            replacement_history: Some(vec![band.clone().into()]),
             window_number: Some(2),
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w".into()),
         }),
-        RolloutItem::ResponseItem(tail.clone()),
+        RolloutItem::ResponseItem(tail.clone().into()),
     ];
     let history = history_from_materialized_items(&items);
     assert_eq!(history, vec![band, tail]);
@@ -250,22 +256,22 @@ fn dual_format_history_picks_newest_compacted_only() {
         }),
         RolloutItem::Compacted(CompactedItem {
             message: "c1".into(),
-            replacement_history: Some(vec![band1]),
+            replacement_history: Some(vec![band1.into()]),
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w1".into()),
         }),
-        RolloutItem::ResponseItem(after1),
+        RolloutItem::ResponseItem(after1.into()),
         RolloutItem::Compacted(CompactedItem {
             message: "c2".into(),
-            replacement_history: Some(vec![band2.clone()]),
+            replacement_history: Some(vec![band2.clone().into()]),
             window_number: Some(2),
             first_window_id: Some("f".into()),
             previous_window_id: Some("w1".into()),
             window_id: Some("w2".into()),
         }),
-        RolloutItem::ResponseItem(after2.clone()),
+        RolloutItem::ResponseItem(after2.clone().into()),
     ];
     let history = history_from_materialized_items(&items);
     assert_eq!(history, vec![band2, after2]);
@@ -296,7 +302,7 @@ fn fl4_model_context_estimate_like_for_like() {
         }),
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
-            replacement_history: Some(vec![band]),
+            replacement_history: Some(vec![band.into()]),
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,
@@ -347,10 +353,10 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
         internal_chat_message_metadata_passthrough: None,
     };
     let items = vec![
-        RolloutItem::ResponseItem(band.clone()),
+        RolloutItem::ResponseItem(band.clone().into()),
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
-            replacement_history: Some(vec![band.clone()]),
+            replacement_history: Some(vec![band.clone().into()]),
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,

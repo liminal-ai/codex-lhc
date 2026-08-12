@@ -99,14 +99,16 @@ async fn pre_open_identity_change_replays_in_order() {
     );
     handle.shutdown().await;
 
-    let ciphers_under = |items: &[codex_protocol::protocol::RolloutItem]| -> Vec<Option<String>> {
+    let ciphers_under = |items: &[codex_history::RolloutItem]| -> Vec<Option<String>> {
         items
             .iter()
             .filter_map(|item| match item {
-                codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::Reasoning {
-                    encrypted_content,
-                    ..
-                }) => Some(encrypted_content.clone()),
+                codex_history::RolloutItem::ResponseItem(item) => match &item.item {
+                    ResponseItem::Reasoning {
+                        encrypted_content, ..
+                    } => Some(encrypted_content.clone()),
+                    _ => None,
+                },
                 _ => None,
             })
             .collect()
@@ -147,16 +149,15 @@ async fn pre_open_identity_change_replays_in_order() {
 
 /// Counts only the test's own buffered payloads (text "x"); the degradation
 /// truncation note also materializes as a user-role Message and must not count.
-fn is_buffered_payload(item: &codex_protocol::protocol::RolloutItem) -> bool {
+fn is_buffered_payload(item: &codex_history::RolloutItem) -> bool {
     use codex_protocol::models::ContentItem;
     match item {
-        codex_protocol::protocol::RolloutItem::ResponseItem(ResponseItem::Message {
-            role,
-            content,
-            ..
-        }) if role == "user" => content
-            .iter()
-            .any(|c| matches!(c, ContentItem::InputText { text } if text == "x")),
+        codex_history::RolloutItem::ResponseItem(item) => match &item.item {
+            ResponseItem::Message { role, content, .. } if role == "user" => content
+                .iter()
+                .any(|c| matches!(c, ContentItem::InputText { text } if text == "x")),
+            _ => false,
+        },
         _ => false,
     }
 }

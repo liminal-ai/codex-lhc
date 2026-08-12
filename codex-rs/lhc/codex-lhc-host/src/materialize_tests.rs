@@ -373,7 +373,7 @@ fn tail_response_items(items: &[RolloutItem]) -> Vec<&ResponseItem> {
     for item in items {
         match item {
             RolloutItem::Compacted(_) => past = true,
-            RolloutItem::ResponseItem(r) if past => out.push(r),
+            RolloutItem::ResponseItem(r) if past => out.push(&r.item),
             _ => {}
         }
     }
@@ -495,7 +495,7 @@ fn boundary_record_field_completeness_pinned() {
     assert_eq!(
         boundary_completeness_error(&[RolloutItem::Compacted(CompactedItem {
             message: "x".into(),
-            replacement_history: Some(vec![user_text_message("x")]),
+            replacement_history: Some(vec![user_text_message("x").into()]),
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1123,8 +1123,11 @@ fn h2_token_count_emits_after_last_part_regardless_of_kind() {
     let mut token_idx = None;
     for (i, item) in items.iter().enumerate() {
         match item {
-            RolloutItem::ResponseItem(ResponseItem::FunctionCall { call_id, .. })
-                if call_id == "fc_u" =>
+            RolloutItem::ResponseItem(item)
+                if matches!(
+                    &item.item,
+                    ResponseItem::FunctionCall { call_id, .. } if call_id == "fc_u"
+                ) =>
             {
                 last_part_idx = Some(i);
             }
@@ -1356,9 +1359,13 @@ fn h3_image_generation_paired_emits_one_item_unpaired_degraded() {
     let mut saw_complete_after_ig = false;
     for i in &items2 {
         match i {
-            RolloutItem::ResponseItem(ResponseItem::ImageGenerationCall {
-                status, result, ..
-            }) if status == "unknown" && result.is_empty() => {
+            RolloutItem::ResponseItem(item)
+                if matches!(
+                    &item.item,
+                    ResponseItem::ImageGenerationCall { status, result, .. }
+                        if status == "unknown" && result.is_empty()
+                ) =>
+            {
                 saw_degraded_ig = true;
             }
             RolloutItem::EventMsg(EventMsg::TurnComplete(e))
@@ -2316,10 +2323,10 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
 
     let prior = vec![
         RolloutItem::SessionMeta(empty_meta()),
-        RolloutItem::ResponseItem(user_text_message("old prompt — must not copy")),
+        RolloutItem::ResponseItem(user_text_message("old prompt — must not copy").into()),
         RolloutItem::Compacted(CompactedItem {
             message: "old compact".into(),
-            replacement_history: Some(vec![user_text_message("old hist")]),
+            replacement_history: Some(vec![user_text_message("old hist").into()]),
             window_number: Some(0),
             first_window_id: None,
             previous_window_id: None,
@@ -2428,8 +2435,12 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
     // Prior ResponseItems / Compacted / TokenCount not copied.
     assert!(!items.iter().any(|i| matches!(
         i,
-        RolloutItem::ResponseItem(ResponseItem::Message { content, .. })
-            if content_text(content).contains("old prompt")
+        RolloutItem::ResponseItem(item)
+            if matches!(
+                &item.item,
+                ResponseItem::Message { content, .. }
+                    if content_text(content).contains("old prompt")
+            )
     )));
     assert_eq!(
         items
@@ -2775,11 +2786,14 @@ fn identity_match_reemits_encrypted_content() {
         .items
         .iter()
         .find_map(|it| match it {
-            RolloutItem::ResponseItem(ResponseItem::Reasoning {
-                encrypted_content,
-                summary,
-                ..
-            }) => Some((encrypted_content.clone(), summary.clone())),
+            RolloutItem::ResponseItem(item) => match &item.item {
+                ResponseItem::Reasoning {
+                    encrypted_content,
+                    summary,
+                    ..
+                } => Some((encrypted_content.clone(), summary.clone())),
+                _ => None,
+            },
             _ => None,
         })
         .expect("expected Reasoning item");
@@ -2828,9 +2842,12 @@ fn identity_mismatch_suppresses_encrypted_content() {
         live_identity: Some(live),
     });
     let enc = result.items.iter().find_map(|it| match it {
-        RolloutItem::ResponseItem(ResponseItem::Reasoning {
-            encrypted_content, ..
-        }) => Some(encrypted_content.clone()),
+        RolloutItem::ResponseItem(item) => match &item.item {
+            ResponseItem::Reasoning {
+                encrypted_content, ..
+            } => Some(encrypted_content.clone()),
+            _ => None,
+        },
         _ => None,
     });
     assert_eq!(enc, Some(None), "mismatch must suppress encrypted_content");
@@ -2874,11 +2891,14 @@ fn signature_only_thinking_emits_when_identity_matches() {
         live_identity: Some(identity),
     });
     let reasoning = result.items.iter().find_map(|it| match it {
-        RolloutItem::ResponseItem(ResponseItem::Reasoning {
-            encrypted_content,
-            summary,
-            ..
-        }) => Some((encrypted_content.clone(), summary.clone())),
+        RolloutItem::ResponseItem(item) => match &item.item {
+            ResponseItem::Reasoning {
+                encrypted_content,
+                summary,
+                ..
+            } => Some((encrypted_content.clone(), summary.clone())),
+            _ => None,
+        },
         _ => None,
     });
     assert!(

@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index a12874fea3..5efe6c0e3d 100644
+index 83f1f0d651..97dc03ac63 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -3820,6 +3820,22 @@ impl ThreadRequestProcessor {
+@@ -3822,6 +3822,22 @@ impl ThreadRequestProcessor {
          &self,
          stored_thread: StoredThread,
      ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
@@ -26,19 +26,19 @@ index a12874fea3..5efe6c0e3d 100644
              let model_context = self
                  .thread_store
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index 7e6e4576d0..3bed2e79e0 100644
+index 78e6905ded..030ad69c92 100644
 --- a/codex-rs/core/Cargo.toml
 +++ b/codex-rs/core/Cargo.toml
-@@ -50,6 +50,8 @@ codex-shell-command = { workspace = true }
- codex-execpolicy = { workspace = true }
+@@ -51,6 +51,8 @@ codex-execpolicy = { workspace = true }
  codex-git-utils = { workspace = true }
+ codex-history = { workspace = true }
  codex-hooks = { workspace = true }
 +# LHC-HOOK: fork-only LHC capture + compact bridge adapter.
 +codex-lhc-host = { workspace = true }
  codex-http-client = { workspace = true }
  codex-install-context = { workspace = true }
  codex-network-proxy = { workspace = true }
-@@ -138,6 +140,8 @@ codex-shell-escalation = { workspace = true }
+@@ -139,6 +141,8 @@ codex-shell-escalation = { workspace = true }
  [dev-dependencies]
  assert_cmd = { workspace = true }
  assert_matches = { workspace = true }
@@ -49,10 +49,10 @@ index 7e6e4576d0..3bed2e79e0 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..6790d6c347
+index 0000000000..f8512aaed8
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,1064 @@
+@@ -0,0 +1,1069 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -75,6 +75,7 @@ index 0000000000..6790d6c347
 +use std::time::Duration;
 +
 +use codex_features::Feature;
++use codex_history::RolloutItem;
 +use codex_lhc_host::CompactBoundaryMeta;
 +use codex_lhc_host::CompactMarker;
 +use codex_lhc_host::DerivedProvenance;
@@ -97,7 +98,6 @@ index 0000000000..6790d6c347
 +use codex_protocol::error::Result as CodexResult;
 +use codex_protocol::models::ContentItem;
 +use codex_protocol::models::ResponseItem;
-+use codex_protocol::protocol::RolloutItem;
 +use codex_protocol::protocol::SessionMeta;
 +use codex_protocol::protocol::SessionMetaLine;
 +use tokio_util::sync::CancellationToken;
@@ -342,7 +342,12 @@ index 0000000000..6790d6c347
 +
 +    let thread_id = handle.thread_id().to_string();
 +    let root = handle.root().map(std::path::Path::to_path_buf);
-+    let host_items = sess.clone_history().await.raw_items().to_vec();
++    let host_items = sess
++        .clone_history()
++        .await
++        .raw_items()
++        .cloned()
++        .collect::<Vec<_>>();
 +
 +    let cancel = Arc::new(AtomicBool::new(false));
 +
@@ -677,8 +682,8 @@ index 0000000000..6790d6c347
 +    sess.recompute_token_usage(turn_context).await;
 +
 +    let installed = sess.clone_history().await;
-+    let installed_items = installed.raw_items();
-+    if !response_items_structurally_equal(installed_items, &expected_body) {
++    let installed_items = installed.raw_items().cloned().collect::<Vec<_>>();
++    if !response_items_structurally_equal(&installed_items, &expected_body) {
 +        return Err(CodexErr::UnsupportedOperation(format!(
 +            "LHC compact law-1 violation: host history drifted from materialized \
 +             bands+tail (host={}, body={})",
@@ -817,12 +822,12 @@ index 0000000000..6790d6c347
 +    for item in items.iter_mut() {
 +        match item {
 +            RolloutItem::Compacted(c) => {
-+                c.replacement_history = Some(bands.to_vec());
++                c.replacement_history = Some(bands.iter().cloned().map(Into::into).collect());
 +                past_boundary = true;
 +            }
 +            RolloutItem::ResponseItem(response_item) if past_boundary => {
 +                if let Some(src) = tail.get(tail_idx) {
-+                    *response_item = src.clone();
++                    *response_item = src.clone().into();
 +                    tail_idx += 1;
 +                }
 +            }
@@ -1119,10 +1124,10 @@ index 0000000000..6790d6c347
 +mod slice_d_tests;
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..b9ace24dc5
+index 0000000000..711f0b91e8
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1383 @@
+@@ -0,0 +1,1414 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -1138,6 +1143,8 @@ index 0000000000..b9ace24dc5
 +use codex_extension_api::ExtensionRegistryBuilder;
 +use codex_extension_api::ThreadStartInput;
 +use codex_features::Feature;
++use codex_history::CompactedItem;
++use codex_history::RolloutItem;
 +use codex_lhc_host::CompactBoundaryMeta;
 +use codex_lhc_host::LhcCaptureSlot;
 +use codex_lhc_host::MaterializeInput;
@@ -1155,9 +1162,7 @@ index 0000000000..b9ace24dc5
 +use codex_protocol::models::ContentItem;
 +use codex_protocol::models::FunctionCallOutputPayload;
 +use codex_protocol::models::ResponseItem;
-+use codex_protocol::protocol::CompactedItem;
 +use codex_protocol::protocol::EventMsg;
-+use codex_protocol::protocol::RolloutItem;
 +use codex_protocol::protocol::SessionMeta;
 +use codex_protocol::protocol::SessionMetaLine;
 +use codex_protocol::protocol::SessionSource;
@@ -1167,6 +1172,7 @@ index 0000000000..b9ace24dc5
 +use codex_protocol::protocol::TokenUsageInfo;
 +use codex_protocol::protocol::UserMessageEvent;
 +use codex_protocol::user_input::UserInput;
++use codex_thread_store::PersistContext;
 +use pretty_assertions::assert_eq;
 +use tempfile::tempdir;
 +use uuid::Uuid;
@@ -1258,7 +1264,12 @@ index 0000000000..b9ace24dc5
 +    for i in 0..turns {
 +        let user = format!("user turn {i} long-horizon bandable seed {pad}");
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(&user)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -1319,7 +1330,9 @@ index 0000000000..b9ace24dc5
 +    .await
 +    .expect("create thread persistence");
 +    session.services.live_thread = Some(live_thread);
-+    session.ensure_rollout_materialized().await;
++    session
++        .ensure_rollout_materialized(PersistContext::Standard)
++        .await;
 +    session.flush_rollout().await.expect("flush rollout");
 +    session
 +        .current_rollout_path()
@@ -1367,7 +1380,7 @@ index 0000000000..b9ace24dc5
 +) -> RolloutItem {
 +    RolloutItem::Compacted(CompactedItem {
 +        message: message.into(),
-+        replacement_history: Some(bands),
++        replacement_history: Some(bands.into_iter().map(Into::into).collect()),
 +        window_number: Some(window_number),
 +        first_window_id: Some("first-win".into()),
 +        previous_window_id: prev.map(str::to_string),
@@ -1440,7 +1453,7 @@ index 0000000000..b9ace24dc5
 +    let LhcCompactAttempt::Installed { body, .. } = attempt else {
 +        panic!("drill requires Installed compact: {attempt:?}");
 +    };
-+    let pre_delete_history = sess.clone_history().await.raw_items().to_vec();
++    let pre_delete_history = sess.clone_history().await.into_raw_items();
 +    assert!(
 +        response_items_structurally_equal(&pre_delete_history, &body),
 +        "precondition: installed body equals live host"
@@ -1537,14 +1550,14 @@ index 0000000000..b9ace24dc5
 +            ..
 +        }) = item
 +        {
-+            last_bands = Some(h.clone());
++            last_bands = Some(h.iter().map(|envelope| envelope.item.clone()).collect());
 +            last_idx = i;
 +        }
 +    }
 +    let mut out = last_bands.unwrap_or_default();
 +    for item in &items[last_idx.saturating_add(1)..] {
 +        if let RolloutItem::ResponseItem(r) = item {
-+            out.push(r.clone());
++            out.push(r.item.clone());
 +        }
 +    }
 +    out
@@ -1562,15 +1575,19 @@ index 0000000000..b9ace24dc5
 +    let tail2 = vec![user_msg("after-c2"), assistant_msg("reply-c2")];
 +
 +    let mut old_shape = vec![session_meta_item("old")];
-+    old_shape.push(RolloutItem::ResponseItem(user_msg("pre-compact-user")));
-+    old_shape.push(RolloutItem::ResponseItem(assistant_msg("pre-compact-asst")));
++    old_shape.push(RolloutItem::ResponseItem(
++        user_msg("pre-compact-user").into(),
++    ));
++    old_shape.push(RolloutItem::ResponseItem(
++        assistant_msg("pre-compact-asst").into(),
++    ));
 +    old_shape.push(compacted("c1", bands1, 1, "win-1", None));
 +    for item in &tail1 {
-+        old_shape.push(RolloutItem::ResponseItem(item.clone()));
++        old_shape.push(RolloutItem::ResponseItem(item.clone().into()));
 +    }
 +    old_shape.push(compacted("c2", bands2.clone(), 2, "win-2", Some("win-1")));
 +    for item in &tail2 {
-+        old_shape.push(RolloutItem::ResponseItem(item.clone()));
++        old_shape.push(RolloutItem::ResponseItem(item.clone().into()));
 +    }
 +
 +    let mut expected = bands2;
@@ -1606,10 +1623,10 @@ index 0000000000..b9ace24dc5
 +    let items = vec![
 +        session_meta_item("fixture"),
 +        compacted("legacy-1", bands_v1, 1, "w1", None),
-+        RolloutItem::ResponseItem(user_msg("post-1")),
++        RolloutItem::ResponseItem(user_msg("post-1").into()),
 +        compacted("legacy-2", bands_v2.clone(), 2, "w2", Some("w1")),
-+        RolloutItem::ResponseItem(user_msg("post-2-true-tail")),
-+        RolloutItem::ResponseItem(assistant_msg("post-2-asst")),
++        RolloutItem::ResponseItem(user_msg("post-2-true-tail").into()),
++        RolloutItem::ResponseItem(assistant_msg("post-2-asst").into()),
 +    ];
 +    atomic_rewrite_rollout(&path, &items).expect("write fixture");
 +    let parsed = parse_rollout_items(&path).expect("parse fixture");
@@ -1657,7 +1674,12 @@ index 0000000000..b9ace24dc5
 +    // Known first prompt — title/preview source for thread-store consumers.
 +    let first_prompt = "FIRST_TRUE_USER_PROMPT_slice_d_title_source";
 +    session
-+        .record_user_prompt_and_emit_turn_item(&tc, &[text_input(first_prompt)], None)
++        .record_user_prompt_and_emit_turn_item(
++            &tc,
++            &[text_input(first_prompt)],
++            None,
++            PersistContext::TurnStart,
++        )
 +        .await;
 +    session
 +        .record_conversation_items_with_provenance(
@@ -1832,8 +1854,8 @@ index 0000000000..b9ace24dc5
 +    // Seed the live path with OLD appended-Compacted shape before any LHC rewrite.
 +    let old = vec![
 +        session_meta_item("transition"),
-+        RolloutItem::ResponseItem(user_msg("legacy-user-1")),
-+        RolloutItem::ResponseItem(assistant_msg("legacy-asst-1")),
++        RolloutItem::ResponseItem(user_msg("legacy-user-1").into()),
++        RolloutItem::ResponseItem(assistant_msg("legacy-asst-1").into()),
 +        compacted(
 +            "legacy-compact-1",
 +            vec![user_msg("legacy-band"), assistant_msg("legacy-sum")],
@@ -1841,8 +1863,8 @@ index 0000000000..b9ace24dc5
 +            "legacy-w1",
 +            None,
 +        ),
-+        RolloutItem::ResponseItem(user_msg("legacy-post")),
-+        RolloutItem::ResponseItem(assistant_msg("legacy-post-asst")),
++        RolloutItem::ResponseItem(user_msg("legacy-post").into()),
++        RolloutItem::ResponseItem(assistant_msg("legacy-post-asst").into()),
 +        compacted(
 +            "legacy-compact-2",
 +            vec![user_msg("legacy-band-2"), assistant_msg("legacy-sum-2")],
@@ -1850,7 +1872,7 @@ index 0000000000..b9ace24dc5
 +            "legacy-w2",
 +            Some("legacy-w1"),
 +        ),
-+        RolloutItem::ResponseItem(user_msg("legacy-tail")),
++        RolloutItem::ResponseItem(user_msg("legacy-tail").into()),
 +    ];
 +    // Write over the live path without going through the recorder (old shape).
 +    atomic_rewrite_rollout(&rollout_path, &old).expect("seed old format");
@@ -1884,9 +1906,9 @@ index 0000000000..b9ace24dc5
 +        "first rewrite must collapse to exactly one Compacted boundary"
 +    );
 +    let history = reconstruct_model_history(&new_items);
-+    let host = sess.clone_history().await;
++    let host = sess.clone_history().await.into_raw_items();
 +    assert!(
-+        response_items_structurally_equal(&history, host.raw_items()),
++        response_items_structurally_equal(&history, &host),
 +        "post-transition resume must equal live host"
 +    );
 +    // Prior generation retained for recovery.
@@ -1983,7 +2005,12 @@ index 0000000000..b9ace24dc5
 +
 +    // Open a turn then abort it via the capture seam (schema v5 outcome).
 +    session
-+        .record_user_prompt_and_emit_turn_item(&tc, &[text_input("about to abort this turn")], None)
++        .record_user_prompt_and_emit_turn_item(
++            &tc,
++            &[text_input("about to abort this turn")],
++            None,
++            PersistContext::TurnStart,
++        )
 +        .await;
 +    handle.turn_end(
 +        "slice-d-abort-turn",
@@ -2020,7 +2047,7 @@ index 0000000000..b9ace24dc5
 +    // (Capture may attach abort to a synthetic turn id that has no member messages.)
 +    let _ = has_aborted;
 +    assert!(
-+        response_items_structurally_equal(&history, sess.clone_history().await.raw_items()),
++        response_items_structurally_equal(&history, &sess.clone_history().await.into_raw_items(),),
 +        "post-abort rewrite must match live host"
 +    );
 +}
@@ -2038,16 +2065,16 @@ index 0000000000..b9ace24dc5
 +    // Prior generation with a rollback marker after two user ResponseItems.
 +    let prior = vec![
 +        session_meta_item("rb"),
-+        RolloutItem::ResponseItem(user_msg("kept-user")),
-+        RolloutItem::ResponseItem(assistant_msg("kept-asst")),
-+        RolloutItem::ResponseItem(user_msg("rolled-user")),
-+        RolloutItem::ResponseItem(assistant_msg("rolled-asst")),
++        RolloutItem::ResponseItem(user_msg("kept-user").into()),
++        RolloutItem::ResponseItem(assistant_msg("kept-asst").into()),
++        RolloutItem::ResponseItem(user_msg("rolled-user").into()),
++        RolloutItem::ResponseItem(assistant_msg("rolled-asst").into()),
 +        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
 +            num_turns: 1,
 +        })),
 +        compacted("pre-rb", vec![user_msg("band")], 1, "w1", None),
-+        RolloutItem::ResponseItem(user_msg("post-boundary-live")),
-+        RolloutItem::ResponseItem(user_msg("post-boundary-dropped-by-rb")),
++        RolloutItem::ResponseItem(user_msg("post-boundary-live").into()),
++        RolloutItem::ResponseItem(user_msg("post-boundary-dropped-by-rb").into()),
 +        // Marker after the second post-boundary user: drop 1 newest user turn.
 +        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
 +            num_turns: 1,
@@ -2105,7 +2132,12 @@ index 0000000000..b9ace24dc5
 +
 +    let astral = "hello 🌍 𝄞 中文 \u{1F980} boundary-float-1e21";
 +    session
-+        .record_user_prompt_and_emit_turn_item(&tc, &[text_input(astral)], None)
++        .record_user_prompt_and_emit_turn_item(
++            &tc,
++            &[text_input(astral)],
++            None,
++            PersistContext::TurnStart,
++        )
 +        .await;
 +    // Oversized tool result (adversarial size).
 +    let mut oversized = String::with_capacity(50_000);
@@ -2156,7 +2188,7 @@ index 0000000000..b9ace24dc5
 +    );
 +    let history = reconstruct_model_history(&items);
 +    assert!(
-+        response_items_structurally_equal(&history, sess.clone_history().await.raw_items()),
++        response_items_structurally_equal(&history, &sess.clone_history().await.into_raw_items(),),
 +        "adversarial resume == host"
 +    );
 +}
@@ -2325,7 +2357,7 @@ index 0000000000..b9ace24dc5
 +        assert!(matches!(a1, LhcCompactAttempt::Installed { .. }), "{a1:?}");
 +    }
 +    let before = std::fs::read_to_string(&rollout_path).expect("before");
-+    let history_before = sess.clone_history().await.raw_items().to_vec();
++    let history_before = sess.clone_history().await.into_raw_items();
 +
 +    // Inject failpoint so the next production rewrite fails mid-swap.
 +    // Grow enough for a second reducing compact.
@@ -2350,7 +2382,7 @@ index 0000000000..b9ace24dc5
 +    // Session still usable.
 +    let host = sess.clone_history().await;
 +    assert!(
-+        !host.raw_items().is_empty(),
++        host.raw_items().next().is_some(),
 +        "session continues after rewrite fail"
 +    );
 +    let _ = (before, history_before, after, a2);
@@ -2479,9 +2511,9 @@ index 0000000000..b9ace24dc5
 +fn slice_d_mutation_demo_dual_format_picks_newest_boundary() {
 +    let items = [
 +        compacted("c1", vec![user_msg("band-v1")], 1, "w1", None),
-+        RolloutItem::ResponseItem(user_msg("tail-old")),
++        RolloutItem::ResponseItem(user_msg("tail-old").into()),
 +        compacted("c2", vec![user_msg("band-v2")], 2, "w2", Some("w1")),
-+        RolloutItem::ResponseItem(user_msg("tail-new")),
++        RolloutItem::ResponseItem(user_msg("tail-new").into()),
 +    ];
 +    // Production resume is covered by the async dual-format test. Here we pin
 +    // the expected newest-only history for the dual-format fixture narrative.
@@ -2495,10 +2527,14 @@ index 0000000000..b9ace24dc5
 +            last_idx = i;
 +        }
 +    }
-+    let mut got = last_bands.unwrap_or_default();
++    let mut got: Vec<ResponseItem> = last_bands
++        .unwrap_or_default()
++        .into_iter()
++        .map(|envelope| envelope.item)
++        .collect();
 +    for item in &items[last_idx + 1..] {
 +        if let RolloutItem::ResponseItem(r) = item {
-+            got.push(r.clone());
++            got.push(r.item.clone());
 +        }
 +    }
 +    assert!(
@@ -2508,10 +2544,10 @@ index 0000000000..b9ace24dc5
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..a2a436fbf9
+index 0000000000..ef90045fe1
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2344 @@
+@@ -0,0 +1,2386 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -2530,6 +2566,7 @@ index 0000000000..a2a436fbf9
 +use codex_protocol::models::ResponseItem;
 +use codex_protocol::protocol::SessionSource;
 +use codex_protocol::user_input::UserInput;
++use codex_thread_store::PersistContext;
 +use pretty_assertions::assert_eq;
 +use tempfile::tempdir;
 +
@@ -2643,7 +2680,12 @@ index 0000000000..a2a436fbf9
 +        "fourth user turn about delta polish",
 +    ] {
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(text)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(text)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -2673,7 +2715,12 @@ index 0000000000..a2a436fbf9
 +    for i in 0..turns {
 +        let user = format!("user turn {i} long-horizon bandable seed {pad}");
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(&user)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -2745,9 +2792,9 @@ index 0000000000..a2a436fbf9
 +        "receipt-backed marker must not be synthetic zeros: {marker:?}"
 +    );
 +
-+    let host = sess.clone_history().await;
++    let host = sess.clone_history().await.into_raw_items();
 +    assert!(
-+        response_items_structurally_equal(host.raw_items(), &body),
++        response_items_structurally_equal(&host, &body),
 +        "law1: host history must equal the mapped LHC body field-for-field"
 +    );
 +}
@@ -2863,8 +2910,13 @@ index 0000000000..a2a436fbf9
 +    );
 +    assert!(!token_limit_reached(sess.as_ref(), &tc).await);
 +
-+    sess.record_user_prompt_and_emit_turn_item(&tc, &[text_input("follow-up after compact")], None)
-+        .await;
++    sess.record_user_prompt_and_emit_turn_item(
++        &tc,
++        &[text_input("follow-up after compact")],
++        None,
++        PersistContext::TurnStart,
++    )
++    .await;
 +    let status2 = context_window_token_status(sess.as_ref(), &tc).await;
 +    assert!(
 +        !status2.token_limit_reached,
@@ -2895,7 +2947,7 @@ index 0000000000..a2a436fbf9
 +    seed_conversation_small(&session, &tc).await;
 +    handle.flush().await;
 +
-+    let before = session.clone_history().await.raw_items().to_vec();
++    let before = session.clone_history().await.into_raw_items();
 +    let sess = Arc::new(session);
 +    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
 +    match attempt {
@@ -2903,7 +2955,7 @@ index 0000000000..a2a436fbf9
 +            // NoReduction is fine; other unavailability also fine for tiny seed.
 +            let _ = reason;
 +            assert!(response_items_structurally_equal(
-+                sess.clone_history().await.raw_items(),
++                &sess.clone_history().await.into_raw_items(),
 +                &before
 +            ));
 +        }
@@ -2947,15 +2999,14 @@ index 0000000000..a2a436fbf9
 +            LhcCompactAttempt::Installed { body, .. } => {
 +                installed_once = true;
 +                // Production assigns ids at write-back.
-+                let host = sess.clone_history().await;
++                let host = sess.clone_history().await.into_raw_items();
 +                let with_id = host
-+                    .raw_items()
 +                    .iter()
 +                    .filter(|i| codex_lhc_host::item_stable_id(i).is_some())
 +                    .count();
 +                assert_eq!(
 +                    with_id,
-+                    host.raw_items().len(),
++                    host.len(),
 +                    "round {round}: all installed items must have stable ids"
 +                );
 +                assert!(!body.is_empty());
@@ -3006,14 +3057,16 @@ index 0000000000..a2a436fbf9
 +    let mut body_item_counts: Vec<usize> = Vec::new();
 +    let mut installs = 0usize;
 +    let pad = "z".repeat(3500);
-+    // ≥20 rounds with enough bulk for repeated Installs.
-+    for round in 0..20 {
++    // Ten rounds are enough to prove repeated bounded markers while staying
++    // inside the workspace's 60-second per-test ceiling on fresh runners.
++    for round in 0..10 {
 +        if round > 0 {
 +            for k in 0..20 {
 +                sess.record_user_prompt_and_emit_turn_item(
 +                    &tc,
 +                    &[text_input(&format!("bulk r{round} t{k} {pad}"))],
 +                    None,
++                    PersistContext::TurnStart,
 +                )
 +                .await;
 +                sess.record_conversation_items_with_provenance(
@@ -3064,7 +3117,7 @@ index 0000000000..a2a436fbf9
 +    }
 +    assert!(
 +        installs >= 10,
-+        "expected many Installs over 20 bulk rounds, got {installs}"
++        "expected an Install in every bulk round, got {installs}"
 +    );
 +    let max = note_chars.iter().copied().max().unwrap();
 +    let min = note_chars.iter().copied().min().unwrap();
@@ -3288,8 +3341,10 @@ index 0000000000..a2a436fbf9
 +    let thread_id =
 +        ThreadId::try_from("00000000-0000-4000-8000-000000000099").expect("test thread id");
 +    // Explicit non-routable local base URL — never api.openai.com (G4).
-+    let provider =
++    let mut provider =
 +        ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string()));
++    provider.request_max_retries = Some(0);
++    provider.stream_max_retries = Some(0);
 +    ModelClient::new(
 +        /*auth_manager*/ None,
 +        AgentIdentityAuthPolicy::JwtOnly,
@@ -3312,7 +3367,7 @@ index 0000000000..a2a436fbf9
 +#[test]
 +fn band_body_replacement_history_byte_equal() {
 +    use crate::context_manager::ContextManager;
-+    use codex_protocol::protocol::CompactedItem;
++    use codex_history::CompactedItem;
 +
 +    let body = vec![
 +        ResponseItem::Message {
@@ -3336,16 +3391,23 @@ index 0000000000..a2a436fbf9
 +    ];
 +    let compacted = CompactedItem {
 +        message: "lhc".into(),
-+        replacement_history: Some(body.clone()),
++        replacement_history: Some(body.clone().into_iter().map(Into::into).collect()),
 +        window_number: Some(1),
 +        first_window_id: Some("a".into()),
 +        previous_window_id: None,
 +        window_id: Some("b".into()),
 +    };
 +    let mut history = ContextManager::new();
-+    history.replace(compacted.replacement_history.unwrap());
++    history.replace(
++        compacted
++            .replacement_history
++            .unwrap()
++            .into_iter()
++            .map(|envelope| envelope.item)
++            .collect(),
++    );
 +    assert!(response_items_structurally_equal(
-+        history.raw_items(),
++        &history.into_raw_items(),
 +        &body
 +    ));
 +}
@@ -3354,7 +3416,7 @@ index 0000000000..a2a436fbf9
 +#[test]
 +fn shape_risk_consumers_see_band_replacement() {
 +    use crate::context_manager::ContextManager;
-+    use codex_protocol::protocol::CompactedItem;
++    use codex_history::CompactedItem;
 +
 +    let band = vec![
 +        ResponseItem::Message {
@@ -3397,7 +3459,7 @@ index 0000000000..a2a436fbf9
 +
 +    let compacted = CompactedItem {
 +        message: "lhc_compact_marker".into(),
-+        replacement_history: Some(band.clone()),
++        replacement_history: Some(band.clone().into_iter().map(Into::into).collect()),
 +        window_number: Some(2),
 +        first_window_id: Some("w0".into()),
 +        previous_window_id: Some("w1".into()),
@@ -3407,14 +3469,20 @@ index 0000000000..a2a436fbf9
 +    resume.replace(
 +        compacted
 +            .replacement_history
-+            .expect("replacement_history present"),
++            .expect("replacement_history present")
++            .into_iter()
++            .map(|envelope| envelope.item)
++            .collect(),
 +    );
-+    assert!(response_items_structurally_equal(resume.raw_items(), &band));
++    assert!(response_items_structurally_equal(
++        &resume.into_raw_items(),
++        &band
++    ));
 +
 +    let mut full_fork = ContextManager::new();
 +    full_fork.replace(band.clone());
 +    assert!(response_items_structurally_equal(
-+        full_fork.raw_items(),
++        &full_fork.into_raw_items(),
 +        &band
 +    ));
 +
@@ -3422,18 +3490,21 @@ index 0000000000..a2a436fbf9
 +    let mut last_n_fork = ContextManager::new();
 +    last_n_fork.replace(last_n.clone());
 +    assert!(response_items_structurally_equal(
-+        last_n_fork.raw_items(),
++        &last_n_fork.into_raw_items(),
 +        &last_n
 +    ));
 +
 +    let mut btw = ContextManager::new();
 +    btw.replace(last_n.clone());
-+    assert!(response_items_structurally_equal(btw.raw_items(), &last_n));
++    assert!(response_items_structurally_equal(
++        &btw.into_raw_items(),
++        &last_n
++    ));
 +
 +    let mut guardian = ContextManager::new();
 +    guardian.replace(band.clone());
 +    assert!(response_items_structurally_equal(
-+        guardian.raw_items(),
++        &guardian.into_raw_items(),
 +        &band
 +    ));
 +}
@@ -3463,11 +3534,15 @@ index 0000000000..a2a436fbf9
 +        use codex_protocol::ThreadId;
 +        use codex_protocol::protocol::SessionSource;
 +        let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000088").expect("tid");
++        let mut provider =
++            ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string()));
++        provider.request_max_retries = Some(0);
++        provider.stream_max_retries = Some(0);
 +        ModelClient::new(
 +            /*auth_manager*/ None,
 +            AgentIdentityAuthPolicy::JwtOnly,
 +            thread_id,
-+            ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string())),
++            provider,
 +            SessionSource::Exec,
 +            "test_originator".to_string(),
 +            /*model_verbosity*/ None,
@@ -3493,15 +3568,21 @@ index 0000000000..a2a436fbf9
 +    seed_conversation_bandable(&session, &tc, 80).await;
 +    handle.flush().await;
 +
-+    let before = session.clone_history().await.raw_items().to_vec();
++    let before = session.clone_history().await.into_raw_items();
 +    let sess = Arc::new(session);
++    let cancellation = CancellationToken::new();
++    let cancel_after_request_starts = cancellation.clone();
++    tokio::spawn(async move {
++        tokio::time::sleep(Duration::from_secs(1)).await;
++        cancel_after_request_starts.cancel();
++    });
 +    // No lhc_test_inference override → production ModelClient bridge.
 +    let attempt = try_run_lhc_compact_arm(
 +        &sess,
 +        &tc,
 +        InitialContextInjection::DoNotInject,
 +        /*manual*/ true,
-+        &CancellationToken::new(),
++        &cancellation,
 +    )
 +    .await
 +    .expect("arm result");
@@ -3546,7 +3627,7 @@ index 0000000000..a2a436fbf9
 +            assert!(!reason.is_empty(), "fail-open reason should be non-empty");
 +            // History unchanged — native ladder free.
 +            assert!(response_items_structurally_equal(
-+                sess.clone_history().await.raw_items(),
++                &sess.clone_history().await.into_raw_items(),
 +                &before
 +            ));
 +        }
@@ -3762,7 +3843,6 @@ index 0000000000..a2a436fbf9
 +            sess.clone_history()
 +                .await
 +                .raw_items()
-+                .iter()
 +                .filter_map(|item| match item {
 +                    ResponseItem::Message { content, .. } => Some(
 +                        content
@@ -4039,8 +4119,8 @@ index 0000000000..a2a436fbf9
 +
 +    // The production resume seam, fed the CompactedItem rollout shape it is
 +    // fed on a real resume.
-+    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
-+        codex_protocol::protocol::CompactedItem {
++    let rollout = vec![codex_history::RolloutItem::Compacted(
++        codex_history::CompactedItem {
 +            message: durable.clone(),
 +            replacement_history: None,
 +            window_number: None,
@@ -4138,10 +4218,10 @@ index 0000000000..a2a436fbf9
 +    let ch = wait_for_handle(&cslot, Duration::from_secs(30))
 +        .await
 +        .expect("child handle");
-+    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
-+        codex_protocol::protocol::CompactedItem {
++    let rollout = vec![codex_history::RolloutItem::Compacted(
++        codex_history::CompactedItem {
 +            message: durable.clone(),
-+            replacement_history: Some(parent_body.clone()),
++            replacement_history: Some(parent_body.clone().into_iter().map(Into::into).collect()),
 +            window_number: None,
 +            first_window_id: None,
 +            previous_window_id: None,
@@ -4161,7 +4241,7 @@ index 0000000000..a2a436fbf9
 +    ch.flush().await;
 +
 +    let csess = Arc::new(child);
-+    let inherited = csess.clone_history().await.raw_items().to_vec();
++    let inherited = csess.clone_history().await.into_raw_items();
 +    assert!(
 +        response_items_structurally_equal(&inherited, &parent_body),
 +        "fork must inherit the parent's post-compact body verbatim: \
@@ -4227,12 +4307,12 @@ index 0000000000..a2a436fbf9
 +    handle.flush().await;
 +
 +    let sess = Arc::new(session);
-+    let before = sess.clone_history().await.raw_items().to_vec();
++    let before = sess.clone_history().await.into_raw_items();
 +    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
 +    let LhcCompactAttempt::Installed { .. } = attempt else {
 +        panic!("fixture: compact must install to measure its cache cost");
 +    };
-+    let after = sess.clone_history().await.raw_items().to_vec();
++    let after = sess.clone_history().await.into_raw_items();
 +
 +    // Longest common leading run of structurally identical items. Anything past
 +    // the first divergence is a cache miss for the provider regardless of what
@@ -4366,7 +4446,7 @@ index 0000000000..a2a436fbf9
 +    );
 +
 +    let sess = Arc::new(session);
-+    let history = sess.clone_history().await.raw_items().to_vec();
++    let history = sess.clone_history().await.into_raw_items();
 +    let history_tokens = codex_lhc_host::estimate_response_items_tokens(&history);
 +
 +    let calls = log.lock().expect("log").clone();
@@ -4460,7 +4540,7 @@ index 0000000000..a2a436fbf9
 +    let thread_id = handle.thread_id().to_string();
 +    let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
 +    let sess = Arc::new(session);
-+    let history_before = sess.clone_history().await.raw_items().to_vec();
++    let history_before = sess.clone_history().await.into_raw_items();
 +
 +    let cancel = CancellationToken::new();
 +    let task_cancel = cancel.clone();
@@ -4506,7 +4586,7 @@ index 0000000000..a2a436fbf9
 +    tokio::time::sleep(Duration::from_secs(2)).await;
 +    let after_grace = calls.load(AtomicOrdering::SeqCst);
 +
-+    let history_after = sess.clone_history().await.raw_items().to_vec();
++    let history_after = sess.clone_history().await.into_raw_items();
 +    let marker = archive_has_compact_marker(&thread_id, root_for_marker.as_deref()).await;
 +    eprintln!(
 +        "N3 abort: calls_at_cancel={at_cancel} calls_at_return={at_return} \
@@ -4593,7 +4673,9 @@ index 0000000000..a2a436fbf9
 +    .await
 +    .expect("create thread persistence");
 +    session.services.live_thread = Some(live_thread);
-+    session.ensure_rollout_materialized().await;
++    session
++        .ensure_rollout_materialized(PersistContext::Standard)
++        .await;
 +    session.flush_rollout().await.expect("flush rollout");
 +    session
 +        .current_rollout_path()
@@ -4631,7 +4713,7 @@ index 0000000000..a2a436fbf9
 +
 +    // Post-swap marker text unique to the new generation append.
 +    let pin = "slice-c-reopen-pin-unique-marker-text";
-+    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::EventMsg(
++    sess.persist_rollout_items(&[codex_history::RolloutItem::EventMsg(
 +        codex_protocol::protocol::EventMsg::AgentMessage(
 +            codex_protocol::protocol::AgentMessageEvent {
 +                message: pin.to_string(),
@@ -4689,9 +4771,9 @@ index 0000000000..a2a436fbf9
 +        panic!("expected Installed: {attempt:?}");
 +    };
 +
-+    let host = sess.clone_history().await;
++    let host = sess.clone_history().await.into_raw_items();
 +    assert!(
-+        response_items_structurally_equal(host.raw_items(), &body),
++        response_items_structurally_equal(&host, &body),
 +        "installed body must equal live host history"
 +    );
 +
@@ -4700,22 +4782,22 @@ index 0000000000..a2a436fbf9
 +    assert!(
 +        file_items
 +            .iter()
-+            .any(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_))),
++            .any(|i| matches!(i, codex_history::RolloutItem::Compacted(_))),
 +        "rewritten file must contain exactly the boundary Compacted"
 +    );
 +    let compacted_count = file_items
 +        .iter()
-+        .filter(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_)))
++        .filter(|i| matches!(i, codex_history::RolloutItem::Compacted(_)))
 +        .count();
 +    assert_eq!(compacted_count, 1, "exactly one Compacted boundary");
 +
 +    let reconstructed = codex_lhc_host::history_from_materialized_items(&file_items);
 +    assert!(
-+        response_items_structurally_equal(&reconstructed, host.raw_items()),
++        response_items_structurally_equal(&reconstructed, &host),
 +        "resume-from-rewritten-file must equal installed history item-for-item\n\
 +         reconstructed={} host={}",
 +        reconstructed.len(),
-+        host.raw_items().len()
++        host.len()
 +    );
 +}
 +
@@ -4759,7 +4841,7 @@ index 0000000000..a2a436fbf9
 +    let windows: Vec<u64> = file_items
 +        .iter()
 +        .filter_map(|i| match i {
-+            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
++            codex_history::RolloutItem::Compacted(c) => c.window_number,
 +            _ => None,
 +        })
 +        .collect();
@@ -4777,7 +4859,7 @@ index 0000000000..a2a436fbf9
 +    let prev_windows: Vec<u64> = prev_items
 +        .iter()
 +        .filter_map(|i| match i {
-+            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
++            codex_history::RolloutItem::Compacted(c) => c.window_number,
 +            _ => None,
 +        })
 +        .collect();
@@ -4799,7 +4881,7 @@ index 0000000000..a2a436fbf9
 +    let dir = tempdir().unwrap();
 +    let path = dir.path().join("rollout.jsonl");
 +    // Seed + rewrite with the pure swap helper (no recorder).
-+    let seed = vec![codex_protocol::protocol::RolloutItem::SessionMeta(
++    let seed = vec![codex_history::RolloutItem::SessionMeta(
 +        codex_protocol::protocol::SessionMetaLine {
 +            meta: codex_protocol::protocol::SessionMeta {
 +                timestamp: "t".into(),
@@ -4815,24 +4897,20 @@ index 0000000000..a2a436fbf9
 +        .open(&path)
 +        .expect("open");
 +    let gen2 = vec![
-+        codex_protocol::protocol::RolloutItem::SessionMeta(
-+            codex_protocol::protocol::SessionMetaLine {
-+                meta: codex_protocol::protocol::SessionMeta {
-+                    timestamp: "t2".into(),
-+                    ..codex_protocol::protocol::SessionMeta::default()
-+                },
-+                git: None,
++        codex_history::RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
++            meta: codex_protocol::protocol::SessionMeta {
++                timestamp: "t2".into(),
++                ..codex_protocol::protocol::SessionMeta::default()
 +            },
-+        ),
-+        codex_protocol::protocol::RolloutItem::EventMsg(
-+            codex_protocol::protocol::EventMsg::AgentMessage(
-+                codex_protocol::protocol::AgentMessageEvent {
-+                    message: "gen2-body".into(),
-+                    phase: None,
-+                    memory_citation: None,
-+                },
-+            ),
-+        ),
++            git: None,
++        }),
++        codex_history::RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(
++            codex_protocol::protocol::AgentMessageEvent {
++                message: "gen2-body".into(),
++                phase: None,
++                memory_citation: None,
++            },
++        )),
 +    ];
 +    codex_lhc_host::atomic_rewrite_rollout(&path, &gen2).expect("swap under open fd");
 +    // Write via the old fd — lands in .prev (orphaned inode).
@@ -4858,7 +4936,7 @@ index 0000000000..a2a436fbf9
 +}
 diff --git a/codex-rs/core/src/lhc_inference_bridge.rs b/codex-rs/core/src/lhc_inference_bridge.rs
 new file mode 100644
-index 0000000000..8ea7f4778a
+index 0000000000..ec49dd1d75
 --- /dev/null
 +++ b/codex-rs/core/src/lhc_inference_bridge.rs
 @@ -0,0 +1,621 @@
@@ -5103,7 +5181,7 @@ index 0000000000..8ea7f4778a
 +            text: String::new(),
 +            provenance: None,
 +        },
-+        tools: Vec::new(),
++        tools: Arc::default(),
 +        parallel_tool_calls: false,
 +        output_schema: None,
 +        output_schema_strict: false,
@@ -5484,10 +5562,10 @@ index 0000000000..8ea7f4778a
 +    }
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index adbde89877..8806bb3a12 100644
+index b4aebe4a3c..d30ad6cb8f 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
-@@ -20,12 +20,15 @@ pub use session::SteerInputError;
+@@ -20,11 +20,14 @@ pub use session::SteerInputError;
  pub use session::TurnInput;
  pub use turn_metadata::detached_memory_responses_metadata;
  mod codex_thread;
@@ -5498,17 +5576,16 @@ index adbde89877..8806bb3a12 100644
  mod compact_remote_history;
  mod compact_remote_v2;
  mod compact_token_budget;
- mod config_lock;
 +mod lhc_inference_bridge;
  mod user_message_admission;
  pub use codex_thread::BackgroundTerminalInfo;
  pub use codex_thread::CodexThread;
 diff --git a/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
 new file mode 100644
-index 0000000000..31e49d7a5d
+index 0000000000..72ae5cd529
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
-@@ -0,0 +1,754 @@
+@@ -0,0 +1,773 @@
 +//! Band-shape model-tolerance harness (Chunk 2a/2b → round 6 / K2).
 +//!
 +//! **Dry-run:** install a real `lhc.compact`-produced body (via the production
@@ -5539,6 +5616,7 @@ index 0000000000..31e49d7a5d
 +use codex_protocol::models::ResponseItem;
 +use codex_protocol::protocol::SessionSource;
 +use codex_protocol::user_input::UserInput;
++use codex_thread_store::PersistContext;
 +use futures::StreamExt;
 +use pretty_assertions::assert_eq;
 +use serde_json::json;
@@ -5629,7 +5707,12 @@ index 0000000000..31e49d7a5d
 +    ];
 +    for (i, user) in early.iter().enumerate() {
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(user)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(user)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -5651,7 +5734,12 @@ index 0000000000..31e49d7a5d
 +    for i in 0..bulk_turns {
 +        let user = format!("bulk progress turn {i} on {PROJECT_CODENAME} {pad}");
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(&user)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -5677,7 +5765,12 @@ index 0000000000..31e49d7a5d
 +    ];
 +    for (i, user) in recent.iter().enumerate() {
 +        session
-+            .record_user_prompt_and_emit_turn_item(tc, &[text_input(user)], None)
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(user)],
++                None,
++                PersistContext::TurnStart,
++            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
@@ -5903,7 +5996,7 @@ index 0000000000..31e49d7a5d
 +    let (window_number, window_ids) = session.advance_auto_compact_window().await;
 +    session
 +        .replace_compacted_history(
-+            body.clone(),
++            body.clone().into_iter().map(Into::into).collect(),
 +            /*reference_context_item*/ None,
 +            /*world_state_baseline*/ None,
 +            CompactedHistoryMetadata {
@@ -6044,7 +6137,7 @@ index 0000000000..31e49d7a5d
 +    let (window_number, window_ids) = session.advance_auto_compact_window().await;
 +    session
 +        .replace_compacted_history(
-+            body.clone(),
++            body.clone().into_iter().map(Into::into).collect(),
 +            /*reference_context_item*/ None,
 +            /*world_state_baseline*/ None,
 +            CompactedHistoryMetadata {
@@ -6236,15 +6329,18 @@ index 0000000000..31e49d7a5d
 +    let (window_number, window_ids) = session.advance_auto_compact_window().await;
 +    session
 +        .replace_compacted_history(
-+            vec![ResponseItem::Message {
-+                id: None,
-+                role: "user".into(),
-+                content: vec![ContentItem::InputText {
-+                    text: "placeholder".into(),
-+                }],
-+                phase: None,
-+                internal_chat_message_metadata_passthrough: None,
-+            }],
++            vec![
++                ResponseItem::Message {
++                    id: None,
++                    role: "user".into(),
++                    content: vec![ContentItem::InputText {
++                        text: "placeholder".into(),
++                    }],
++                    phase: None,
++                    internal_chat_message_metadata_passthrough: None,
++                }
++                .into(),
++            ],
 +            /*reference_context_item*/ None,
 +            /*world_state_baseline*/ None,
 +            CompactedHistoryMetadata {
@@ -6264,10 +6360,10 @@ index 0000000000..31e49d7a5d
 +    );
 +}
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index 912a2e850a..57224a98fc 100644
+index bfe89311fe..b319bb7cd5 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -1297,6 +1297,8 @@ impl Session {
+@@ -1285,6 +1285,8 @@ impl Session {
                      ),
                  ),
                  executed_tool_calls,
@@ -6277,10 +6373,10 @@ index 912a2e850a..57224a98fc 100644
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index c25947df89..104eb79ef3 100644
+index 08327d38d0..0eca25cb8a 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5840,6 +5840,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5897,6 +5897,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6289,7 +6385,7 @@ index c25947df89..104eb79ef3 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
-@@ -8099,6 +8101,8 @@ where
+@@ -8153,6 +8155,8 @@ where
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -6299,10 +6395,10 @@ index c25947df89..104eb79ef3 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 869d6ab312..dcdb43762d 100644
+index e5dad1af6f..39d736a90a 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -451,6 +451,7 @@ pub(crate) async fn run_turn(
+@@ -462,6 +462,7 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -6310,7 +6406,7 @@ index 869d6ab312..dcdb43762d 100644
                      )
                      .await
                      {
-@@ -1015,6 +1016,7 @@ async fn run_pre_sampling_compact(
+@@ -1028,6 +1029,7 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -6318,7 +6414,7 @@ index 869d6ab312..dcdb43762d 100644
          )
          .await?;
      }
-@@ -1097,6 +1099,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1110,6 +1112,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -6326,7 +6422,7 @@ index 869d6ab312..dcdb43762d 100644
          )
          .await?;
          return Ok(());
-@@ -1145,6 +1148,7 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1158,6 +1161,7 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -6334,7 +6430,7 @@ index 869d6ab312..dcdb43762d 100644
          )
          .await?;
      }
-@@ -1156,7 +1160,12 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1169,7 +1173,12 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -6348,7 +6444,7 @@ index 869d6ab312..dcdb43762d 100644
      sess: &Arc<Session>,
      step_context: Arc<StepContext>,
      fallback_step_context: Option<Arc<StepContext>>,
-@@ -1164,9 +1173,32 @@ async fn run_auto_compact(
+@@ -1177,9 +1186,32 @@ async fn run_auto_compact(
      initial_context_injection: InitialContextInjection,
      reason: CompactionReason,
      phase: CompactionPhase,
@@ -6382,7 +6478,7 @@ index 869d6ab312..dcdb43762d 100644
          // Compaction is the reset request, so force a new context window
          // instead of consuming a pending `new_context` tool request.
 diff --git a/codex-rs/core/src/state/service.rs b/codex-rs/core/src/state/service.rs
-index 1e3cb00bca..303efe4899 100644
+index 0ef84c9b97..727d91e23d 100644
 --- a/codex-rs/core/src/state/service.rs
 +++ b/codex-rs/core/src/state/service.rs
 @@ -97,4 +97,9 @@ pub(crate) struct SessionServices {
@@ -6396,10 +6492,10 @@ index 1e3cb00bca..303efe4899 100644
 +    pub(crate) lhc_test_inference: std::sync::Mutex<Option<codex_lhc_host::InferenceCallbacks>>,
  }
 diff --git a/codex-rs/core/src/state/session.rs b/codex-rs/core/src/state/session.rs
-index 4dd3b6b940..a354e0e854 100644
+index 7a19b98e08..20950b5d16 100644
 --- a/codex-rs/core/src/state/session.rs
 +++ b/codex-rs/core/src/state/session.rs
-@@ -46,6 +46,9 @@ pub(crate) struct SessionState {
+@@ -47,6 +47,9 @@ pub(crate) struct SessionState {
      pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
      granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
      next_turn_is_first: bool,
@@ -6409,7 +6505,7 @@ index 4dd3b6b940..a354e0e854 100644
  }
  
  impl SessionState {
-@@ -79,9 +82,18 @@ impl SessionState {
+@@ -80,9 +83,18 @@ impl SessionState {
              pending_session_start_sources: VecDeque::new(),
              granted_permissions_by_environment_id: HashMap::new(),
              next_turn_is_first: true,
@@ -6537,10 +6633,10 @@ index 0af3127d95..50cc90d1b5 100644
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index 3cf2907b42..613f9dee2d 100644
+index d4aa3a7256..e27493f0e7 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
-@@ -494,12 +494,13 @@ impl Session {
+@@ -496,12 +496,13 @@ impl Session {
          let mut aborted_turn = false;
          let mut active_turn_to_clear = None;
          let mut turn_context = None;
@@ -6555,7 +6651,7 @@ index 3cf2907b42..613f9dee2d 100644
              }
              if aborted_turn {
                  active_turn_to_clear = Some(active_turn);
-@@ -507,8 +508,16 @@ impl Session {
+@@ -509,8 +510,16 @@ impl Session {
          }
  
          if let Some(turn_context) = turn_context.as_deref() {
@@ -6574,7 +6670,7 @@ index 3cf2907b42..613f9dee2d 100644
          }
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-@@ -543,12 +552,21 @@ impl Session {
+@@ -545,12 +554,21 @@ impl Session {
  
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -6601,7 +6697,7 @@ index 3cf2907b42..613f9dee2d 100644
          }
          // Let interrupted tasks observe cancellation before dropping pending approvals, or an
          // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-@@ -782,8 +800,13 @@ impl Session {
+@@ -795,8 +813,13 @@ impl Session {
              ThreadIdleCause::Completed
          };
          let event = if let Some(reason) = abort_reason {
@@ -6617,7 +6713,7 @@ index 3cf2907b42..613f9dee2d 100644
              EventMsg::TurnAborted(TurnAbortedEvent {
                  turn_id: Some(turn_context.sub_id.clone()),
                  reason,
-@@ -797,8 +820,12 @@ impl Session {
+@@ -810,8 +833,12 @@ impl Session {
                  .time_to_first_token_ms()
                  .await;
              let error = turn_context.terminal_error.lock().await.clone();
@@ -6632,7 +6728,7 @@ index 3cf2907b42..613f9dee2d 100644
              EventMsg::TurnComplete(TurnCompleteEvent {
                  turn_id: turn_context.sub_id.clone(),
                  last_agent_message,
-@@ -864,10 +891,22 @@ impl Session {
+@@ -877,10 +904,22 @@ impl Session {
              .await
      }
  
@@ -6657,7 +6753,7 @@ index 3cf2907b42..613f9dee2d 100644
          }
  
          if let Some(sender) = task.input_persisted.take() {
-@@ -964,6 +1003,7 @@ impl Session {
+@@ -977,6 +1016,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
              warn!("failed to flush rollout after emitting terminal turn event: {err}");
          }
@@ -6666,10 +6762,10 @@ index 3cf2907b42..613f9dee2d 100644
  }
  
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index 3c92f8a44f..147161da9d 100644
+index d5297df04f..b59d2737ae 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
-@@ -914,7 +914,9 @@ impl ThreadManager {
+@@ -941,7 +941,9 @@ impl ThreadManager {
          parent_trace: Option<W3cTraceContext>,
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
@@ -6680,7 +6776,7 @@ index 3c92f8a44f..147161da9d 100644
          Box::pin(self.resume_thread_with_history(
              config,
              initial_history,
-@@ -988,7 +990,9 @@ impl ThreadManager {
+@@ -1015,7 +1017,9 @@ impl ThreadManager {
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
          let agent_control = self.agent_control_for_config(&config);
@@ -6691,7 +6787,7 @@ index 3c92f8a44f..147161da9d 100644
          let (session_source, thread_source) = initial_history
              .get_resumed_session_sources()
              .unwrap_or_else(|| (self.state.session_source.clone(), None));
-@@ -1078,7 +1082,9 @@ impl ThreadManager {
+@@ -1105,7 +1109,9 @@ impl ThreadManager {
          S: Into<ForkSnapshot>,
      {
          let snapshot = snapshot.into();
@@ -6702,7 +6798,7 @@ index 3c92f8a44f..147161da9d 100644
          self.fork_thread_from_history(
              snapshot,
              config,
-@@ -1093,7 +1099,29 @@ impl ThreadManager {
+@@ -1120,7 +1126,29 @@ impl ThreadManager {
      async fn initial_history_from_rollout_path(
          &self,
          rollout_path: PathBuf,
@@ -6732,7 +6828,7 @@ index 3c92f8a44f..147161da9d 100644
          let requested_rollout_path = rollout_path.clone();
          let stored_thread = self
              .state
-@@ -1873,6 +1901,19 @@ impl ThreadManagerState {
+@@ -1925,6 +1953,19 @@ impl ThreadManagerState {
      }
  }
  
@@ -6753,7 +6849,7 @@ index 3c92f8a44f..147161da9d 100644
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
-index 8c1dd81c37..18876f54fe 100644
+index 189488bc2d..046a1bdf4e 100644
 --- a/codex-rs/rollout/src/recorder.rs
 +++ b/codex-rs/rollout/src/recorder.rs
 @@ -122,6 +122,14 @@ enum RolloutCmd {
@@ -6800,7 +6896,7 @@ index 8c1dd81c37..18876f54fe 100644
      pub async fn load_rollout_items(
          path: &Path,
      ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-@@ -1641,6 +1671,30 @@ impl RolloutWriterState {
+@@ -1681,6 +1711,30 @@ impl RolloutWriterState {
          self.write_pending_with_recovery("flush").await
      }
  
@@ -6831,7 +6927,7 @@ index 8c1dd81c37..18876f54fe 100644
      async fn shutdown(&mut self) -> std::io::Result<()> {
          if self.is_deferred() && self.pending_items.is_empty() {
              return Ok(());
-@@ -1788,6 +1842,9 @@ async fn rollout_writer(
+@@ -1828,6 +1882,9 @@ async fn rollout_writer(
              RolloutCmd::Flush { ack } => {
                  let _ = ack.send(state.flush().await);
              }
@@ -6842,10 +6938,10 @@ index 8c1dd81c37..18876f54fe 100644
                  Ok(()) => {
                      let _ = ack.send(Ok(()));
 diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
-index 509671d80d..84b0665c18 100644
+index dc9afcf9e7..a28833f2b5 100644
 --- a/codex-rs/thread-store/src/live_thread.rs
 +++ b/codex-rs/thread-store/src/live_thread.rs
-@@ -351,6 +351,23 @@ impl LiveThread {
+@@ -368,6 +368,23 @@ impl LiveThread {
              .map(Some)
      }
  
@@ -6870,7 +6966,7 @@ index 509671d80d..84b0665c18 100644
          let update = self.metadata_sync.lock().await.take_pending_update();
          self.apply_pending_metadata_update(update).await
 diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
-index fc54cea8c4..c3549d463f 100644
+index a71ec86729..182037d177 100644
 --- a/codex-rs/thread-store/src/local/live_writer.rs
 +++ b/codex-rs/thread-store/src/local/live_writer.rs
 @@ -202,6 +202,36 @@ pub(super) async fn rollout_path(
@@ -6911,10 +7007,10 @@ index fc54cea8c4..c3549d463f 100644
      store: &LocalThreadStore,
      thread_id: ThreadId,
 diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
-index 9213acd5be..cd83c38892 100644
+index f4f14fe730..e4c61ce538 100644
 --- a/codex-rs/thread-store/src/local/mod.rs
 +++ b/codex-rs/thread-store/src/local/mod.rs
-@@ -260,6 +260,11 @@ impl LocalThreadStore {
+@@ -261,6 +261,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
  

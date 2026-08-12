@@ -55,6 +55,8 @@ use crate::mapping::ModelIdentity;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -68,11 +70,9 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AgentReasoningEvent;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ContextCompactedEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ImageGenerationEndEvent;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
@@ -193,7 +193,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
 
     let compacted = CompactedItem {
         message: input.boundary.message.clone(),
-        replacement_history: Some(model_stream.clone()),
+        replacement_history: Some(model_stream.iter().cloned().map(Into::into).collect()),
         window_number: Some(input.boundary.window_number),
         first_window_id: Some(input.boundary.first_window_id.clone()),
         previous_window_id: input.boundary.previous_window_id.clone(),
@@ -382,13 +382,15 @@ fn prior_user_segments_with_drop(prior: &[RolloutItem]) -> Vec<PriorUserSegment>
                     &mut segments_newest_first,
                 );
             }
-            RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. })
-                if role == "user" =>
-            {
-                segment_is_user = true;
-                let t = content_text(content);
-                if !t.is_empty() {
-                    segment_text = Some(t);
+            RolloutItem::ResponseItem(item) => {
+                if let ResponseItem::Message { role, content, .. } = &item.item
+                    && role == "user"
+                {
+                    segment_is_user = true;
+                    let t = content_text(content);
+                    if !t.is_empty() {
+                        segment_text = Some(t);
+                    }
                 }
             }
             _ => {}
@@ -534,7 +536,7 @@ fn emit_band_entry(
     }
     let item = user_text_message(&u.content);
     model_stream.push(item.clone());
-    out.push(RolloutItem::ResponseItem(item));
+    out.push(RolloutItem::ResponseItem(item.into()));
 }
 
 fn user_text_message(text: &str) -> ResponseItem {
@@ -577,7 +579,7 @@ fn user_message_event(text: &str) -> RolloutItem {
 
 /// ResponseItem first, then display twin (L17).
 fn push_response_with_twins(item: ResponseItem, out: &mut Vec<RolloutItem>, with_twins: bool) {
-    out.push(RolloutItem::ResponseItem(item.clone()));
+    out.push(RolloutItem::ResponseItem(item.clone().into()));
     if with_twins {
         emit_display_twins(&item, out);
     }
@@ -658,6 +660,7 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                     status: status.clone(),
                     revised_prompt: revised_prompt.clone(),
                     result: result.clone(),
+                    failure: None,
                     transparent_background: None,
                     saved_path: None,
                 },

@@ -1,13 +1,16 @@
 use codex_core::UserMessageAdmission;
+use codex_core::UserMessageAdmissionError;
 use codex_core::config::Constrained;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses;
@@ -35,6 +38,155 @@ fn user_input(text: &str) -> Op {
         additional_context: Default::default(),
         thread_settings: Default::default(),
     }
+}
+
+fn empty_user_input() -> Op {
+    Op::UserInput {
+        items: Vec::new(),
+        final_output_json_schema: None,
+        responsesapi_client_metadata: None,
+        additional_context: Default::default(),
+        thread_settings: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn user_message_admission_starts_turn_for_empty_input() {
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .expect("build empty user-message admission session");
+
+    let admission = test
+        .codex
+        .submit_user_input_and_wait_for_admission(
+            empty_user_input(),
+            /*trace*/ None,
+            Some("clock-wake".to_string()),
+        )
+        .await
+        .expect("empty user input should start a turn");
+    assert!(matches!(admission, UserMessageAdmission::Started { .. }));
+
+    loop {
+        let event = timeout(Duration::from_secs(10), test.codex.next_event())
+            .await
+            .expect("empty-input turn should finish promptly")
+            .expect("empty-input turn event stream should remain available");
+        match event.msg {
+            EventMsg::ItemStarted(event) => {
+                assert!(!matches!(event.item, TurnItem::UserMessage(_)));
+            }
+            EventMsg::ItemCompleted(event) => {
+                assert!(!matches!(event.item, TurnItem::UserMessage(_)));
+            }
+            EventMsg::Error(error) => panic!("empty-input turn failed: {error:?}"),
+            EventMsg::StreamError(error) => {
+                panic!("empty-input turn stream failed: {error:?}")
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+
+    let user_input_groups = response_mock
+        .single_request()
+        .message_input_text_groups("user");
+    assert_eq!(user_input_groups.len(), 1);
+    assert_eq!(user_input_groups[0].len(), 1);
+    assert!(user_input_groups[0][0].starts_with("<environment_context>"));
+}
+
+#[tokio::test]
+async fn persisted_user_message_admission_rejects_empty_input() {
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .build_with_auto_env(&server)
+        .await
+        .expect("build persisted user-message admission session");
+
+    let error = timeout(
+        Duration::from_secs(5),
+        test.codex
+            .submit_user_input_and_wait_for_persisted_admission(
+                empty_user_input(),
+                /*trace*/ None,
+                Some("empty-client-message".to_string()),
+            ),
+    )
+    .await
+    .expect("empty persisted input should be rejected promptly")
+    .expect_err("empty input cannot produce a persisted user message");
+    assert!(matches!(
+        error,
+        UserMessageAdmissionError::Admission(ref error)
+            if matches!(error.details(), CodexErrorDetails::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_turn_start_persists_developer_and_user_input_before_model_request() {
+    let (release_response, response_gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![vec![StreamingSseChunk {
+        gate: Some(response_gate),
+        body: responses::sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    }]])
+    .await;
+    let test = test_codex()
+        .with_model("gpt-5.4")
+        .with_history_mode(ThreadHistoryMode::Paginated)
+        .build_with_streaming_server(&server)
+        .await
+        .expect("build default thread-store session");
+    test.codex
+        .inject_response_items_for_turn(vec![ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "turn-start developer instructions".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }])
+        .await
+        .expect("inject developer instructions");
+    test.codex
+        .submit(user_input("turn-start user input"))
+        .await
+        .expect("submit user input");
+
+    timeout(
+        Duration::from_secs(5),
+        server.wait_for_request_count(/*count*/ 1),
+    )
+    .await
+    .expect("turn should reach the model request");
+    let rollout_path = test.codex.rollout_path().expect("local rollout path");
+    let rollout = tokio::fs::read_to_string(rollout_path)
+        .await
+        .expect("read rollout while the model response is blocked");
+    assert!(rollout.contains("turn-start developer instructions"));
+    assert!(rollout.contains("turn-start user input"));
+
+    release_response.send(()).expect("release model response");
+    loop {
+        let event = timeout(Duration::from_secs(5), test.codex.next_event())
+            .await
+            .expect("turn should finish")
+            .expect("event stream should remain available");
+        if matches!(event.msg, EventMsg::TurnComplete(_)) {
+            break;
+        }
+    }
+    server.shutdown().await;
 }
 
 /// Concurrent submissions must start exactly one turn, steer the other message, and persist both client IDs.

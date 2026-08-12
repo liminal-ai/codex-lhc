@@ -9,9 +9,9 @@
 
 use std::path::Path;
 
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use tracing::info;

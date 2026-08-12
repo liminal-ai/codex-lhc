@@ -26,6 +26,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -87,6 +88,7 @@ async fn e2e_user_prompt_reaches_lhc_record() {
             &turn_context,
             &[text_input("e2e human utterance")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
 
@@ -134,7 +136,12 @@ async fn e2e_item_order_preserved_across_records() {
     ];
     for text in texts {
         session
-            .record_user_prompt_and_emit_turn_item(&turn_context, &[text_input(text)], None)
+            .record_user_prompt_and_emit_turn_item(
+                &turn_context,
+                &[text_input(text)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
     }
     handle.flush().await;
@@ -195,6 +202,7 @@ async fn e2e_core_id_assignment_is_restart_stable() {
             &turn_context,
             &[text_input("core-assigned-id-utterance")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
     handle.flush().await;
@@ -274,6 +282,7 @@ async fn e2e_user_prompt_provenance_is_required() {
             &turn_context,
             &[text_input("provenance-sensitive")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
     handle.flush().await;
@@ -434,6 +443,7 @@ async fn e2e_panicking_raw_item_contributor_is_contained() {
             &turn_context,
             &[text_input("after-panic-contributor")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
 
@@ -546,6 +556,7 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
             &turn_context,
             &[text_input("live turn that must be captured")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
     handle.flush().await;
@@ -575,10 +586,10 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
             internal_chat_message_metadata_passthrough: None,
         })
         .collect();
-    let rollout_items: Vec<codex_protocol::protocol::RolloutItem> = replayed
+    let rollout_items: Vec<codex_history::RolloutItem> = replayed
         .iter()
         .cloned()
-        .map(codex_protocol::protocol::RolloutItem::ResponseItem)
+        .map(|item| codex_history::RolloutItem::ResponseItem(item.into()))
         .collect();
 
     // The production entry itself — the same call `InitialHistory::Resumed`
@@ -658,6 +669,7 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
             &turn_context,
             &[text_input("v5 host facts prompt")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
 
@@ -805,6 +817,7 @@ async fn e2e_v5_host_facts_abort_with_reason() {
             &turn_context,
             &[text_input("abort path prompt")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
 
@@ -889,6 +902,7 @@ async fn e2e_v5_turn_end_without_host_facts_still_records() {
             &turn_context,
             &[text_input("optional facts prompt")],
             None,
+            PersistContext::TurnStart,
         )
         .await;
 
@@ -945,8 +959,8 @@ async fn e2e_v5_turn_end_without_host_facts_still_records() {
 /// correctly through the production reverse-scan path.
 #[tokio::test]
 async fn slice_d_dual_format_old_appended_via_production_resume() {
-    use codex_protocol::protocol::CompactedItem;
-    use codex_protocol::protocol::RolloutItem;
+    use codex_history::CompactedItem;
+    use codex_history::RolloutItem;
     use codex_protocol::protocol::SessionMeta;
     use codex_protocol::protocol::SessionMetaLine;
 
@@ -979,28 +993,28 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
             },
             git: None,
         }),
-        RolloutItem::ResponseItem(user("pre-compact-user")),
-        RolloutItem::ResponseItem(assistant("pre-compact-asst")),
+        RolloutItem::ResponseItem(user("pre-compact-user").into()),
+        RolloutItem::ResponseItem(assistant("pre-compact-asst").into()),
         RolloutItem::Compacted(CompactedItem {
             message: "c1".into(),
-            replacement_history: Some(bands1),
+            replacement_history: Some(bands1.into_iter().map(Into::into).collect()),
             window_number: Some(1),
             first_window_id: Some("first".into()),
             previous_window_id: None,
             window_id: Some("win-1".into()),
         }),
-        RolloutItem::ResponseItem(user("after-c1")),
-        RolloutItem::ResponseItem(assistant("reply-c1")),
+        RolloutItem::ResponseItem(user("after-c1").into()),
+        RolloutItem::ResponseItem(assistant("reply-c1").into()),
         RolloutItem::Compacted(CompactedItem {
             message: "c2".into(),
-            replacement_history: Some(bands2.clone()),
+            replacement_history: Some(bands2.clone().into_iter().map(Into::into).collect()),
             window_number: Some(2),
             first_window_id: Some("first".into()),
             previous_window_id: Some("win-1".into()),
             window_id: Some("win-2".into()),
         }),
-        RolloutItem::ResponseItem(user("after-c2")),
-        RolloutItem::ResponseItem(assistant("reply-c2")),
+        RolloutItem::ResponseItem(user("after-c2").into()),
+        RolloutItem::ResponseItem(assistant("reply-c2").into()),
     ];
 
     let (session, turn_context) = make_session_and_context().await;
@@ -1008,9 +1022,9 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)
         .await;
 
-    let mut expected = bands2;
-    expected.push(user("after-c2"));
-    expected.push(assistant("reply-c2"));
+    let mut expected: Vec<_> = bands2.into_iter().map(Into::into).collect();
+    expected.push(user("after-c2").into());
+    expected.push(assistant("reply-c2").into());
     assert_eq!(
         reconstructed.history, expected,
         "production resume must keep newest Compacted bands + post-boundary tail only"

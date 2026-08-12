@@ -274,7 +274,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 let mut launch = network.remote_launch_config().await.map_err(|err| {
                     ToolError::Codex(CodexErr::Io(io::Error::other(err.to_string())))
                 })?;
-                if routes_approval_to_guardian(&ctx.turn)
+                if routes_approval_to_guardian(&ctx.step_context.turn)
                     && network.remote_policy_decider().is_some()
                 {
                     let timeout = ctx
@@ -483,7 +483,7 @@ mod tests {
     use super::*;
     use crate::config::PermissionProfileSnapshot;
     use crate::exec::DEFAULT_EXEC_COMMAND_TIMEOUT_MS;
-    use crate::session::turn_context::EnvironmentConfig;
+    use crate::session::turn_context::TurnEnvironmentConfig;
     use crate::tools::sandboxing::ToolRuntime;
     use codex_exec_server::Environment;
     use codex_exec_server::LOCAL_ENVIRONMENT_ID;
@@ -502,11 +502,12 @@ mod tests {
             cwd,
             Vec::new(),
             /*shell*/ None,
-            EnvironmentConfig {
+            TurnEnvironmentConfig {
                 allow_login_shell: true,
                 permission_profile: PermissionProfileSnapshot::legacy(
                     PermissionProfile::read_only(),
                 ),
+                selected_capability_roots: None,
             },
         )
     }

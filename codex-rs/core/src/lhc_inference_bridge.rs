@@ -239,7 +239,7 @@ pub(crate) fn derivation_prompt(text: &str) -> Prompt {
             text: String::new(),
             provenance: None,
         },
-        tools: Vec::new(),
+        tools: Arc::default(),
         parallel_tool_calls: false,
         output_schema: None,
         output_schema_strict: false,

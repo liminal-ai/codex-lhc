@@ -27,9 +27,10 @@
 
 use chrono::SecondsFormat;
 use chrono::Utc;
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use serde::Serialize;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -169,7 +170,12 @@ pub fn history_from_materialized_items(items: &[RolloutItem]) -> Vec<ResponseIte
         }) = item
         {
             last_idx = Some(i);
-            bands = replacement_history.clone();
+            bands = replacement_history.as_ref().map(|history| {
+                history
+                    .iter()
+                    .map(|item| item.item.clone())
+                    .collect::<Vec<_>>()
+            });
         }
     }
     let mut tail: Vec<ResponseItem> = Vec::new();
@@ -184,7 +190,7 @@ pub fn history_from_materialized_items(items: &[RolloutItem]) -> Vec<ResponseIte
     for item in scan {
         match item {
             RolloutItem::ResponseItem(response_item) => {
-                tail.push(response_item.clone());
+                tail.push(response_item.item.clone());
             }
             RolloutItem::InterAgentCommunication(communication) => {
                 tail.push(communication.to_model_input_item());
@@ -219,7 +225,7 @@ pub fn parse_rollout_items(path: &Path) -> std::io::Result<Vec<RolloutItem>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        match serde_json::from_value::<codex_protocol::protocol::RolloutLine>(value) {
+        match serde_json::from_value::<RolloutLine>(value) {
             Ok(rollout_line) => items.push(rollout_line.item),
             Err(_) => continue,
         }

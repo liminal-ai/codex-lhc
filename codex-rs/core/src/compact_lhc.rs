@@ -20,6 +20,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_features::Feature;
+use codex_history::RolloutItem;
 use codex_lhc_host::CompactBoundaryMeta;
 use codex_lhc_host::CompactMarker;
 use codex_lhc_host::DerivedProvenance;
@@ -42,7 +43,6 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use tokio_util::sync::CancellationToken;
@@ -287,7 +287,12 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
 
     let thread_id = handle.thread_id().to_string();
     let root = handle.root().map(std::path::Path::to_path_buf);
-    let host_items = sess.clone_history().await.raw_items().to_vec();
+    let host_items = sess
+        .clone_history()
+        .await
+        .raw_items()
+        .cloned()
+        .collect::<Vec<_>>();
 
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -622,8 +627,8 @@ async fn install_lhc_compact_rewrite(
     sess.recompute_token_usage(turn_context).await;
 
     let installed = sess.clone_history().await;
-    let installed_items = installed.raw_items();
-    if !response_items_structurally_equal(installed_items, &expected_body) {
+    let installed_items = installed.raw_items().cloned().collect::<Vec<_>>();
+    if !response_items_structurally_equal(&installed_items, &expected_body) {
         return Err(CodexErr::UnsupportedOperation(format!(
             "LHC compact law-1 violation: host history drifted from materialized \
              bands+tail (host={}, body={})",
@@ -762,12 +767,12 @@ fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[
     for item in items.iter_mut() {
         match item {
             RolloutItem::Compacted(c) => {
-                c.replacement_history = Some(bands.to_vec());
+                c.replacement_history = Some(bands.iter().cloned().map(Into::into).collect());
                 past_boundary = true;
             }
             RolloutItem::ResponseItem(response_item) if past_boundary => {
                 if let Some(src) = tail.get(tail_idx) {
-                    *response_item = src.clone();
+                    *response_item = src.clone().into();
                     tail_idx += 1;
                 }
             }

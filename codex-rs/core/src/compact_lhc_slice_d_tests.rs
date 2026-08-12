@@ -13,6 +13,8 @@ use std::time::Duration;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_lhc_host::CompactBoundaryMeta;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::MaterializeInput;
@@ -30,9 +32,7 @@ use codex_lhc_host::wait_for_handle;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
@@ -42,6 +42,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -133,7 +134,12 @@ async fn seed_conversation_bandable(
     for i in 0..turns {
         let user = format!("user turn {i} long-horizon bandable seed {pad}");
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(&user)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -194,7 +200,9 @@ async fn attach_rollout(session: &mut Session) -> std::path::PathBuf {
     .await
     .expect("create thread persistence");
     session.services.live_thread = Some(live_thread);
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session.flush_rollout().await.expect("flush rollout");
     session
         .current_rollout_path()
@@ -242,7 +250,7 @@ fn compacted(
 ) -> RolloutItem {
     RolloutItem::Compacted(CompactedItem {
         message: message.into(),
-        replacement_history: Some(bands),
+        replacement_history: Some(bands.into_iter().map(Into::into).collect()),
         window_number: Some(window_number),
         first_window_id: Some("first-win".into()),
         previous_window_id: prev.map(str::to_string),
@@ -315,7 +323,7 @@ async fn slice_d_regenerate_and_resume_drill() {
     let LhcCompactAttempt::Installed { body, .. } = attempt else {
         panic!("drill requires Installed compact: {attempt:?}");
     };
-    let pre_delete_history = sess.clone_history().await.raw_items().to_vec();
+    let pre_delete_history = sess.clone_history().await.into_raw_items();
     assert!(
         response_items_structurally_equal(&pre_delete_history, &body),
         "precondition: installed body equals live host"
@@ -412,14 +420,14 @@ fn dual_format_model_history(items: &[RolloutItem]) -> Vec<ResponseItem> {
             ..
         }) = item
         {
-            last_bands = Some(h.clone());
+            last_bands = Some(h.iter().map(|envelope| envelope.item.clone()).collect());
             last_idx = i;
         }
     }
     let mut out = last_bands.unwrap_or_default();
     for item in &items[last_idx.saturating_add(1)..] {
         if let RolloutItem::ResponseItem(r) = item {
-            out.push(r.clone());
+            out.push(r.item.clone());
         }
     }
     out
@@ -437,15 +445,19 @@ fn slice_d_dual_format_old_appended_compacted_reconstructs() {
     let tail2 = vec![user_msg("after-c2"), assistant_msg("reply-c2")];
 
     let mut old_shape = vec![session_meta_item("old")];
-    old_shape.push(RolloutItem::ResponseItem(user_msg("pre-compact-user")));
-    old_shape.push(RolloutItem::ResponseItem(assistant_msg("pre-compact-asst")));
+    old_shape.push(RolloutItem::ResponseItem(
+        user_msg("pre-compact-user").into(),
+    ));
+    old_shape.push(RolloutItem::ResponseItem(
+        assistant_msg("pre-compact-asst").into(),
+    ));
     old_shape.push(compacted("c1", bands1, 1, "win-1", None));
     for item in &tail1 {
-        old_shape.push(RolloutItem::ResponseItem(item.clone()));
+        old_shape.push(RolloutItem::ResponseItem(item.clone().into()));
     }
     old_shape.push(compacted("c2", bands2.clone(), 2, "win-2", Some("win-1")));
     for item in &tail2 {
-        old_shape.push(RolloutItem::ResponseItem(item.clone()));
+        old_shape.push(RolloutItem::ResponseItem(item.clone().into()));
     }
 
     let mut expected = bands2;
@@ -481,10 +493,10 @@ fn slice_d_dual_format_fixture_file_round_trip() {
     let items = vec![
         session_meta_item("fixture"),
         compacted("legacy-1", bands_v1, 1, "w1", None),
-        RolloutItem::ResponseItem(user_msg("post-1")),
+        RolloutItem::ResponseItem(user_msg("post-1").into()),
         compacted("legacy-2", bands_v2.clone(), 2, "w2", Some("w1")),
-        RolloutItem::ResponseItem(user_msg("post-2-true-tail")),
-        RolloutItem::ResponseItem(assistant_msg("post-2-asst")),
+        RolloutItem::ResponseItem(user_msg("post-2-true-tail").into()),
+        RolloutItem::ResponseItem(assistant_msg("post-2-asst").into()),
     ];
     atomic_rewrite_rollout(&path, &items).expect("write fixture");
     let parsed = parse_rollout_items(&path).expect("parse fixture");
@@ -532,7 +544,12 @@ async fn slice_d_display_consumers_on_rebuilt_file() {
     // Known first prompt — title/preview source for thread-store consumers.
     let first_prompt = "FIRST_TRUE_USER_PROMPT_slice_d_title_source";
     session
-        .record_user_prompt_and_emit_turn_item(&tc, &[text_input(first_prompt)], None)
+        .record_user_prompt_and_emit_turn_item(
+            &tc,
+            &[text_input(first_prompt)],
+            None,
+            PersistContext::TurnStart,
+        )
         .await;
     session
         .record_conversation_items_with_provenance(
@@ -707,8 +724,8 @@ async fn slice_d_l2_first_rewrite_on_old_format_transition() {
     // Seed the live path with OLD appended-Compacted shape before any LHC rewrite.
     let old = vec![
         session_meta_item("transition"),
-        RolloutItem::ResponseItem(user_msg("legacy-user-1")),
-        RolloutItem::ResponseItem(assistant_msg("legacy-asst-1")),
+        RolloutItem::ResponseItem(user_msg("legacy-user-1").into()),
+        RolloutItem::ResponseItem(assistant_msg("legacy-asst-1").into()),
         compacted(
             "legacy-compact-1",
             vec![user_msg("legacy-band"), assistant_msg("legacy-sum")],
@@ -716,8 +733,8 @@ async fn slice_d_l2_first_rewrite_on_old_format_transition() {
             "legacy-w1",
             None,
         ),
-        RolloutItem::ResponseItem(user_msg("legacy-post")),
-        RolloutItem::ResponseItem(assistant_msg("legacy-post-asst")),
+        RolloutItem::ResponseItem(user_msg("legacy-post").into()),
+        RolloutItem::ResponseItem(assistant_msg("legacy-post-asst").into()),
         compacted(
             "legacy-compact-2",
             vec![user_msg("legacy-band-2"), assistant_msg("legacy-sum-2")],
@@ -725,7 +742,7 @@ async fn slice_d_l2_first_rewrite_on_old_format_transition() {
             "legacy-w2",
             Some("legacy-w1"),
         ),
-        RolloutItem::ResponseItem(user_msg("legacy-tail")),
+        RolloutItem::ResponseItem(user_msg("legacy-tail").into()),
     ];
     // Write over the live path without going through the recorder (old shape).
     atomic_rewrite_rollout(&rollout_path, &old).expect("seed old format");
@@ -759,9 +776,9 @@ async fn slice_d_l2_first_rewrite_on_old_format_transition() {
         "first rewrite must collapse to exactly one Compacted boundary"
     );
     let history = reconstruct_model_history(&new_items);
-    let host = sess.clone_history().await;
+    let host = sess.clone_history().await.into_raw_items();
     assert!(
-        response_items_structurally_equal(&history, host.raw_items()),
+        response_items_structurally_equal(&history, &host),
         "post-transition resume must equal live host"
     );
     // Prior generation retained for recovery.
@@ -858,7 +875,12 @@ async fn slice_d_l2_mid_turn_abort_then_rewrite() {
 
     // Open a turn then abort it via the capture seam (schema v5 outcome).
     session
-        .record_user_prompt_and_emit_turn_item(&tc, &[text_input("about to abort this turn")], None)
+        .record_user_prompt_and_emit_turn_item(
+            &tc,
+            &[text_input("about to abort this turn")],
+            None,
+            PersistContext::TurnStart,
+        )
         .await;
     handle.turn_end(
         "slice-d-abort-turn",
@@ -895,7 +917,7 @@ async fn slice_d_l2_mid_turn_abort_then_rewrite() {
     // (Capture may attach abort to a synthetic turn id that has no member messages.)
     let _ = has_aborted;
     assert!(
-        response_items_structurally_equal(&history, sess.clone_history().await.raw_items()),
+        response_items_structurally_equal(&history, &sess.clone_history().await.into_raw_items(),),
         "post-abort rewrite must match live host"
     );
 }
@@ -913,16 +935,16 @@ async fn slice_d_l2_rollback_markers_applied_not_carried() {
     // Prior generation with a rollback marker after two user ResponseItems.
     let prior = vec![
         session_meta_item("rb"),
-        RolloutItem::ResponseItem(user_msg("kept-user")),
-        RolloutItem::ResponseItem(assistant_msg("kept-asst")),
-        RolloutItem::ResponseItem(user_msg("rolled-user")),
-        RolloutItem::ResponseItem(assistant_msg("rolled-asst")),
+        RolloutItem::ResponseItem(user_msg("kept-user").into()),
+        RolloutItem::ResponseItem(assistant_msg("kept-asst").into()),
+        RolloutItem::ResponseItem(user_msg("rolled-user").into()),
+        RolloutItem::ResponseItem(assistant_msg("rolled-asst").into()),
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
         })),
         compacted("pre-rb", vec![user_msg("band")], 1, "w1", None),
-        RolloutItem::ResponseItem(user_msg("post-boundary-live")),
-        RolloutItem::ResponseItem(user_msg("post-boundary-dropped-by-rb")),
+        RolloutItem::ResponseItem(user_msg("post-boundary-live").into()),
+        RolloutItem::ResponseItem(user_msg("post-boundary-dropped-by-rb").into()),
         // Marker after the second post-boundary user: drop 1 newest user turn.
         RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
             num_turns: 1,
@@ -980,7 +1002,12 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
 
     let astral = "hello 🌍 𝄞 中文 \u{1F980} boundary-float-1e21";
     session
-        .record_user_prompt_and_emit_turn_item(&tc, &[text_input(astral)], None)
+        .record_user_prompt_and_emit_turn_item(
+            &tc,
+            &[text_input(astral)],
+            None,
+            PersistContext::TurnStart,
+        )
         .await;
     // Oversized tool result (adversarial size).
     let mut oversized = String::with_capacity(50_000);
@@ -1031,7 +1058,7 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
     );
     let history = reconstruct_model_history(&items);
     assert!(
-        response_items_structurally_equal(&history, sess.clone_history().await.raw_items()),
+        response_items_structurally_equal(&history, &sess.clone_history().await.into_raw_items(),),
         "adversarial resume == host"
     );
 }
@@ -1200,7 +1227,7 @@ async fn slice_d_l2_rewrite_failure_old_authoritative_session_continues() {
         assert!(matches!(a1, LhcCompactAttempt::Installed { .. }), "{a1:?}");
     }
     let before = std::fs::read_to_string(&rollout_path).expect("before");
-    let history_before = sess.clone_history().await.raw_items().to_vec();
+    let history_before = sess.clone_history().await.into_raw_items();
 
     // Inject failpoint so the next production rewrite fails mid-swap.
     // Grow enough for a second reducing compact.
@@ -1225,7 +1252,7 @@ async fn slice_d_l2_rewrite_failure_old_authoritative_session_continues() {
     // Session still usable.
     let host = sess.clone_history().await;
     assert!(
-        !host.raw_items().is_empty(),
+        host.raw_items().next().is_some(),
         "session continues after rewrite fail"
     );
     let _ = (before, history_before, after, a2);
@@ -1354,9 +1381,9 @@ fn slice_d_mutation_demo_drill_requires_structural_eq() {
 fn slice_d_mutation_demo_dual_format_picks_newest_boundary() {
     let items = [
         compacted("c1", vec![user_msg("band-v1")], 1, "w1", None),
-        RolloutItem::ResponseItem(user_msg("tail-old")),
+        RolloutItem::ResponseItem(user_msg("tail-old").into()),
         compacted("c2", vec![user_msg("band-v2")], 2, "w2", Some("w1")),
-        RolloutItem::ResponseItem(user_msg("tail-new")),
+        RolloutItem::ResponseItem(user_msg("tail-new").into()),
     ];
     // Production resume is covered by the async dual-format test. Here we pin
     // the expected newest-only history for the dual-format fixture narrative.
@@ -1370,10 +1397,14 @@ fn slice_d_mutation_demo_dual_format_picks_newest_boundary() {
             last_idx = i;
         }
     }
-    let mut got = last_bands.unwrap_or_default();
+    let mut got: Vec<ResponseItem> = last_bands
+        .unwrap_or_default()
+        .into_iter()
+        .map(|envelope| envelope.item)
+        .collect();
     for item in &items[last_idx + 1..] {
         if let RolloutItem::ResponseItem(r) = item {
-            got.push(r.clone());
+            got.push(r.item.clone());
         }
     }
     assert!(

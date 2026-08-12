@@ -8,11 +8,11 @@ use crate::inference::LateBoundCallbacks;
 use crate::inference::lhc_inference_callbacks;
 use crate::parse_rollout_items;
 use codex_extension_api::RawItemProvenance;
+use codex_history::CompactedItem;
+use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::CompactedItem;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use pretty_assertions::assert_eq;
@@ -72,13 +72,13 @@ fn single_boundary_items(compact_point: i64) -> Vec<RolloutItem> {
         }),
         RolloutItem::Compacted(CompactedItem {
             message: durable_message(compact_point),
-            replacement_history: Some(vec![user("band", "u1")]),
+            replacement_history: Some(vec![user("band", "u1").into()]),
             window_number: Some(1),
             first_window_id: Some("first".into()),
             previous_window_id: None,
             window_id: Some("win-1".into()),
         }),
-        RolloutItem::ResponseItem(user("tail", "u2")),
+        RolloutItem::ResponseItem(user("tail", "u2").into()),
     ]
 }
 
@@ -86,7 +86,7 @@ fn dual_compacted_polluted() -> Vec<RolloutItem> {
     let mut items = single_boundary_items(3);
     items.push(RolloutItem::Compacted(CompactedItem {
         message: "native-append-compacted".into(),
-        replacement_history: Some(vec![user("native-band", "u3")]),
+        replacement_history: Some(vec![user("native-band", "u3").into()]),
         window_number: Some(2),
         first_window_id: Some("first".into()),
         previous_window_id: Some("win-1".into()),
@@ -435,9 +435,12 @@ async fn encrypted_reasoning_round_trip_identity_gate() {
 
     let encrypted_of = |items: &[RolloutItem]| -> Option<Option<String>> {
         items.iter().find_map(|item| match item {
-            RolloutItem::ResponseItem(ResponseItem::Reasoning {
-                encrypted_content, ..
-            }) => Some(encrypted_content.clone()),
+            RolloutItem::ResponseItem(item) => match &item.item {
+                ResponseItem::Reasoning {
+                    encrypted_content, ..
+                } => Some(encrypted_content.clone()),
+                _ => None,
+            },
             _ => None,
         })
     };

@@ -203,10 +203,10 @@ index f34c88cc3b..0ff42ff566 100644
  
  /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 2ab1b954b7..eb29d4d50e 100644
+index 7ac890183e..a6930f83c9 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-@@ -1230,6 +1230,7 @@ impl GoalExtensionHarness {
+@@ -1366,6 +1366,7 @@ impl GoalExtensionHarness {
                      turn_id,
                      collaboration_mode: &collaboration_mode,
                      token_usage_at_turn_start: usage,
@@ -214,7 +214,7 @@ index 2ab1b954b7..eb29d4d50e 100644
                      session_store: &self.session_store,
                      thread_store: &self.thread_store,
                      turn_store: &turn_store,
-@@ -1243,6 +1244,8 @@ impl GoalExtensionHarness {
+@@ -1379,6 +1380,8 @@ impl GoalExtensionHarness {
          for contributor in self.registry.turn_lifecycle_contributors() {
              contributor
                  .on_turn_stop(TurnStopInput {

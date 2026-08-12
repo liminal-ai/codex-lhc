@@ -1,6 +1,7 @@
 //! Central approval policy-stage execution and reviewer routing.
 
 use crate::command_canonicalization::canonicalize_command_for_approval;
+use crate::guardian::GuardianReviewContext;
 use crate::guardian::guardian_timeout_message;
 use crate::guardian::new_guardian_review_id;
 use crate::guardian::review_approval_request;
@@ -21,7 +22,10 @@ use crate::tools::sandboxing::with_cached_approval;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::approvals::ExecPolicyAmendment;
+#[cfg(unix)]
+use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalContext;
+use codex_protocol::error::CodexErr;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::NetworkPolicyRuleAction;
@@ -32,10 +36,11 @@ use codex_utils_path_uri::PathUri;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::error;
 
 #[derive(Clone)]
 pub(crate) struct ApprovalContext {
-    pub(crate) turn: Arc<TurnContext>,
+    pub(crate) review_context: GuardianReviewContext,
     pub(crate) call_id: String,
     pub(crate) tool_name: ToolName,
     pub(crate) strict_auto_review: bool,
@@ -69,6 +74,18 @@ pub(crate) enum ApprovalAction {
         tty: bool,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
+    #[cfg(unix)]
+    Execve {
+        id: String,
+        approval_id: String,
+        environment_id: String,
+        source: GuardianCommandSource,
+        program: AbsolutePathBuf,
+        argv: Vec<String>,
+        command: Vec<String>,
+        cwd: AbsolutePathBuf,
+        additional_permissions: Option<AdditionalPermissionProfile>,
+    },
     ApplyPatch {
         id: String,
         environment_id: String,
@@ -101,6 +118,11 @@ impl ApprovalAction {
                 justification,
                 ..
             } => PermissionRequestPayload::bash(hook_command.clone(), justification.clone()),
+            #[cfg(unix)]
+            Self::Execve { command, .. } => PermissionRequestPayload::bash(
+                codex_shell_command::parse_command::shlex_join(command),
+                /*description*/ None,
+            ),
             Self::ApplyPatch { patch, .. } => PermissionRequestPayload {
                 tool_name: HookToolName::apply_patch(),
                 tool_input: serde_json::json!({ "command": patch }),
@@ -140,6 +162,8 @@ impl ApprovalAction {
                 sandbox_permissions: *sandbox_permissions,
                 additional_permissions: additional_permissions.clone(),
             })],
+            #[cfg(unix)]
+            Self::Execve { .. } => Vec::new(),
             Self::ApplyPatch {
                 environment_id,
                 files,
@@ -194,6 +218,23 @@ impl ApprovalAction {
                 additional_permissions,
                 justification,
                 tty,
+            },
+            #[cfg(unix)]
+            Self::Execve {
+                id,
+                source,
+                program,
+                argv,
+                cwd,
+                additional_permissions,
+                ..
+            } => crate::guardian::GuardianApprovalRequest::Execve {
+                id,
+                source,
+                program: program.to_string_lossy().into_owned(),
+                argv,
+                cwd,
+                additional_permissions,
             },
             Self::ApplyPatch {
                 id,
@@ -270,6 +311,12 @@ impl ApprovalResolution {
     fn into_tool_result(self) -> Result<ReviewDecision, ToolError> {
         let source = self.source;
         match self.decision {
+            ReviewDecision::ApprovedMcpPolicyAmendment => {
+                error!("Tool approval received ApprovedMcpPolicyAmendment");
+                Err(ToolError::Rejected(
+                    "Error while requesting approval".to_string(),
+                ))
+            }
             ReviewDecision::NetworkPolicyAmendment {
                 network_policy_amendment,
             } if network_policy_amendment.action == NetworkPolicyRuleAction::Deny => {
@@ -284,9 +331,7 @@ impl ApprovalResolution {
             }
             ReviewDecision::Denied { rejection } => Err(ToolError::Rejected(rejection)),
             ReviewDecision::TimedOut => Err(ToolError::Rejected(guardian_timeout_message())),
-            ReviewDecision::Abort => {
-                Err(ToolError::Rejected("approval request aborted".to_string()))
-            }
+            ReviewDecision::Abort => Err(ToolError::Codex(CodexErr::TurnAborted)),
             decision => Ok(decision),
         }
     }
@@ -298,18 +343,20 @@ impl Session {
         action: ApprovalAction,
         ctx: ApprovalContext,
     ) -> Result<ReviewDecision, ToolError> {
-        let permission_request_run_id = ctx
-            .retry_reason
-            .as_ref()
-            .map(|_| format!("{}:retry", ctx.call_id));
+        let permission_request_run_id = match &action {
+            #[cfg(unix)]
+            ApprovalAction::Execve { approval_id, .. } => approval_id.clone(),
+            _ if ctx.retry_reason.is_some() => format!("{}:retry", ctx.call_id),
+            _ => ctx.call_id.clone(),
+        };
 
         // Approval precedence is:
         // 1. Hooks
         // 2. If StrictAutoReview || Guardian enabled, then Guardian. Else, user.
         let resolution = match run_permission_request_hooks(
             self,
-            &ctx.turn,
-            permission_request_run_id.as_deref().unwrap_or(&ctx.call_id),
+            ctx.review_context.turn(),
+            &permission_request_run_id,
             action.permission_request_payload(),
         )
         .await
@@ -336,7 +383,7 @@ impl Session {
         let reviewer = if ctx.strict_auto_review {
             ApprovalReviewer::Guardian
         } else {
-            ApprovalReviewer::for_turn(&ctx.turn)
+            ApprovalReviewer::for_turn(ctx.review_context.turn())
         };
 
         let decision = match reviewer {
@@ -368,7 +415,7 @@ impl Session {
 
         review_approval_request(
             self,
-            &ctx.turn,
+            ctx.review_context.clone(),
             review_id,
             action,
             ApprovalRequestReasons {
@@ -407,12 +454,16 @@ impl Session {
                     Ok(cwd) => cwd,
                     Err(err) => {
                         tracing::error!(%err, "failed to resolve approval command cwd");
-                        return ReviewDecision::Abort;
+                        return ReviewDecision::denied(format!(
+                            "failed to resolve approval command cwd: {err}"
+                        ));
                     }
                 };
                 let tool_name = match action {
                     ApprovalAction::Shell { .. } => "shell",
                     ApprovalAction::ExecCommand { .. } => "unified_exec",
+                    #[cfg(unix)]
+                    ApprovalAction::Execve { .. } => unreachable!("matched command approval"),
                     ApprovalAction::ApplyPatch { .. } => unreachable!("matched command approval"),
                 };
                 let reason = ctx
@@ -422,7 +473,7 @@ impl Session {
                     .or_else(|| justification.clone());
                 with_cached_approval(&self.services, tool_name, action.cache_keys(), || async {
                     self.request_command_approval(
-                        &ctx.turn,
+                        ctx.review_context.turn(),
                         ctx.call_id.clone(),
                         /*approval_id*/ None,
                         Some(environment_id.clone()),
@@ -437,6 +488,31 @@ impl Session {
                     )
                     .await
                 })
+                .await
+            }
+            #[cfg(unix)]
+            ApprovalAction::Execve {
+                approval_id,
+                environment_id,
+                command,
+                cwd,
+                additional_permissions,
+                ..
+            } => {
+                self.request_command_approval(
+                    ctx.review_context.turn(),
+                    ctx.call_id.clone(),
+                    Some(approval_id.clone()),
+                    Some(environment_id.clone()),
+                    command.clone(),
+                    cwd.clone(),
+                    /*reason*/ None,
+                    /*network_approval_context*/ None,
+                    /*proposed_execpolicy_amendment*/ None,
+                    additional_permissions.clone(),
+                    Some(vec![ReviewDecision::Approved, ReviewDecision::Abort]),
+                    /*plugin_attribution_override*/ None,
+                )
                 .await
             }
             ApprovalAction::ApplyPatch {
@@ -454,7 +530,7 @@ impl Session {
                 if reason.is_some() {
                     return self
                         .request_patch_approval(
-                            &ctx.turn,
+                            ctx.review_context.turn(),
                             ctx.call_id.clone(),
                             changes.as_ref().clone(),
                             reason,
@@ -468,7 +544,7 @@ impl Session {
                     action.cache_keys(),
                     || async {
                         self.request_patch_approval(
-                            &ctx.turn,
+                            ctx.review_context.turn(),
                             ctx.call_id.clone(),
                             changes.as_ref().clone(),
                             /*reason*/ None,
@@ -490,7 +566,7 @@ fn record_resolution(ctx: &ApprovalContext, resolution: &ApprovalResolution) {
         ApprovalResolutionSource::User => ToolDecisionSource::User,
     };
     let tool_name = flat_tool_name(&ctx.tool_name);
-    ctx.turn.session_telemetry.tool_decision(
+    ctx.review_context.turn().session_telemetry.tool_decision(
         tool_name.as_ref(),
         &ctx.call_id,
         &resolution.decision,

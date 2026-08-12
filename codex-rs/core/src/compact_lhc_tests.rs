@@ -16,6 +16,7 @@ use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -129,7 +130,12 @@ async fn seed_conversation_small(
         "fourth user turn about delta polish",
     ] {
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(text)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(text)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -159,7 +165,12 @@ async fn seed_conversation_bandable(
     for i in 0..turns {
         let user = format!("user turn {i} long-horizon bandable seed {pad}");
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(&user)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -231,9 +242,9 @@ async fn law1_installed_items_equal_lhc_body_structurally() {
         "receipt-backed marker must not be synthetic zeros: {marker:?}"
     );
 
-    let host = sess.clone_history().await;
+    let host = sess.clone_history().await.into_raw_items();
     assert!(
-        response_items_structurally_equal(host.raw_items(), &body),
+        response_items_structurally_equal(&host, &body),
         "law1: host history must equal the mapped LHC body field-for-field"
     );
 }
@@ -349,8 +360,13 @@ async fn law2_token_count_drops_and_threshold_does_not_retrigger() {
     );
     assert!(!token_limit_reached(sess.as_ref(), &tc).await);
 
-    sess.record_user_prompt_and_emit_turn_item(&tc, &[text_input("follow-up after compact")], None)
-        .await;
+    sess.record_user_prompt_and_emit_turn_item(
+        &tc,
+        &[text_input("follow-up after compact")],
+        None,
+        PersistContext::TurnStart,
+    )
+    .await;
     let status2 = context_window_token_status(sess.as_ref(), &tc).await;
     assert!(
         !status2.token_limit_reached,
@@ -381,7 +397,7 @@ async fn sub_threshold_does_not_grow_model_context() {
     seed_conversation_small(&session, &tc).await;
     handle.flush().await;
 
-    let before = session.clone_history().await.raw_items().to_vec();
+    let before = session.clone_history().await.into_raw_items();
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     match attempt {
@@ -389,7 +405,7 @@ async fn sub_threshold_does_not_grow_model_context() {
             // NoReduction is fine; other unavailability also fine for tiny seed.
             let _ = reason;
             assert!(response_items_structurally_equal(
-                sess.clone_history().await.raw_items(),
+                &sess.clone_history().await.into_raw_items(),
                 &before
             ));
         }
@@ -433,15 +449,14 @@ async fn production_three_compacts_do_not_reingest_body() {
             LhcCompactAttempt::Installed { body, .. } => {
                 installed_once = true;
                 // Production assigns ids at write-back.
-                let host = sess.clone_history().await;
+                let host = sess.clone_history().await.into_raw_items();
                 let with_id = host
-                    .raw_items()
                     .iter()
                     .filter(|i| codex_lhc_host::item_stable_id(i).is_some())
                     .count();
                 assert_eq!(
                     with_id,
-                    host.raw_items().len(),
+                    host.len(),
                     "round {round}: all installed items must have stable ids"
                 );
                 assert!(!body.is_empty());
@@ -492,14 +507,16 @@ async fn production_many_compacts_marker_bounded_body_not_growing() {
     let mut body_item_counts: Vec<usize> = Vec::new();
     let mut installs = 0usize;
     let pad = "z".repeat(3500);
-    // ≥20 rounds with enough bulk for repeated Installs.
-    for round in 0..20 {
+    // Ten rounds are enough to prove repeated bounded markers while staying
+    // inside the workspace's 60-second per-test ceiling on fresh runners.
+    for round in 0..10 {
         if round > 0 {
             for k in 0..20 {
                 sess.record_user_prompt_and_emit_turn_item(
                     &tc,
                     &[text_input(&format!("bulk r{round} t{k} {pad}"))],
                     None,
+                    PersistContext::TurnStart,
                 )
                 .await;
                 sess.record_conversation_items_with_provenance(
@@ -550,7 +567,7 @@ async fn production_many_compacts_marker_bounded_body_not_growing() {
     }
     assert!(
         installs >= 10,
-        "expected many Installs over 20 bulk rounds, got {installs}"
+        "expected an Install in every bulk round, got {installs}"
     );
     let max = note_chars.iter().copied().max().unwrap();
     let min = note_chars.iter().copied().min().unwrap();
@@ -774,8 +791,10 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
     let thread_id =
         ThreadId::try_from("00000000-0000-4000-8000-000000000099").expect("test thread id");
     // Explicit non-routable local base URL — never api.openai.com (G4).
-    let provider =
+    let mut provider =
         ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string()));
+    provider.request_max_retries = Some(0);
+    provider.stream_max_retries = Some(0);
     ModelClient::new(
         /*auth_manager*/ None,
         AgentIdentityAuthPolicy::JwtOnly,
@@ -798,7 +817,7 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
 #[test]
 fn band_body_replacement_history_byte_equal() {
     use crate::context_manager::ContextManager;
-    use codex_protocol::protocol::CompactedItem;
+    use codex_history::CompactedItem;
 
     let body = vec![
         ResponseItem::Message {
@@ -822,16 +841,23 @@ fn band_body_replacement_history_byte_equal() {
     ];
     let compacted = CompactedItem {
         message: "lhc".into(),
-        replacement_history: Some(body.clone()),
+        replacement_history: Some(body.clone().into_iter().map(Into::into).collect()),
         window_number: Some(1),
         first_window_id: Some("a".into()),
         previous_window_id: None,
         window_id: Some("b".into()),
     };
     let mut history = ContextManager::new();
-    history.replace(compacted.replacement_history.unwrap());
+    history.replace(
+        compacted
+            .replacement_history
+            .unwrap()
+            .into_iter()
+            .map(|envelope| envelope.item)
+            .collect(),
+    );
     assert!(response_items_structurally_equal(
-        history.raw_items(),
+        &history.into_raw_items(),
         &body
     ));
 }
@@ -840,7 +866,7 @@ fn band_body_replacement_history_byte_equal() {
 #[test]
 fn shape_risk_consumers_see_band_replacement() {
     use crate::context_manager::ContextManager;
-    use codex_protocol::protocol::CompactedItem;
+    use codex_history::CompactedItem;
 
     let band = vec![
         ResponseItem::Message {
@@ -883,7 +909,7 @@ fn shape_risk_consumers_see_band_replacement() {
 
     let compacted = CompactedItem {
         message: "lhc_compact_marker".into(),
-        replacement_history: Some(band.clone()),
+        replacement_history: Some(band.clone().into_iter().map(Into::into).collect()),
         window_number: Some(2),
         first_window_id: Some("w0".into()),
         previous_window_id: Some("w1".into()),
@@ -893,14 +919,20 @@ fn shape_risk_consumers_see_band_replacement() {
     resume.replace(
         compacted
             .replacement_history
-            .expect("replacement_history present"),
+            .expect("replacement_history present")
+            .into_iter()
+            .map(|envelope| envelope.item)
+            .collect(),
     );
-    assert!(response_items_structurally_equal(resume.raw_items(), &band));
+    assert!(response_items_structurally_equal(
+        &resume.into_raw_items(),
+        &band
+    ));
 
     let mut full_fork = ContextManager::new();
     full_fork.replace(band.clone());
     assert!(response_items_structurally_equal(
-        full_fork.raw_items(),
+        &full_fork.into_raw_items(),
         &band
     ));
 
@@ -908,18 +940,21 @@ fn shape_risk_consumers_see_band_replacement() {
     let mut last_n_fork = ContextManager::new();
     last_n_fork.replace(last_n.clone());
     assert!(response_items_structurally_equal(
-        last_n_fork.raw_items(),
+        &last_n_fork.into_raw_items(),
         &last_n
     ));
 
     let mut btw = ContextManager::new();
     btw.replace(last_n.clone());
-    assert!(response_items_structurally_equal(btw.raw_items(), &last_n));
+    assert!(response_items_structurally_equal(
+        &btw.into_raw_items(),
+        &last_n
+    ));
 
     let mut guardian = ContextManager::new();
     guardian.replace(band.clone());
     assert!(response_items_structurally_equal(
-        guardian.raw_items(),
+        &guardian.into_raw_items(),
         &band
     ));
 }
@@ -949,11 +984,15 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
         use codex_protocol::ThreadId;
         use codex_protocol::protocol::SessionSource;
         let thread_id = ThreadId::try_from("00000000-0000-4000-8000-000000000088").expect("tid");
+        let mut provider =
+            ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string()));
+        provider.request_max_retries = Some(0);
+        provider.stream_max_retries = Some(0);
         ModelClient::new(
             /*auth_manager*/ None,
             AgentIdentityAuthPolicy::JwtOnly,
             thread_id,
-            ModelProviderInfo::create_openai_provider(Some("http://127.0.0.1:9/v1".to_string())),
+            provider,
             SessionSource::Exec,
             "test_originator".to_string(),
             /*model_verbosity*/ None,
@@ -979,15 +1018,21 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
     seed_conversation_bandable(&session, &tc, 80).await;
     handle.flush().await;
 
-    let before = session.clone_history().await.raw_items().to_vec();
+    let before = session.clone_history().await.into_raw_items();
     let sess = Arc::new(session);
+    let cancellation = CancellationToken::new();
+    let cancel_after_request_starts = cancellation.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        cancel_after_request_starts.cancel();
+    });
     // No lhc_test_inference override → production ModelClient bridge.
     let attempt = try_run_lhc_compact_arm(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
-        &CancellationToken::new(),
+        &cancellation,
     )
     .await
     .expect("arm result");
@@ -1032,7 +1077,7 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
             assert!(!reason.is_empty(), "fail-open reason should be non-empty");
             // History unchanged — native ladder free.
             assert!(response_items_structurally_equal(
-                sess.clone_history().await.raw_items(),
+                &sess.clone_history().await.into_raw_items(),
                 &before
             ));
         }
@@ -1248,7 +1293,6 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
             sess.clone_history()
                 .await
                 .raw_items()
-                .iter()
                 .filter_map(|item| match item {
                     ResponseItem::Message { content, .. } => Some(
                         content
@@ -1525,8 +1569,8 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
 
     // The production resume seam, fed the CompactedItem rollout shape it is
     // fed on a real resume.
-    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
-        codex_protocol::protocol::CompactedItem {
+    let rollout = vec![codex_history::RolloutItem::Compacted(
+        codex_history::CompactedItem {
             message: durable.clone(),
             replacement_history: None,
             window_number: None,
@@ -1624,10 +1668,10 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
     let ch = wait_for_handle(&cslot, Duration::from_secs(30))
         .await
         .expect("child handle");
-    let rollout = vec![codex_protocol::protocol::RolloutItem::Compacted(
-        codex_protocol::protocol::CompactedItem {
+    let rollout = vec![codex_history::RolloutItem::Compacted(
+        codex_history::CompactedItem {
             message: durable.clone(),
-            replacement_history: Some(parent_body.clone()),
+            replacement_history: Some(parent_body.clone().into_iter().map(Into::into).collect()),
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1647,7 +1691,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
     ch.flush().await;
 
     let csess = Arc::new(child);
-    let inherited = csess.clone_history().await.raw_items().to_vec();
+    let inherited = csess.clone_history().await.into_raw_items();
     assert!(
         response_items_structurally_equal(&inherited, &parent_body),
         "fork must inherit the parent's post-compact body verbatim: \
@@ -1713,12 +1757,12 @@ async fn c1_kv_prefix_cache_invalidation_after_compact_is_measured() {
     handle.flush().await;
 
     let sess = Arc::new(session);
-    let before = sess.clone_history().await.raw_items().to_vec();
+    let before = sess.clone_history().await.into_raw_items();
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     let LhcCompactAttempt::Installed { .. } = attempt else {
         panic!("fixture: compact must install to measure its cache cost");
     };
-    let after = sess.clone_history().await.raw_items().to_vec();
+    let after = sess.clone_history().await.into_raw_items();
 
     // Longest common leading run of structurally identical items. Anything past
     // the first divergence is a cache miss for the provider regardless of what
@@ -1852,7 +1896,7 @@ async fn c1_derivation_call_input_cost_profile_is_measured() {
     );
 
     let sess = Arc::new(session);
-    let history = sess.clone_history().await.raw_items().to_vec();
+    let history = sess.clone_history().await.into_raw_items();
     let history_tokens = codex_lhc_host::estimate_response_items_tokens(&history);
 
     let calls = log.lock().expect("log").clone();
@@ -1946,7 +1990,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     let thread_id = handle.thread_id().to_string();
     let root_for_marker = handle.root().map(std::path::Path::to_path_buf);
     let sess = Arc::new(session);
-    let history_before = sess.clone_history().await.raw_items().to_vec();
+    let history_before = sess.clone_history().await.into_raw_items();
 
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -1992,7 +2036,7 @@ async fn c1_abort_mid_compact_leaves_turn_and_history_intact() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let after_grace = calls.load(AtomicOrdering::SeqCst);
 
-    let history_after = sess.clone_history().await.raw_items().to_vec();
+    let history_after = sess.clone_history().await.into_raw_items();
     let marker = archive_has_compact_marker(&thread_id, root_for_marker.as_deref()).await;
     eprintln!(
         "N3 abort: calls_at_cancel={at_cancel} calls_at_return={at_return} \
@@ -2079,7 +2123,9 @@ async fn attach_rollout_for_slice_c(session: &mut Session) -> std::path::PathBuf
     .await
     .expect("create thread persistence");
     session.services.live_thread = Some(live_thread);
-    session.ensure_rollout_materialized().await;
+    session
+        .ensure_rollout_materialized(PersistContext::Standard)
+        .await;
     session.flush_rollout().await.expect("flush rollout");
     session
         .current_rollout_path()
@@ -2117,7 +2163,7 @@ async fn slice_c_reopen_pin_append_lands_in_new_file() {
 
     // Post-swap marker text unique to the new generation append.
     let pin = "slice-c-reopen-pin-unique-marker-text";
-    sess.persist_rollout_items(&[codex_protocol::protocol::RolloutItem::EventMsg(
+    sess.persist_rollout_items(&[codex_history::RolloutItem::EventMsg(
         codex_protocol::protocol::EventMsg::AgentMessage(
             codex_protocol::protocol::AgentMessageEvent {
                 message: pin.to_string(),
@@ -2175,9 +2221,9 @@ async fn slice_c_in_memory_equals_resume_from_rewritten_file() {
         panic!("expected Installed: {attempt:?}");
     };
 
-    let host = sess.clone_history().await;
+    let host = sess.clone_history().await.into_raw_items();
     assert!(
-        response_items_structurally_equal(host.raw_items(), &body),
+        response_items_structurally_equal(&host, &body),
         "installed body must equal live host history"
     );
 
@@ -2186,22 +2232,22 @@ async fn slice_c_in_memory_equals_resume_from_rewritten_file() {
     assert!(
         file_items
             .iter()
-            .any(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_))),
+            .any(|i| matches!(i, codex_history::RolloutItem::Compacted(_))),
         "rewritten file must contain exactly the boundary Compacted"
     );
     let compacted_count = file_items
         .iter()
-        .filter(|i| matches!(i, codex_protocol::protocol::RolloutItem::Compacted(_)))
+        .filter(|i| matches!(i, codex_history::RolloutItem::Compacted(_)))
         .count();
     assert_eq!(compacted_count, 1, "exactly one Compacted boundary");
 
     let reconstructed = codex_lhc_host::history_from_materialized_items(&file_items);
     assert!(
-        response_items_structurally_equal(&reconstructed, host.raw_items()),
+        response_items_structurally_equal(&reconstructed, &host),
         "resume-from-rewritten-file must equal installed history item-for-item\n\
          reconstructed={} host={}",
         reconstructed.len(),
-        host.raw_items().len()
+        host.len()
     );
 }
 
@@ -2245,7 +2291,7 @@ async fn slice_c_window_continuity_across_two_rewrites() {
     let windows: Vec<u64> = file_items
         .iter()
         .filter_map(|i| match i {
-            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
+            codex_history::RolloutItem::Compacted(c) => c.window_number,
             _ => None,
         })
         .collect();
@@ -2263,7 +2309,7 @@ async fn slice_c_window_continuity_across_two_rewrites() {
     let prev_windows: Vec<u64> = prev_items
         .iter()
         .filter_map(|i| match i {
-            codex_protocol::protocol::RolloutItem::Compacted(c) => c.window_number,
+            codex_history::RolloutItem::Compacted(c) => c.window_number,
             _ => None,
         })
         .collect();
@@ -2285,7 +2331,7 @@ async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");
     // Seed + rewrite with the pure swap helper (no recorder).
-    let seed = vec![codex_protocol::protocol::RolloutItem::SessionMeta(
+    let seed = vec![codex_history::RolloutItem::SessionMeta(
         codex_protocol::protocol::SessionMetaLine {
             meta: codex_protocol::protocol::SessionMeta {
                 timestamp: "t".into(),
@@ -2301,24 +2347,20 @@ async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
         .open(&path)
         .expect("open");
     let gen2 = vec![
-        codex_protocol::protocol::RolloutItem::SessionMeta(
-            codex_protocol::protocol::SessionMetaLine {
-                meta: codex_protocol::protocol::SessionMeta {
-                    timestamp: "t2".into(),
-                    ..codex_protocol::protocol::SessionMeta::default()
-                },
-                git: None,
+        codex_history::RolloutItem::SessionMeta(codex_protocol::protocol::SessionMetaLine {
+            meta: codex_protocol::protocol::SessionMeta {
+                timestamp: "t2".into(),
+                ..codex_protocol::protocol::SessionMeta::default()
             },
-        ),
-        codex_protocol::protocol::RolloutItem::EventMsg(
-            codex_protocol::protocol::EventMsg::AgentMessage(
-                codex_protocol::protocol::AgentMessageEvent {
-                    message: "gen2-body".into(),
-                    phase: None,
-                    memory_citation: None,
-                },
-            ),
-        ),
+            git: None,
+        }),
+        codex_history::RolloutItem::EventMsg(codex_protocol::protocol::EventMsg::AgentMessage(
+            codex_protocol::protocol::AgentMessageEvent {
+                message: "gen2-body".into(),
+                phase: None,
+                memory_citation: None,
+            },
+        )),
     ];
     codex_lhc_host::atomic_rewrite_rollout(&path, &gen2).expect("swap under open fd");
     // Write via the old fd — lands in .prev (orphaned inode).

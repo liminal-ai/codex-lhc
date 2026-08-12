@@ -28,6 +28,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::PersistContext;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -118,7 +119,12 @@ async fn seed_distinctive_bandable(
     ];
     for (i, user) in early.iter().enumerate() {
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(user)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(user)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -140,7 +146,12 @@ async fn seed_distinctive_bandable(
     for i in 0..bulk_turns {
         let user = format!("bulk progress turn {i} on {PROJECT_CODENAME} {pad}");
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(&user)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(&user)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -166,7 +177,12 @@ async fn seed_distinctive_bandable(
     ];
     for (i, user) in recent.iter().enumerate() {
         session
-            .record_user_prompt_and_emit_turn_item(tc, &[text_input(user)], None)
+            .record_user_prompt_and_emit_turn_item(
+                tc,
+                &[text_input(user)],
+                None,
+                PersistContext::TurnStart,
+            )
             .await;
         session
             .record_conversation_items_with_provenance(
@@ -392,7 +408,7 @@ async fn lhc_band_shape_eval_dry_run_installs_and_dumps() {
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     session
         .replace_compacted_history(
-            body.clone(),
+            body.clone().into_iter().map(Into::into).collect(),
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
@@ -533,7 +549,7 @@ async fn lhc_band_shape_eval_live() {
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     session
         .replace_compacted_history(
-            body.clone(),
+            body.clone().into_iter().map(Into::into).collect(),
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {
@@ -725,15 +741,18 @@ async fn replace_compacted_history_clears_prefill_for_threshold_untrip() {
     let (window_number, window_ids) = session.advance_auto_compact_window().await;
     session
         .replace_compacted_history(
-            vec![ResponseItem::Message {
-                id: None,
-                role: "user".into(),
-                content: vec![ContentItem::InputText {
-                    text: "placeholder".into(),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }],
+            vec![
+                ResponseItem::Message {
+                    id: None,
+                    role: "user".into(),
+                    content: vec![ContentItem::InputText {
+                        text: "placeholder".into(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }
+                .into(),
+            ],
             /*reference_context_item*/ None,
             /*world_state_baseline*/ None,
             CompactedHistoryMetadata {

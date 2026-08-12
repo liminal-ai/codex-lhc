@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index df0daaee38..597ebe783c 100644
+index 7cf1074b58..cdb2460218 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
-@@ -121,6 +121,28 @@ where
+@@ -125,6 +125,28 @@ where
                  .enabled(codex_features::Feature::SkillSearch),
          },
      );
@@ -31,7 +31,7 @@ index df0daaee38..597ebe783c 100644
      Arc::new(builder.build())
  }
  
-@@ -296,6 +318,135 @@ mod tests {
+@@ -300,6 +322,135 @@ mod tests {
  
      use super::*;
  

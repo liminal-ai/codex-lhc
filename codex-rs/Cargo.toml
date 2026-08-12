@@ -6,6 +6,7 @@ members = [
     "agent-identity",
     "backend-client",
     "bwrap",
+    "build-info",
     "ansi-escape",
     "async-utils",
     "app-server",
@@ -43,6 +44,7 @@ members = [
     "core-plugins",
     "diagnostics",
     "hooks",
+    "history",
     "http-client",
     "secrets",
     "exec",
@@ -96,6 +98,7 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "workload-identity",
     "utils/absolute-path",
     "utils/audio",
     "utils/path-uri",
@@ -207,6 +210,7 @@ codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
+codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 # LHC-HOOK 1/8: path dep for the fork-only LHC adapter.

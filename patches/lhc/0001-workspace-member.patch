@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 8ce32222e2..0062365f92 100644
+index f23232e3d0..3cf12a3ca7 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -69,6 +69,8 @@ members = [
+@@ -71,6 +71,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,8 +11,8 @@ index 8ce32222e2..0062365f92 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -207,6 +209,8 @@ codex-git-utils = { path = "git-utils" }
- codex-hooks = { path = "hooks" }
+@@ -211,6 +213,8 @@ codex-hooks = { path = "hooks" }
+ codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }
 +# LHC-HOOK 1/8: path dep for the fork-only LHC adapter.
@@ -21,7 +21,7 @@ index 8ce32222e2..0062365f92 100644
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
 diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
-index 0fe910d272..79f34b84ba 100644
+index 30e5a52a02..fcb7448450 100644
 --- a/codex-rs/cli/Cargo.toml
 +++ b/codex-rs/cli/Cargo.toml
 @@ -1,6 +1,6 @@

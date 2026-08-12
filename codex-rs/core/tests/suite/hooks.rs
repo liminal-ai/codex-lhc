@@ -8,6 +8,8 @@ use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_plugin::PluginHookSource;
@@ -21,8 +23,6 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
-use codex_protocol::protocol::RolloutItem;
-use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -1104,7 +1104,8 @@ fn rollout_hook_prompt_texts(text: &str) -> Result<Vec<String>> {
             continue;
         }
         let rollout: RolloutLine = serde_json::from_str(trimmed).context("parse rollout line")?;
-        if let RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) = rollout.item
+        if let RolloutItem::ResponseItem(envelope) = rollout.item
+            && let ResponseItem::Message { role, content, .. } = envelope.item
             && role == "user"
         {
             for item in content {
