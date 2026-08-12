@@ -282,6 +282,8 @@ pub enum Feature {
     /// Enable LHC long-horizon capture (parallel SQLite record; product default on).
     // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
     LhcCapture,
+    /// Retain client-authored developer messages across compacted context windows.
+    RetainClientDeveloperMessages,
     /// Use Agent Identity for ChatGPT-authenticated sessions.
     UseAgentIdentity,
     /// Enable workspace dependency support.
@@ -1463,6 +1465,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "lhc_capture",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::RetainClientDeveloperMessages,
+        key: "retain_client_developer_messages",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::UseAgentIdentity,
