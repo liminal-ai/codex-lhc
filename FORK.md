@@ -292,6 +292,24 @@ change: band-walk brief-fallback repair). All tripwire layers passed, including
 98 adapter tests, the real Session seam, compact arm, certification, schema,
 patch reproduction at the new base, and the slice-D matrix.
 
+### Sync run 2026-08-12 — 108 upstream commits, two conflicts, green
+
+Merged `3aae5d885b..16fbfe5574`. Conflicts were limited to `core/src/lib.rs`
+(upstream removed `config_lock`; LHC retained its inference bridge module) and
+`core/src/tasks/mod.rs` (upstream simplified task abort; LHC retained the
+finalized timing tuple required by lifecycle capture).
+
+Upstream moved persisted rollout records from `codex-protocol` into the new
+`codex-history` crate and wrapped response items in metadata envelopes. The LHC
+host, compaction write-back, resume/materialization paths, and their tests now
+use that typed boundary. The final upstream tail also renamed rollout writer
+deferred state; the LHC reopen hook follows the new `deferred_creation` field.
+
+All tripwire layers passed at the new base, including default bare-exec
+durability, host tests and certification, the real Session seam, compact arm,
+38-file patch reproduction, and the slice-D matrix. The canonical SDK pin was
+also corrected to the actual certified `7062814` gitlink.
+
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
