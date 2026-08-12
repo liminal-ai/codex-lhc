@@ -1,3 +1,207 @@
+diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
+index 048d614a50..c5de040b7e 100644
+--- a/codex-rs/ext/extension-api/src/contributors.rs
++++ b/codex-rs/ext/extension-api/src/contributors.rs
+@@ -15,6 +15,7 @@ use crate::ExtensionMetrics;
+ mod context;
+ mod mcp;
+ mod prompt;
++mod raw_item; // LHC-HOOK 2/8: additive RawItemContributor module
+ mod skill_invocation;
+ mod thread_lifecycle;
+ mod tool_lifecycle;
+@@ -27,6 +28,9 @@ pub use mcp::McpServerContribution;
+ pub use mcp::McpServerContributionContext;
+ pub use prompt::PromptFragment;
+ pub use prompt::PromptSlot;
++pub use raw_item::RawItemContributor; // LHC-HOOK
++pub use raw_item::RawItemInput; // LHC-HOOK
++pub use raw_item::RawItemProvenance; // LHC-HOOK
+ pub use skill_invocation::SkillInvocationInput;
+ pub use skill_invocation::SkillInvocationKind;
+ pub use thread_lifecycle::ThreadIdleCause;
+diff --git a/codex-rs/ext/extension-api/src/contributors/raw_item.rs b/codex-rs/ext/extension-api/src/contributors/raw_item.rs
+new file mode 100644
+index 0000000000..3b754efc03
+--- /dev/null
++++ b/codex-rs/ext/extension-api/src/contributors/raw_item.rs
+@@ -0,0 +1,62 @@
++use codex_protocol::models::ResponseItem;
++
++use crate::ExtensionData;
++use crate::ExtensionFuture;
++
++/// Host-supplied origin of a raw conversation item batch.
++///
++/// Discriminator for capture classification. Set at the recording call site —
++/// never inferred from rendered text (FORK.md law 6). Exhaustive match required
++/// at every consumer; no wildcard arm.
++///
++/// LHC-HOOK: additive enum, designed to be upstreamable.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum RawItemProvenance {
++    /// Real human input (`record_user_prompt_and_emit_turn_item`).
++    UserPrompt,
++    /// Model/tool/stream output (`record_response_item_and_emit_turn_item`,
++    /// stream events, tool results).
++    ModelOutput,
++    /// Host scaffolding: initial context, time reminders, budgets, hooks,
++    /// developer messages, world-state diffs.
++    HostContext,
++    /// Inter-agent traffic (`record_inter_agent_communication`).
++    InterAgent,
++}
++
++/// Input supplied when the host records raw conversation items.
++///
++/// Items are the pre-normalization `ResponseItem` values the host is about to
++/// fan out as `EventMsg::RawResponseItem`. Extensions that need full fidelity
++/// (encrypted reasoning, exact function-call JSON, call_id linkage) should
++/// observe this path rather than prompt-fragment or turn-item hooks.
++///
++/// LHC-HOOK: additive only — designed to be upstreamable. See FORK.md.
++pub struct RawItemInput<'a> {
++    /// Raw response items being recorded for this thread.
++    pub items: &'a [ResponseItem],
++    /// Typed origin of this batch (call-site supplied).
++    pub provenance: RawItemProvenance,
++    /// Store scoped to the host session runtime.
++    pub session_store: &'a ExtensionData,
++    /// Store scoped to this thread runtime (`level_id` is the thread id).
++    pub thread_store: &'a ExtensionData,
++    /// Store scoped to the current turn, when a turn is active.
++    pub turn_store: Option<&'a ExtensionData>,
++}
++
++/// Contributor for host-owned raw conversation item recording.
++///
++/// Implementations must stay cheap on the session path: do not block on I/O.
++/// Heavy work belongs on a background drain (for example `on_thread_idle`).
++/// Panic/timeout containment is the adapter's responsibility.
++pub trait RawItemContributor: Send + Sync {
++    /// Called after the host records items into history and is about to emit
++    /// raw-response-item events.
++    fn on_raw_items<'a>(&'a self, input: RawItemInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            let _self = self;
++            let _input = input;
++        })
++    }
++}
+diff --git a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
+index e2c9e4bf7b..dd4a9b335c 100644
+--- a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
++++ b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
+@@ -13,6 +13,10 @@ pub struct TurnStartInput<'a> {
+     pub collaboration_mode: &'a CollaborationMode,
+     /// Total token usage snapshot captured when the turn started.
+     pub token_usage_at_turn_start: &'a TokenUsage,
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
+@@ -23,6 +27,14 @@ pub struct TurnStartInput<'a> {
+ 
+ /// Input supplied when the host completes a turn.
+ pub struct TurnStopInput<'a> {
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
++    /// Host-reported turn end time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
++    pub completed_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
+@@ -35,6 +47,14 @@ pub struct TurnStopInput<'a> {
+ pub struct TurnAbortInput<'a> {
+     /// Reason the host aborted the turn.
+     pub reason: TurnAbortReason,
++    /// Host-reported turn start time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
++    pub started_at: Option<i64>,
++    /// Host-reported turn abort time (Unix seconds), when known.
++    ///
++    /// LHC-HOOK: optional host wall-clock end for turn_end payload (schema v5).
++    pub completed_at: Option<i64>,
+     /// Store scoped to the host session runtime.
+     pub session_store: &'a ExtensionData,
+     /// Store scoped to this thread runtime.
+diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
+index 2f21380b0f..ae39a53c45 100644
+--- a/codex-rs/ext/extension-api/src/lib.rs
++++ b/codex-rs/ext/extension-api/src/lib.rs
+@@ -43,6 +43,9 @@ pub use contributors::McpServerContributor;
+ pub use contributors::PreviousWorldStateSection;
+ pub use contributors::PromptFragment;
+ pub use contributors::PromptSlot;
++pub use contributors::RawItemContributor; // LHC-HOOK
++pub use contributors::RawItemInput; // LHC-HOOK
++pub use contributors::RawItemProvenance; // LHC-HOOK
+ pub use contributors::RenderedWorldStateFragment;
+ pub use contributors::SkillInvocationContributor;
+ pub use contributors::SkillInvocationInput;
+diff --git a/codex-rs/ext/extension-api/src/registry.rs b/codex-rs/ext/extension-api/src/registry.rs
+index f34c88cc3b..0ff42ff566 100644
+--- a/codex-rs/ext/extension-api/src/registry.rs
++++ b/codex-rs/ext/extension-api/src/registry.rs
+@@ -9,6 +9,7 @@ use crate::ExtensionData;
+ use crate::ExtensionEventSink;
+ use crate::McpServerContributor;
+ use crate::NoopExtensionEventSink;
++use crate::RawItemContributor;
+ use crate::SkillInvocationContributor;
+ use crate::ThreadLifecycleContributor;
+ use crate::TokenUsageContributor;
+@@ -40,6 +41,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
+                 tool_contributors: Vec::new(),
+                 tool_lifecycle_contributors: Vec::new(),
+                 turn_item_contributors: Vec::new(),
++                raw_item_contributors: Vec::new(), // LHC-HOOK 2/8
+             },
+         }
+     }
+@@ -133,6 +135,12 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
+         self.registry.turn_item_contributors.push(contributor);
+     }
+ 
++    /// Registers one raw-item contributor.
++    // LHC-HOOK 2/8: builder method for RawItemContributor (additive).
++    pub fn raw_item_contributor(&mut self, contributor: Arc<dyn RawItemContributor>) {
++        self.registry.raw_item_contributors.push(contributor);
++    }
++
+     /// Finishes construction and returns the immutable registry.
+     pub fn build(self) -> ExtensionRegistry<C> {
+         self.registry
+@@ -153,6 +161,8 @@ pub struct ExtensionRegistry<C: Sync> {
+     tool_contributors: Vec<Arc<dyn ToolContributor>>,
+     tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
+     turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
++    // LHC-HOOK 2/8: additive raw-item contributor list (upstreamable).
++    raw_item_contributors: Vec<Arc<dyn RawItemContributor>>,
+     approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
+ }
+ 
+@@ -236,6 +246,12 @@ impl<C: Sync> ExtensionRegistry<C> {
+     pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
+         &self.turn_item_contributors
+     }
++
++    /// Returns the registered raw-item contributors.
++    // LHC-HOOK 2/8: accessor for RawItemContributor list.
++    pub fn raw_item_contributors(&self) -> &[Arc<dyn RawItemContributor>] {
++        &self.raw_item_contributors
++    }
+ }
+ 
+ /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
 index 7ac890183e..a6930f83c9 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
