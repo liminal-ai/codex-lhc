@@ -1,9 +1,9 @@
 name: Close stale contributor PRs
 
+# liminal-ai/codex-lhc: schedule removed — not part of LHC fork process;
+# skipped jobs still created email noise for watchers.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 6 * * *"
 
 permissions:
   contents: read
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   close-stale-contributor-prs:
-    # Prevent scheduled runs on forks
+    # Upstream-only; never meaningful on liminal-ai/codex-lhc
     if: github.repository == 'openai/codex'
     runs-on: ubuntu-latest
     steps:

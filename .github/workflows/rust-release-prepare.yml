@@ -1,8 +1,9 @@
 name: rust-release-prepare
+# liminal-ai/codex-lhc: schedule removed — inherited upstream cadence only
+# spammed Actions/email on the fork (job skipped via if, but runs still
+# created). Manual dispatch kept for rare upstream-parity experiments.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */4 * * *"
 
 concurrency:
   group: ${{ github.workflow }}
@@ -14,7 +15,7 @@ permissions:
 
 jobs:
   prepare:
-    # Prevent scheduled runs on forks (no secrets, wastes Actions minutes)
+    # Upstream-only job body; liminal-ai/codex-lhc never runs this productively
     if: github.repository == 'openai/codex'
     environment:
       name: rust-release-prepare
