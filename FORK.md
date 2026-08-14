@@ -23,13 +23,15 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`98826c1`** — LIM-63A certified compact-continuation runtime
-  (schema v10 writer/boundary/receipt stores) on the
-  `feature/compact-continuation` line. Descends the prior retrieval pin
-  `7062814` / `dd251ec` (byte-fitting slices, clean-tail token windows,
-  rusqlite 0.37–0.39 host-compat, bundled SQLite 3.51.3) and adds the staged
-  `run_compact_continuation` operation with marker/install gating on valid
-  candidate material only.
+  Current pin: **`6232317`** — LIM-63 certified compact-continuation runtime
+  (schema v10 writer/boundary/receipt/attempt stores + read-only stored
+  operation-identity inspection) on the `feature/compact-continuation` line.
+  Descends the prior LIM-63A pin `98826c1` (marker/install gated on valid
+  candidate material only) and the retrieval pin `7062814` / `dd251ec`
+  (byte-fitting slices, clean-tail token windows, rusqlite 0.37–0.39
+  host-compat, bundled SQLite 3.51.3). Side-branch pin until the feature
+  line folds into shared main; tripwire still requires a clean tree at the
+  pin and full mid-turn / full-loop layers.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
