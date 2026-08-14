@@ -32,7 +32,7 @@ index 78e6905ded..6e46cc1a68 100644
 @@ -4,6 +4,11 @@ license.workspace = true
  name = "codex-core"
  version.workspace = true
- 
+
 +[features]
 +default = []
 +# Offline MidTurn fault hooks / test knobs (pulls lhc/test-util).
@@ -8822,7 +8822,7 @@ index 9f35a335e2..a270663c88 100644
 +use std::sync::atomic::Ordering;
  use tokio::sync::Mutex;
  use tokio::sync::watch;
- 
+
 @@ -42,6 +44,9 @@ pub(crate) struct TurnInputQueue {
  pub(crate) struct InputQueue {
      activity_tx: watch::Sender<InputQueueActivity>,
@@ -8831,7 +8831,7 @@ index 9f35a335e2..a270663c88 100644
 +    /// provider request (steer / mailbox enqueue). Not history_version.
 +    input_epoch: AtomicU64,
  }
- 
+
  struct PendingMailboxCommunication {
 @@ -56,9 +61,20 @@ impl InputQueue {
          Self {
@@ -8840,7 +8840,7 @@ index 9f35a335e2..a270663c88 100644
 +            input_epoch: AtomicU64::new(0),
          }
      }
- 
+
 +    /// Current pending-input epoch. Bumps on every steer/mailbox enqueue (or
 +    /// other pending-input mutation that can change the next provider request).
 +    pub(crate) fn input_epoch(&self) -> u64 {
@@ -8861,7 +8861,7 @@ index 9f35a335e2..a270663c88 100644
 +        self.bump_input_epoch();
          self.activity_tx.send_replace(InputQueueActivity::Mailbox);
      }
- 
+
 @@ -203,11 +220,15 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
@@ -8877,7 +8877,7 @@ index 9f35a335e2..a270663c88 100644
 +        }
          self.activity_tx.send_replace(InputQueueActivity::Steer);
      }
- 
+
 @@ -216,7 +237,11 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
@@ -8888,14 +8888,14 @@ index 9f35a335e2..a270663c88 100644
          turn_state.lock().await.pending_input.items.extend(input);
 +        self.bump_input_epoch();
      }
- 
+
      pub(crate) async fn take_pending_input_for_turn_state(
 @@ -327,6 +352,7 @@ mod tests {
          let (mut activity_rx, pending_activity) =
              input_queue.subscribe_activity(/*turn_state*/ None).await;
          assert_eq!(pending_activity, None);
 +        assert_eq!(input_queue.input_epoch(), 0);
- 
+
          let mail_one = make_mail(
              AgentPath::root(),
 @@ -337,6 +363,7 @@ mod tests {
@@ -8911,13 +8911,13 @@ index 9f35a335e2..a270663c88 100644
              .enqueue_mailbox_communication(mail_two, /*parent_turn_id*/ None)
              .await;
 +        assert_eq!(input_queue.input_epoch(), 2);
- 
+
          activity_rx.changed().await.expect("mailbox update");
          assert_eq!(
 @@ -354,6 +382,31 @@ mod tests {
          );
      }
- 
+
 +    #[tokio::test]
 +    async fn input_queue_epoch_bumps_on_steer_enqueue() {
 +        let input_queue = InputQueue::new();
@@ -9784,9 +9784,9 @@ index bef1dd3398..9fa88da221 100644
 +                // Total continuation intent for the next provider request.
                  let needs_follow_up = model_needs_follow_up || has_pending_input;
                  let token_limit_reached = token_status.token_limit_reached;
- 
+
 @@ -450,6 +455,27 @@ pub(crate) async fn run_turn(
- 
+
                  // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                  if should_roll_over {
 +                    // LHC MidTurn seam: capture flushed, tools settled, before next
@@ -9947,7 +9947,7 @@ index bef1dd3398..9fa88da221 100644
 +    /// Mailbox-preempted / abandoned streams must pass false.
 +    response_complete: bool,
  }
- 
+
  /// Ephemeral per-response state for streaming a single proposed plan.
 @@ -2208,6 +2316,8 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
@@ -10061,7 +10061,7 @@ index 7a19b98e08..20950b5d16 100644
 +    /// Survives process restart when reseeded from rollout reconstruction.
 +    pub(crate) last_lhc_durable_derived: Option<String>,
  }
- 
+
  impl SessionState {
 @@ -80,9 +83,18 @@ impl SessionState {
              pending_session_start_sources: VecDeque::new(),
@@ -10070,7 +10070,7 @@ index 7a19b98e08..20950b5d16 100644
 +            last_lhc_durable_derived: None,
          }
      }
- 
+
 +    pub(crate) fn set_last_lhc_durable_derived(&mut self, message: Option<String>) {
 +        self.last_lhc_durable_derived = message;
 +    }
@@ -10152,7 +10152,7 @@ index 0af3127d95..50cc90d1b5 100644
 @@ -28,10 +31,18 @@ impl Session {
          }
      }
- 
+
 -    pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {
 +    pub(super) async fn emit_turn_stop_lifecycle(
 +        &self,
@@ -10172,7 +10172,7 @@ index 0af3127d95..50cc90d1b5 100644
 @@ -47,6 +58,11 @@ impl Session {
              return;
          }
- 
+
 +        // LHC-HOOK: seed production derivation callbacks so the capture
 +        // session's background scheduler derives with the real model (never
 +        // deterministic text). No-op when the feature is off.
@@ -10219,7 +10219,7 @@ index 3418ba83c1..91cb1c10e2 100644
                  active_turn_to_clear = Some(active_turn);
 @@ -497,8 +498,16 @@ impl Session {
          }
- 
+
          if let Some(turn_context) = turn_context.as_deref() {
 -            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
 -                .await;
@@ -10237,7 +10237,7 @@ index 3418ba83c1..91cb1c10e2 100644
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
 @@ -533,12 +542,21 @@ impl Session {
- 
+
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
 -        if let Some(task) = task {
@@ -10297,7 +10297,7 @@ index 3418ba83c1..91cb1c10e2 100644
 @@ -848,10 +875,22 @@ impl Session {
              .await
      }
- 
+
 -    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
 +    /// Abort a running task and emit `TurnAborted`. Returns host turn timing
 +    /// `(started_at, completed_at)` so lifecycle contributors can attach the
@@ -10317,7 +10317,7 @@ index 3418ba83c1..91cb1c10e2 100644
 +                .await;
 +            return (started_at, None);
          }
- 
+
          trace!(task_kind = ?task.kind, sub_id, "aborting running task");
 @@ -941,6 +980,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
@@ -10326,7 +10326,7 @@ index 3418ba83c1..91cb1c10e2 100644
 +        (started_at, completed_at)
      }
  }
- 
+
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
 index d5297df04f..b59d2737ae 100644
 --- a/codex-rs/core/src/thread_manager.rs
@@ -10397,7 +10397,7 @@ index d5297df04f..b59d2737ae 100644
 @@ -1925,6 +1953,19 @@ impl ThreadManagerState {
      }
  }
- 
+
 +/// Best-effort thread id from a rollout filename (`rollout-<ts>-<uuid>.jsonl`).
 +fn thread_id_hint_from_rollout_path(path: &std::path::Path) -> Option<String> {
 +    let name = path.file_name()?.to_str()?;
@@ -10932,7 +10932,7 @@ index 11ce48b5bf..7423c9ffe9 100644
 @@ -1002,6 +1010,28 @@ impl RolloutRecorder {
          })?
      }
- 
+
 +    /// Reopen the append-mode file handle after an external rewrite of `rollout_path`.
 +    ///
 +    /// Slice C atomic swap renames the live path onto a new inode. An unreopened
@@ -10961,7 +10961,7 @@ index 11ce48b5bf..7423c9ffe9 100644
 @@ -1686,6 +1716,30 @@ impl RolloutWriterState {
          self.write_pending_with_recovery("flush").await
      }
- 
+
 +    /// Drop any open handle and reopen at `rollout_path`, recomputing ordinals.
 +    async fn reopen_after_rewrite(&mut self) -> std::io::Result<()> {
 +        // Drain anything still queued against the old inode first.
@@ -11006,7 +11006,7 @@ index dc9afcf9e7..a28833f2b5 100644
 @@ -368,6 +368,23 @@ impl LiveThread {
              .map(Some)
      }
- 
+
 +    /// Reopen the local rollout append handle after an external atomic rewrite.
 +    ///
 +    /// No-op for non-local stores. See `RolloutRecorder::reopen_after_rewrite`.
@@ -11034,7 +11034,7 @@ index a71ec86729..182037d177 100644
 @@ -202,6 +202,36 @@ pub(super) async fn rollout_path(
          .to_path_buf())
  }
- 
+
 +/// Reopen the live recorder after an external atomic rewrite of its path.
 +///
 +/// LHC compact (slice C) renames a new generation onto the same path; the
@@ -11075,7 +11075,7 @@ index f4f14fe730..e4c61ce538 100644
 @@ -261,6 +261,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
- 
+
 +    /// Reopen the live append handle after an external atomic rewrite of the rollout file.
 +    pub async fn reopen_rollout_after_rewrite(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
 +        live_writer::reopen_after_rewrite(self, thread_id).await
