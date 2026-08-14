@@ -105,7 +105,7 @@ or ask the user to restate the past.
 | Fidelity ramp | Oldest material is brief; recent work keeps texture; the live tail is verbatim |
 | Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
 | Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
-| Failure behavior | If LHC cannot safely build a view, Codex falls through to its native compaction ladder |
+| Failure behavior | PreTurn/manual: fail open to native ladder. MidTurn (in-task rollover) with LHC on: one writer — refuse/skip, never silent native fallback |
 | Current default | Capture on; set `lhc_capture = false` only for troubleshooting |
 
 ## What this fork is not
@@ -230,12 +230,20 @@ strategies in order. The fork inserts an LHC arm at the front of that
 ladder, in both the manual `/compact` path and the automatic
 threshold-triggered path.
 
-The arm either **installs** a banded view as the session's history, or
-returns **unavailable** with a reason and Codex proceeds down its native
-ladder exactly as before. Every failure path — derivation not ready,
-inference failure, no token reduction achieved, cancellation — fails open.
-There is no path that produces placeholder or partial content: LHC either
-delivers a real banded body or gets out of the way.
+**PreTurn / manual / StandaloneTurn:** the arm either **installs** a banded
+view as the session's history, or returns **unavailable** with a reason and
+Codex proceeds down its native ladder. Failure paths (derivation not ready,
+inference failure, no token reduction, cancellation) fail open. There is no
+path that produces placeholder or partial content.
+
+**MidTurn (LIM-63B compact-continuation):** when a long agentic turn crosses
+the context threshold between provider requests, LHC owns the seam as the
+**single writer**. Pending tool-result continuation keeps the call/result
+pair verbatim (no marker). Active non-tool continuation forces a
+`context_compact_continue` boundary, installs one typed marker, and continues
+the same task. With LHC enabled, MidTurn does **not** silently fall open to
+native compaction — refuse/skip residuals leave the prior view intact and
+may block the next provider request when required.
 
 **3. Retrieval** — while capture is active, the extension registry exposes
 `get_turns` and `get_messages` as direct typed tools. They resolve the current

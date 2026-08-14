@@ -450,6 +450,17 @@ pub(crate) async fn run_turn(
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if should_roll_over {
+                    // LHC MidTurn seam: capture flushed, tools settled, before next
+                    // provider request. Epoch = history_version for input-epoch gate.
+                    let history_epoch = i64::try_from(sess.clone_history().await.history_version())
+                        .unwrap_or(i64::MAX);
+                    let mid_turn = crate::compact_lhc::MidTurnSeamFacts {
+                        attempt_id: format!("midturn:{}:hv:{}", turn_context.sub_id, history_epoch),
+                        model_needs_follow_up,
+                        input_epoch_at_decision: history_epoch,
+                        input_epoch_at_apply: history_epoch,
+                        inside_transport_retry: false,
+                    };
                     if let Err(err) = run_auto_compact(
                         &sess,
                         Arc::clone(&step_context),
@@ -461,6 +472,7 @@ pub(crate) async fn run_turn(
                         },
                         CompactionReason::ContextLimit,
                         CompactionPhase::MidTurn,
+                        Some(mid_turn),
                         &cancellation_token,
                     )
                     .await
@@ -1020,6 +1032,7 @@ async fn run_pre_sampling_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ContextLimit,
             CompactionPhase::PreTurn,
+            /*mid_turn*/ None,
             cancellation_token,
         )
         .await?;
@@ -1103,6 +1116,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::CompHashChanged,
             CompactionPhase::PreTurn,
+            /*mid_turn*/ None,
             cancellation_token,
         )
         .await?;
@@ -1152,6 +1166,7 @@ async fn maybe_run_previous_model_inline_compact(
             InitialContextInjection::DoNotInject,
             CompactionReason::ModelDownshift,
             CompactionPhase::PreTurn,
+            /*mid_turn*/ None,
             cancellation_token,
         )
         .await?;
@@ -1177,16 +1192,20 @@ pub(crate) async fn run_auto_compact(
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
+    mid_turn: Option<crate::compact_lhc::MidTurnSeamFacts>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
     let turn_context = &step_context.turn;
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
-    // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
+    // LHC-HOOK: compact arm above TokenBudget (Chunk 2b).
+    // MidTurn + LHC enabled: one writer — never silently fall open to native.
     match crate::compact_lhc::try_run_lhc_compact_arm(
         sess,
         turn_context.as_ref(),
         initial_context_injection.clone(),
         /*manual*/ false,
+        phase,
+        mid_turn,
         cancellation_token,
     )
     .await?
@@ -1199,7 +1218,38 @@ pub(crate) async fn run_auto_compact(
             );
             return Ok(());
         }
+        crate::compact_lhc::LhcCompactAttempt::MidTurnSkipped { reason } => {
+            tracing::info!(%reason, "LHC MidTurn compact-continuation skipped; continue without native");
+            return Ok(());
+        }
+        crate::compact_lhc::LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            tracing::error!(
+                %reason,
+                next_provider_request_allowed,
+                "LHC MidTurn compact-continuation blocked; native fallback refused"
+            );
+            if !next_provider_request_allowed {
+                return Err(CodexErr::UnsupportedOperation(format!(
+                    "LHC MidTurn compact-continuation blocked next provider request: {reason}"
+                )));
+            }
+            // Allowed to continue without native mutation.
+            return Ok(());
+        }
         crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
+            if matches!(phase, CompactionPhase::MidTurn) && sess.enabled(Feature::LhcCapture) {
+                // Defensive: MidTurn with LHC on must not reach native.
+                tracing::error!(
+                    %reason,
+                    "LHC MidTurn unavailable while LhcCapture on; refusing native fallback"
+                );
+                return Err(CodexErr::UnsupportedOperation(format!(
+                    "LHC MidTurn unavailable (no native fallback): {reason}"
+                )));
+            }
             tracing::debug!(%reason, "LHC auto-compact arm unavailable; native ladder continues");
         }
     }

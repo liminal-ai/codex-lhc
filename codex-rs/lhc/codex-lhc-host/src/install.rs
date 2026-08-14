@@ -187,6 +187,11 @@ pub struct LhcCaptureSlot {
     /// ever installed here — never the deterministic ones, which would bake
     /// canned text into the record and serve it as real derivation.
     derivation_callbacks: crate::inference::LateBoundCallbacks,
+    /// MidTurn compact-continuation hysteresis (no-reduction treadmill guard).
+    mid_turn_hysteresis: Mutex<crate::compact_continuation::CompactContinuationHysteresis>,
+    /// Optional test-only compact opts (small lower bounds) for MidTurn offline
+    /// evidence. Production leaves this unset so the SDK profile policy applies.
+    mid_turn_test_compact: Mutex<Option<lhc::compact_continuation::HostCompactOpts>>,
 }
 
 impl LhcCaptureSlot {
@@ -206,7 +211,54 @@ impl LhcCaptureSlot {
             superseded_ids: Mutex::new(HashSet::new()),
             superseded_digests: Mutex::new(HashSet::new()),
             derivation_callbacks: crate::inference::LateBoundCallbacks::new(),
+            mid_turn_hysteresis: Mutex::new(
+                crate::compact_continuation::CompactContinuationHysteresis::default(),
+            ),
+            mid_turn_test_compact: Mutex::new(None),
         }
+    }
+
+    /// Snapshot MidTurn hysteresis (no-reduction treadmill guard).
+    pub fn mid_turn_hysteresis(
+        &self,
+    ) -> crate::compact_continuation::CompactContinuationHysteresis {
+        self.mid_turn_hysteresis
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record MidTurn hysteresis after a compact-continuation attempt.
+    pub fn record_mid_turn_hysteresis(
+        &self,
+        attempt_id: &str,
+        pressure: i64,
+        reduced: bool,
+        outcome: &str,
+    ) {
+        self.mid_turn_hysteresis
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .record(attempt_id, pressure, reduced, outcome);
+    }
+
+    /// Install test-only compact opts for MidTurn (offline evidence only).
+    pub fn set_mid_turn_test_compact(
+        &self,
+        opts: Option<lhc::compact_continuation::HostCompactOpts>,
+    ) {
+        *self
+            .mid_turn_test_compact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = opts;
+    }
+
+    /// Take MidTurn test compact opts without clearing (clone).
+    pub fn mid_turn_test_compact(&self) -> Option<lhc::compact_continuation::HostCompactOpts> {
+        self.mid_turn_test_compact
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.

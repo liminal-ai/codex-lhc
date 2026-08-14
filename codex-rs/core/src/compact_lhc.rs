@@ -19,15 +19,19 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_analytics::CompactionPhase;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_lhc_host::CompactBoundaryMeta;
 use codex_lhc_host::CompactMarker;
+use codex_lhc_host::DEFAULT_LOWER_TARGET_TOKENS;
 use codex_lhc_host::DerivedProvenance;
 use codex_lhc_host::InferenceCallbacks;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::LhcCompactResult;
 use codex_lhc_host::MaterializeInput;
+use codex_lhc_host::MidTurnCompactContinuationRequest;
+use codex_lhc_host::WriterClaim;
 use codex_lhc_host::atomic_rewrite_rollout;
 use codex_lhc_host::commit_compact_marker;
 use codex_lhc_host::content_identity_digest;
@@ -35,10 +39,15 @@ use codex_lhc_host::estimate_response_items_tokens;
 use codex_lhc_host::history_from_materialized_items;
 use codex_lhc_host::item_stable_id;
 use codex_lhc_host::materialize_rollout;
+use codex_lhc_host::missing_provider_usage_authority;
 use codex_lhc_host::model_context_token_estimate_from_rollout_items;
+use codex_lhc_host::next_request_pressure;
 use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
+use codex_lhc_host::run_mid_turn_compact_continuation;
+use codex_lhc_host::token_usage_to_provider_usage_authority;
+use codex_lhc_host::work_continuation_from_history_tail;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
@@ -60,6 +69,7 @@ use crate::session::turn_context::TurnContext;
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Installed body is the load-bearing result; boxing breaks law-1 callers.
 pub(crate) enum LhcCompactAttempt {
     Installed {
         /// Served body installed on the host (law-1 reference).
@@ -69,12 +79,37 @@ pub(crate) enum LhcCompactAttempt {
         #[allow(dead_code)]
         marker: CompactMarker,
     },
-    Unavailable {
+    /// Arm did not install; caller may fall open to native **except** at
+    /// `CompactionPhase::MidTurn` when LHC is enabled (one-writer choke).
+    Unavailable { reason: String },
+    /// MidTurn compact-continuation explicitly skipped (transport retry, below
+    /// trigger, hysteresis). No host mutation; next provider request allowed.
+    MidTurnSkipped { reason: String },
+    /// MidTurn compact-continuation refused or failed in a way that must not
+    /// fall open to native compaction. When `next_provider_request_allowed` is
+    /// false the turn must stop before the next provider request.
+    MidTurnBlocked {
         reason: String,
+        next_provider_request_allowed: bool,
     },
 }
 
 // LHC-HOOK: LHC compact arm entry (manual + auto ladders).
+
+/// MidTurn inputs collected at the settled post-sampling seam.
+#[derive(Debug, Clone)]
+pub(crate) struct MidTurnSeamFacts {
+    /// Provider response id (stable attempt identity) when available.
+    pub attempt_id: String,
+    /// Whether the model needs another provider request for this task.
+    pub model_needs_follow_up: bool,
+    /// Input queue / history epoch at decision time.
+    pub input_epoch_at_decision: i64,
+    /// Same epoch re-read immediately before apply (must match for mutation).
+    pub input_epoch_at_apply: i64,
+    /// True only while a transport retry is in flight (never compact then).
+    pub inside_transport_retry: bool,
+}
 
 /// Slice E startup reconciliation: if the rollout is MISSING / CORRUPT / STALE
 /// relative to the LHC thread, regenerate it from the thread **before** history
@@ -152,15 +187,30 @@ pub async fn reconcile_rollout_before_history_load(
 // effort). Deterministic callbacks are never the silent default — tests must
 // call [`try_run_lhc_compact_arm_with_callbacks`] or install a cfg(test)
 // override. If the real client cannot be resolved, fail open to the native
-// ladder (Unavailable) — never substitute canned text.
-#[tracing::instrument(level = "info", skip_all, fields(manual = manual))]
+// ladder (Unavailable) for non-MidTurn phases — never substitute canned text.
+// At MidTurn with LHC enabled, unavailable is a hard block (one-writer).
+#[tracing::instrument(level = "info", skip_all, fields(manual = manual, phase = ?phase))]
 pub(crate) async fn try_run_lhc_compact_arm(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     initial_context_injection: InitialContextInjection,
     manual: bool,
+    phase: CompactionPhase,
+    mid_turn: Option<MidTurnSeamFacts>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<LhcCompactAttempt> {
+    if matches!(phase, CompactionPhase::MidTurn) {
+        // Box to keep rustc query depth under the limit when nested under run_turn.
+        return Box::pin(try_run_mid_turn_compact_continuation(
+            sess,
+            turn_context,
+            initial_context_injection,
+            mid_turn,
+            cancellation_token,
+        ))
+        .await;
+    }
+
     let callbacks = match select_production_inference_callbacks(sess.as_ref()).await {
         Ok(c) => c,
         Err(reason) => {
@@ -188,6 +238,8 @@ pub(crate) async fn try_run_lhc_compact_arm(
 ///
 /// Runs with a token that is never cancelled; tests that exercise abort use
 /// [`try_run_lhc_compact_arm_with_callbacks_and_cancel`].
+///
+/// Non-MidTurn path only (legacy band compact / PreTurn / Standalone).
 #[cfg(test)]
 pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
     sess: &Arc<Session>,
@@ -205,6 +257,319 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
         &CancellationToken::new(),
     )
     .await
+}
+
+/// LIM-63B MidTurn: certified compact-continuation at the settled post-sampling
+/// seam. LHC is the single writer; never silently falls open to native.
+async fn try_run_mid_turn_compact_continuation(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    initial_context_injection: InitialContextInjection,
+    mid_turn: Option<MidTurnSeamFacts>,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<LhcCompactAttempt> {
+    if cancellation_token.is_cancelled() {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "turn cancelled before MidTurn compact-continuation".into(),
+            next_provider_request_allowed: false,
+        });
+    }
+    if !sess.enabled(Feature::LhcCapture) {
+        // Kill-switch: MidTurn native may proceed when LHC is off.
+        return Ok(LhcCompactAttempt::Unavailable {
+            reason: "Feature::LhcCapture off (MidTurn native path allowed)".into(),
+        });
+    }
+
+    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "LHC enabled but no LhcCaptureSlot at MidTurn; refusing native fallback".into(),
+            next_provider_request_allowed: false,
+        });
+    };
+    let Some(handle) = slot.get() else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "LHC capture handle not ready at MidTurn; incomplete facts, no mutation".into(),
+            next_provider_request_allowed: true,
+        });
+    };
+    if handle.is_degraded() {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "LHC capture degraded at MidTurn; refusing native fallback".into(),
+            next_provider_request_allowed: false,
+        });
+    }
+
+    let Some(mid) = mid_turn else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "MidTurn seam facts missing; refusing compact and native fallback".into(),
+            next_provider_request_allowed: false,
+        });
+    };
+
+    if mid.inside_transport_retry {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: "inside transport retry; stable view, no MidTurn compact".into(),
+        });
+    }
+
+    // Capture flush before decision (settled seam). Incomplete flush → skip.
+    handle.flush().await;
+    let capture_complete = !handle.is_degraded();
+    if !capture_complete {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: "capture incomplete after flush; no mutation".into(),
+        });
+    }
+
+    if mid.input_epoch_at_decision != mid.input_epoch_at_apply {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: format!(
+                "input epoch changed decision={} apply={}; no mutation",
+                mid.input_epoch_at_decision, mid.input_epoch_at_apply
+            ),
+        });
+    }
+
+    let token_status = context_window_token_status(sess.as_ref(), turn_context).await;
+    let upper_trigger = token_status
+        .auto_compact_scope_limit
+        .or(token_status.full_context_window_limit)
+        .unwrap_or(i64::MAX);
+
+    let provider_usage = match sess.token_usage_info().await {
+        Some(info) => token_usage_to_provider_usage_authority(&info.last_token_usage),
+        None => missing_provider_usage_authority(),
+    };
+    let post_measurement = sess
+        .estimated_tokens_after_last_model_generated_item()
+        .await;
+    let pressure = next_request_pressure(&provider_usage, post_measurement);
+
+    // Hysteresis: after truthful no-reduction, require measured growth.
+    if let Some(p) = pressure {
+        let hyst = slot.mid_turn_hysteresis();
+        if !hyst.should_attempt_after_no_reduction(p) {
+            info!(
+                pressure = p,
+                last = hyst.last_pressure_tokens,
+                "LHC MidTurn hysteresis: no growth since no-reduction; skip"
+            );
+            return Ok(LhcCompactAttempt::MidTurnSkipped {
+                reason: format!(
+                    "hysteresis: no measured growth since no_reduction (pressure={p}, last={})",
+                    hyst.last_pressure_tokens
+                ),
+            });
+        }
+    }
+
+    let host_items = sess
+        .clone_history()
+        .await
+        .raw_items()
+        .cloned()
+        .collect::<Vec<_>>();
+    let continuation = work_continuation_from_history_tail(&host_items, mid.model_needs_follow_up);
+
+    // Lower target from LHC continuation profile (or test override).
+    let lower_target = slot
+        .mid_turn_test_compact()
+        .and_then(|opts| {
+            opts.params
+                .as_ref()
+                .and_then(|p| p.lower_bound)
+                .map(|b| b as i64)
+        })
+        .unwrap_or(DEFAULT_LOWER_TARGET_TOKENS);
+
+    let provider_identity_valid = !turn_context.config.model_provider_id.is_empty()
+        && turn_context
+            .config
+            .model
+            .as_ref()
+            .is_some_and(|m| !m.is_empty());
+
+    let attempt_id = if mid.attempt_id.is_empty() {
+        format!(
+            "midturn:{}:epoch:{}",
+            turn_context.sub_id, mid.input_epoch_at_decision
+        )
+    } else {
+        mid.attempt_id.clone()
+    };
+
+    let req = MidTurnCompactContinuationRequest {
+        thread_id: handle.thread_id().to_string(),
+        root: handle.root().map(std::path::Path::to_path_buf),
+        attempt_id: attempt_id.clone(),
+        provider_usage,
+        post_measurement_tokens: post_measurement,
+        upper_trigger_tokens: upper_trigger,
+        lower_target_tokens: lower_target,
+        continuation,
+        writer_claim: WriterClaim::None,
+        capture_complete: true,
+        provider_identity_valid,
+        input_epoch_at_decision: mid.input_epoch_at_decision,
+        input_epoch_at_apply: mid.input_epoch_at_apply,
+        inside_transport_retry: false,
+        compact: slot.mid_turn_test_compact(),
+    };
+
+    // SDK futures are !Send — hop to a dedicated thread (same pattern as produce).
+    let outcome = match run_mid_turn_on_thread(req, cancellation_token).await {
+        Ok(o) => o,
+        Err(err) => {
+            error!(%err, "LHC MidTurn compact-continuation operation failed");
+            return Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason: err,
+                next_provider_request_allowed: false,
+            });
+        }
+    };
+
+    if let Some(p) = pressure {
+        slot.record_mid_turn_hysteresis(&attempt_id, p, outcome.reduced, &outcome.outcome_kind);
+    }
+
+    if outcome.should_rewrite_host_rollout() {
+        // Runtime installed a serving view in LHC; materialize through the
+        // existing native-fidelity rewrite path. Host does not synthesize a
+        // second continuation marker — CompactMarker here is fork bookkeeping
+        // only (covered range + rewrite boundary).
+        let thread_id = handle.thread_id().to_string();
+        let root = handle.root().map(std::path::Path::to_path_buf);
+        let (_initial_context, world_state_baseline) =
+            build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+        let reference_context_item = match &initial_context_injection {
+            InitialContextInjection::DoNotInject => None,
+            InitialContextInjection::BeforeLastUserMessage { .. } => {
+                Some(turn_context.to_turn_context_item())
+            }
+        };
+
+        let marker = match outcome.run.compact_receipt.as_ref() {
+            Some(receipt) => CompactMarker::from_receipt(
+                receipt,
+                &thread_id,
+                /*body*/ &[],
+                /*archive_tip*/ "midturn",
+            ),
+            None => {
+                return Ok(LhcCompactAttempt::MidTurnBlocked {
+                    reason: "LHC install reported but compact receipt missing".into(),
+                    next_provider_request_allowed: false,
+                });
+            }
+        };
+        let install = install_lhc_compact_rewrite(
+            sess,
+            turn_context,
+            &slot,
+            thread_id,
+            root,
+            marker,
+            world_state_baseline,
+            reference_context_item,
+            /*manual*/ false,
+            cancellation_token,
+        )
+        .await?;
+        match install {
+            LhcCompactAttempt::Installed { body, marker } => {
+                info!(
+                    attempt_id = %attempt_id,
+                    outcome = %outcome.outcome_kind,
+                    marker_persisted = outcome.marker_persisted,
+                    "LHC MidTurn compact-continuation installed serving view"
+                );
+                return Ok(LhcCompactAttempt::Installed { body, marker });
+            }
+            other => {
+                error!(?other, "MidTurn host rewrite failed after LHC install");
+                return Ok(LhcCompactAttempt::MidTurnBlocked {
+                    reason: format!("host rewrite after LHC install failed: {other:?}"),
+                    next_provider_request_allowed: false,
+                });
+            }
+        }
+    }
+
+    if !outcome.next_provider_request_allowed {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: format!(
+                "compact-continuation outcome={} refuse={:?} skip={:?} reason={}",
+                outcome.outcome_kind, outcome.refuse_code, outcome.skip_code, outcome.reason_code
+            ),
+            next_provider_request_allowed: false,
+        });
+    }
+
+    // Allowed next request without install (below trigger, skip, no-reduction
+    // with valid prior view, etc.).
+    Ok(LhcCompactAttempt::MidTurnSkipped {
+        reason: format!(
+            "compact-continuation outcome={} reason={}",
+            outcome.outcome_kind, outcome.reason_code
+        ),
+    })
+}
+
+/// Hop `run_mid_turn_compact_continuation` onto a current-thread runtime.
+/// Keeps `!Send` LHC futures off the multi-thread session path.
+async fn run_mid_turn_on_thread(
+    req: MidTurnCompactContinuationRequest,
+    turn_cancel: &CancellationToken,
+) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let attempt = req.attempt_id.clone();
+    let join = std::thread::Builder::new()
+        .name(format!("lhc-midturn-{attempt}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("runtime: {e}"))?;
+                rt.block_on(run_mid_turn_compact_continuation(req))
+            }));
+            let out = match result {
+                Ok(inner) => inner,
+                Err(_) => Err("lhc-midturn thread panicked".into()),
+            };
+            let _ = tx.send(out);
+        })
+        .map_err(|e| format!("spawn lhc-midturn thread: {e}"))?;
+
+    let raced = tokio::select! {
+        biased;
+        () = turn_cancel.cancelled() => {
+            drop(join);
+            return Err("lhc-midturn cancelled by turn abort".into());
+        }
+        r = tokio::time::timeout(COMPACT_THREAD_TIMEOUT, rx) => r,
+    };
+    match raced {
+        Ok(Ok(r)) => {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = join.join();
+            })
+            .await;
+            r
+        }
+        Ok(Err(_)) => {
+            drop(join);
+            Err("lhc-midturn channel closed".into())
+        }
+        Err(_) => {
+            drop(join);
+            Err(format!(
+                "lhc-midturn timed out after {}s",
+                COMPACT_THREAD_TIMEOUT.as_secs()
+            ))
+        }
+    }
 }
 
 /// N3: the arm, bound to the **turn's own** cancellation token.
@@ -1067,3 +1432,7 @@ mod tests;
 #[cfg(test)]
 #[path = "compact_lhc_slice_d_tests.rs"]
 mod slice_d_tests;
+
+#[cfg(test)]
+#[path = "compact_lhc_mid_turn_tests.rs"]
+mod mid_turn_tests;

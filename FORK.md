@@ -21,21 +21,15 @@ history preserved and rebuildable at full fidelity.
 ## Layout
 
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
-  **certified `main` commits only** (gate-green at the pin; the historical
+  **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`7062814`** — adds portable system entropy and descends the
-  certified `dd251ec` retrieval line: byte-fitting slices for byte-denominated
-  host output limits, clean-tail token windows, and the byte-bound sliver
-  exemption. It includes the certified
-  rusqlite host-compat change (`614543a`, descendant of the original
-  `3663839` compatibility pin) and the band-walk brief-fallback repair:
-  - codex-rs pins `libsqlite3-sys 0.37` (WAL-reset fix);
-  - the port accepts the compatible rusqlite 0.37–0.39 range, avoiding two
-    crates with `links = "sqlite3"`;
-  - **bundled SQLite is 3.51.3**, aligned with the SQLite build codex-rs pins;
-  - `65580ea` carries the signed retrieval/serving wave and the shared
-    capture-totality special-token fix (`f274cea`, replacing the temporary
-    side-branch hotfix pin `c136899`).
+  Current pin: **`98826c1`** — LIM-63A certified compact-continuation runtime
+  (schema v10 writer/boundary/receipt stores) on the
+  `feature/compact-continuation` line. Descends the prior retrieval pin
+  `7062814` / `dd251ec` (byte-fitting slices, clean-tail token windows,
+  rusqlite 0.37–0.39 host-compat, bundled SQLite 3.51.3) and adds the staged
+  `run_compact_continuation` operation with marker/install gating on valid
+  candidate material only.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
@@ -90,9 +84,9 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
-| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install | `0007-lhc-compact-arm` |
+| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + LIM-63B MidTurn compact-continuation (one-writer, no native fall-open) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
-| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget | (with 0007) |
+| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
@@ -483,6 +477,41 @@ slot. Contributors remain registered (one `Box::pin` ready-future per raw-item
 batch is ~cheap); **no LHC I/O, no SQLite, no mapping**. This is not
 bit-identical registration to an upstream empty registry, but no LHC code path
 touches durable state.
+
+## Compact-continuation MidTurn (LIM-63B)
+
+At `CompactionPhase::MidTurn` (post-sampling seam: provider response complete,
+tools settled, async hooks drained, capture flushed, before next provider
+request), **LHC is the single writer**. The certified SDK operation
+`run_compact_continuation` owns boundary/marker/install residual:
+
+| Continuation branch | Behavior |
+|---------------------|----------|
+| `pending_correlated_tool_result` | Same canonical turn; tool call/result pair preserved verbatim; **no** continuation marker. Parallel calls stay intact; branch id = lexicographically smallest correlated `call_id`. |
+| `active_non_tool` | Force LHC `context_compact_continue` boundary; compact; **one** typed marker; continue same Codex task. |
+| `none` | No continuation compact path. |
+
+Host obligations:
+
+- Build truthful `CompactContinuationHostFacts` (provider usage without
+  double-counting cache; post-measurement estimate from newly captured tail;
+  upper trigger from Codex model/window policy; lower target from LHC compact
+  profile; real attempt identity; input epoch at decision/apply).
+- Obey `next_provider_request_allowed`. Refuse → stop before next request with
+  a clear diagnostic; **do not** fall open to native compaction while
+  `Feature::LhcCapture` is on.
+- Transport retry and input-epoch change → stable skip, no mutation.
+- Capture lag / incomplete flush → skip; prior serving view remains.
+- After truthful `no_reduction` / `reduced=false`, hysteresis blocks re-attempt
+  until measured pressure grows.
+- Kill-switch off (`lhc_capture = false`) restores native MidTurn behavior
+  (visible `Unavailable` residual).
+- Schema v10 thread stores (writer claim, boundary, receipt, stage log) are
+  owned by the vendored pin; startup reconcile remains valid.
+
+Implementation: `codex-lhc-host::compact_continuation` +
+`core/src/compact_lhc.rs` MidTurn arm; evidence in
+`compact_lhc_mid_turn_tests.rs`.
 
 ## Turn abort / SIGINT capture (slice A + F-L3 live-cert)
 

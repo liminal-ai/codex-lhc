@@ -401,7 +401,9 @@ async fn sub_threshold_does_not_grow_model_context() {
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     match attempt {
-        LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::MidTurnSkipped { reason }
+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+        | LhcCompactAttempt::Unavailable { reason } => {
             // NoReduction is fine; other unavailability also fine for tiny seed.
             let _ = reason;
             assert!(response_items_structurally_equal(
@@ -461,7 +463,9 @@ async fn production_three_compacts_do_not_reingest_body() {
                 );
                 assert!(!body.is_empty());
             }
-            LhcCompactAttempt::Unavailable { reason } => {
+            LhcCompactAttempt::MidTurnSkipped { reason }
+            | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+            | LhcCompactAttempt::Unavailable { reason } => {
                 // After first Install, further rounds may NoReduction — still
                 // must not re-ingest during produce's import path.
                 assert!(
@@ -663,6 +667,8 @@ async fn fail_open_feature_off() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
         &CancellationToken::new(),
     )
     .await
@@ -757,6 +763,7 @@ async fn production_auto_ladder_invokes_lhc_arm() {
         InitialContextInjection::DoNotInject,
         CompactionReason::ContextLimit,
         CompactionPhase::PreTurn,
+        /*mid_turn*/ None,
         &CancellationToken::new(),
     )
     .await;
@@ -1032,6 +1039,8 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
         &cancellation,
     )
     .await
@@ -1073,7 +1082,9 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
                 body.len()
             );
         }
-        LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::MidTurnSkipped { reason }
+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+        | LhcCompactAttempt::Unavailable { reason } => {
             assert!(!reason.is_empty(), "fail-open reason should be non-empty");
             // History unchanged — native ladder free.
             assert!(response_items_structurally_equal(
@@ -1119,12 +1130,16 @@ async fn j1_unavailable_derivation_model_fails_open() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
         &CancellationToken::new(),
     )
     .await
     .expect("arm");
     match attempt {
-        LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::MidTurnSkipped { reason }
+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+        | LhcCompactAttempt::Unavailable { reason } => {
             assert!(
                 reason.contains("gpt-5.6-luna") || reason.contains("unavailable"),
                 "expected derivation-model unavailable reason, got: {reason}"
@@ -1230,6 +1245,8 @@ async fn j1_explicit_override_installs_via_production_entry() {
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
         &CancellationToken::new(),
     )
     .await
@@ -1279,6 +1296,8 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
             &tc,
             InitialContextInjection::DoNotInject,
             /*manual*/ true,
+            codex_analytics::CompactionPhase::StandaloneTurn,
+            /*mid_turn*/ None,
             &CancellationToken::new(),
         )
         .await
@@ -1325,7 +1344,9 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
     }
     let a = run_with_empty_catalog().await;
     let reason_a = match a {
-        LhcCompactAttempt::Unavailable { reason } => reason,
+        LhcCompactAttempt::MidTurnSkipped { reason }
+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+        | LhcCompactAttempt::Unavailable { reason } => reason,
         other => panic!("no usable client must Unavailable, got {other:?}"),
     };
     assert!(
@@ -1341,7 +1362,9 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
         std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
     }
     let reason_b = match b {
-        LhcCompactAttempt::Unavailable { reason } => reason,
+        LhcCompactAttempt::MidTurnSkipped { reason }
+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+        | LhcCompactAttempt::Unavailable { reason } => reason,
         other => panic!(
             "CODEX_LHC_LIVE_INFERENCE=1 must not re-enable deterministic Install; got {other:?}"
         ),
@@ -1430,6 +1453,8 @@ async fn background_derivation_leaves_compact_with_no_inference_to_do() {
          calls_at_compact={at_compact} attempt={}",
         match &attempt {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
         }
     );
@@ -1598,6 +1623,8 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
         marker.derived_host_ids.len(),
         match &a2 {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
         }
     );
@@ -1707,6 +1734,8 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
         pmarker.derived_host_ids.len(),
         match &ca {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
+            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
         }
     );
@@ -1722,7 +1751,9 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
                 "child marker must describe the body it installed"
             );
         }
-        LhcCompactAttempt::Unavailable { .. } => {}
+        LhcCompactAttempt::MidTurnSkipped { .. }
+        | LhcCompactAttempt::MidTurnBlocked { .. }
+        | LhcCompactAttempt::Unavailable { .. } => {}
     }
 }
 

@@ -35,12 +35,15 @@ impl SessionTask for CompactTask {
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
         let _profile_guard = ctx.turn_timing_state.begin_compaction();
-        // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native.
+        // LHC-HOOK: compact arm above TokenBudget (Chunk 2b). Fail-open to native
+        // for manual / non-MidTurn only.
         match crate::compact_lhc::try_run_lhc_compact_arm(
             &session,
             ctx.as_ref(),
             crate::compact::InitialContextInjection::DoNotInject,
             /*manual*/ true,
+            codex_analytics::CompactionPhase::StandaloneTurn,
+            /*mid_turn*/ None,
             &cancellation_token,
         )
         .await?
@@ -52,6 +55,11 @@ impl SessionTask for CompactTask {
                     /*manual*/ true,
                 );
                 return Ok(None);
+            }
+            crate::compact_lhc::LhcCompactAttempt::MidTurnSkipped { reason }
+            | crate::compact_lhc::LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+                // Manual ladder is never MidTurn; treat as unavailable.
+                tracing::debug!(%reason, "LHC compact arm MidTurn residual on manual path");
             }
             crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
                 tracing::debug!(%reason, "LHC compact arm unavailable; native ladder continues");

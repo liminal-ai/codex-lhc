@@ -336,6 +336,8 @@ async fn produce_real_lhc_body() -> (Vec<ResponseItem>, usize, String, serde_jso
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
         &CancellationToken::new(),
     )
     .await

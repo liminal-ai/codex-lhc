@@ -7,6 +7,7 @@
 mod band_shape;
 mod capture;
 mod compact_bridge;
+mod compact_continuation;
 mod gating;
 mod idempotency;
 mod inference;
@@ -49,9 +50,27 @@ pub use compact_bridge::produce_lhc_compact_deterministic;
 pub use compact_bridge::produce_lhc_compact_with_derived;
 pub use compact_bridge::produce_lhc_compact_with_provenance;
 pub use compact_bridge::read_materialize_surfaces;
+pub use compact_continuation::COMPACT_CONTINUATION_ACTOR;
+pub use compact_continuation::CompactContinuationHysteresis;
+pub use compact_continuation::DEFAULT_LOWER_TARGET_TOKENS;
+pub use compact_continuation::MidTurnCompactContinuationOutcome;
+pub use compact_continuation::MidTurnCompactContinuationRequest;
+pub use compact_continuation::POST_MEASUREMENT_SOURCE;
+pub use compact_continuation::build_host_facts;
+pub use compact_continuation::missing_provider_usage_authority;
+pub use compact_continuation::next_request_pressure;
+pub use compact_continuation::run_mid_turn_compact_continuation;
+pub use compact_continuation::settled_mid_turn_seam;
+pub use compact_continuation::test_compact_opts;
+pub use compact_continuation::thread_sqlite_path;
+pub use compact_continuation::token_usage_to_provider_usage_authority;
+pub use compact_continuation::work_continuation_from_history_tail;
 pub use inference::LateBoundCallbacks;
 pub use inference::LhcInferenceError;
 pub use inference::lhc_inference_callbacks;
+/// Re-export certified compact-continuation types for core MidTurn wiring.
+pub use lhc::compact_continuation::CompactContinuationHostFacts;
+pub use lhc::compact_continuation::HostCompactOpts;
 /// Re-export so core can pass live ModelClient-backed callbacks without a
 /// direct `lhc` path dep.
 pub use lhc::shared_tech::CompressDetailedTurnInput;
@@ -60,6 +79,16 @@ pub use lhc::shared_tech::InferenceResult;
 pub use lhc::shared_tech::SmoothPromptInput;
 pub use lhc::shared_tech::SummarizeChunkBriefInput;
 pub use lhc::shared_tech::SummarizeToolResultInput;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationHostCapability;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationOutcomeKind;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationPolicy;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationRefuseCode;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationSeam;
+pub use lhc::shared_tech::compact_continuation::CompactContinuationSkipCode;
+pub use lhc::shared_tech::compact_continuation::PostMeasurementEstimate;
+pub use lhc::shared_tech::compact_continuation::ProviderUsageAuthority;
+pub use lhc::shared_tech::compact_continuation::WorkContinuation;
+pub use lhc::shared_tech::compact_continuation::WriterClaim;
 /// Return type of every [`InferenceCallbacks`] lane — lets hosts wrap the
 /// callbacks (counting, tracing, delaying) without a direct `lhc` path dep.
 pub type BoxInferenceFuture = lhc::shared_tech::derivation::BoxFuture<InferenceResult>;
