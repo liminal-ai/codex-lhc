@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -42,6 +44,9 @@ pub(crate) struct TurnInputQueue {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
+    /// Monotonic epoch for pending-input mutations that can affect the next
+    /// provider request (steer / mailbox enqueue). Not history_version.
+    input_epoch: AtomicU64,
 }
 
 struct PendingMailboxCommunication {
@@ -56,7 +61,18 @@ impl InputQueue {
         Self {
             activity_tx,
             mailbox_pending_mails: Mutex::new(VecDeque::new()),
+            input_epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Current pending-input epoch. Bumps on every steer/mailbox enqueue (or
+    /// other pending-input mutation that can change the next provider request).
+    pub(crate) fn input_epoch(&self) -> u64 {
+        self.input_epoch.load(Ordering::SeqCst)
+    }
+
+    fn bump_input_epoch(&self) {
+        self.input_epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub(crate) async fn subscribe_activity(
@@ -95,6 +111,7 @@ impl InputQueue {
                 parent_turn_id,
                 _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
             });
+        self.bump_input_epoch();
         self.activity_tx.send_replace(InputQueueActivity::Mailbox);
     }
 
@@ -203,10 +220,14 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
+        let mutated = !input.is_empty();
         {
             let mut turn_state = turn_state.lock().await;
             turn_state.pending_input.items.extend(input);
             turn_state.accept_mailbox_delivery_for_current_turn();
+        }
+        if mutated {
+            self.bump_input_epoch();
         }
         self.activity_tx.send_replace(InputQueueActivity::Steer);
     }
@@ -216,7 +237,11 @@ impl InputQueue {
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
+        if input.is_empty() {
+            return;
+        }
         turn_state.lock().await.pending_input.items.extend(input);
+        self.bump_input_epoch();
     }
 
     pub(crate) async fn take_pending_input_for_turn_state(
@@ -327,6 +352,7 @@ mod tests {
         let (mut activity_rx, pending_activity) =
             input_queue.subscribe_activity(/*turn_state*/ None).await;
         assert_eq!(pending_activity, None);
+        assert_eq!(input_queue.input_epoch(), 0);
 
         let mail_one = make_mail(
             AgentPath::root(),
@@ -337,6 +363,7 @@ mod tests {
         input_queue
             .enqueue_mailbox_communication(mail_one, /*parent_turn_id*/ None)
             .await;
+        assert_eq!(input_queue.input_epoch(), 1);
         let mail_two = make_mail(
             AgentPath::root(),
             AgentPath::try_from("/root/worker").expect("agent path"),
@@ -346,12 +373,38 @@ mod tests {
         input_queue
             .enqueue_mailbox_communication(mail_two, /*parent_turn_id*/ None)
             .await;
+        assert_eq!(input_queue.input_epoch(), 2);
 
         activity_rx.changed().await.expect("mailbox update");
         assert_eq!(
             *activity_rx.borrow_and_update(),
             InputQueueActivity::Mailbox
         );
+    }
+
+    #[tokio::test]
+    async fn input_queue_epoch_bumps_on_steer_enqueue() {
+        let input_queue = InputQueue::new();
+        let turn_state = Mutex::new(TurnState::default());
+        assert_eq!(input_queue.input_epoch(), 0);
+        input_queue
+            .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
+                &turn_state,
+                vec![TurnInput::UserInput {
+                    content: vec![UserInput::Text {
+                        text: "steer".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    client_id: None,
+                }],
+            )
+            .await;
+        assert_eq!(input_queue.input_epoch(), 1);
+        // Empty extend must not bump.
+        input_queue
+            .extend_pending_input_for_turn_state(&turn_state, Vec::new())
+            .await;
+        assert_eq!(input_queue.input_epoch(), 1);
     }
 
     #[tokio::test]

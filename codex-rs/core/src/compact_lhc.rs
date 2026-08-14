@@ -47,13 +47,14 @@ use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
 use codex_lhc_host::run_mid_turn_compact_continuation;
 use codex_lhc_host::token_usage_to_provider_usage_authority;
-use codex_lhc_host::work_continuation_from_history_tail;
+use codex_lhc_host::work_continuation_for_mid_turn;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::TokenUsage;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use tracing::error;
@@ -101,12 +102,15 @@ pub(crate) enum LhcCompactAttempt {
 pub(crate) struct MidTurnSeamFacts {
     /// Provider response id (stable attempt identity) when available.
     pub attempt_id: String,
-    /// Whether the model needs another provider request for this task.
-    pub model_needs_follow_up: bool,
-    /// Input queue / history epoch at decision time.
+    /// Token usage from the completed provider response (not a later aggregate).
+    pub response_token_usage: Option<TokenUsage>,
+    /// Response-scoped tool call IDs from the just-completed sampling response.
+    pub response_tool_call_ids: Vec<String>,
+    /// Total continuation intent: model tool follow-up **or** queued
+    /// steering/mailbox/hook work that plans a next provider request.
+    pub total_needs_follow_up: bool,
+    /// Input-queue epoch at rollover decision time (not history_version).
     pub input_epoch_at_decision: i64,
-    /// Same epoch re-read immediately before apply (must match for mutation).
-    pub input_epoch_at_apply: i64,
     /// True only while a transport retry is in flight (never compact then).
     pub inside_transport_retry: bool,
 }
@@ -322,43 +326,57 @@ async fn try_run_mid_turn_compact_continuation(
         });
     }
 
-    if mid.input_epoch_at_decision != mid.input_epoch_at_apply {
+    // Re-read input-queue epoch immediately before the LHC operation. Pending
+    // steer/mailbox can arrive without touching history; history_version is
+    // not a proxy for queued input.
+    let input_epoch_at_apply = i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
+    if mid.input_epoch_at_decision != input_epoch_at_apply {
         return Ok(LhcCompactAttempt::MidTurnSkipped {
             reason: format!(
                 "input epoch changed decision={} apply={}; no mutation",
-                mid.input_epoch_at_decision, mid.input_epoch_at_apply
+                mid.input_epoch_at_decision, input_epoch_at_apply
             ),
         });
     }
 
     let token_status = context_window_token_status(sess.as_ref(), turn_context).await;
-    let upper_trigger = token_status
-        .auto_compact_scope_limit
-        .or(token_status.full_context_window_limit)
-        .unwrap_or(i64::MAX);
+    let upper_trigger = slot.mid_turn_test_upper_trigger().unwrap_or_else(|| {
+        token_status
+            .auto_compact_scope_limit
+            .or(token_status.full_context_window_limit)
+            .unwrap_or(i64::MAX)
+    });
 
-    let provider_usage = match sess.token_usage_info().await {
-        Some(info) => token_usage_to_provider_usage_authority(&info.last_token_usage),
-        None => missing_provider_usage_authority(),
+    // Prefer the completed response's usage; do not re-read a later aggregate
+    // session snapshot when the seam already carried response-scoped usage.
+    let provider_usage = match mid.response_token_usage.as_ref() {
+        Some(usage) => token_usage_to_provider_usage_authority(usage),
+        None => match sess.token_usage_info().await {
+            Some(info) => token_usage_to_provider_usage_authority(&info.last_token_usage),
+            None => missing_provider_usage_authority(),
+        },
     };
+    // Post-measurement: host-captured content after the usage-bearing response
+    // through the settled seam (tool results, runtime notes) — not older history.
     let post_measurement = sess
         .estimated_tokens_after_last_model_generated_item()
         .await;
     let pressure = next_request_pressure(&provider_usage, post_measurement);
 
-    // Hysteresis: after truthful no-reduction, require measured growth.
+    // Hysteresis: only after truthful no-reduction, require configured growth.
     if let Some(p) = pressure {
         let hyst = slot.mid_turn_hysteresis();
         if !hyst.should_attempt_after_no_reduction(p) {
             info!(
                 pressure = p,
                 last = hyst.last_pressure_tokens,
+                margin = hyst.growth_margin_tokens,
                 "LHC MidTurn hysteresis: no growth since no-reduction; skip"
             );
             return Ok(LhcCompactAttempt::MidTurnSkipped {
                 reason: format!(
-                    "hysteresis: no measured growth since no_reduction (pressure={p}, last={})",
-                    hyst.last_pressure_tokens
+                    "hysteresis: no measured growth since no_reduction (pressure={p}, last={}, margin={})",
+                    hyst.last_pressure_tokens, hyst.growth_margin_tokens
                 ),
             });
         }
@@ -370,7 +388,11 @@ async fn try_run_mid_turn_compact_continuation(
         .raw_items()
         .cloned()
         .collect::<Vec<_>>();
-    let continuation = work_continuation_from_history_tail(&host_items, mid.model_needs_follow_up);
+    let continuation = work_continuation_for_mid_turn(
+        &mid.response_tool_call_ids,
+        &host_items,
+        mid.total_needs_follow_up,
+    );
 
     // Lower target from LHC continuation profile (or test override).
     let lower_target = slot
@@ -412,12 +434,14 @@ async fn try_run_mid_turn_compact_continuation(
         capture_complete: true,
         provider_identity_valid,
         input_epoch_at_decision: mid.input_epoch_at_decision,
-        input_epoch_at_apply: mid.input_epoch_at_apply,
+        input_epoch_at_apply,
         inside_transport_retry: false,
         compact: slot.mid_turn_test_compact(),
     };
 
-    // SDK futures are !Send — hop to a dedicated thread (same pattern as produce).
+    // SDK futures are !Send — hop to a dedicated thread. Once the LHC operation
+    // begins, the hop is an uninterruptible critical section: cancellation may
+    // suppress host apply, but never leaves a detached mutator.
     let outcome = match run_mid_turn_on_thread(req, cancellation_token).await {
         Ok(o) => o,
         Err(err) => {
@@ -428,6 +452,14 @@ async fn try_run_mid_turn_compact_continuation(
             });
         }
     };
+
+    // Host apply suppression if the turn cancelled during the critical section.
+    if cancellation_token.is_cancelled() {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "turn cancelled during MidTurn compact-continuation critical section; host apply suppressed".into(),
+            next_provider_request_allowed: false,
+        });
+    }
 
     if let Some(p) = pressure {
         slot.record_mid_turn_hysteresis(&attempt_id, p, outcome.reduced, &outcome.outcome_kind);
@@ -518,10 +550,20 @@ async fn try_run_mid_turn_compact_continuation(
 
 /// Hop `run_mid_turn_compact_continuation` onto a current-thread runtime.
 /// Keeps `!Send` LHC futures off the multi-thread session path.
+///
+/// Once mutation begins this is an **uninterruptible critical section**: the
+/// join handle is always awaited. Cancellation/timeout after spawn never drops
+/// the mutator thread; the caller suppresses host apply when the turn token is
+/// cancelled after return.
 async fn run_mid_turn_on_thread(
     req: MidTurnCompactContinuationRequest,
     turn_cancel: &CancellationToken,
 ) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, String> {
+    // If already cancelled before the critical section, refuse without spawn.
+    if turn_cancel.is_cancelled() {
+        return Err("lhc-midturn cancelled by turn abort before critical section".into());
+    }
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     let attempt = req.attempt_id.clone();
     let join = std::thread::Builder::new()
@@ -542,33 +584,37 @@ async fn run_mid_turn_on_thread(
         })
         .map_err(|e| format!("spawn lhc-midturn thread: {e}"))?;
 
-    let raced = tokio::select! {
-        biased;
-        () = turn_cancel.cancelled() => {
-            drop(join);
-            return Err("lhc-midturn cancelled by turn abort".into());
+    // Always observe the worker. Never drop `join` while the mutator may still
+    // run — cancellation only marks that host apply must be suppressed later.
+    let timed = tokio::time::timeout(COMPACT_THREAD_TIMEOUT, rx).await;
+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
+    match join_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err("lhc-midturn thread panicked during join".into());
         }
-        r = tokio::time::timeout(COMPACT_THREAD_TIMEOUT, rx) => r,
-    };
-    match raced {
+        Err(err) => {
+            return Err(format!("lhc-midturn join task failed: {err}"));
+        }
+    }
+
+    match timed {
         Ok(Ok(r)) => {
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = join.join();
-            })
-            .await;
+            if turn_cancel.is_cancelled() {
+                // Worker finished (and may have mutated LHC SQLite). Caller
+                // must suppress host rewrite / next-request apply.
+                return Err(
+                    "lhc-midturn cancelled after critical section; host apply must be suppressed"
+                        .into(),
+                );
+            }
             r
         }
-        Ok(Err(_)) => {
-            drop(join);
-            Err("lhc-midturn channel closed".into())
-        }
-        Err(_) => {
-            drop(join);
-            Err(format!(
-                "lhc-midturn timed out after {}s",
-                COMPACT_THREAD_TIMEOUT.as_secs()
-            ))
-        }
+        Ok(Err(_)) => Err("lhc-midturn channel closed".into()),
+        Err(_) => Err(format!(
+            "lhc-midturn timed out after {}s (worker joined; no detached mutator)",
+            COMPACT_THREAD_TIMEOUT.as_secs()
+        )),
     }
 }
 

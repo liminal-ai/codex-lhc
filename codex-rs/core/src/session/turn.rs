@@ -378,6 +378,9 @@ pub(crate) async fn run_turn(
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
+                    response_id: sampling_response_id,
+                    token_usage: sampling_token_usage,
+                    response_tool_call_ids,
                 } = sampling_request_output;
                 if model_needs_follow_up {
                     sess.input_queue
@@ -402,6 +405,7 @@ pub(crate) async fn run_turn(
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
+                // Total continuation intent for the next provider request.
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
                 let token_limit_reached = token_status.token_limit_reached;
 
@@ -451,14 +455,23 @@ pub(crate) async fn run_turn(
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if should_roll_over {
                     // LHC MidTurn seam: capture flushed, tools settled, before next
-                    // provider request. Epoch = history_version for input-epoch gate.
-                    let history_epoch = i64::try_from(sess.clone_history().await.history_version())
-                        .unwrap_or(i64::MAX);
+                    // provider request. Decision-time input-queue epoch (not history).
+                    let input_epoch_at_decision =
+                        i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
+                    let attempt_id = if sampling_response_id.is_empty() {
+                        format!(
+                            "midturn:{}:epoch:{}",
+                            turn_context.sub_id, input_epoch_at_decision
+                        )
+                    } else {
+                        sampling_response_id.clone()
+                    };
                     let mid_turn = crate::compact_lhc::MidTurnSeamFacts {
-                        attempt_id: format!("midturn:{}:hv:{}", turn_context.sub_id, history_epoch),
-                        model_needs_follow_up,
-                        input_epoch_at_decision: history_epoch,
-                        input_epoch_at_apply: history_epoch,
+                        attempt_id,
+                        response_token_usage: sampling_token_usage.clone(),
+                        response_tool_call_ids: response_tool_call_ids.clone(),
+                        total_needs_follow_up: needs_follow_up,
+                        input_epoch_at_decision,
                         inside_transport_retry: false,
                     };
                     if let Err(err) = run_auto_compact(
@@ -1644,6 +1657,12 @@ pub(crate) async fn built_tools(
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
+    /// Completed provider response id (stable MidTurn attempt identity).
+    response_id: String,
+    /// Token usage from that completed response (not a later aggregate).
+    token_usage: Option<codex_protocol::protocol::TokenUsage>,
+    /// Tool call IDs produced by the just-completed sampling response.
+    response_tool_call_ids: Vec<String>,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2290,6 +2309,8 @@ async fn try_run_sampling_request(
     let mut should_emit_token_count = false;
     const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
     let mut analytics_tool_call_ids = Vec::new();
+    // Response-scoped tool call IDs for MidTurn continuation classification.
+    let mut response_tool_call_ids: Vec<String> = Vec::new();
     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
     let plan_mode = turn_context.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
@@ -2359,6 +2380,9 @@ async fn try_run_sampling_request(
                     };
                     if let Some(call_id) = call_id {
                         analytics_tool_call_ids.push(call_id.to_string());
+                        if !response_tool_call_ids.iter().any(|id| id == call_id) {
+                            response_tool_call_ids.push(call_id.to_string());
+                        }
                     }
                 }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
@@ -2451,6 +2475,9 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
+                        response_id: String::new(),
+                        token_usage: None,
+                        response_tool_call_ids,
                     });
                 }
             }
@@ -2612,7 +2639,7 @@ async fn try_run_sampling_request(
                 sess.send_event(
                     &turn_context,
                     EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
-                        response_id,
+                        response_id: response_id.clone(),
                         token_usage: token_usage.clone(),
                     }),
                 )
@@ -2631,6 +2658,9 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
+                    response_id,
+                    token_usage,
+                    response_tool_call_ids,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

@@ -86,7 +86,8 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
 | 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + LIM-63B MidTurn compact-continuation (one-writer, no native fall-open) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
-| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts | (with 0007) |
+| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch) | (with 0007) |
+| 13a | `core/src/session/input_queue.rs` | monotonic pending-input epoch for MidTurn input-epoch gate (steer/mailbox enqueue) | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` | (with 0007) |
@@ -502,8 +503,22 @@ Host obligations:
   `Feature::LhcCapture` is on.
 - Transport retry and input-epoch change → stable skip, no mutation.
 - Capture lag / incomplete flush → skip; prior serving view remains.
-- After truthful `no_reduction` / `reduced=false`, hysteresis blocks re-attempt
-  until measured pressure grows.
+- After truthful `no_reduction` / `terminal_no_reduction` /
+  `dry_relief_no_reduction` only, hysteresis arms and blocks re-attempt until
+  measured pressure grows by the configured margin (default **10_000** tokens).
+  Skip/refuse/capture-lag/transport-retry/input-epoch/invalid-install outcomes
+  do **not** arm or suppress later recovery. Successful reduction clears.
+- Input-epoch gate uses the monotonic `InputQueue` epoch (bumped on every
+  steer/mailbox enqueue), snapshotted at rollover decision and re-read at apply
+  — never `history_version`.
+- Cancellation/timeout awaits the LHC worker join (uninterruptible critical
+  section once mutation begins); host rewrite is suppressed if the turn token
+  cancelled during the section. No detached mutator.
+- Continuation classification carries total follow-up intent and response-scoped
+  tool call IDs from the completed sampling response (not a history-tail rescan
+  as authority). Queued steering/mailbox alone is `active_non_tool`, not `none`.
+- Attempt identity uses the completed provider `response_id`; provider usage is
+  that response's `token_usage` (cache split exact).
 - Kill-switch off (`lhc_capture = false`) restores native MidTurn behavior
   (visible `Unavailable` residual).
 - Schema v10 thread stores (writer claim, boundary, receipt, stage log) are

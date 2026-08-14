@@ -192,6 +192,9 @@ pub struct LhcCaptureSlot {
     /// Optional test-only compact opts (small lower bounds) for MidTurn offline
     /// evidence. Production leaves this unset so the SDK profile policy applies.
     mid_turn_test_compact: Mutex<Option<lhc::compact_continuation::HostCompactOpts>>,
+    /// Optional test-only upper trigger override (tokens). Production leaves
+    /// this unset so Codex model/window policy applies.
+    mid_turn_test_upper_trigger: Mutex<Option<i64>>,
 }
 
 impl LhcCaptureSlot {
@@ -215,6 +218,7 @@ impl LhcCaptureSlot {
                 crate::compact_continuation::CompactContinuationHysteresis::default(),
             ),
             mid_turn_test_compact: Mutex::new(None),
+            mid_turn_test_upper_trigger: Mutex::new(None),
         }
     }
 
@@ -259,6 +263,22 @@ impl LhcCaptureSlot {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Install test-only upper trigger for MidTurn (offline evidence only).
+    pub fn set_mid_turn_test_upper_trigger(&self, upper: Option<i64>) {
+        *self
+            .mid_turn_test_upper_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = upper;
+    }
+
+    /// Take MidTurn test upper trigger without clearing.
+    pub fn mid_turn_test_upper_trigger(&self) -> Option<i64> {
+        *self
+            .mid_turn_test_upper_trigger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.

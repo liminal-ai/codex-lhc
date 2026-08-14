@@ -96,79 +96,61 @@ pub fn settled_mid_turn_seam(
     }
 }
 
-/// Continuation branch from a completed sampling request.
+/// Continuation branch for the MidTurn compact-continuation seam.
 ///
-/// Parallel tool calls remain structurally intact. When multiple correlated
-/// tool results are pending, the branch id is the **lexicographically smallest
-/// non-empty call_id** among settled call/result pairs observed after the last
-/// model-generated item. That choice is deterministic across retries.
-pub fn work_continuation_from_history_tail(
-    items: &[ResponseItem],
-    model_needs_follow_up: bool,
+/// `response_tool_call_ids` must be the **response-scoped** tool call IDs
+/// captured from the just-completed sampling response (not a heuristic rescan
+/// of arbitrary older history). History may still be used to validate that
+/// settled results exist for those IDs.
+///
+/// Total continuation intent is separate from the completed response's tool
+/// facts:
+/// - `pending_correlated_tool_result` when the completed response produced tool
+///   calls whose settled results must go on the next provider request;
+/// - `active_non_tool` when any other work continues (queued steering/mailbox/
+///   hook continuation, end_turn=false, etc.);
+/// - `none` only when no next provider request is planned.
+///
+/// Parallel pairs stay intact. Branch id = lexicographically smallest
+/// non-empty response-scoped call_id (deterministic across retries).
+pub fn work_continuation_for_mid_turn(
+    response_tool_call_ids: &[String],
+    history_items: &[ResponseItem],
+    total_needs_follow_up: bool,
 ) -> WorkContinuation {
-    if !model_needs_follow_up {
+    if !total_needs_follow_up {
         return WorkContinuation::None;
     }
 
-    let start = items
+    let mut response_ids: Vec<String> = response_tool_call_ids
         .iter()
-        .rposition(is_model_generated_item)
-        .map(|i| i.saturating_add(1))
-        .unwrap_or(0);
-    let tail = &items[start..];
+        .filter(|id| !id.is_empty())
+        .cloned()
+        .collect();
+    response_ids.sort();
+    response_ids.dedup();
 
-    let mut call_ids: Vec<String> = Vec::new();
-    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if response_ids.is_empty() {
+        return WorkContinuation::ActiveNonTool;
+    }
 
-    // Also scan the last model-generated segment for tool calls.
-    let model_start = match items.iter().rposition(is_model_generated_item) {
-        Some(end) => {
-            // Walk back while model-generated so parallel tool calls in one response
-            // stay in the same window.
-            let mut i = end;
-            while i > 0 && is_model_generated_item(&items[i - 1]) {
-                i -= 1;
-            }
-            i
-        }
-        None => 0,
-    };
-    let model_window = &items[model_start..start.min(items.len())];
-
-    for item in model_window.iter().chain(tail.iter()) {
-        match item {
-            ResponseItem::FunctionCall { call_id, .. }
-            | ResponseItem::CustomToolCall { call_id, .. }
-                if !call_id.is_empty() =>
-            {
-                call_ids.push(call_id.clone());
-            }
-            ResponseItem::LocalShellCall {
-                call_id: Some(call_id),
-                ..
-            }
-            | ResponseItem::ToolSearchCall {
-                call_id: Some(call_id),
-                ..
-            } if !call_id.is_empty() => {
-                call_ids.push(call_id.clone());
-            }
+    let result_ids: std::collections::HashSet<String> = history_items
+        .iter()
+        .filter_map(|item| match item {
             ResponseItem::FunctionCallOutput { call_id, .. }
             | ResponseItem::CustomToolCallOutput { call_id, .. }
                 if !call_id.is_empty() =>
             {
-                result_ids.insert(call_id.clone());
+                Some(call_id.clone())
             }
-            _ => {}
-        }
-    }
+            _ => None,
+        })
+        .collect();
 
-    // Note: FunctionCallOutput items are not model-generated; they live in the
-    // post-model tail. Call items live in the model window.
-
-    let mut correlated: Vec<String> = call_ids
-        .into_iter()
-        .filter(|id| result_ids.contains(id))
+    let mut correlated: Vec<String> = response_ids
+        .iter()
+        .filter(|id| result_ids.contains(*id))
+        .cloned()
         .collect();
     correlated.sort();
     correlated.dedup();
@@ -180,26 +162,49 @@ pub fn work_continuation_from_history_tail(
         };
     }
 
-    // Model asked for tools but correlation is incomplete — still a pending-tool
-    // shape so the runtime can refuse invalid correlation rather than force a
-    // non-tool boundary.
-    if model_window.iter().any(is_tool_call_item) {
-        let mut ids: Vec<String> = model_window
-            .iter()
-            .filter_map(tool_call_id_of)
-            .filter(|s| !s.is_empty())
-            .collect();
-        ids.sort();
-        ids.dedup();
-        if let Some(tool_call_id) = ids.first().cloned() {
-            return WorkContinuation::PendingCorrelatedToolResult {
-                tool_call_id,
-                correlation_valid: false,
-            };
-        }
+    // Response produced tool calls but correlation is incomplete — still a
+    // pending-tool shape so the runtime can refuse invalid correlation rather
+    // than force a non-tool boundary.
+    WorkContinuation::PendingCorrelatedToolResult {
+        tool_call_id: response_ids[0].clone(),
+        correlation_valid: false,
+    }
+}
+
+/// History-tail helper retained for offline unit tests of pair-shape scanning.
+/// Production MidTurn must use [`work_continuation_for_mid_turn`] with
+/// response-scoped IDs.
+pub fn work_continuation_from_history_tail(
+    items: &[ResponseItem],
+    total_needs_follow_up: bool,
+) -> WorkContinuation {
+    if !total_needs_follow_up {
+        return WorkContinuation::None;
     }
 
-    WorkContinuation::ActiveNonTool
+    let start = items
+        .iter()
+        .rposition(is_model_generated_item)
+        .map(|i| i.saturating_add(1))
+        .unwrap_or(0);
+
+    let model_start = match items.iter().rposition(is_model_generated_item) {
+        Some(end) => {
+            let mut i = end;
+            while i > 0 && is_model_generated_item(&items[i - 1]) {
+                i -= 1;
+            }
+            i
+        }
+        None => 0,
+    };
+    let model_window = &items[model_start..start.min(items.len())];
+    let response_ids: Vec<String> = model_window
+        .iter()
+        .filter_map(tool_call_id_of)
+        .filter(|s| !s.is_empty())
+        .collect();
+    work_continuation_for_mid_turn(&response_ids, items, total_needs_follow_up)
 }
 
 fn is_model_generated_item(item: &ResponseItem) -> bool {
@@ -216,16 +221,6 @@ fn is_model_generated_item(item: &ResponseItem) -> bool {
         | ResponseItem::ContextCompaction { .. } => true,
         _ => false,
     }
-}
-
-fn is_tool_call_item(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::FunctionCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::ToolSearchCall { .. }
-    )
 }
 
 fn tool_call_id_of(item: &ResponseItem) -> Option<String> {
@@ -421,39 +416,90 @@ pub async fn run_mid_turn_compact_continuation(
     }
 }
 
-/// Hysteresis state after a truthful no-reduction / reduced=false install so
-/// the host does not re-attempt the same seam every model turn without growth.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+/// Default growth margin (tokens) required after a truthful no-reduction before
+/// MidTurn may re-attempt compact-continuation. Named / configured for tests.
+pub const DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS: i64 = 10_000;
+
+/// Hysteresis after a **truthful** no-reduction (or exact frozen dry-relief
+/// outcome). Skip/refusal/capture-lag/transport-retry/input-epoch/invalid-
+/// install must **not** suppress later recovery.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactContinuationHysteresis {
     pub last_attempt_id: String,
     pub last_pressure_tokens: i64,
     pub last_reduced: bool,
     pub last_outcome: String,
+    /// Required measured growth above `last_pressure_tokens` to clear.
+    pub growth_margin_tokens: i64,
+    /// True only while a truthful no-reduction treadmill guard is armed.
+    pub armed: bool,
+}
+
+impl Default for CompactContinuationHysteresis {
+    fn default() -> Self {
+        Self {
+            last_attempt_id: String::new(),
+            last_pressure_tokens: 0,
+            last_reduced: true,
+            last_outcome: String::new(),
+            growth_margin_tokens: DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS,
+            armed: false,
+        }
+    }
 }
 
 impl CompactContinuationHysteresis {
-    /// Whether another attempt is warranted given new measured pressure.
-    /// Requires strictly greater pressure than the prior no-reduction attempt.
-    pub fn should_attempt_after_no_reduction(&self, next_pressure_tokens: i64) -> bool {
-        if self.last_reduced {
-            return true;
-        }
-        if self.last_outcome.is_empty() {
-            return true;
-        }
-        if self.last_outcome != "no_reduction" && self.last_reduced {
-            return true;
-        }
-        // After truthful no-reduction, require meaningful measured growth.
-        next_pressure_tokens > self.last_pressure_tokens
+    pub fn with_growth_margin(mut self, margin: i64) -> Self {
+        self.growth_margin_tokens = margin.max(0);
+        self
     }
 
+    /// Whether another attempt is warranted given new measured pressure.
+    /// When armed after truthful no-reduction, requires pressure growth of at
+    /// least `growth_margin_tokens` (default 10k).
+    pub fn should_attempt_after_no_reduction(&self, next_pressure_tokens: i64) -> bool {
+        if !self.armed {
+            return true;
+        }
+        next_pressure_tokens
+            >= self
+                .last_pressure_tokens
+                .saturating_add(self.growth_margin_tokens)
+    }
+
+    /// Record an attempt. Only truthful no-reduction (or frozen dry-relief
+    /// alias) arms the treadmill guard. Successful reduction clears it.
+    /// Skip/refuse/capture/transport outcomes leave prior state alone.
     pub fn record(&mut self, attempt_id: &str, pressure: i64, reduced: bool, outcome: &str) {
+        if reduced {
+            self.clear(attempt_id, pressure, outcome);
+            return;
+        }
+        if is_truthful_no_reduction_outcome(outcome) {
+            self.last_attempt_id = attempt_id.to_string();
+            self.last_pressure_tokens = pressure;
+            self.last_reduced = false;
+            self.last_outcome = outcome.to_string();
+            self.armed = true;
+        }
+        // Non-suppressive outcomes: leave armed state unchanged so recovery
+        // after capture lag / transport retry / epoch change still works.
+    }
+
+    pub fn clear(&mut self, attempt_id: &str, pressure: i64, outcome: &str) {
         self.last_attempt_id = attempt_id.to_string();
         self.last_pressure_tokens = pressure;
-        self.last_reduced = reduced;
+        self.last_reduced = true;
         self.last_outcome = outcome.to_string();
+        self.armed = false;
     }
+}
+
+fn is_truthful_no_reduction_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "no_reduction" | "terminal_no_reduction" | "dry_relief_no_reduction"
+    )
 }
 
 /// Next-request pressure = provider total + post-measurement estimate.
@@ -598,11 +644,138 @@ mod tests {
     }
 
     #[test]
-    fn hysteresis_blocks_same_pressure_after_no_reduction() {
+    fn hysteresis_blocks_until_growth_margin_after_no_reduction() {
+        let mut h = CompactContinuationHysteresis::default();
+        h.record("a1", 100_000, false, "no_reduction");
+        assert!(h.armed);
+        assert!(!h.should_attempt_after_no_reduction(100_000));
+        assert!(!h.should_attempt_after_no_reduction(109_999));
+        assert!(h.should_attempt_after_no_reduction(110_000));
+    }
+
+    #[test]
+    fn hysteresis_table_truthful_only() {
+        let cases = [
+            ("no_reduction", false, true, false),
+            ("terminal_no_reduction", false, true, false),
+            ("dry_relief_no_reduction", false, true, false),
+            ("skip_seam", false, false, true),
+            ("refuse", false, false, true),
+            ("continue_normal", false, false, true),
+            ("compact_continue_turn", true, false, true),
+            ("degraded_compact", true, false, true),
+        ];
+        for (outcome, reduced, expect_armed, expect_attempt_same) in cases {
+            let mut h = CompactContinuationHysteresis::default();
+            h.record("t", 50_000, reduced, outcome);
+            assert_eq!(
+                h.armed, expect_armed,
+                "outcome={outcome} reduced={reduced} armed"
+            );
+            assert_eq!(
+                h.should_attempt_after_no_reduction(50_000),
+                expect_attempt_same,
+                "outcome={outcome} same-pressure attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn hysteresis_clears_on_successful_reduction() {
         let mut h = CompactContinuationHysteresis::default();
         h.record("a1", 100_000, false, "no_reduction");
         assert!(!h.should_attempt_after_no_reduction(100_000));
-        assert!(!h.should_attempt_after_no_reduction(99_000));
-        assert!(h.should_attempt_after_no_reduction(100_001));
+        h.record("a2", 100_000, true, "compact_continue_turn");
+        assert!(!h.armed);
+        assert!(h.should_attempt_after_no_reduction(100_000));
+    }
+
+    #[test]
+    fn hysteresis_skip_does_not_suppress_recovery() {
+        let mut h = CompactContinuationHysteresis::default();
+        // Prior skip must not arm.
+        h.record("skip1", 90_000, false, "skip_seam");
+        assert!(!h.armed);
+        assert!(h.should_attempt_after_no_reduction(90_000));
+        // Capture lag / transport / epoch refuse aliases.
+        for outcome in [
+            "skip_capture_incomplete",
+            "input_epoch_changed",
+            "inside_transport_retry",
+            "invalid_install",
+        ] {
+            let mut h = CompactContinuationHysteresis::default();
+            h.record("x", 80_000, false, outcome);
+            assert!(!h.armed, "{outcome} must not arm hysteresis");
+            assert!(h.should_attempt_after_no_reduction(80_000));
+        }
+    }
+
+    #[test]
+    fn pending_tool_uses_response_scoped_ids_not_older_history() {
+        let history = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "old".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                encrypted_function_args: None,
+                call_id: "old-call".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "old-call".into(),
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text("old".into()),
+                    success: Some(true),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "new".into(),
+                namespace: None,
+                arguments: "{}".into(),
+                encrypted_function_args: None,
+                call_id: "new-call".into(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "new-call".into(),
+                output: codex_protocol::models::FunctionCallOutputPayload {
+                    body: codex_protocol::models::FunctionCallOutputBody::Text("new".into()),
+                    success: Some(true),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        match work_continuation_for_mid_turn(
+            &["new-call".into()],
+            &history,
+            /*total_needs_follow_up*/ true,
+        ) {
+            WorkContinuation::PendingCorrelatedToolResult {
+                tool_call_id,
+                correlation_valid,
+            } => {
+                assert_eq!(tool_call_id, "new-call");
+                assert!(correlation_valid);
+            }
+            other => panic!("expected new-call branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_input_only_is_active_non_tool() {
+        assert_eq!(
+            work_continuation_for_mid_turn(&[], &[], /*total_needs_follow_up*/ true,),
+            WorkContinuation::ActiveNonTool
+        );
+        assert_eq!(
+            work_continuation_for_mid_turn(&[], &[], /*total_needs_follow_up*/ false,),
+            WorkContinuation::None
+        );
     }
 }
