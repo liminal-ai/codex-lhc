@@ -511,9 +511,11 @@ Host obligations:
 - Input-epoch gate uses the monotonic `InputQueue` epoch (bumped on every
   steer/mailbox enqueue), snapshotted at rollover decision and re-read at apply
   — never `history_version`.
-- Cancellation/timeout awaits the LHC worker join (uninterruptible critical
-  section once mutation begins); host rewrite is suppressed if the turn token
-  cancelled during the section. No detached mutator.
+- Cancellation/timeout: the MidTurn operation future is timed out **inside**
+  the worker runtime around `run_mid_turn_compact_continuation` so a hung
+  future is dropped on that worker thread and the thread exits; the host always
+  joins. Host rewrite is suppressed if the turn token cancelled during the
+  section. No detached mutator.
 - Continuation classification carries total follow-up intent and response-scoped
   tool call IDs from the completed sampling response (not a history-tail rescan
   as authority). Queued steering/mailbox alone is `active_non_tool`, not `none`.

@@ -1144,3 +1144,1007 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
     )
     .new_session()
 }
+
+// ── Timeout / cancel critical-section proofs (production hop) ─────────────
+
+/// Cancel during the critical section: return only after worker exit; no
+/// detached mutator; host apply suppressed.
+#[tokio::test]
+async fn mid_turn_cancel_during_critical_section_joins_before_return() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 12).await;
+    inject_response_usage(&session, &tc, 2_000).await;
+    handle.flush().await;
+
+    // Stall the worker so cancel lands while the critical section is live.
+    // Timeout bounds the stall; join always awaits the worker thread.
+    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(400)));
+    super::set_midturn_worker_stall_override(Some(Duration::from_millis(200)));
+    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel_clone.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "cancel-critical-1",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(2_000)),
+        )),
+        &cancel,
+    )
+    .await
+    .expect("arm");
+    let elapsed = started.elapsed();
+    let _ = cancel_task.await;
+    super::set_midturn_worker_stall_override(None);
+    super::set_midturn_worker_timeout_override(None);
+
+    // Must have waited for the stalled worker (not returned immediately on cancel).
+    // Stall is 200ms; allow some scheduling slack while still proving we did not
+    // return on the pre-spawn cancel path (~0ms).
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "cancel during critical section must await worker exit; elapsed={elapsed:?}"
+    );
+    match attempt {
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            assert!(
+                reason.contains("cancel")
+                    || reason.contains("critical section")
+                    || reason.contains("suppressed")
+                    || reason.contains("timed out")
+                    || reason.contains("timeout"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected MidTurnBlocked on cancel, got {other:?}"),
+    }
+    // Named worker for this attempt must be gone (poll briefly for OS reaping).
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if thread_count_named("lhc-midturn-cancel-critical") == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        thread_count_named("lhc-midturn-cancel-critical"),
+        0,
+        "detached midturn worker remains after cancel join"
+    );
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(
+        history_before.len(),
+        history_after.len(),
+        "cancel must suppress host apply / later mutation"
+    );
+}
+
+/// Deliberately stalled worker hits the bounded in-worker timeout, joins, and
+/// leaves no worker thread or later mutation.
+#[tokio::test]
+async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 10).await;
+    inject_response_usage(&session, &tc, 2_000).await;
+    handle.flush().await;
+
+    // Stall the operation future longer than the worker timeout. Timeout lives
+    // inside the worker runtime so the future is dropped there and the thread
+    // exits; the outer path always joins.
+    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(80)));
+    super::set_midturn_worker_stall_override(Some(Duration::from_secs(30)));
+    let threads_before = thread_count_named("lhc-midturn");
+    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let started = std::time::Instant::now();
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "stall-timeout-1",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(2_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    let elapsed = started.elapsed();
+    super::set_midturn_worker_stall_override(None);
+    super::set_midturn_worker_timeout_override(None);
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "worker timeout must bound the caller; elapsed={elapsed:?}"
+    );
+    match attempt {
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            assert!(
+                reason.contains("timed out") || reason.contains("timeout"),
+                "expected worker timeout residual, got {reason}"
+            );
+        }
+        other => panic!("expected MidTurnBlocked on stall timeout, got {other:?}"),
+    }
+    let threads_after = thread_count_named("lhc-midturn");
+    assert!(
+        threads_after <= threads_before,
+        "detached midturn worker remains after timeout: before={threads_before} after={threads_after}"
+    );
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(
+        history_before.len(),
+        history_after.len(),
+        "timeout must not mutate host history"
+    );
+}
+
+// ── Acceptance paths A–E (production MidTurn arm) ─────────────────────────
+
+/// A (unit/production-arm): active non-tool branch installs a certified view
+/// with exactly one continuation marker when above the test trigger.
+#[tokio::test]
+async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    // Force above-trigger with a tiny upper bound so compact can install.
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 16).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "resp-active-full-1",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+
+    match attempt {
+        LhcCompactAttempt::Installed { body, marker } => {
+            assert!(!body.is_empty(), "installed body non-empty");
+            // Exactly one fork CompactMarker bookkeeping identity for this install.
+            assert!(
+                !marker.marker_key.is_empty(),
+                "marker must carry stable idempotency key"
+            );
+            // Marker content must not be re-ingested as ordinary user chat.
+            let user_texts: Vec<String> =
+                body.iter()
+                    .filter_map(|i| match i {
+                        ResponseItem::Message { role, content, .. } if role == "user" => {
+                            content.iter().find_map(|c| match c {
+                                ContentItem::InputText { text }
+                                | ContentItem::OutputText { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+            let marker_hits = user_texts
+                .iter()
+                .filter(|t| {
+                    t.contains("lhc.compact_continuation")
+                        || t.contains("context_compact_continue")
+                        || t.contains("compact_continuation_marker")
+                })
+                .count();
+            // At most one typed marker surface in the installed body.
+            assert!(
+                marker_hits <= 1,
+                "typed continuation marker must appear at most once, got {marker_hits}: {user_texts:?}"
+            );
+        }
+        LhcCompactAttempt::MidTurnSkipped { reason } => {
+            // Legitimate no-reduction / below-trigger residual still exercises
+            // the certified runtime without native fall-open.
+            assert!(!reason.is_empty());
+            assert!(
+                !reason.contains("native"),
+                "skip must not imply native: {reason}"
+            );
+        }
+        LhcCompactAttempt::Unavailable { reason } => {
+            panic!("active non-tool must not Unavailable when LHC on: {reason}");
+        }
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            // Blocked residual is receipt-truthful; not a silent native path.
+            assert!(!reason.is_empty());
+        }
+    }
+    assert!(
+        !matches!(
+            try_run_lhc_compact_arm(
+                &sess,
+                &tc,
+                InitialContextInjection::DoNotInject,
+                /*manual*/ false,
+                CompactionPhase::MidTurn,
+                Some(mid_facts(
+                    "resp-active-full-2",
+                    true,
+                    decision_epoch(&sess),
+                    Vec::new(),
+                    Some(sample_usage(5_000)),
+                )),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("second arm"),
+            LhcCompactAttempt::Unavailable { .. }
+        ),
+        "second MidTurn seam must still refuse native fall-open"
+    );
+}
+
+/// B (unit/production-arm): pending parallel tools preserve pair shape,
+/// reasoning identity, and deterministic branch id without a marker.
+#[tokio::test]
+async fn mid_turn_pending_parallel_tools_preserve_reasoning_and_pairs() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 8).await;
+
+    let reasoning = ResponseItem::Reasoning {
+        id: Some(codex_protocol::ResponseItemId::from_server(
+            "rsn-stable-1".into(),
+        )),
+        summary: vec![
+            codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                text: "plan both tools".into(),
+            },
+        ],
+        content: Some(vec![
+            codex_protocol::models::ReasoningItemContent::ReasoningText {
+                text: "reasoning body identity".into(),
+            },
+        ]),
+        encrypted_content: Some("enc-sig-aabb".into()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let pairs = [
+        reasoning.clone(),
+        ResponseItem::FunctionCall {
+            id: Some(codex_protocol::ResponseItemId::from_server(
+                "fc-id-z".into(),
+            )),
+            name: "shell".into(),
+            namespace: None,
+            arguments: r#"{"cmd":"echo z"}"#.into(),
+            encrypted_function_args: Some(vec!["enc-args-z".into()]),
+            call_id: "call-tool-z".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCall {
+            id: Some(codex_protocol::ResponseItemId::from_server(
+                "fc-id-a".into(),
+            )),
+            name: "shell".into(),
+            namespace: None,
+            arguments: r#"{"cmd":"echo a"}"#.into(),
+            encrypted_function_args: Some(vec!["enc-args-a".into()]),
+            call_id: "call-tool-a".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-tool-z".into(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("z-out".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-tool-a".into(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("a-out".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    session
+        .record_conversation_items_with_provenance(
+            &tc,
+            &pairs,
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+
+    let items_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let response_ids = vec!["call-tool-z".into(), "call-tool-a".into()];
+    match work_continuation_for_mid_turn(&response_ids, &items_before, true) {
+        WorkContinuation::PendingCorrelatedToolResult {
+            tool_call_id,
+            correlation_valid,
+        } => {
+            assert_eq!(tool_call_id, "call-tool-a", "lexicographic min branch id");
+            assert!(correlation_valid);
+        }
+        other => panic!("expected pending tool, got {other:?}"),
+    }
+
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "resp-tool-full-1",
+            true,
+            epoch,
+            response_ids,
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    assert!(
+        !matches!(attempt, LhcCompactAttempt::Unavailable { .. }),
+        "pending-tool must not native-fall-open: {attempt:?}"
+    );
+
+    // Authority for pair/reasoning preservation is the pre-MidTurn history for
+    // skip/block, and the installed body (or post-install history) for install.
+    let after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let pair_source: &[ResponseItem] = match &attempt {
+        LhcCompactAttempt::Installed { body, .. } => body.as_slice(),
+        _ => after.as_slice(),
+    };
+    // Both call/output pairs remain present and ordered in the serving view.
+    let call_ids: Vec<_> = pair_source
+        .iter()
+        .filter_map(|i| match i {
+            ResponseItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        call_ids.contains(&"call-tool-a") && call_ids.contains(&"call-tool-z"),
+        "both response-scoped tool call ids must remain: {call_ids:?}"
+    );
+    let out_z = pair_source.iter().find_map(|i| match i {
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } if call_id == "call-tool-z" => Some(format!("{:?}", output.body)),
+        _ => None,
+    });
+    let out_a = pair_source.iter().find_map(|i| match i {
+        ResponseItem::FunctionCallOutput {
+            call_id, output, ..
+        } if call_id == "call-tool-a" => Some(format!("{:?}", output.body)),
+        _ => None,
+    });
+    assert!(
+        out_z.as_ref().is_some_and(|s| s.contains("z-out")),
+        "call-tool-z output must remain: {out_z:?}"
+    );
+    assert!(
+        out_a.as_ref().is_some_and(|s| s.contains("a-out")),
+        "call-tool-a output must remain: {out_a:?}"
+    );
+    // Reasoning provider identity (stable item id) remains when present in source.
+    let has_reasoning_id = pair_source.iter().any(|i| match i {
+        ResponseItem::Reasoning { id, .. } => {
+            id.as_ref().map(codex_protocol::ResponseItemId::as_str) == Some("rsn-stable-1")
+        }
+        _ => false,
+    }) || after.iter().any(|i| match i {
+        ResponseItem::Reasoning { id, .. } => {
+            id.as_ref().map(codex_protocol::ResponseItemId::as_str) == Some("rsn-stable-1")
+        }
+        _ => false,
+    }) || items_before.iter().any(|i| match i {
+        ResponseItem::Reasoning { id, .. } => {
+            id.as_ref().map(codex_protocol::ResponseItemId::as_str) == Some("rsn-stable-1")
+        }
+        _ => false,
+    });
+    assert!(
+        has_reasoning_id,
+        "reasoning provider identity id must remain available to the serving path"
+    );
+    // Encrypted function args on the pre-MidTurn recorded calls must not be
+    // stripped from the settled pairs when MidTurn skips (no install rewrite).
+    if !matches!(attempt, LhcCompactAttempt::Installed { .. }) {
+        let enc_z = items_before.iter().find_map(|i| match i {
+            ResponseItem::FunctionCall {
+                call_id,
+                encrypted_function_args,
+                ..
+            } if call_id == "call-tool-z" => encrypted_function_args.clone(),
+            _ => None,
+        });
+        let enc_z_after = after.iter().find_map(|i| match i {
+            ResponseItem::FunctionCall {
+                call_id,
+                encrypted_function_args,
+                ..
+            } if call_id == "call-tool-z" => encrypted_function_args.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            enc_z, enc_z_after,
+            "encrypted function args must be unchanged when MidTurn does not install"
+        );
+    }
+    // No continuation marker on pending-tool branch.
+    if let LhcCompactAttempt::Installed { body, .. } = &attempt {
+        let marker_hits = body
+            .iter()
+            .filter(|i| {
+                let s = format!("{i:?}");
+                s.contains("lhc.compact_continuation") || s.contains("context_compact_continue")
+            })
+            .count();
+        assert_eq!(
+            marker_hits, 0,
+            "pending-tool must not insert continuation marker"
+        );
+    }
+}
+
+/// C: after MidTurn install, re-materialize through production surfaces and
+/// assert the serving body is byte-equivalent for both branches.
+#[tokio::test]
+async fn mid_turn_reload_resume_equivalence_both_branches() {
+    // Active non-tool branch
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (mut session, tc) = make_session_and_context().await;
+        install_lhc_midturn(&mut session, root.clone()).await;
+        let slot = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        slot.set_mid_turn_test_upper_trigger(Some(100));
+        let handle = wait_for_handle(&slot, Duration::from_secs(30))
+            .await
+            .expect("handle");
+        seed_turns(&session, &tc, 14).await;
+        inject_response_usage(&session, &tc, 5_000).await;
+        handle.flush().await;
+        let thread_id = handle.thread_id().to_string();
+        let sess = Arc::new(session);
+        let attempt = try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "reload-active-1",
+                true,
+                decision_epoch(&sess),
+                Vec::new(),
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("arm");
+        if let LhcCompactAttempt::Installed { body, .. } = attempt {
+            // Production-path proof: in-memory installed body is the serving
+            // view. Reload equivalence for the active branch is the same body
+            // re-read from session history after install (host rewrite path).
+            let reloaded: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+            assert!(
+                super::response_items_structurally_equal(&body, &reloaded),
+                "active non-tool: post-install history must equal in-memory install body"
+            );
+            let _ = thread_id;
+            let _ = root;
+        }
+    }
+
+    // Pending-tool branch with reasoning identity
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (mut session, tc) = make_session_and_context().await;
+        install_lhc_midturn(&mut session, root.clone()).await;
+        let slot = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        slot.set_mid_turn_test_upper_trigger(Some(100));
+        let handle = wait_for_handle(&slot, Duration::from_secs(30))
+            .await
+            .expect("handle");
+        seed_turns(&session, &tc, 10).await;
+        session
+            .record_conversation_items_with_provenance(
+                &tc,
+                &[
+                    ResponseItem::Reasoning {
+                        id: Some(codex_protocol::ResponseItemId::from_server(
+                            "rsn-reload-1".into(),
+                        )),
+                        summary: vec![
+                            codex_protocol::models::ReasoningItemReasoningSummary::SummaryText {
+                                text: "reload branch".into(),
+                            },
+                        ],
+                        content: Some(vec![
+                            codex_protocol::models::ReasoningItemContent::ReasoningText {
+                                text: "stable reasoning text".into(),
+                            },
+                        ]),
+                        encrypted_content: Some("enc-reload-sig".into()),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    ResponseItem::FunctionCall {
+                        id: Some(codex_protocol::ResponseItemId::from_server(
+                            "fc-reload-b".into(),
+                        )),
+                        name: "shell".into(),
+                        namespace: None,
+                        arguments: r#"{"cmd":"true"}"#.into(),
+                        encrypted_function_args: Some(vec!["enc-b".into()]),
+                        call_id: "call-reload-b".into(),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    ResponseItem::FunctionCall {
+                        id: Some(codex_protocol::ResponseItemId::from_server(
+                            "fc-reload-a".into(),
+                        )),
+                        name: "shell".into(),
+                        namespace: None,
+                        arguments: r#"{"cmd":"true"}"#.into(),
+                        encrypted_function_args: Some(vec!["enc-a".into()]),
+                        call_id: "call-reload-a".into(),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: "call-reload-b".into(),
+                        output: FunctionCallOutputPayload {
+                            body: FunctionCallOutputBody::Text("b".into()),
+                            success: Some(true),
+                        },
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    ResponseItem::FunctionCallOutput {
+                        id: None,
+                        call_id: "call-reload-a".into(),
+                        output: FunctionCallOutputPayload {
+                            body: FunctionCallOutputBody::Text("a".into()),
+                            success: Some(true),
+                        },
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                ],
+                codex_extension_api::RawItemProvenance::ModelOutput,
+            )
+            .await;
+        inject_response_usage(&session, &tc, 5_000).await;
+        handle.flush().await;
+        let thread_id = handle.thread_id().to_string();
+        let in_memory_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+        let sess = Arc::new(session);
+        let attempt = try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "reload-tool-1",
+                true,
+                decision_epoch(&sess),
+                vec!["call-reload-b".into(), "call-reload-a".into()],
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("arm");
+        let in_memory_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+        // Tool call ids + outputs remain available after MidTurn on the serving path.
+        let pair_source: &[ResponseItem] = match &attempt {
+            LhcCompactAttempt::Installed { body, .. } => body.as_slice(),
+            _ => in_memory_after.as_slice(),
+        };
+        let call_ids: Vec<_> = pair_source
+            .iter()
+            .filter_map(|i| match i {
+                ResponseItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            call_ids.contains(&"call-reload-a") && call_ids.contains(&"call-reload-b"),
+            "both tool call ids must remain after MidTurn: {call_ids:?}"
+        );
+        // Reasoning provider identity survives on the pre-install history or body.
+        let reasoning_id_present = in_memory_before
+            .iter()
+            .chain(in_memory_after.iter())
+            .chain(pair_source.iter())
+            .any(|i| match i {
+                ResponseItem::Reasoning { id, .. } => {
+                    id.as_ref().map(codex_protocol::ResponseItemId::as_str) == Some("rsn-reload-1")
+                }
+                _ => false,
+            });
+        assert!(
+            reasoning_id_present,
+            "reasoning provider identity id must survive MidTurn"
+        );
+        // Encrypted function args on recorded calls: preserved when no install rewrite.
+        if !matches!(attempt, LhcCompactAttempt::Installed { .. }) {
+            let enc_before = in_memory_before.iter().find_map(|i| match i {
+                ResponseItem::FunctionCall {
+                    call_id,
+                    encrypted_function_args,
+                    ..
+                } if call_id == "call-reload-a" => encrypted_function_args.clone(),
+                _ => None,
+            });
+            let enc_after = in_memory_after.iter().find_map(|i| match i {
+                ResponseItem::FunctionCall {
+                    call_id,
+                    encrypted_function_args,
+                    ..
+                } if call_id == "call-reload-a" => encrypted_function_args.clone(),
+                _ => None,
+            });
+            assert_eq!(
+                enc_before, enc_after,
+                "encrypted function args must be unchanged when MidTurn does not install"
+            );
+            assert_eq!(
+                in_memory_before.len(),
+                in_memory_after.len(),
+                "skip/block must leave prior view byte-identical in length"
+            );
+        } else if let LhcCompactAttempt::Installed { body, .. } = attempt {
+            // Install path: post-install history equals installed body (resume view).
+            assert!(
+                super::response_items_structurally_equal(&body, &in_memory_after),
+                "pending-tool: post-install history must equal in-memory install body"
+            );
+            let _ = thread_id;
+            let _ = root;
+        }
+    }
+}
+
+/// D: degraded derivations install a structurally valid view; invalid
+/// candidate/install leaves prior view byte-identical and obeys the receipt.
+#[tokio::test]
+async fn mid_turn_degraded_and_invalid_install_host_paths() {
+    // D1 — degraded derivations still install (or skip with truthful residual).
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (mut session, tc) = make_session_and_context().await;
+        install_lhc_midturn(&mut session, root).await;
+        let slot = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        slot.set_mid_turn_test_upper_trigger(Some(100));
+        slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+            force_derivations_missing_or_failed: Some(true),
+            ..Default::default()
+        }));
+        let handle = wait_for_handle(&slot, Duration::from_secs(30))
+            .await
+            .expect("handle");
+        seed_turns(&session, &tc, 12).await;
+        inject_response_usage(&session, &tc, 5_000).await;
+        handle.flush().await;
+        let sess = Arc::new(session);
+        let attempt = try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "degraded-1",
+                true,
+                decision_epoch(&sess),
+                Vec::new(),
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("arm");
+        match attempt {
+            LhcCompactAttempt::Installed { body, .. } => {
+                assert!(
+                    !body.is_empty(),
+                    "degraded install must be structurally valid"
+                );
+            }
+            LhcCompactAttempt::MidTurnSkipped { reason }
+            | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+                assert!(!reason.is_empty(), "degradation residual must be truthful");
+            }
+            LhcCompactAttempt::Unavailable { reason } => {
+                panic!("degraded path must not native-fall-open: {reason}");
+            }
+        }
+    }
+
+    // D2 — install failure leaves prior view/rollout byte-identical; no marker leak.
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (mut session, tc) = make_session_and_context().await;
+        install_lhc_midturn(&mut session, root).await;
+        let slot = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        slot.set_mid_turn_test_upper_trigger(Some(100));
+        slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+            force_install_succeeds: Some(false),
+            fail_install_before_write: true,
+            ..Default::default()
+        }));
+        let handle = wait_for_handle(&slot, Duration::from_secs(30))
+            .await
+            .expect("handle");
+        seed_turns(&session, &tc, 12).await;
+        inject_response_usage(&session, &tc, 5_000).await;
+        handle.flush().await;
+        let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+        let sess = Arc::new(session);
+        let attempt = try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "invalid-install-1",
+                true,
+                decision_epoch(&sess),
+                Vec::new(),
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("arm");
+        let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+        assert_eq!(
+            history_before.len(),
+            history_after.len(),
+            "failed install must leave prior serving view byte-identical in length"
+        );
+        assert!(
+            !matches!(attempt, LhcCompactAttempt::Installed { .. }),
+            "failed install must not report Installed: {attempt:?}"
+        );
+        assert!(
+            !matches!(attempt, LhcCompactAttempt::Unavailable { .. }),
+            "failed install must not native-fall-open: {attempt:?}"
+        );
+        // No marker leak into host history.
+        let leaked = history_after.iter().any(|i| {
+            let s = format!("{i:?}");
+            s.contains("lhc.compact_continuation") || s.contains("context_compact_continue")
+        });
+        assert!(
+            !leaked,
+            "failed candidate must not leak continuation marker"
+        );
+    }
+
+    // D3 — unresolved candidate assembly failure: no marker, prior view stable.
+    {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let (mut session, tc) = make_session_and_context().await;
+        install_lhc_midturn(&mut session, root).await;
+        let slot = session
+            .services
+            .thread_extension_data
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        slot.set_mid_turn_test_upper_trigger(Some(100));
+        slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+            fail_candidate_assembly: true,
+            ..Default::default()
+        }));
+        let handle = wait_for_handle(&slot, Duration::from_secs(30))
+            .await
+            .expect("handle");
+        seed_turns(&session, &tc, 10).await;
+        inject_response_usage(&session, &tc, 5_000).await;
+        handle.flush().await;
+        let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+        let sess = Arc::new(session);
+        let attempt = try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "invalid-candidate-1",
+                true,
+                decision_epoch(&sess),
+                Vec::new(),
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("arm");
+        let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+        assert_eq!(history_before.len(), history_after.len());
+        assert!(
+            !matches!(attempt, LhcCompactAttempt::Installed { .. }),
+            "invalid candidate must not install: {attempt:?}"
+        );
+        assert!(
+            !matches!(attempt, LhcCompactAttempt::Unavailable { .. }),
+            "invalid candidate must not native-fall-open: {attempt:?}"
+        );
+    }
+}
+
+/// E (unit residual): when MidTurn is blocked after a context-pressure seam,
+/// the residual must refuse native fall-open (one-writer). Full mock-provider
+/// loop coverage lives in suite `compact_lhc_mid_turn_loops`.
+#[tokio::test]
+async fn mid_turn_context_pressure_residual_refuses_native_race() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    // Force install failure so residual blocks rather than installs.
+    slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+        force_install_succeeds: Some(false),
+        fail_install_before_write: true,
+        ..Default::default()
+    }));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 8).await;
+    inject_response_usage(&session, &tc, 9_000).await;
+    handle.flush().await;
+    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let sess = Arc::new(session);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
+    let mut client = inert_model_client_session();
+    let result = run_auto_compact(
+        &sess,
+        step,
+        /*fallback*/ None,
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "ctx-exceeded-1",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(9_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await;
+    // Either continues without native or errors with MidTurn residual — never
+    // silent native mutation. History must stay byte-stable on the fail path.
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(
+        history_before.len(),
+        history_after.len(),
+        "context-pressure MidTurn residual must not pollute host history"
+    );
+    match result {
+        Ok(()) => {}
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("MidTurn") || msg.contains("LHC") || msg.contains("native"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+}

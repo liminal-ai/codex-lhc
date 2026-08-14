@@ -56,6 +56,7 @@ pub use compact_continuation::DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS;
 pub use compact_continuation::DEFAULT_LOWER_TARGET_TOKENS;
 pub use compact_continuation::MidTurnCompactContinuationOutcome;
 pub use compact_continuation::MidTurnCompactContinuationRequest;
+pub use compact_continuation::MidTurnTestHooks;
 pub use compact_continuation::POST_MEASUREMENT_SOURCE;
 pub use compact_continuation::build_host_facts;
 pub use compact_continuation::missing_provider_usage_authority;

@@ -195,6 +195,9 @@ pub struct LhcCaptureSlot {
     /// Optional test-only upper trigger override (tokens). Production leaves
     /// this unset so Codex model/window policy applies.
     mid_turn_test_upper_trigger: Mutex<Option<i64>>,
+    /// Optional test-only MidTurn fault hooks (degraded/invalid residual paths).
+    /// Production leaves this unset.
+    mid_turn_test_hooks: Mutex<Option<crate::compact_continuation::MidTurnTestHooks>>,
 }
 
 impl LhcCaptureSlot {
@@ -219,6 +222,7 @@ impl LhcCaptureSlot {
             ),
             mid_turn_test_compact: Mutex::new(None),
             mid_turn_test_upper_trigger: Mutex::new(None),
+            mid_turn_test_hooks: Mutex::new(None),
         }
     }
 
@@ -279,6 +283,25 @@ impl LhcCaptureSlot {
             .mid_turn_test_upper_trigger
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Install test-only MidTurn fault hooks (degraded / invalid residual only).
+    pub fn set_mid_turn_test_hooks(
+        &self,
+        hooks: Option<crate::compact_continuation::MidTurnTestHooks>,
+    ) {
+        *self
+            .mid_turn_test_hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = hooks;
+    }
+
+    /// Take MidTurn test fault hooks without clearing.
+    pub fn mid_turn_test_hooks(&self) -> Option<crate::compact_continuation::MidTurnTestHooks> {
+        self.mid_turn_test_hooks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.

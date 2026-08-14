@@ -259,6 +259,25 @@ pub struct MidTurnCompactContinuationRequest {
     pub inside_transport_retry: bool,
     /// Optional compact profile override (tests use small lower bounds).
     pub compact: Option<HostCompactOpts>,
+    /// Test-only fault injection for MidTurn host residual paths (degraded /
+    /// invalid install). Production always leaves this `None`; the public
+    /// certified entry never accepts hooks.
+    pub test_hooks: Option<MidTurnTestHooks>,
+}
+
+/// Subset of certified-runtime test hooks exposed for MidTurn host residual
+/// coverage. Does not replace production behavior — only injects faults at the
+/// same stages the SDK evidence suite already covers.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MidTurnTestHooks {
+    /// Force `derivations_missing_or_failed` on material facts.
+    pub force_derivations_missing_or_failed: Option<bool>,
+    /// Force install success/failure after a valid candidate.
+    pub force_install_succeeds: Option<bool>,
+    /// Fail candidate assembly before install (no marker / no install).
+    pub fail_candidate_assembly: bool,
+    /// Fail install before the write commits.
+    pub fail_install_before_write: bool,
 }
 
 /// Host-facing result of one MidTurn attempt.
@@ -359,7 +378,23 @@ pub async fn run_mid_turn_compact_continuation(
     let facts = build_host_facts(&req);
     let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
 
-    let op = run_compact_continuation(ref_, facts).await;
+    // Production path: public certified entry with no test hooks.
+    // Offline residual coverage may inject fault hooks via test_support only.
+    let op = match &req.test_hooks {
+        None => run_compact_continuation(ref_, facts).await,
+        Some(hooks) => {
+            use lhc::compact_continuation::test_support::CompactContinuationTestHooks;
+            use lhc::compact_continuation::test_support::run_compact_continuation_for_tests;
+            let mapped = CompactContinuationTestHooks {
+                force_derivations_missing_or_failed: hooks.force_derivations_missing_or_failed,
+                force_install_succeeds: hooks.force_install_succeeds,
+                fail_candidate_assembly: hooks.fail_candidate_assembly,
+                fail_install_before_write: hooks.fail_install_before_write,
+                ..CompactContinuationTestHooks::default()
+            };
+            run_compact_continuation_for_tests(ref_, facts, None, Some(mapped)).await
+        }
+    };
     match op {
         OpResult::Ok { value } => {
             let installed = value.compact_receipt.is_some()

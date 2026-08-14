@@ -54,6 +54,7 @@ mod code_mode_elicitation;
 mod codex_delegate;
 mod collaboration_instructions;
 mod compact;
+mod compact_lhc_mid_turn_loops;
 mod compact_remote;
 mod compact_remote_parity;
 mod compact_resume_fork;

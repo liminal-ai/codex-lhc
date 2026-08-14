@@ -69,6 +69,57 @@ use crate::session::turn_context::TurnContext;
 
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Process-wide MidTurn worker timeout override used only by offline tests.
+/// `None` restores the production 120s bound.
+#[cfg(test)]
+static MIDTURN_WORKER_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Process-wide MidTurn worker stall injected at the start of the timed
+/// operation future (tests only). Used to prove the timeout drops the future
+/// on the worker thread without detaching.
+#[cfg(test)]
+static MIDTURN_WORKER_STALL_OVERRIDE: std::sync::Mutex<Option<Duration>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only: bound the MidTurn worker timeout without waiting 120s.
+#[cfg(test)]
+pub(crate) fn set_midturn_worker_timeout_override(timeout: Option<Duration>) {
+    *MIDTURN_WORKER_TIMEOUT_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+}
+
+/// Test-only: stall the MidTurn worker operation future for `stall` before the
+/// certified runtime runs. Combined with a small timeout override, proves the
+/// timeout drops the future on the worker thread and join still completes.
+#[cfg(test)]
+pub(crate) fn set_midturn_worker_stall_override(stall: Option<Duration>) {
+    *MIDTURN_WORKER_STALL_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = stall;
+}
+
+fn midturn_worker_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(t) = *MIDTURN_WORKER_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return t;
+        }
+    }
+    COMPACT_THREAD_TIMEOUT
+}
+
+#[cfg(test)]
+fn midturn_worker_stall() -> Option<Duration> {
+    *MIDTURN_WORKER_STALL_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)] // Installed body is the load-bearing result; boxing breaks law-1 callers.
 pub(crate) enum LhcCompactAttempt {
@@ -437,6 +488,7 @@ async fn try_run_mid_turn_compact_continuation(
         input_epoch_at_apply,
         inside_transport_retry: false,
         compact: slot.mid_turn_test_compact(),
+        test_hooks: slot.mid_turn_test_hooks(),
     };
 
     // SDK futures are !Send — hop to a dedicated thread. Once the LHC operation
@@ -552,9 +604,11 @@ async fn try_run_mid_turn_compact_continuation(
 /// Keeps `!Send` LHC futures off the multi-thread session path.
 ///
 /// Once mutation begins this is an **uninterruptible critical section**: the
-/// join handle is always awaited. Cancellation/timeout after spawn never drops
-/// the mutator thread; the caller suppresses host apply when the turn token is
-/// cancelled after return.
+/// join handle is always awaited. The operation timeout lives **inside** the
+/// worker runtime so the future is dropped on that same thread at the deadline
+/// and the thread exits; the caller then joins. Cancellation never detaches a
+/// mutator — host apply is suppressed if the turn token cancelled during the
+/// section.
 async fn run_mid_turn_on_thread(
     req: MidTurnCompactContinuationRequest,
     turn_cancel: &CancellationToken,
@@ -566,6 +620,7 @@ async fn run_mid_turn_on_thread(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let attempt = req.attempt_id.clone();
+    let worker_timeout = midturn_worker_timeout();
     let join = std::thread::Builder::new()
         .name(format!("lhc-midturn-{attempt}"))
         .spawn(move || {
@@ -574,7 +629,25 @@ async fn run_mid_turn_on_thread(
                     .enable_all()
                     .build()
                     .map_err(|e| format!("runtime: {e}"))?;
-                rt.block_on(run_mid_turn_compact_continuation(req))
+                // Bound the operation future on this worker thread so a hung
+                // `run_mid_turn_compact_continuation` is dropped at the deadline
+                // and the thread can exit. The outer path always joins.
+                rt.block_on(async move {
+                    let op = async {
+                        #[cfg(test)]
+                        if let Some(stall) = midturn_worker_stall() {
+                            tokio::time::sleep(stall).await;
+                        }
+                        run_mid_turn_compact_continuation(req).await
+                    };
+                    match tokio::time::timeout(worker_timeout, op).await {
+                        Ok(inner) => inner,
+                        Err(_) => Err(format!(
+                            "lhc-midturn worker timed out after {}s (operation future dropped on worker)",
+                            worker_timeout.as_secs_f64()
+                        )),
+                    }
+                })
             }));
             let out = match result {
                 Ok(inner) => inner,
@@ -584,9 +657,11 @@ async fn run_mid_turn_on_thread(
         })
         .map_err(|e| format!("spawn lhc-midturn thread: {e}"))?;
 
-    // Always observe the worker. Never drop `join` while the mutator may still
+    // Always join the worker. Never drop `join` while the mutator may still
     // run — cancellation only marks that host apply must be suppressed later.
-    let timed = tokio::time::timeout(COMPACT_THREAD_TIMEOUT, rx).await;
+    // The operation is already bounded inside the worker, so join cannot hang
+    // forever on a stalled compact-continuation future.
+    let worker_out = rx.await;
     let join_result = tokio::task::spawn_blocking(move || join.join()).await;
     match join_result {
         Ok(Ok(())) => {}
@@ -598,8 +673,8 @@ async fn run_mid_turn_on_thread(
         }
     }
 
-    match timed {
-        Ok(Ok(r)) => {
+    match worker_out {
+        Ok(r) => {
             if turn_cancel.is_cancelled() {
                 // Worker finished (and may have mutated LHC SQLite). Caller
                 // must suppress host rewrite / next-request apply.
@@ -610,11 +685,7 @@ async fn run_mid_turn_on_thread(
             }
             r
         }
-        Ok(Err(_)) => Err("lhc-midturn channel closed".into()),
-        Err(_) => Err(format!(
-            "lhc-midturn timed out after {}s (worker joined; no detached mutator)",
-            COMPACT_THREAD_TIMEOUT.as_secs()
-        )),
+        Err(_) => Err("lhc-midturn channel closed".into()),
     }
 }
 
