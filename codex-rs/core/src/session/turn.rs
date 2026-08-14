@@ -381,6 +381,7 @@ pub(crate) async fn run_turn(
                     response_id: sampling_response_id,
                     token_usage: sampling_token_usage,
                     response_tool_call_ids,
+                    response_complete: sampling_response_complete,
                 } = sampling_request_output;
                 if model_needs_follow_up {
                     sess.input_queue
@@ -473,6 +474,7 @@ pub(crate) async fn run_turn(
                         total_needs_follow_up: needs_follow_up,
                         input_epoch_at_decision,
                         inside_transport_retry: false,
+                        model_response_complete: sampling_response_complete,
                     };
                     if let Err(err) = run_auto_compact(
                         &sess,
@@ -1661,8 +1663,13 @@ struct SamplingRequestResult {
     response_id: String,
     /// Token usage from that completed response (not a later aggregate).
     token_usage: Option<codex_protocol::protocol::TokenUsage>,
-    /// Tool call IDs produced by the just-completed sampling response.
+    /// Client-executed tool call IDs produced by the just-completed sampling
+    /// response (FunctionCall / CustomToolCall / LocalShellCall / ToolSearchCall).
+    /// Analytics-only server-side items (WebSearch / ImageGeneration) are excluded.
     response_tool_call_ids: Vec<String>,
+    /// True only when the provider stream settled on `ResponseEvent::Completed`.
+    /// Mailbox-preempted / abandoned streams must pass false.
+    response_complete: bool,
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2367,7 +2374,8 @@ async fn try_run_sampling_request(
             ResponseEvent::OutputItemDone(mut item) => {
                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
-                    let call_id = match &item {
+                    // Analytics collector: all tool-like item ids (incl. server-side).
+                    let analytics_id = match &item {
                         ResponseItem::FunctionCall { call_id, .. }
                         | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                         ResponseItem::ToolSearchCall { call_id, .. }
@@ -2378,12 +2386,33 @@ async fn try_run_sampling_request(
                         }
                         _ => None,
                     };
-                    if let Some(call_id) = call_id {
+                    if let Some(call_id) = analytics_id {
                         analytics_tool_call_ids.push(call_id.to_string());
-                        if !response_tool_call_ids.iter().any(|id| id == call_id) {
-                            response_tool_call_ids.push(call_id.to_string());
-                        }
                     }
+                }
+                // MidTurn correlation ids: client-executed kinds only.
+                // WebSearch / ImageGeneration are server-side and never produce
+                // FunctionCallOutput/CustomToolCallOutput — including them would
+                // misclassify active_non_tool (queued steering) as invalid
+                // pending-tool and hard-refuse the flagship field case.
+                let mid_turn_call_id = match &item {
+                    ResponseItem::FunctionCall { call_id, .. }
+                    | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+                    ResponseItem::LocalShellCall {
+                        call_id: Some(call_id),
+                        ..
+                    }
+                    | ResponseItem::ToolSearchCall {
+                        call_id: Some(call_id),
+                        ..
+                    } => Some(call_id.as_str()),
+                    _ => None,
+                };
+                if let Some(call_id) = mid_turn_call_id
+                    && !call_id.is_empty()
+                    && !response_tool_call_ids.iter().any(|id| id == call_id)
+                {
+                    response_tool_call_ids.push(call_id.to_string());
                 }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                     && let Ok(Some(event)) = consumer.finish()
@@ -2478,6 +2507,7 @@ async fn try_run_sampling_request(
                         response_id: String::new(),
                         token_usage: None,
                         response_tool_call_ids,
+                        response_complete: false,
                     });
                 }
             }
@@ -2661,6 +2691,7 @@ async fn try_run_sampling_request(
                     response_id,
                     token_usage,
                     response_tool_call_ids,
+                    response_complete: true,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {

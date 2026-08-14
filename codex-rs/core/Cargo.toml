@@ -4,6 +4,11 @@ license.workspace = true
 name = "codex-core"
 version.workspace = true
 
+[features]
+default = []
+# Offline MidTurn fault hooks / test knobs (pulls lhc/test-util).
+test-util = ["codex-lhc-host/test-util"]
+
 [lib]
 name = "codex_core"
 path = "src/lib.rs"

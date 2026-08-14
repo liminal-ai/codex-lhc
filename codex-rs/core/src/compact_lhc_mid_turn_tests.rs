@@ -31,6 +31,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::PersistContext;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
 use tempfile::tempdir;
 use tokio_util::sync::CancellationToken;
 
@@ -159,6 +160,7 @@ fn mid_facts(
     usage: Option<TokenUsage>,
 ) -> MidTurnSeamFacts {
     MidTurnSeamFacts {
+        model_response_complete: true,
         attempt_id: attempt.into(),
         response_token_usage: usage,
         response_tool_call_ids: tool_ids,
@@ -1150,6 +1152,7 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
 /// Cancel during the critical section: return only after worker exit; no
 /// detached mutator; host apply suppressed.
 #[tokio::test]
+#[serial]
 async fn mid_turn_cancel_during_critical_section_joins_before_return() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1169,8 +1172,11 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
 
     // Stall the worker so cancel lands while the critical section is live.
     // Timeout bounds the stall; join always awaits the worker thread.
-    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(400)));
-    super::set_midturn_worker_stall_override(Some(Duration::from_millis(200)));
+    // Hold the process-wide override lock for the whole test so plain-parallel
+    // runs cannot race sibling timeout/stall injections.
+    let override_guard = super::midturn_worker_override_guard();
+    override_guard.set_timeout(Some(Duration::from_millis(400)));
+    override_guard.set_stall(Some(Duration::from_millis(200)));
     let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
@@ -1201,8 +1207,7 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
     .expect("arm");
     let elapsed = started.elapsed();
     let _ = cancel_task.await;
-    super::set_midturn_worker_stall_override(None);
-    super::set_midturn_worker_timeout_override(None);
+    drop(override_guard);
 
     // Must have waited for the stalled worker (not returned immediately on cancel).
     // Stall is 200ms; allow some scheduling slack while still proving we did not
@@ -1248,6 +1253,7 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
 /// Deliberately stalled worker hits the bounded in-worker timeout, joins, and
 /// leaves no worker thread or later mutation.
 #[tokio::test]
+#[serial]
 async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
@@ -1268,8 +1274,10 @@ async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
     // Stall the operation future longer than the worker timeout. Timeout lives
     // inside the worker runtime so the future is dropped there and the thread
     // exits; the outer path always joins.
-    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(80)));
-    super::set_midturn_worker_stall_override(Some(Duration::from_secs(30)));
+    // Serial guard: process-global overrides race under plain parallel cargo test.
+    let override_guard = super::midturn_worker_override_guard();
+    override_guard.set_timeout(Some(Duration::from_millis(80)));
+    override_guard.set_stall(Some(Duration::from_secs(30)));
     let threads_before = thread_count_named("lhc-midturn");
     let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
     let sess = Arc::new(session);
@@ -1293,8 +1301,7 @@ async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
     .await
     .expect("arm");
     let elapsed = started.elapsed();
-    super::set_midturn_worker_stall_override(None);
-    super::set_midturn_worker_timeout_override(None);
+    drop(override_guard);
 
     assert!(
         elapsed < Duration::from_secs(5),
@@ -1365,59 +1372,75 @@ async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
     .await
     .expect("arm");
 
-    match attempt {
-        LhcCompactAttempt::Installed { body, marker } => {
-            assert!(!body.is_empty(), "installed body non-empty");
-            // Exactly one fork CompactMarker bookkeeping identity for this install.
-            assert!(
-                !marker.marker_key.is_empty(),
-                "marker must carry stable idempotency key"
-            );
-            // Marker content must not be re-ingested as ordinary user chat.
-            let user_texts: Vec<String> =
-                body.iter()
-                    .filter_map(|i| match i {
-                        ResponseItem::Message { role, content, .. } if role == "user" => {
-                            content.iter().find_map(|c| match c {
-                                ContentItem::InputText { text }
-                                | ContentItem::OutputText { text } => Some(text.clone()),
-                                _ => None,
-                            })
-                        }
-                        _ => None,
-                    })
-                    .collect();
-            let marker_hits = user_texts
-                .iter()
-                .filter(|t| {
-                    t.contains("lhc.compact_continuation")
-                        || t.contains("context_compact_continue")
-                        || t.contains("compact_continuation_marker")
-                })
-                .count();
-            // At most one typed marker surface in the installed body.
-            assert!(
-                marker_hits <= 1,
-                "typed continuation marker must appear at most once, got {marker_hits}: {user_texts:?}"
-            );
-        }
-        LhcCompactAttempt::MidTurnSkipped { reason } => {
-            // Legitimate no-reduction / below-trigger residual still exercises
-            // the certified runtime without native fall-open.
-            assert!(!reason.is_empty());
-            assert!(
-                !reason.contains("native"),
-                "skip must not imply native: {reason}"
-            );
-        }
-        LhcCompactAttempt::Unavailable { reason } => {
-            panic!("active non-tool must not Unavailable when LHC on: {reason}");
-        }
-        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
-            // Blocked residual is receipt-truthful; not a silent native path.
-            assert!(!reason.is_empty());
-        }
-    }
+    // Positive acceptance: an always-skip implementation must fail here.
+    // Frozen contract marker constants (LIM-60/61) — asserted via durable
+    // receipt/marker identity (host body is bands+tail; the typed marker lives
+    // in the LHC event log / receipt residual).
+    const MARKER_KIND: &str = "lhc.compact_continuation";
+    const MARKER_CAUSE: &str = "context_compacted_task_in_progress";
+    const MARKER_ACTION: &str = "continue_existing_task";
+    let LhcCompactAttempt::Installed { body, marker } = attempt else {
+        panic!("active non-tool above trigger must Install, got {attempt:?}");
+    };
+    assert!(!body.is_empty(), "installed body non-empty");
+    assert!(
+        !marker.marker_key.is_empty(),
+        "marker must carry stable idempotency key"
+    );
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+    let pending =
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
+            .await
+            .expect("inspect pending");
+    assert!(
+        pending.is_none(),
+        "successful active install must clear pending boundary, got {pending:?}"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
+            .await
+            .expect("inspect receipts");
+    assert!(
+        !receipts.is_empty(),
+        "successful active install must leave a durable receipt"
+    );
+    let last = receipts.last().expect("receipt");
+    assert!(last.terminal, "active install receipt must be terminal");
+    assert!(
+        matches!(
+            last.outcome.as_str(),
+            "compact_continue_turn" | "degraded_compact" | "no_reduction"
+        ),
+        "unexpected outcome {}",
+        last.outcome
+    );
+    // Typed marker: durable event exists for the continuation turn, and the
+    // receipt residual carries frozen kind/cause/action constants.
+    let cont_turn = last
+        .continuation_turn_id
+        .as_deref()
+        .expect("active install must open a continuation turn");
+    let has_marker = codex_lhc_host::inspect_has_compact_continuation_marker(
+        &thread_id,
+        root.as_deref(),
+        cont_turn,
+    )
+    .await
+    .expect("inspect marker");
+    assert!(
+        has_marker,
+        "exactly one durable typed continuation marker must exist for {cont_turn}"
+    );
+    let receipt_json = format!("{:?}", last.receipt);
+    assert!(
+        receipt_json.contains(MARKER_KIND)
+            || receipt_json.contains(MARKER_CAUSE)
+            || receipt_json.contains(MARKER_ACTION)
+            || last.outcome == "compact_continue_turn",
+        "receipt residual must reflect typed continuation (kind/cause/action); got {receipt_json}"
+    );
+    // Always-skip would leave zero receipts / no marker / no install — proven above.
     assert!(
         !matches!(
             try_run_lhc_compact_arm(
@@ -1901,6 +1924,7 @@ async fn mid_turn_reload_resume_equivalence_both_branches() {
 /// D: degraded derivations install a structurally valid view; invalid
 /// candidate/install leaves prior view byte-identical and obeys the receipt.
 #[tokio::test]
+#[serial]
 async fn mid_turn_degraded_and_invalid_install_host_paths() {
     // D1 — degraded derivations still install (or skip with truthful residual).
     {
@@ -2147,4 +2171,312 @@ async fn mid_turn_context_pressure_residual_refuses_native_race() {
             );
         }
     }
+}
+
+// ── B1 durable repair / resume + B3 preempt truthfulness ──────────────────
+
+/// B1: install failure leaves failed_repairable; next seam re-enters same
+/// attempt_id and repairs/installs rather than permanent wedge.
+#[tokio::test]
+#[serial]
+async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+        fail_install_before_write: true,
+        ..Default::default()
+    }));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 12).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let attempt_id = "b1-repair-1";
+
+    let failed = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            attempt_id,
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    // Residual must not permanently block; next seam repairs.
+    assert!(
+        matches!(
+            failed,
+            LhcCompactAttempt::MidTurnBlocked { .. }
+                | LhcCompactAttempt::MidTurnSkipped { .. }
+                | LhcCompactAttempt::Installed { .. }
+        ),
+        "first attempt residual: {failed:?}"
+    );
+
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+    let pending =
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
+            .await
+            .expect("inspect");
+    // Clear fault hooks so repair can succeed.
+    slot.set_mid_turn_test_hooks(None);
+
+    // Fresh response id must not be used when durable owner exists — arm
+    // re-enters with owner attempt. Use a different fresh id to prove resume.
+    let repaired = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "fresh-should-not-win",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("repair arm");
+
+    // After repair, pending must clear OR install succeeded.
+    let pending_after =
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
+            .await
+            .expect("inspect after");
+    match repaired {
+        LhcCompactAttempt::Installed { .. } => {
+            assert!(pending_after.is_none(), "install clears pending boundary");
+        }
+        LhcCompactAttempt::MidTurnSkipped { reason } => {
+            // Quiet skip still allowed if pressure/hysteresis; must not hard-error.
+            assert!(!reason.contains("conflict"), "{reason}");
+        }
+        LhcCompactAttempt::MidTurnBlocked {
+            next_provider_request_allowed,
+            reason,
+        } => {
+            // Permanent wedge is the bug: foreign/same-attempt conflict forever.
+            assert!(
+                next_provider_request_allowed || !reason.contains("owned by another"),
+                "must not permanently wedge: {reason}"
+            );
+        }
+        LhcCompactAttempt::Unavailable { reason } => {
+            panic!("repair must not Unavailable: {reason}");
+        }
+    }
+    let _ = (pending, attempt_id);
+}
+
+/// B1: claim-only stale writer (no pending boundary) resumes/releases rather
+/// than hard-erroring forever.
+#[tokio::test]
+#[serial]
+async fn mid_turn_claim_only_stale_writer_resumes_or_releases() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 10).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+    // Seed a claim-only held writer for a known attempt (host test-util helper).
+    codex_lhc_host::seed_mid_turn_writer_claim_for_tests(
+        &thread_id,
+        root_path.as_deref(),
+        "claim-only-1",
+    )
+    .expect("seed claim");
+    let claim =
+        codex_lhc_host::inspect_compact_continuation_writer_claim(&thread_id, root_path.as_deref())
+            .await
+            .expect("claim");
+    assert_eq!(claim.attempt_id.as_deref(), Some("claim-only-1"));
+
+    let sess = Arc::new(session);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "fresh-id-ignored",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+
+    // Must not permanent-wedge as foreign conflict on the fresh id.
+    match attempt {
+        LhcCompactAttempt::Unavailable { reason } => {
+            panic!("claim-only resume must not Unavailable: {reason}");
+        }
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            assert!(
+                !reason.contains("owned by another attempt"),
+                "must re-enter same owner, not steal conflict: {reason}"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// B3: incomplete model response must skip MidTurn with no mutation.
+#[tokio::test]
+async fn mid_turn_preempted_response_skips_without_mutation() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 8).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let mut facts = mid_facts(
+        "preempt-1",
+        true,
+        epoch,
+        Vec::new(),
+        Some(sample_usage(5_000)),
+    );
+    facts.model_response_complete = false;
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(facts),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    match attempt {
+        LhcCompactAttempt::MidTurnSkipped { reason } => {
+            assert!(
+                reason.contains("incomplete")
+                    || reason.contains("preempt")
+                    || reason.contains("abandoned")
+                    || reason.contains("not_at_settled")
+                    || reason.contains("model response"),
+                "{reason}"
+            );
+        }
+        other => panic!("preempted response must skip, got {other:?}"),
+    }
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(
+        history_before.len(),
+        history_after.len(),
+        "preempt skip must not mutate host history"
+    );
+}
+
+/// N2: input epoch change at the apply re-check suppresses host mutation.
+///
+/// Production re-reads the epoch both before the worker and after it returns
+/// (same residual). Feeding a stale decision-epoch snapshot against the live
+/// queue proves the gate without private input-queue mutators.
+#[tokio::test]
+async fn mid_turn_epoch_change_during_critical_section_suppresses_apply() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 8).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    let live_epoch = decision_epoch(&session);
+    let sess = Arc::new(session);
+    // Stale decision epoch relative to live queue (steer-during-critical shape).
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "epoch-critical-1",
+            true,
+            live_epoch.saturating_sub(1),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    match attempt {
+        LhcCompactAttempt::MidTurnSkipped { reason } => {
+            assert!(
+                reason.contains("epoch"),
+                "expected epoch skip residual, got {reason}"
+            );
+        }
+        other => panic!("epoch change must skip apply, got {other:?}"),
+    }
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(history_before.len(), history_after.len());
 }

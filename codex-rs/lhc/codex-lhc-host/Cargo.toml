@@ -17,7 +17,8 @@ workspace = true
 [features]
 default = []
 # Enables crash-injection and blocking test helpers for certification.
-test-util = []
+# Pulls LHC SDK test-only fault hooks / raw store mutators.
+test-util = ["lhc/test-util"]
 
 [[test]]
 name = "certification"

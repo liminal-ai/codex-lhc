@@ -178,6 +178,26 @@ else
   fail=1
 fi
 
+# LIM-63B MidTurn module evidence (plain parallel — serial guards inside).
+if cargo test -q -p codex-core --lib 'compact_lhc::mid_turn_tests::' \
+    --manifest-path codex-rs/Cargo.toml >/tmp/lhc-hook-midturn.log 2>&1; then
+  echo "ok mid-turn: compact_lhc::mid_turn_tests::"
+else
+  echo "TRIPWIRE mid-turn: failed:"
+  grep -E "^error|FAILED|panicked" -A5 /tmp/lhc-hook-midturn.log | head -40
+  fail=1
+fi
+
+# Full-loop MidTurn suite requires elevated stack (documented in the suite).
+if RUST_MIN_STACK=8388608 cargo test -q -p codex-core --test all suite::compact_lhc_mid_turn_loops \
+    --manifest-path codex-rs/Cargo.toml >/tmp/lhc-hook-loops.log 2>&1; then
+  echo "ok mid-turn-loops: suite::compact_lhc_mid_turn_loops (RUST_MIN_STACK=8M)"
+else
+  echo "TRIPWIRE mid-turn-loops: failed:"
+  grep -E "^error|FAILED|panicked|SIGABRT" -A5 /tmp/lhc-hook-loops.log | head -40
+  fail=1
+fi
+
 if cargo fmt --check --manifest-path codex-rs/lhc/codex-lhc-host/Cargo.toml >/dev/null 2>&1; then
   echo "ok fmt: codex-lhc-host"
 else

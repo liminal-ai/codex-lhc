@@ -4,6 +4,12 @@
 //! capture installed and MidTurn test knobs (small upper trigger / lower bound).
 //! Asserts request shapes, marker/pair residuals, and bounded
 //! `context_length_exceeded` behavior — not enum return values alone.
+//!
+//! **Stack:** these full-loop suites nest tokio workers deep enough that the
+//! default host stack can SIGABRT. CI and the tripwire set
+//! `RUST_MIN_STACK=8388608`. Plain local runs should use the same env (or the
+//! tripwire) — the suite documents this requirement explicitly so an always-skip
+//! or under-stacked runner cannot silently green-pass.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -176,22 +182,70 @@ async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
     );
 
     let req2 = &bodies[1];
+    // Positive durable evidence (always-skip fails): receipt + typed marker event.
+    const MARKER_KIND: &str = "lhc.compact_continuation";
+    const MARKER_CAUSE: &str = "context_compacted_task_in_progress";
+    const MARKER_ACTION: &str = "continue_existing_task";
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
+            .await
+            .expect("inspect receipts");
+    assert!(
+        !receipts.is_empty(),
+        "active non-tool full loop must leave a durable compact-continuation receipt"
+    );
+    let last = receipts.last().expect("receipt");
+    assert!(
+        last.terminal || last.outcome.contains("compact") || last.outcome.contains("no_reduction"),
+        "unexpected durable outcome {}",
+        last.outcome
+    );
+    if let Some(cont) = last.continuation_turn_id.as_deref() {
+        let has = codex_lhc_host::inspect_has_compact_continuation_marker(
+            &thread_id,
+            root.as_deref(),
+            cont,
+        )
+        .await
+        .expect("marker");
+        assert!(
+            has,
+            "durable typed marker must exist for continuation turn {cont}"
+        );
+    }
+    // When reverse-mapped into request 2, require frozen kind/cause/action once.
+    let marker_hits = count_substr(req2, MARKER_KIND);
+    if marker_hits > 0 {
+        assert_eq!(marker_hits, 1, "at most one typed marker in request 2");
+        assert!(
+            req2.contains(MARKER_CAUSE) && req2.contains(MARKER_ACTION),
+            "request 2 marker must carry cause/action constants"
+        );
+    }
+    assert_eq!(
+        count_substr(&bodies[0], MARKER_KIND),
+        0,
+        "request 1 must not already carry the continuation marker"
+    );
     // Task context retained on the continuation request.
     assert!(
         req2.contains("continue this long agentic task")
             || req2.contains("working on long task")
             || req2.contains("part one")
-            || req2.contains("lhc.compact_continuation")
+            || req2.contains(MARKER_KIND)
             || req2.contains("context_compact"),
-        "request 2 must retain task context or carry typed continuation surface: {}",
+        "request 2 must retain task context: {}",
         &req2[..req2.len().min(500)]
-    );
-    // At most one typed continuation marker surface.
-    let marker_hits = count_substr(req2, "lhc.compact_continuation")
-        + count_substr(req2, "compact_continuation_marker");
-    assert!(
-        marker_hits <= 1,
-        "typed continuation marker must appear at most once, got {marker_hits}"
     );
 
     Ok(())
@@ -393,12 +447,14 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
     for m in &cle_mocks {
         bodies.extend(request_bodies(m));
     }
-    // Bounded: first success + a small number of CLE follow-ups, not a compact loop.
+    // Bounded product policy: must terminate without a native compact loop.
+    // Do not derive the bound from mock capacity alone (always-pass trap).
     assert!(
-        !bodies.is_empty() && bodies.len() <= 6,
-        "provider attempts must be bounded, got {}",
-        bodies.len()
+        !bodies.is_empty(),
+        "at least one provider request must have been issued"
     );
+    // Terminal outcome already asserted above. CLE path must not arm native
+    // summarization or spin unbounded marker pollution.
     let native_compact_hits = bodies.iter().filter(|b| body_has_summarization(b)).count();
     assert_eq!(
         native_compact_hits,
@@ -415,6 +471,8 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
         total_markers <= 1,
         "no polluted duplicate markers across requests, total={total_markers}"
     );
+    // Product policy: turn reached a terminal EventMsg (asserted above) without
+    // requiring mock exhaustion — the CLE path is not an open retry loop.
 
     Ok(())
 }

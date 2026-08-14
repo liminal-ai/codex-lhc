@@ -31,6 +31,7 @@ use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::LhcCompactResult;
 use codex_lhc_host::MaterializeInput;
 use codex_lhc_host::MidTurnCompactContinuationRequest;
+use codex_lhc_host::WorkContinuation;
 use codex_lhc_host::WriterClaim;
 use codex_lhc_host::atomic_rewrite_rollout;
 use codex_lhc_host::commit_compact_marker;
@@ -45,6 +46,7 @@ use codex_lhc_host::next_request_pressure;
 use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
+use codex_lhc_host::resolve_mid_turn_recovery_identity;
 use codex_lhc_host::run_mid_turn_compact_continuation;
 use codex_lhc_host::token_usage_to_provider_usage_authority;
 use codex_lhc_host::work_continuation_for_mid_turn;
@@ -71,6 +73,9 @@ const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Process-wide MidTurn worker timeout override used only by offline tests.
 /// `None` restores the production 120s bound.
+///
+/// Guarded by [`MIDTURN_WORKER_OVERRIDE_LOCK`] so plain-parallel test runs
+/// cannot race timeout/stall injections against each other.
 #[cfg(test)]
 static MIDTURN_WORKER_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
     std::sync::Mutex::new(None);
@@ -82,7 +87,67 @@ static MIDTURN_WORKER_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
 static MIDTURN_WORKER_STALL_OVERRIDE: std::sync::Mutex<Option<Duration>> =
     std::sync::Mutex::new(None);
 
+/// Serializes tests that mutate the process-wide MidTurn worker knobs.
+#[cfg(test)]
+static MIDTURN_WORKER_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only RAII guard: holds the process-wide MidTurn worker override lock
+/// and clears both overrides on drop so plain-parallel runs stay isolated even
+/// when a test panics mid-body.
+#[cfg(test)]
+pub(crate) struct MidturnWorkerOverrideGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl MidturnWorkerOverrideGuard {
+    pub(crate) fn acquire() -> Self {
+        let lock = MIDTURN_WORKER_OVERRIDE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Start from a clean slate for this holder.
+        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *MIDTURN_WORKER_STALL_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Self { _lock: lock }
+    }
+
+    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
+        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
+    }
+
+    pub(crate) fn set_stall(&self, stall: Option<Duration>) {
+        *MIDTURN_WORKER_STALL_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = stall;
+    }
+}
+
+#[cfg(test)]
+impl Drop for MidturnWorkerOverrideGuard {
+    fn drop(&mut self) {
+        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *MIDTURN_WORKER_STALL_OVERRIDE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// Test-only: hold the process-wide MidTurn worker override lock.
+#[cfg(test)]
+pub(crate) fn midturn_worker_override_guard() -> MidturnWorkerOverrideGuard {
+    MidturnWorkerOverrideGuard::acquire()
+}
+
 /// Test-only: bound the MidTurn worker timeout without waiting 120s.
+/// Prefer [`MidturnWorkerOverrideGuard::set_timeout`] so drop cleans up.
 #[cfg(test)]
 pub(crate) fn set_midturn_worker_timeout_override(timeout: Option<Duration>) {
     *MIDTURN_WORKER_TIMEOUT_OVERRIDE
@@ -91,8 +156,7 @@ pub(crate) fn set_midturn_worker_timeout_override(timeout: Option<Duration>) {
 }
 
 /// Test-only: stall the MidTurn worker operation future for `stall` before the
-/// certified runtime runs. Combined with a small timeout override, proves the
-/// timeout drops the future on the worker thread and join still completes.
+/// certified runtime runs.
 #[cfg(test)]
 pub(crate) fn set_midturn_worker_stall_override(stall: Option<Duration>) {
     *MIDTURN_WORKER_STALL_OVERRIDE
@@ -155,7 +219,9 @@ pub(crate) struct MidTurnSeamFacts {
     pub attempt_id: String,
     /// Token usage from the completed provider response (not a later aggregate).
     pub response_token_usage: Option<TokenUsage>,
-    /// Response-scoped tool call IDs from the just-completed sampling response.
+    /// Response-scoped **client-executed** tool call IDs from the just-completed
+    /// sampling response (FunctionCall / CustomToolCall / LocalShellCall /
+    /// ToolSearchCall). Analytics-only server-side items are excluded.
     pub response_tool_call_ids: Vec<String>,
     /// Total continuation intent: model tool follow-up **or** queued
     /// steering/mailbox/hook work that plans a next provider request.
@@ -164,6 +230,9 @@ pub(crate) struct MidTurnSeamFacts {
     pub input_epoch_at_decision: i64,
     /// True only while a transport retry is in flight (never compact then).
     pub inside_transport_retry: bool,
+    /// True only when the provider stream settled on `ResponseEvent::Completed`.
+    /// Mailbox-preempted / abandoned streams must pass false.
+    pub model_response_complete: bool,
 }
 
 /// Slice E startup reconciliation: if the rollout is MISSING / CORRUPT / STALE
@@ -390,13 +459,28 @@ async fn try_run_mid_turn_compact_continuation(
         });
     }
 
+    // Unsettled stream (mailbox preempt / abandoned): certified runtime skips
+    // without mutation. Do not assert a completed response or stale usage.
+    if !mid.model_response_complete {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: "model response incomplete (preempted/abandoned stream); no MidTurn compact"
+                .into(),
+        });
+    }
+
     let token_status = context_window_token_status(sess.as_ref(), turn_context).await;
+    #[cfg(any(test, feature = "test-util"))]
     let upper_trigger = slot.mid_turn_test_upper_trigger().unwrap_or_else(|| {
         token_status
             .auto_compact_scope_limit
             .or(token_status.full_context_window_limit)
             .unwrap_or(i64::MAX)
     });
+    #[cfg(not(any(test, feature = "test-util")))]
+    let upper_trigger = token_status
+        .auto_compact_scope_limit
+        .or(token_status.full_context_window_limit)
+        .unwrap_or(i64::MAX);
 
     // Prefer the completed response's usage; do not re-read a later aggregate
     // session snapshot when the seam already carried response-scoped usage.
@@ -409,9 +493,18 @@ async fn try_run_mid_turn_compact_continuation(
     };
     // Post-measurement: host-captured content after the usage-bearing response
     // through the settled seam (tool results, runtime notes) — not older history.
-    let post_measurement = sess
+    let post_measurement_tail = sess
         .estimated_tokens_after_last_model_generated_item()
         .await;
+    // N1: include the completed response's own output so next-request growth
+    // is not undercounted. Labelled via response-scoped output when present;
+    // never double-count the post-measurement tail.
+    let response_output_estimate = mid
+        .response_token_usage
+        .as_ref()
+        .map(|u| u.output_tokens.max(0))
+        .unwrap_or(0);
+    let post_measurement = post_measurement_tail.saturating_add(response_output_estimate);
     let pressure = next_request_pressure(&provider_usage, post_measurement);
 
     // Hysteresis: only after truthful no-reduction, require configured growth.
@@ -439,13 +532,14 @@ async fn try_run_mid_turn_compact_continuation(
         .raw_items()
         .cloned()
         .collect::<Vec<_>>();
-    let continuation = work_continuation_for_mid_turn(
+    let mut continuation = work_continuation_for_mid_turn(
         &mid.response_tool_call_ids,
         &host_items,
         mid.total_needs_follow_up,
     );
 
     // Lower target from LHC continuation profile (or test override).
+    #[cfg(any(test, feature = "test-util"))]
     let lower_target = slot
         .mid_turn_test_compact()
         .and_then(|opts| {
@@ -455,6 +549,8 @@ async fn try_run_mid_turn_compact_continuation(
                 .map(|b| b as i64)
         })
         .unwrap_or(DEFAULT_LOWER_TARGET_TOKENS);
+    #[cfg(not(any(test, feature = "test-util")))]
+    let lower_target = DEFAULT_LOWER_TARGET_TOKENS;
 
     let provider_identity_valid = !turn_context.config.model_provider_id.is_empty()
         && turn_context
@@ -463,7 +559,7 @@ async fn try_run_mid_turn_compact_continuation(
             .as_ref()
             .is_some_and(|m| !m.is_empty());
 
-    let attempt_id = if mid.attempt_id.is_empty() {
+    let fresh_attempt_id = if mid.attempt_id.is_empty() {
         format!(
             "midturn:{}:epoch:{}",
             turn_context.sub_id, mid.input_epoch_at_decision
@@ -472,23 +568,82 @@ async fn try_run_mid_turn_compact_continuation(
         mid.attempt_id.clone()
     };
 
+    // B1: inspect durable pending boundary / writer claim before a fresh entry.
+    // Same-attempt re-entry is the only recovery protocol — never invent a
+    // lease/expiry or clear a foreign owner. SDK inspection futures are !Send
+    // — hop to a dedicated thread (same pattern as the MidTurn worker).
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+    let recovery = match inspect_mid_turn_recovery_on_thread(&thread_id, root.clone()).await {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(%err, "LHC MidTurn durable inspection failed; proceeding with fresh attempt");
+            None
+        }
+    };
+
+    let (attempt_id, writer_claim, recovering) = if let Some(rec) = recovery {
+        if matches!(rec.writer_claim, WriterClaim::Conflict) {
+            return Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason: format!(
+                    "durable compact-continuation state owned by another attempt ({}); refuse without steal",
+                    rec.attempt_id
+                ),
+                next_provider_request_allowed: false,
+            });
+        }
+        info!(
+            owner_attempt = %rec.attempt_id,
+            pending_boundary = rec.pending_boundary,
+            claim_only = rec.claim_only,
+            "LHC MidTurn re-entering with durable owner attempt for repair/resume"
+        );
+        // Protocol: boundary repair requires active_non_tool continuation kind.
+        if rec.pending_boundary {
+            continuation = WorkContinuation::ActiveNonTool;
+        }
+        (rec.attempt_id, rec.writer_claim, true)
+    } else {
+        (fresh_attempt_id, WriterClaim::None, false)
+    };
+    let _ = recovering;
+
     let req = MidTurnCompactContinuationRequest {
-        thread_id: handle.thread_id().to_string(),
-        root: handle.root().map(std::path::Path::to_path_buf),
+        thread_id: thread_id.clone(),
+        root: root.clone(),
         attempt_id: attempt_id.clone(),
         provider_usage,
         post_measurement_tokens: post_measurement,
         upper_trigger_tokens: upper_trigger,
         lower_target_tokens: lower_target,
         continuation,
-        writer_claim: WriterClaim::None,
+        writer_claim,
         capture_complete: true,
         provider_identity_valid,
         input_epoch_at_decision: mid.input_epoch_at_decision,
         input_epoch_at_apply,
         inside_transport_retry: false,
-        compact: slot.mid_turn_test_compact(),
-        test_hooks: slot.mid_turn_test_hooks(),
+        model_response_complete: mid.model_response_complete,
+        compact: {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                slot.mid_turn_test_compact()
+            }
+            #[cfg(not(any(test, feature = "test-util")))]
+            {
+                None
+            }
+        },
+        test_hooks: {
+            #[cfg(any(test, feature = "test-util"))]
+            {
+                slot.mid_turn_test_hooks()
+            }
+            #[cfg(not(any(test, feature = "test-util")))]
+            {
+                None
+            }
+        },
     };
 
     // SDK futures are !Send — hop to a dedicated thread. Once the LHC operation
@@ -510,6 +665,20 @@ async fn try_run_mid_turn_compact_continuation(
         return Ok(LhcCompactAttempt::MidTurnBlocked {
             reason: "turn cancelled during MidTurn compact-continuation critical section; host apply suppressed".into(),
             next_provider_request_allowed: false,
+        });
+    }
+
+    // N2: re-read input epoch after the worker returns and before host rewrite.
+    // Steering during the critical section must not be silently applied over;
+    // leave a truthful residual that B1 can repair on the next settled seam.
+    let input_epoch_after_worker =
+        i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
+    if mid.input_epoch_at_decision != input_epoch_after_worker {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: format!(
+                "input epoch changed during MidTurn critical section decision={} after={}; host apply suppressed",
+                mid.input_epoch_at_decision, input_epoch_after_worker
+            ),
         });
     }
 
@@ -609,6 +778,44 @@ async fn try_run_mid_turn_compact_continuation(
 /// and the thread exits; the caller then joins. Cancellation never detaches a
 /// mutator — host apply is suppressed if the turn token cancelled during the
 /// section.
+/// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
+/// inspection futures are `!Send`).
+async fn inspect_mid_turn_recovery_on_thread(
+    thread_id: &str,
+    root: Option<PathBuf>,
+) -> Result<Option<codex_lhc_host::MidTurnRecoveryIdentity>, String> {
+    let tid = thread_id.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let join = std::thread::Builder::new()
+        .name(format!("lhc-midturn-inspect-{tid}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("runtime: {e}"))?;
+                rt.block_on(resolve_mid_turn_recovery_identity(&tid, root.as_deref()))
+            }));
+            let out = match result {
+                Ok(inner) => inner,
+                Err(_) => Err("lhc-midturn inspect thread panicked".into()),
+            };
+            let _ = tx.send(out);
+        })
+        .map_err(|e| format!("spawn lhc-midturn inspect thread: {e}"))?;
+    let worker_out = rx.await;
+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
+    match join_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err("lhc-midturn inspect thread panicked during join".into()),
+        Err(err) => return Err(format!("lhc-midturn inspect join task failed: {err}")),
+    }
+    match worker_out {
+        Ok(r) => r,
+        Err(_) => Err("lhc-midturn inspect channel closed".into()),
+    }
+}
+
 async fn run_mid_turn_on_thread(
     req: MidTurnCompactContinuationRequest,
     turn_cancel: &CancellationToken,
@@ -1151,6 +1358,15 @@ async fn install_lhc_compact_rewrite(
         derived_ids = marker.derived_host_ids.len(),
         runtime_note_chars = marker.to_runtime_note_text().len(),
         "LHC compact arm installed write-back from real CompactReceipt (rewrite path)"
+    );
+
+    // N3: any successful PreTurn/manual LHC install clears MidTurn
+    // no-reduction hysteresis so a subsequent above-trigger MidTurn is not
+    // suppressed by a stale margin band.
+    slot.clear_mid_turn_hysteresis(
+        /*attempt_id*/ if manual { "manual" } else { "preturn" },
+        /*pressure*/ 0,
+        /*outcome*/ "preturn_or_manual_install",
     );
 
     Ok(LhcCompactAttempt::Installed {

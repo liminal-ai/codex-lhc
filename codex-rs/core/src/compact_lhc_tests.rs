@@ -401,9 +401,7 @@ async fn sub_threshold_does_not_grow_model_context() {
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     match attempt {
-        LhcCompactAttempt::MidTurnSkipped { reason }
-        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-        | LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::Unavailable { reason } => {
             // NoReduction is fine; other unavailability also fine for tiny seed.
             let _ = reason;
             assert!(response_items_structurally_equal(
@@ -413,6 +411,9 @@ async fn sub_threshold_does_not_grow_model_context() {
         }
         LhcCompactAttempt::Installed { .. } => {
             // Install allowed when body ≤ rollout model-context (F-L4).
+        }
+        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
+            panic!("StandaloneTurn must not return MidTurn residual");
         }
     }
 }
@@ -1082,15 +1083,16 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
                 body.len()
             );
         }
-        LhcCompactAttempt::MidTurnSkipped { reason }
-        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-        | LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::Unavailable { reason } => {
             assert!(!reason.is_empty(), "fail-open reason should be non-empty");
             // History unchanged — native ladder free.
             assert!(response_items_structurally_equal(
                 &sess.clone_history().await.into_raw_items(),
                 &before
             ));
+        }
+        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
+            panic!("StandaloneTurn must not return MidTurn residual");
         }
     }
 }
@@ -1137,9 +1139,7 @@ async fn j1_unavailable_derivation_model_fails_open() {
     .await
     .expect("arm");
     match attempt {
-        LhcCompactAttempt::MidTurnSkipped { reason }
-        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-        | LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::Unavailable { reason } => {
             assert!(
                 reason.contains("gpt-5.6-luna") || reason.contains("unavailable"),
                 "expected derivation-model unavailable reason, got: {reason}"
@@ -1344,9 +1344,7 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
     }
     let a = run_with_empty_catalog().await;
     let reason_a = match a {
-        LhcCompactAttempt::MidTurnSkipped { reason }
-        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-        | LhcCompactAttempt::Unavailable { reason } => reason,
+        LhcCompactAttempt::Unavailable { reason } => reason,
         other => panic!("no usable client must Unavailable, got {other:?}"),
     };
     assert!(
@@ -1362,9 +1360,7 @@ async fn j1_live_inference_env_has_no_effect_when_client_unusable() {
         std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
     }
     let reason_b = match b {
-        LhcCompactAttempt::MidTurnSkipped { reason }
-        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-        | LhcCompactAttempt::Unavailable { reason } => reason,
+        LhcCompactAttempt::Unavailable { reason } => reason,
         other => panic!(
             "CODEX_LHC_LIVE_INFERENCE=1 must not re-enable deterministic Install; got {other:?}"
         ),
@@ -1751,9 +1747,10 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
                 "child marker must describe the body it installed"
             );
         }
-        LhcCompactAttempt::MidTurnSkipped { .. }
-        | LhcCompactAttempt::MidTurnBlocked { .. }
-        | LhcCompactAttempt::Unavailable { .. } => {}
+        LhcCompactAttempt::Unavailable { .. } => {}
+        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
+            panic!("StandaloneTurn must not return MidTurn residual");
+        }
     }
 }
 

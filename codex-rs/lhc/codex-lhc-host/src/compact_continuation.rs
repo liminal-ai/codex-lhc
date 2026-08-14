@@ -78,15 +78,36 @@ pub fn missing_provider_usage_authority() -> ProviderUsageAuthority {
     })
 }
 
-/// Build a settled MidTurn seam snapshot.
+/// Build a MidTurn seam snapshot.
+///
+/// `model_response_complete` must be true only when the provider stream reached
+/// `ResponseEvent::Completed`. Mailbox-preempted / abandoned streams pass false
+/// so the certified runtime skips with `not_at_settled_seam`.
 pub fn settled_mid_turn_seam(
     input_epoch_at_decision: i64,
     input_epoch_at_apply: i64,
     inside_transport_retry: bool,
     capture_flushed: bool,
 ) -> CompactContinuationSeam {
+    mid_turn_seam(
+        /*model_response_complete*/ true,
+        input_epoch_at_decision,
+        input_epoch_at_apply,
+        inside_transport_retry,
+        capture_flushed,
+    )
+}
+
+/// Build a MidTurn seam with an explicit response-complete flag.
+pub fn mid_turn_seam(
+    model_response_complete: bool,
+    input_epoch_at_decision: i64,
+    input_epoch_at_apply: i64,
+    inside_transport_retry: bool,
+    capture_flushed: bool,
+) -> CompactContinuationSeam {
     CompactContinuationSeam {
-        model_response_complete: true,
+        model_response_complete,
         requested_tools_settled: true,
         capture_flushed,
         before_next_provider_request: true,
@@ -143,6 +164,11 @@ pub fn work_continuation_for_mid_turn(
             {
                 Some(call_id.clone())
             }
+            // ToolSearch is client-correlated when present; scan its output type.
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } if !call_id.is_empty() => Some(call_id.clone()),
             _ => None,
         })
         .collect();
@@ -257,17 +283,24 @@ pub struct MidTurnCompactContinuationRequest {
     pub input_epoch_at_decision: i64,
     pub input_epoch_at_apply: i64,
     pub inside_transport_retry: bool,
+    /// True only when the provider stream settled on `ResponseEvent::Completed`.
+    pub model_response_complete: bool,
     /// Optional compact profile override (tests use small lower bounds).
     pub compact: Option<HostCompactOpts>,
     /// Test-only fault injection for MidTurn host residual paths (degraded /
-    /// invalid install). Production always leaves this `None`; the public
-    /// certified entry never accepts hooks.
+    /// invalid install). Production always leaves this `None`. The match arm
+    /// that routes to SDK `test_support` is compiled only under
+    /// `feature = "test-util"`; without that feature non-`None` values are
+    /// ignored and the certified public entry is used.
     pub test_hooks: Option<MidTurnTestHooks>,
 }
 
 /// Subset of certified-runtime test hooks exposed for MidTurn host residual
 /// coverage. Does not replace production behavior — only injects faults at the
 /// same stages the SDK evidence suite already covers.
+///
+/// The type is always nameable so request structs stay stable across feature
+/// unification; routing to the SDK fault path requires `feature = "test-util"`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MidTurnTestHooks {
     /// Force `derivations_missing_or_failed` on material facts.
@@ -311,7 +344,8 @@ pub fn thread_sqlite_path(thread_id: &str, root: Option<&Path>) -> Option<PathBu
 pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactContinuationHostFacts {
     CompactContinuationHostFacts {
         attempt_id: req.attempt_id.clone(),
-        seam: settled_mid_turn_seam(
+        seam: mid_turn_seam(
+            req.model_response_complete,
             req.input_epoch_at_decision,
             req.input_epoch_at_apply,
             req.inside_transport_retry,
@@ -339,6 +373,125 @@ pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactConti
     }
 }
 
+/// Inspect durable pending/failed_repairable boundary for host resume/repair.
+pub async fn inspect_pending_compact_continuation_boundary(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Result<Option<lhc::compact_continuation::BoundaryRow>, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect compact-continuation".to_string())?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::get_pending_compact_continuation_boundary(ref_).await {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect pending boundary {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
+/// Inspect durable writer claim for host resume/repair.
+pub async fn inspect_compact_continuation_writer_claim(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Result<lhc::compact_continuation::WriterClaimRow, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect compact-continuation".to_string())?;
+    if !path.exists() {
+        return Err(format!(
+            "LHC thread file missing for compact-continuation inspect: {}",
+            path.display()
+        ));
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::get_compact_continuation_writer_claim(ref_).await {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect writer claim {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
+/// Durable recovery identity for the next MidTurn entry.
+///
+/// When a pending/failed_repairable boundary or held LHC writer claim exists,
+/// the host must re-enter with that exact `attempt_id` and
+/// `active_non_tool` continuation (boundary repair). Never invents a lease or
+/// clears a foreign owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidTurnRecoveryIdentity {
+    pub attempt_id: String,
+    pub writer_claim: WriterClaim,
+    /// True when a durable pending/failed_repairable boundary owns the attempt.
+    pub pending_boundary: bool,
+    /// True when only a same-owner writer claim is held (no pending boundary).
+    pub claim_only: bool,
+}
+
+/// Resolve same-attempt resume identity from durable SDK state.
+///
+/// Returns `None` when the durable state is clean (caller uses the fresh
+/// response-scoped attempt id). Foreign held claims surface as
+/// `WriterClaim::Conflict` so the certified runtime refuses without stealing.
+pub async fn resolve_mid_turn_recovery_identity(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Result<Option<MidTurnRecoveryIdentity>, String> {
+    let pending = inspect_pending_compact_continuation_boundary(thread_id, root).await?;
+    let claim = match inspect_compact_continuation_writer_claim(thread_id, root).await {
+        Ok(c) => c,
+        Err(_) if pending.is_none() => {
+            // Missing thread file with no pending is clean.
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+
+    if let Some(boundary) = pending {
+        // Boundary owner wins; re-enter with that attempt and active_non_tool.
+        let writer_claim = if claim.claim == lhc::compact_continuation::WriterClaimKind::Lhc
+            && claim.attempt_id.as_deref() == Some(boundary.attempt_id.as_str())
+        {
+            WriterClaim::Lhc
+        } else if claim.claim == lhc::compact_continuation::WriterClaimKind::Lhc
+            && claim
+                .attempt_id
+                .as_ref()
+                .is_some_and(|id| id != &boundary.attempt_id)
+        {
+            // Foreign claim alongside a pending boundary is still not stealable.
+            WriterClaim::Conflict
+        } else {
+            WriterClaim::None
+        };
+        return Ok(Some(MidTurnRecoveryIdentity {
+            attempt_id: boundary.attempt_id,
+            writer_claim,
+            pending_boundary: true,
+            claim_only: false,
+        }));
+    }
+
+    if claim.claim == lhc::compact_continuation::WriterClaimKind::Lhc {
+        if let Some(owner) = claim.attempt_id {
+            return Ok(Some(MidTurnRecoveryIdentity {
+                attempt_id: owner,
+                writer_claim: WriterClaim::Lhc,
+                pending_boundary: false,
+                claim_only: true,
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
 /// Test-oriented compact opts that use a small lower bound so banded compact
 /// can run offline without 120k tokens of seed history.
 pub fn test_compact_opts(lower_bound: f64) -> HostCompactOpts {
@@ -353,6 +506,80 @@ pub fn test_compact_opts(lower_bound: f64) -> HostCompactOpts {
                 brief: Some(25.0),
             }),
         }),
+    }
+}
+
+/// Test-only: seed a held LHC writer claim without going through claim_lhc_writer.
+/// Used for claim-only resume/repair evidence. Feature-gated with test-util.
+#[cfg(feature = "test-util")]
+pub fn seed_mid_turn_writer_claim_for_tests(
+    thread_id: &str,
+    root: Option<&Path>,
+    attempt_id: &str,
+) -> Result<(), String> {
+    let path = thread_sqlite_path(thread_id, root).ok_or_else(|| "LHC root missing".to_string())?;
+    if !path.exists() {
+        return Err(format!("thread file missing: {}", path.display()));
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    let db = match lhc::shared_tech::storage::open_database(&path_str) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => {
+            return Err(format!("open db: {}", error.reason));
+        }
+    };
+    lhc::compact_continuation::test_support::seed_writer_claim(
+        &db,
+        attempt_id,
+        "2020-01-01T00:00:00.000Z",
+    );
+    db.close();
+    Ok(())
+}
+
+/// Inspect whether a compact-continuation marker event exists for a turn.
+pub async fn inspect_has_compact_continuation_marker(
+    thread_id: &str,
+    root: Option<&Path>,
+    continuation_turn_id: &str,
+) -> Result<bool, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect marker".to_string())?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::has_compact_continuation_marker(ref_, continuation_turn_id)
+        .await
+    {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect marker {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
+/// List compact-continuation receipts for durable positive evidence.
+pub async fn inspect_compact_continuation_receipts(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Result<Vec<lhc::compact_continuation::StoredCompactContinuationReceipt>, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect receipts".to_string())?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::list_compact_continuation_receipts(ref_, /*limit*/ None).await
+    {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect receipts {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
     }
 }
 
@@ -379,7 +606,10 @@ pub async fn run_mid_turn_compact_continuation(
     let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
 
     // Production path: public certified entry with no test hooks.
-    // Offline residual coverage may inject fault hooks via test_support only.
+    // Fault injection routes only when `feature = "test-util"` is enabled
+    // (pulls `lhc/test-util`). Without that feature, any non-None hooks are
+    // ignored so release builds cannot reach the fault path.
+    #[cfg(feature = "test-util")]
     let op = match &req.test_hooks {
         None => run_compact_continuation(ref_, facts).await,
         Some(hooks) => {
@@ -394,6 +624,14 @@ pub async fn run_mid_turn_compact_continuation(
             };
             run_compact_continuation_for_tests(ref_, facts, None, Some(mapped)).await
         }
+    };
+    #[cfg(not(feature = "test-util"))]
+    let op = {
+        debug_assert!(
+            req.test_hooks.is_none(),
+            "MidTurn test_hooks set without feature = \"test-util\"; ignored"
+        );
+        run_compact_continuation(ref_, facts).await
     };
     match op {
         OpResult::Ok { value } => {
@@ -676,6 +914,67 @@ mod tests {
             work_continuation_from_history_tail(&items, false),
             WorkContinuation::None
         );
+    }
+
+    #[test]
+    fn web_search_with_queued_steering_is_active_non_tool() {
+        // Server-side WebSearch must not enter response_tool_call_ids; with
+        // queued steering the branch is active_non_tool (not invalid pending-tool).
+        let items = vec![
+            ResponseItem::WebSearchCall {
+                id: Some(codex_protocol::ResponseItemId::from_server("ws-1".into())),
+                status: Some("completed".into()),
+                action: Some(codex_protocol::models::WebSearchAction::Search {
+                    query: Some("q".into()),
+                    queries: None,
+                }),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".into(),
+                content: vec![],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        // Empty response-scoped client-executed ids + follow-up → ActiveNonTool.
+        assert_eq!(
+            work_continuation_for_mid_turn(&[], &items, true),
+            WorkContinuation::ActiveNonTool
+        );
+    }
+
+    #[test]
+    fn tool_search_call_and_output_is_valid_pending_tool() {
+        let items = vec![
+            ResponseItem::ToolSearchCall {
+                id: None,
+                call_id: Some("ts-1".into()),
+                status: Some("completed".into()),
+                execution: "client".into(),
+                arguments: serde_json::json!({}),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::ToolSearchOutput {
+                id: None,
+                call_id: Some("ts-1".into()),
+                status: "completed".into(),
+                execution: "client".into(),
+                tools: vec![],
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        match work_continuation_for_mid_turn(&["ts-1".into()], &items, true) {
+            WorkContinuation::PendingCorrelatedToolResult {
+                tool_call_id,
+                correlation_valid,
+            } => {
+                assert_eq!(tool_call_id, "ts-1");
+                assert!(correlation_valid);
+            }
+            other => panic!("expected valid pending tool, got {other:?}"),
+        }
     }
 
     #[test]

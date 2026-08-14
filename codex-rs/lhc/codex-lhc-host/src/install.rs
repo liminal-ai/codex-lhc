@@ -191,12 +191,15 @@ pub struct LhcCaptureSlot {
     mid_turn_hysteresis: Mutex<crate::compact_continuation::CompactContinuationHysteresis>,
     /// Optional test-only compact opts (small lower bounds) for MidTurn offline
     /// evidence. Production leaves this unset so the SDK profile policy applies.
+    #[cfg(any(test, feature = "test-util"))]
     mid_turn_test_compact: Mutex<Option<lhc::compact_continuation::HostCompactOpts>>,
     /// Optional test-only upper trigger override (tokens). Production leaves
     /// this unset so Codex model/window policy applies.
+    #[cfg(any(test, feature = "test-util"))]
     mid_turn_test_upper_trigger: Mutex<Option<i64>>,
     /// Optional test-only MidTurn fault hooks (degraded/invalid residual paths).
     /// Production leaves this unset.
+    #[cfg(any(test, feature = "test-util"))]
     mid_turn_test_hooks: Mutex<Option<crate::compact_continuation::MidTurnTestHooks>>,
 }
 
@@ -220,10 +223,23 @@ impl LhcCaptureSlot {
             mid_turn_hysteresis: Mutex::new(
                 crate::compact_continuation::CompactContinuationHysteresis::default(),
             ),
+            #[cfg(any(test, feature = "test-util"))]
             mid_turn_test_compact: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
             mid_turn_test_upper_trigger: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
             mid_turn_test_hooks: Mutex::new(None),
         }
+    }
+
+    /// Clear MidTurn no-reduction hysteresis after any successful LHC install
+    /// (PreTurn / manual / MidTurn reduction). Prevents a stale margin band
+    /// from suppressing a warranted re-attempt after non-MidTurn relief.
+    pub fn clear_mid_turn_hysteresis(&self, attempt_id: &str, pressure: i64, outcome: &str) {
+        self.mid_turn_hysteresis
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear(attempt_id, pressure, outcome);
     }
 
     /// Snapshot MidTurn hysteresis (no-reduction treadmill guard).
@@ -251,6 +267,7 @@ impl LhcCaptureSlot {
     }
 
     /// Install test-only compact opts for MidTurn (offline evidence only).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_mid_turn_test_compact(
         &self,
         opts: Option<lhc::compact_continuation::HostCompactOpts>,
@@ -262,6 +279,7 @@ impl LhcCaptureSlot {
     }
 
     /// Take MidTurn test compact opts without clearing (clone).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mid_turn_test_compact(&self) -> Option<lhc::compact_continuation::HostCompactOpts> {
         self.mid_turn_test_compact
             .lock()
@@ -270,6 +288,7 @@ impl LhcCaptureSlot {
     }
 
     /// Install test-only upper trigger for MidTurn (offline evidence only).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_mid_turn_test_upper_trigger(&self, upper: Option<i64>) {
         *self
             .mid_turn_test_upper_trigger
@@ -278,6 +297,7 @@ impl LhcCaptureSlot {
     }
 
     /// Take MidTurn test upper trigger without clearing.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mid_turn_test_upper_trigger(&self) -> Option<i64> {
         *self
             .mid_turn_test_upper_trigger
@@ -286,6 +306,7 @@ impl LhcCaptureSlot {
     }
 
     /// Install test-only MidTurn fault hooks (degraded / invalid residual only).
+    #[cfg(any(test, feature = "test-util"))]
     pub fn set_mid_turn_test_hooks(
         &self,
         hooks: Option<crate::compact_continuation::MidTurnTestHooks>,
@@ -297,6 +318,7 @@ impl LhcCaptureSlot {
     }
 
     /// Take MidTurn test fault hooks without clearing.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn mid_turn_test_hooks(&self) -> Option<crate::compact_continuation::MidTurnTestHooks> {
         self.mid_turn_test_hooks
             .lock()

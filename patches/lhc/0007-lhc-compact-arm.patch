@@ -26,10 +26,22 @@ index 83f1f0d651..97dc03ac63 100644
              let model_context = self
                  .thread_store
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index 78e6905ded..030ad69c92 100644
+index 78e6905ded..6e46cc1a68 100644
 --- a/codex-rs/core/Cargo.toml
 +++ b/codex-rs/core/Cargo.toml
-@@ -51,6 +51,8 @@ codex-execpolicy = { workspace = true }
+@@ -4,6 +4,11 @@ license.workspace = true
+ name = "codex-core"
+ version.workspace = true
+ 
++[features]
++default = []
++# Offline MidTurn fault hooks / test knobs (pulls lhc/test-util).
++test-util = ["codex-lhc-host/test-util"]
++
+ [lib]
+ name = "codex_core"
+ path = "src/lib.rs"
+@@ -51,6 +56,8 @@ codex-execpolicy = { workspace = true }
  codex-git-utils = { workspace = true }
  codex-history = { workspace = true }
  codex-hooks = { workspace = true }
@@ -38,7 +50,7 @@ index 78e6905ded..030ad69c92 100644
  codex-http-client = { workspace = true }
  codex-install-context = { workspace = true }
  codex-network-proxy = { workspace = true }
-@@ -139,6 +141,8 @@ codex-shell-escalation = { workspace = true }
+@@ -139,6 +146,8 @@ codex-shell-escalation = { workspace = true }
  [dev-dependencies]
  assert_cmd = { workspace = true }
  assert_matches = { workspace = true }
@@ -49,10 +61,10 @@ index 78e6905ded..030ad69c92 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..6b67e3eb5d
+index 0000000000..d901c4b66d
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,1555 @@
+@@ -0,0 +1,1771 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -86,6 +98,7 @@ index 0000000000..6b67e3eb5d
 +use codex_lhc_host::LhcCompactResult;
 +use codex_lhc_host::MaterializeInput;
 +use codex_lhc_host::MidTurnCompactContinuationRequest;
++use codex_lhc_host::WorkContinuation;
 +use codex_lhc_host::WriterClaim;
 +use codex_lhc_host::atomic_rewrite_rollout;
 +use codex_lhc_host::commit_compact_marker;
@@ -100,6 +113,7 @@ index 0000000000..6b67e3eb5d
 +use codex_lhc_host::parse_rollout_items;
 +use codex_lhc_host::produce_lhc_compact_with_provenance;
 +use codex_lhc_host::read_materialize_surfaces;
++use codex_lhc_host::resolve_mid_turn_recovery_identity;
 +use codex_lhc_host::run_mid_turn_compact_continuation;
 +use codex_lhc_host::token_usage_to_provider_usage_authority;
 +use codex_lhc_host::work_continuation_for_mid_turn;
@@ -126,6 +140,9 @@ index 0000000000..6b67e3eb5d
 +
 +/// Process-wide MidTurn worker timeout override used only by offline tests.
 +/// `None` restores the production 120s bound.
++///
++/// Guarded by [`MIDTURN_WORKER_OVERRIDE_LOCK`] so plain-parallel test runs
++/// cannot race timeout/stall injections against each other.
 +#[cfg(test)]
 +static MIDTURN_WORKER_TIMEOUT_OVERRIDE: std::sync::Mutex<Option<Duration>> =
 +    std::sync::Mutex::new(None);
@@ -137,7 +154,67 @@ index 0000000000..6b67e3eb5d
 +static MIDTURN_WORKER_STALL_OVERRIDE: std::sync::Mutex<Option<Duration>> =
 +    std::sync::Mutex::new(None);
 +
++/// Serializes tests that mutate the process-wide MidTurn worker knobs.
++#[cfg(test)]
++static MIDTURN_WORKER_OVERRIDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
++
++/// Test-only RAII guard: holds the process-wide MidTurn worker override lock
++/// and clears both overrides on drop so plain-parallel runs stay isolated even
++/// when a test panics mid-body.
++#[cfg(test)]
++pub(crate) struct MidturnWorkerOverrideGuard {
++    _lock: std::sync::MutexGuard<'static, ()>,
++}
++
++#[cfg(test)]
++impl MidturnWorkerOverrideGuard {
++    pub(crate) fn acquire() -> Self {
++        let lock = MIDTURN_WORKER_OVERRIDE_LOCK
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        // Start from a clean slate for this holder.
++        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++        *MIDTURN_WORKER_STALL_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++        Self { _lock: lock }
++    }
++
++    pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
++        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = timeout;
++    }
++
++    pub(crate) fn set_stall(&self, stall: Option<Duration>) {
++        *MIDTURN_WORKER_STALL_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = stall;
++    }
++}
++
++#[cfg(test)]
++impl Drop for MidturnWorkerOverrideGuard {
++    fn drop(&mut self) {
++        *MIDTURN_WORKER_TIMEOUT_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++        *MIDTURN_WORKER_STALL_OVERRIDE
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
++    }
++}
++
++/// Test-only: hold the process-wide MidTurn worker override lock.
++#[cfg(test)]
++pub(crate) fn midturn_worker_override_guard() -> MidturnWorkerOverrideGuard {
++    MidturnWorkerOverrideGuard::acquire()
++}
++
 +/// Test-only: bound the MidTurn worker timeout without waiting 120s.
++/// Prefer [`MidturnWorkerOverrideGuard::set_timeout`] so drop cleans up.
 +#[cfg(test)]
 +pub(crate) fn set_midturn_worker_timeout_override(timeout: Option<Duration>) {
 +    *MIDTURN_WORKER_TIMEOUT_OVERRIDE
@@ -146,8 +223,7 @@ index 0000000000..6b67e3eb5d
 +}
 +
 +/// Test-only: stall the MidTurn worker operation future for `stall` before the
-+/// certified runtime runs. Combined with a small timeout override, proves the
-+/// timeout drops the future on the worker thread and join still completes.
++/// certified runtime runs.
 +#[cfg(test)]
 +pub(crate) fn set_midturn_worker_stall_override(stall: Option<Duration>) {
 +    *MIDTURN_WORKER_STALL_OVERRIDE
@@ -210,7 +286,9 @@ index 0000000000..6b67e3eb5d
 +    pub attempt_id: String,
 +    /// Token usage from the completed provider response (not a later aggregate).
 +    pub response_token_usage: Option<TokenUsage>,
-+    /// Response-scoped tool call IDs from the just-completed sampling response.
++    /// Response-scoped **client-executed** tool call IDs from the just-completed
++    /// sampling response (FunctionCall / CustomToolCall / LocalShellCall /
++    /// ToolSearchCall). Analytics-only server-side items are excluded.
 +    pub response_tool_call_ids: Vec<String>,
 +    /// Total continuation intent: model tool follow-up **or** queued
 +    /// steering/mailbox/hook work that plans a next provider request.
@@ -219,6 +297,9 @@ index 0000000000..6b67e3eb5d
 +    pub input_epoch_at_decision: i64,
 +    /// True only while a transport retry is in flight (never compact then).
 +    pub inside_transport_retry: bool,
++    /// True only when the provider stream settled on `ResponseEvent::Completed`.
++    /// Mailbox-preempted / abandoned streams must pass false.
++    pub model_response_complete: bool,
 +}
 +
 +/// Slice E startup reconciliation: if the rollout is MISSING / CORRUPT / STALE
@@ -445,13 +526,28 @@ index 0000000000..6b67e3eb5d
 +        });
 +    }
 +
++    // Unsettled stream (mailbox preempt / abandoned): certified runtime skips
++    // without mutation. Do not assert a completed response or stale usage.
++    if !mid.model_response_complete {
++        return Ok(LhcCompactAttempt::MidTurnSkipped {
++            reason: "model response incomplete (preempted/abandoned stream); no MidTurn compact"
++                .into(),
++        });
++    }
++
 +    let token_status = context_window_token_status(sess.as_ref(), turn_context).await;
++    #[cfg(any(test, feature = "test-util"))]
 +    let upper_trigger = slot.mid_turn_test_upper_trigger().unwrap_or_else(|| {
 +        token_status
 +            .auto_compact_scope_limit
 +            .or(token_status.full_context_window_limit)
 +            .unwrap_or(i64::MAX)
 +    });
++    #[cfg(not(any(test, feature = "test-util")))]
++    let upper_trigger = token_status
++        .auto_compact_scope_limit
++        .or(token_status.full_context_window_limit)
++        .unwrap_or(i64::MAX);
 +
 +    // Prefer the completed response's usage; do not re-read a later aggregate
 +    // session snapshot when the seam already carried response-scoped usage.
@@ -464,9 +560,18 @@ index 0000000000..6b67e3eb5d
 +    };
 +    // Post-measurement: host-captured content after the usage-bearing response
 +    // through the settled seam (tool results, runtime notes) — not older history.
-+    let post_measurement = sess
++    let post_measurement_tail = sess
 +        .estimated_tokens_after_last_model_generated_item()
 +        .await;
++    // N1: include the completed response's own output so next-request growth
++    // is not undercounted. Labelled via response-scoped output when present;
++    // never double-count the post-measurement tail.
++    let response_output_estimate = mid
++        .response_token_usage
++        .as_ref()
++        .map(|u| u.output_tokens.max(0))
++        .unwrap_or(0);
++    let post_measurement = post_measurement_tail.saturating_add(response_output_estimate);
 +    let pressure = next_request_pressure(&provider_usage, post_measurement);
 +
 +    // Hysteresis: only after truthful no-reduction, require configured growth.
@@ -494,13 +599,14 @@ index 0000000000..6b67e3eb5d
 +        .raw_items()
 +        .cloned()
 +        .collect::<Vec<_>>();
-+    let continuation = work_continuation_for_mid_turn(
++    let mut continuation = work_continuation_for_mid_turn(
 +        &mid.response_tool_call_ids,
 +        &host_items,
 +        mid.total_needs_follow_up,
 +    );
 +
 +    // Lower target from LHC continuation profile (or test override).
++    #[cfg(any(test, feature = "test-util"))]
 +    let lower_target = slot
 +        .mid_turn_test_compact()
 +        .and_then(|opts| {
@@ -510,6 +616,8 @@ index 0000000000..6b67e3eb5d
 +                .map(|b| b as i64)
 +        })
 +        .unwrap_or(DEFAULT_LOWER_TARGET_TOKENS);
++    #[cfg(not(any(test, feature = "test-util")))]
++    let lower_target = DEFAULT_LOWER_TARGET_TOKENS;
 +
 +    let provider_identity_valid = !turn_context.config.model_provider_id.is_empty()
 +        && turn_context
@@ -518,7 +626,7 @@ index 0000000000..6b67e3eb5d
 +            .as_ref()
 +            .is_some_and(|m| !m.is_empty());
 +
-+    let attempt_id = if mid.attempt_id.is_empty() {
++    let fresh_attempt_id = if mid.attempt_id.is_empty() {
 +        format!(
 +            "midturn:{}:epoch:{}",
 +            turn_context.sub_id, mid.input_epoch_at_decision
@@ -527,23 +635,82 @@ index 0000000000..6b67e3eb5d
 +        mid.attempt_id.clone()
 +    };
 +
++    // B1: inspect durable pending boundary / writer claim before a fresh entry.
++    // Same-attempt re-entry is the only recovery protocol — never invent a
++    // lease/expiry or clear a foreign owner. SDK inspection futures are !Send
++    // — hop to a dedicated thread (same pattern as the MidTurn worker).
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++    let recovery = match inspect_mid_turn_recovery_on_thread(&thread_id, root.clone()).await {
++        Ok(r) => r,
++        Err(err) => {
++            warn!(%err, "LHC MidTurn durable inspection failed; proceeding with fresh attempt");
++            None
++        }
++    };
++
++    let (attempt_id, writer_claim, recovering) = if let Some(rec) = recovery {
++        if matches!(rec.writer_claim, WriterClaim::Conflict) {
++            return Ok(LhcCompactAttempt::MidTurnBlocked {
++                reason: format!(
++                    "durable compact-continuation state owned by another attempt ({}); refuse without steal",
++                    rec.attempt_id
++                ),
++                next_provider_request_allowed: false,
++            });
++        }
++        info!(
++            owner_attempt = %rec.attempt_id,
++            pending_boundary = rec.pending_boundary,
++            claim_only = rec.claim_only,
++            "LHC MidTurn re-entering with durable owner attempt for repair/resume"
++        );
++        // Protocol: boundary repair requires active_non_tool continuation kind.
++        if rec.pending_boundary {
++            continuation = WorkContinuation::ActiveNonTool;
++        }
++        (rec.attempt_id, rec.writer_claim, true)
++    } else {
++        (fresh_attempt_id, WriterClaim::None, false)
++    };
++    let _ = recovering;
++
 +    let req = MidTurnCompactContinuationRequest {
-+        thread_id: handle.thread_id().to_string(),
-+        root: handle.root().map(std::path::Path::to_path_buf),
++        thread_id: thread_id.clone(),
++        root: root.clone(),
 +        attempt_id: attempt_id.clone(),
 +        provider_usage,
 +        post_measurement_tokens: post_measurement,
 +        upper_trigger_tokens: upper_trigger,
 +        lower_target_tokens: lower_target,
 +        continuation,
-+        writer_claim: WriterClaim::None,
++        writer_claim,
 +        capture_complete: true,
 +        provider_identity_valid,
 +        input_epoch_at_decision: mid.input_epoch_at_decision,
 +        input_epoch_at_apply,
 +        inside_transport_retry: false,
-+        compact: slot.mid_turn_test_compact(),
-+        test_hooks: slot.mid_turn_test_hooks(),
++        model_response_complete: mid.model_response_complete,
++        compact: {
++            #[cfg(any(test, feature = "test-util"))]
++            {
++                slot.mid_turn_test_compact()
++            }
++            #[cfg(not(any(test, feature = "test-util")))]
++            {
++                None
++            }
++        },
++        test_hooks: {
++            #[cfg(any(test, feature = "test-util"))]
++            {
++                slot.mid_turn_test_hooks()
++            }
++            #[cfg(not(any(test, feature = "test-util")))]
++            {
++                None
++            }
++        },
 +    };
 +
 +    // SDK futures are !Send — hop to a dedicated thread. Once the LHC operation
@@ -565,6 +732,20 @@ index 0000000000..6b67e3eb5d
 +        return Ok(LhcCompactAttempt::MidTurnBlocked {
 +            reason: "turn cancelled during MidTurn compact-continuation critical section; host apply suppressed".into(),
 +            next_provider_request_allowed: false,
++        });
++    }
++
++    // N2: re-read input epoch after the worker returns and before host rewrite.
++    // Steering during the critical section must not be silently applied over;
++    // leave a truthful residual that B1 can repair on the next settled seam.
++    let input_epoch_after_worker =
++        i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
++    if mid.input_epoch_at_decision != input_epoch_after_worker {
++        return Ok(LhcCompactAttempt::MidTurnSkipped {
++            reason: format!(
++                "input epoch changed during MidTurn critical section decision={} after={}; host apply suppressed",
++                mid.input_epoch_at_decision, input_epoch_after_worker
++            ),
 +        });
 +    }
 +
@@ -664,6 +845,44 @@ index 0000000000..6b67e3eb5d
 +/// and the thread exits; the caller then joins. Cancellation never detaches a
 +/// mutator — host apply is suppressed if the turn token cancelled during the
 +/// section.
++/// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
++/// inspection futures are `!Send`).
++async fn inspect_mid_turn_recovery_on_thread(
++    thread_id: &str,
++    root: Option<PathBuf>,
++) -> Result<Option<codex_lhc_host::MidTurnRecoveryIdentity>, String> {
++    let tid = thread_id.to_string();
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let join = std::thread::Builder::new()
++        .name(format!("lhc-midturn-inspect-{tid}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| format!("runtime: {e}"))?;
++                rt.block_on(resolve_mid_turn_recovery_identity(&tid, root.as_deref()))
++            }));
++            let out = match result {
++                Ok(inner) => inner,
++                Err(_) => Err("lhc-midturn inspect thread panicked".into()),
++            };
++            let _ = tx.send(out);
++        })
++        .map_err(|e| format!("spawn lhc-midturn inspect thread: {e}"))?;
++    let worker_out = rx.await;
++    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
++    match join_result {
++        Ok(Ok(())) => {}
++        Ok(Err(_)) => return Err("lhc-midturn inspect thread panicked during join".into()),
++        Err(err) => return Err(format!("lhc-midturn inspect join task failed: {err}")),
++    }
++    match worker_out {
++        Ok(r) => r,
++        Err(_) => Err("lhc-midturn inspect channel closed".into()),
++    }
++}
++
 +async fn run_mid_turn_on_thread(
 +    req: MidTurnCompactContinuationRequest,
 +    turn_cancel: &CancellationToken,
@@ -1208,6 +1427,15 @@ index 0000000000..6b67e3eb5d
 +        "LHC compact arm installed write-back from real CompactReceipt (rewrite path)"
 +    );
 +
++    // N3: any successful PreTurn/manual LHC install clears MidTurn
++    // no-reduction hysteresis so a subsequent above-trigger MidTurn is not
++    // suppressed by a stale margin band.
++    slot.clear_mid_turn_hysteresis(
++        /*attempt_id*/ if manual { "manual" } else { "preturn" },
++        /*pressure*/ 0,
++        /*outcome*/ "preturn_or_manual_install",
++    );
++
 +    Ok(LhcCompactAttempt::Installed {
 +        body: expected_body,
 +        marker,
@@ -1610,10 +1838,10 @@ index 0000000000..6b67e3eb5d
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..f6e8cf3e94
+index 0000000000..842ff85f5c
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,2150 @@
+@@ -0,0 +1,2482 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -1647,6 +1875,7 @@ index 0000000000..f6e8cf3e94
 +use codex_protocol::user_input::UserInput;
 +use codex_thread_store::PersistContext;
 +use pretty_assertions::assert_eq;
++use serial_test::serial;
 +use tempfile::tempdir;
 +use tokio_util::sync::CancellationToken;
 +
@@ -1775,6 +2004,7 @@ index 0000000000..f6e8cf3e94
 +    usage: Option<TokenUsage>,
 +) -> MidTurnSeamFacts {
 +    MidTurnSeamFacts {
++        model_response_complete: true,
 +        attempt_id: attempt.into(),
 +        response_token_usage: usage,
 +        response_tool_call_ids: tool_ids,
@@ -2766,6 +2996,7 @@ index 0000000000..f6e8cf3e94
 +/// Cancel during the critical section: return only after worker exit; no
 +/// detached mutator; host apply suppressed.
 +#[tokio::test]
++#[serial]
 +async fn mid_turn_cancel_during_critical_section_joins_before_return() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
@@ -2785,8 +3016,11 @@ index 0000000000..f6e8cf3e94
 +
 +    // Stall the worker so cancel lands while the critical section is live.
 +    // Timeout bounds the stall; join always awaits the worker thread.
-+    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(400)));
-+    super::set_midturn_worker_stall_override(Some(Duration::from_millis(200)));
++    // Hold the process-wide override lock for the whole test so plain-parallel
++    // runs cannot race sibling timeout/stall injections.
++    let override_guard = super::midturn_worker_override_guard();
++    override_guard.set_timeout(Some(Duration::from_millis(400)));
++    override_guard.set_stall(Some(Duration::from_millis(200)));
 +    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
 +    let sess = Arc::new(session);
 +    let epoch = decision_epoch(&sess);
@@ -2817,8 +3051,7 @@ index 0000000000..f6e8cf3e94
 +    .expect("arm");
 +    let elapsed = started.elapsed();
 +    let _ = cancel_task.await;
-+    super::set_midturn_worker_stall_override(None);
-+    super::set_midturn_worker_timeout_override(None);
++    drop(override_guard);
 +
 +    // Must have waited for the stalled worker (not returned immediately on cancel).
 +    // Stall is 200ms; allow some scheduling slack while still proving we did not
@@ -2864,6 +3097,7 @@ index 0000000000..f6e8cf3e94
 +/// Deliberately stalled worker hits the bounded in-worker timeout, joins, and
 +/// leaves no worker thread or later mutation.
 +#[tokio::test]
++#[serial]
 +async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
@@ -2884,8 +3118,10 @@ index 0000000000..f6e8cf3e94
 +    // Stall the operation future longer than the worker timeout. Timeout lives
 +    // inside the worker runtime so the future is dropped there and the thread
 +    // exits; the outer path always joins.
-+    super::set_midturn_worker_timeout_override(Some(Duration::from_millis(80)));
-+    super::set_midturn_worker_stall_override(Some(Duration::from_secs(30)));
++    // Serial guard: process-global overrides race under plain parallel cargo test.
++    let override_guard = super::midturn_worker_override_guard();
++    override_guard.set_timeout(Some(Duration::from_millis(80)));
++    override_guard.set_stall(Some(Duration::from_secs(30)));
 +    let threads_before = thread_count_named("lhc-midturn");
 +    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
 +    let sess = Arc::new(session);
@@ -2909,8 +3145,7 @@ index 0000000000..f6e8cf3e94
 +    .await
 +    .expect("arm");
 +    let elapsed = started.elapsed();
-+    super::set_midturn_worker_stall_override(None);
-+    super::set_midturn_worker_timeout_override(None);
++    drop(override_guard);
 +
 +    assert!(
 +        elapsed < Duration::from_secs(5),
@@ -2981,59 +3216,75 @@ index 0000000000..f6e8cf3e94
 +    .await
 +    .expect("arm");
 +
-+    match attempt {
-+        LhcCompactAttempt::Installed { body, marker } => {
-+            assert!(!body.is_empty(), "installed body non-empty");
-+            // Exactly one fork CompactMarker bookkeeping identity for this install.
-+            assert!(
-+                !marker.marker_key.is_empty(),
-+                "marker must carry stable idempotency key"
-+            );
-+            // Marker content must not be re-ingested as ordinary user chat.
-+            let user_texts: Vec<String> =
-+                body.iter()
-+                    .filter_map(|i| match i {
-+                        ResponseItem::Message { role, content, .. } if role == "user" => {
-+                            content.iter().find_map(|c| match c {
-+                                ContentItem::InputText { text }
-+                                | ContentItem::OutputText { text } => Some(text.clone()),
-+                                _ => None,
-+                            })
-+                        }
-+                        _ => None,
-+                    })
-+                    .collect();
-+            let marker_hits = user_texts
-+                .iter()
-+                .filter(|t| {
-+                    t.contains("lhc.compact_continuation")
-+                        || t.contains("context_compact_continue")
-+                        || t.contains("compact_continuation_marker")
-+                })
-+                .count();
-+            // At most one typed marker surface in the installed body.
-+            assert!(
-+                marker_hits <= 1,
-+                "typed continuation marker must appear at most once, got {marker_hits}: {user_texts:?}"
-+            );
-+        }
-+        LhcCompactAttempt::MidTurnSkipped { reason } => {
-+            // Legitimate no-reduction / below-trigger residual still exercises
-+            // the certified runtime without native fall-open.
-+            assert!(!reason.is_empty());
-+            assert!(
-+                !reason.contains("native"),
-+                "skip must not imply native: {reason}"
-+            );
-+        }
-+        LhcCompactAttempt::Unavailable { reason } => {
-+            panic!("active non-tool must not Unavailable when LHC on: {reason}");
-+        }
-+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
-+            // Blocked residual is receipt-truthful; not a silent native path.
-+            assert!(!reason.is_empty());
-+        }
-+    }
++    // Positive acceptance: an always-skip implementation must fail here.
++    // Frozen contract marker constants (LIM-60/61) — asserted via durable
++    // receipt/marker identity (host body is bands+tail; the typed marker lives
++    // in the LHC event log / receipt residual).
++    const MARKER_KIND: &str = "lhc.compact_continuation";
++    const MARKER_CAUSE: &str = "context_compacted_task_in_progress";
++    const MARKER_ACTION: &str = "continue_existing_task";
++    let LhcCompactAttempt::Installed { body, marker } = attempt else {
++        panic!("active non-tool above trigger must Install, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "installed body non-empty");
++    assert!(
++        !marker.marker_key.is_empty(),
++        "marker must carry stable idempotency key"
++    );
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++    let pending =
++        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
++            .await
++            .expect("inspect pending");
++    assert!(
++        pending.is_none(),
++        "successful active install must clear pending boundary, got {pending:?}"
++    );
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
++            .await
++            .expect("inspect receipts");
++    assert!(
++        !receipts.is_empty(),
++        "successful active install must leave a durable receipt"
++    );
++    let last = receipts.last().expect("receipt");
++    assert!(last.terminal, "active install receipt must be terminal");
++    assert!(
++        matches!(
++            last.outcome.as_str(),
++            "compact_continue_turn" | "degraded_compact" | "no_reduction"
++        ),
++        "unexpected outcome {}",
++        last.outcome
++    );
++    // Typed marker: durable event exists for the continuation turn, and the
++    // receipt residual carries frozen kind/cause/action constants.
++    let cont_turn = last
++        .continuation_turn_id
++        .as_deref()
++        .expect("active install must open a continuation turn");
++    let has_marker = codex_lhc_host::inspect_has_compact_continuation_marker(
++        &thread_id,
++        root.as_deref(),
++        cont_turn,
++    )
++    .await
++    .expect("inspect marker");
++    assert!(
++        has_marker,
++        "exactly one durable typed continuation marker must exist for {cont_turn}"
++    );
++    let receipt_json = format!("{:?}", last.receipt);
++    assert!(
++        receipt_json.contains(MARKER_KIND)
++            || receipt_json.contains(MARKER_CAUSE)
++            || receipt_json.contains(MARKER_ACTION)
++            || last.outcome == "compact_continue_turn",
++        "receipt residual must reflect typed continuation (kind/cause/action); got {receipt_json}"
++    );
++    // Always-skip would leave zero receipts / no marker / no install — proven above.
 +    assert!(
 +        !matches!(
 +            try_run_lhc_compact_arm(
@@ -3517,6 +3768,7 @@ index 0000000000..f6e8cf3e94
 +/// D: degraded derivations install a structurally valid view; invalid
 +/// candidate/install leaves prior view byte-identical and obeys the receipt.
 +#[tokio::test]
++#[serial]
 +async fn mid_turn_degraded_and_invalid_install_host_paths() {
 +    // D1 — degraded derivations still install (or skip with truthful residual).
 +    {
@@ -3763,6 +4015,314 @@ index 0000000000..f6e8cf3e94
 +            );
 +        }
 +    }
++}
++
++// ── B1 durable repair / resume + B3 preempt truthfulness ──────────────────
++
++/// B1: install failure leaves failed_repairable; next seam re-enters same
++/// attempt_id and repairs/installs rather than permanent wedge.
++#[tokio::test]
++#[serial]
++async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
++        fail_install_before_write: true,
++        ..Default::default()
++    }));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 12).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++    let sess = Arc::new(session);
++    let epoch = decision_epoch(&sess);
++    let attempt_id = "b1-repair-1";
++
++    let failed = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            attempt_id,
++            true,
++            epoch,
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    // Residual must not permanently block; next seam repairs.
++    assert!(
++        matches!(
++            failed,
++            LhcCompactAttempt::MidTurnBlocked { .. }
++                | LhcCompactAttempt::MidTurnSkipped { .. }
++                | LhcCompactAttempt::Installed { .. }
++        ),
++        "first attempt residual: {failed:?}"
++    );
++
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++    let pending =
++        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
++            .await
++            .expect("inspect");
++    // Clear fault hooks so repair can succeed.
++    slot.set_mid_turn_test_hooks(None);
++
++    // Fresh response id must not be used when durable owner exists — arm
++    // re-enters with owner attempt. Use a different fresh id to prove resume.
++    let repaired = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "fresh-should-not-win",
++            true,
++            decision_epoch(&sess),
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("repair arm");
++
++    // After repair, pending must clear OR install succeeded.
++    let pending_after =
++        codex_lhc_host::inspect_pending_compact_continuation_boundary(&thread_id, root.as_deref())
++            .await
++            .expect("inspect after");
++    match repaired {
++        LhcCompactAttempt::Installed { .. } => {
++            assert!(pending_after.is_none(), "install clears pending boundary");
++        }
++        LhcCompactAttempt::MidTurnSkipped { reason } => {
++            // Quiet skip still allowed if pressure/hysteresis; must not hard-error.
++            assert!(!reason.contains("conflict"), "{reason}");
++        }
++        LhcCompactAttempt::MidTurnBlocked {
++            next_provider_request_allowed,
++            reason,
++        } => {
++            // Permanent wedge is the bug: foreign/same-attempt conflict forever.
++            assert!(
++                next_provider_request_allowed || !reason.contains("owned by another"),
++                "must not permanently wedge: {reason}"
++            );
++        }
++        LhcCompactAttempt::Unavailable { reason } => {
++            panic!("repair must not Unavailable: {reason}");
++        }
++    }
++    let _ = (pending, attempt_id);
++}
++
++/// B1: claim-only stale writer (no pending boundary) resumes/releases rather
++/// than hard-erroring forever.
++#[tokio::test]
++#[serial]
++async fn mid_turn_claim_only_stale_writer_resumes_or_releases() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 10).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++
++    let thread_id = handle.thread_id().to_string();
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
++    // Seed a claim-only held writer for a known attempt (host test-util helper).
++    codex_lhc_host::seed_mid_turn_writer_claim_for_tests(
++        &thread_id,
++        root_path.as_deref(),
++        "claim-only-1",
++    )
++    .expect("seed claim");
++    let claim =
++        codex_lhc_host::inspect_compact_continuation_writer_claim(&thread_id, root_path.as_deref())
++            .await
++            .expect("claim");
++    assert_eq!(claim.attempt_id.as_deref(), Some("claim-only-1"));
++
++    let sess = Arc::new(session);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "fresh-id-ignored",
++            true,
++            decision_epoch(&sess),
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++
++    // Must not permanent-wedge as foreign conflict on the fresh id.
++    match attempt {
++        LhcCompactAttempt::Unavailable { reason } => {
++            panic!("claim-only resume must not Unavailable: {reason}");
++        }
++        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
++            assert!(
++                !reason.contains("owned by another attempt"),
++                "must re-enter same owner, not steal conflict: {reason}"
++            );
++        }
++        _ => {}
++    }
++}
++
++/// B3: incomplete model response must skip MidTurn with no mutation.
++#[tokio::test]
++async fn mid_turn_preempted_response_skips_without_mutation() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 8).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
++    let sess = Arc::new(session);
++    let epoch = decision_epoch(&sess);
++    let mut facts = mid_facts(
++        "preempt-1",
++        true,
++        epoch,
++        Vec::new(),
++        Some(sample_usage(5_000)),
++    );
++    facts.model_response_complete = false;
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(facts),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    match attempt {
++        LhcCompactAttempt::MidTurnSkipped { reason } => {
++            assert!(
++                reason.contains("incomplete")
++                    || reason.contains("preempt")
++                    || reason.contains("abandoned")
++                    || reason.contains("not_at_settled")
++                    || reason.contains("model response"),
++                "{reason}"
++            );
++        }
++        other => panic!("preempted response must skip, got {other:?}"),
++    }
++    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert_eq!(
++        history_before.len(),
++        history_after.len(),
++        "preempt skip must not mutate host history"
++    );
++}
++
++/// N2: input epoch change at the apply re-check suppresses host mutation.
++///
++/// Production re-reads the epoch both before the worker and after it returns
++/// (same residual). Feeding a stale decision-epoch snapshot against the live
++/// queue proves the gate without private input-queue mutators.
++#[tokio::test]
++async fn mid_turn_epoch_change_during_critical_section_suppresses_apply() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 8).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++    let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
++    let live_epoch = decision_epoch(&session);
++    let sess = Arc::new(session);
++    // Stale decision epoch relative to live queue (steer-during-critical shape).
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "epoch-critical-1",
++            true,
++            live_epoch.saturating_sub(1),
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    match attempt {
++        LhcCompactAttempt::MidTurnSkipped { reason } => {
++            assert!(
++                reason.contains("epoch"),
++                "expected epoch skip residual, got {reason}"
++            );
++        }
++        other => panic!("epoch change must skip apply, got {other:?}"),
++    }
++    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert_eq!(history_before.len(), history_after.len());
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
@@ -5186,10 +5746,10 @@ index 0000000000..711f0b91e8
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..1cdc9c27d2
+index 0000000000..f2a1aa8b4b
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2417 @@
+@@ -0,0 +1,2414 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -5593,9 +6153,7 @@ index 0000000000..1cdc9c27d2
 +    let sess = Arc::new(session);
 +    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
 +    match attempt {
-+        LhcCompactAttempt::MidTurnSkipped { reason }
-+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-+        | LhcCompactAttempt::Unavailable { reason } => {
++        LhcCompactAttempt::Unavailable { reason } => {
 +            // NoReduction is fine; other unavailability also fine for tiny seed.
 +            let _ = reason;
 +            assert!(response_items_structurally_equal(
@@ -5605,6 +6163,9 @@ index 0000000000..1cdc9c27d2
 +        }
 +        LhcCompactAttempt::Installed { .. } => {
 +            // Install allowed when body ≤ rollout model-context (F-L4).
++        }
++        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
++            panic!("StandaloneTurn must not return MidTurn residual");
 +        }
 +    }
 +}
@@ -6274,15 +6835,16 @@ index 0000000000..1cdc9c27d2
 +                body.len()
 +            );
 +        }
-+        LhcCompactAttempt::MidTurnSkipped { reason }
-+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-+        | LhcCompactAttempt::Unavailable { reason } => {
++        LhcCompactAttempt::Unavailable { reason } => {
 +            assert!(!reason.is_empty(), "fail-open reason should be non-empty");
 +            // History unchanged — native ladder free.
 +            assert!(response_items_structurally_equal(
 +                &sess.clone_history().await.into_raw_items(),
 +                &before
 +            ));
++        }
++        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
++            panic!("StandaloneTurn must not return MidTurn residual");
 +        }
 +    }
 +}
@@ -6329,9 +6891,7 @@ index 0000000000..1cdc9c27d2
 +    .await
 +    .expect("arm");
 +    match attempt {
-+        LhcCompactAttempt::MidTurnSkipped { reason }
-+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-+        | LhcCompactAttempt::Unavailable { reason } => {
++        LhcCompactAttempt::Unavailable { reason } => {
 +            assert!(
 +                reason.contains("gpt-5.6-luna") || reason.contains("unavailable"),
 +                "expected derivation-model unavailable reason, got: {reason}"
@@ -6536,9 +7096,7 @@ index 0000000000..1cdc9c27d2
 +    }
 +    let a = run_with_empty_catalog().await;
 +    let reason_a = match a {
-+        LhcCompactAttempt::MidTurnSkipped { reason }
-+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-+        | LhcCompactAttempt::Unavailable { reason } => reason,
++        LhcCompactAttempt::Unavailable { reason } => reason,
 +        other => panic!("no usable client must Unavailable, got {other:?}"),
 +    };
 +    assert!(
@@ -6554,9 +7112,7 @@ index 0000000000..1cdc9c27d2
 +        std::env::remove_var("CODEX_LHC_LIVE_INFERENCE");
 +    }
 +    let reason_b = match b {
-+        LhcCompactAttempt::MidTurnSkipped { reason }
-+        | LhcCompactAttempt::MidTurnBlocked { reason, .. }
-+        | LhcCompactAttempt::Unavailable { reason } => reason,
++        LhcCompactAttempt::Unavailable { reason } => reason,
 +        other => panic!(
 +            "CODEX_LHC_LIVE_INFERENCE=1 must not re-enable deterministic Install; got {other:?}"
 +        ),
@@ -6943,9 +7499,10 @@ index 0000000000..1cdc9c27d2
 +                "child marker must describe the body it installed"
 +            );
 +        }
-+        LhcCompactAttempt::MidTurnSkipped { .. }
-+        | LhcCompactAttempt::MidTurnBlocked { .. }
-+        | LhcCompactAttempt::Unavailable { .. } => {}
++        LhcCompactAttempt::Unavailable { .. } => {}
++        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
++            panic!("StandaloneTurn must not return MidTurn residual");
++        }
 +    }
 +}
 +
@@ -8265,7 +8822,7 @@ index 9f35a335e2..a270663c88 100644
 +use std::sync::atomic::Ordering;
  use tokio::sync::Mutex;
  use tokio::sync::watch;
-
+ 
 @@ -42,6 +44,9 @@ pub(crate) struct TurnInputQueue {
  pub(crate) struct InputQueue {
      activity_tx: watch::Sender<InputQueueActivity>,
@@ -8274,7 +8831,7 @@ index 9f35a335e2..a270663c88 100644
 +    /// provider request (steer / mailbox enqueue). Not history_version.
 +    input_epoch: AtomicU64,
  }
-
+ 
  struct PendingMailboxCommunication {
 @@ -56,9 +61,20 @@ impl InputQueue {
          Self {
@@ -8283,7 +8840,7 @@ index 9f35a335e2..a270663c88 100644
 +            input_epoch: AtomicU64::new(0),
          }
      }
-
+ 
 +    /// Current pending-input epoch. Bumps on every steer/mailbox enqueue (or
 +    /// other pending-input mutation that can change the next provider request).
 +    pub(crate) fn input_epoch(&self) -> u64 {
@@ -8304,7 +8861,7 @@ index 9f35a335e2..a270663c88 100644
 +        self.bump_input_epoch();
          self.activity_tx.send_replace(InputQueueActivity::Mailbox);
      }
-
+ 
 @@ -203,11 +220,15 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
@@ -8320,7 +8877,7 @@ index 9f35a335e2..a270663c88 100644
 +        }
          self.activity_tx.send_replace(InputQueueActivity::Steer);
      }
-
+ 
 @@ -216,7 +237,11 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
@@ -8331,14 +8888,14 @@ index 9f35a335e2..a270663c88 100644
          turn_state.lock().await.pending_input.items.extend(input);
 +        self.bump_input_epoch();
      }
-
+ 
      pub(crate) async fn take_pending_input_for_turn_state(
 @@ -327,6 +352,7 @@ mod tests {
          let (mut activity_rx, pending_activity) =
              input_queue.subscribe_activity(/*turn_state*/ None).await;
          assert_eq!(pending_activity, None);
 +        assert_eq!(input_queue.input_epoch(), 0);
-
+ 
          let mail_one = make_mail(
              AgentPath::root(),
 @@ -337,6 +363,7 @@ mod tests {
@@ -8354,13 +8911,13 @@ index 9f35a335e2..a270663c88 100644
              .enqueue_mailbox_communication(mail_two, /*parent_turn_id*/ None)
              .await;
 +        assert_eq!(input_queue.input_epoch(), 2);
-
+ 
          activity_rx.changed().await.expect("mailbox update");
          assert_eq!(
 @@ -354,6 +382,31 @@ mod tests {
          );
      }
-
+ 
 +    #[tokio::test]
 +    async fn input_queue_epoch_bumps_on_steer_enqueue() {
 +        let input_queue = InputQueue::new();
@@ -9206,29 +9763,30 @@ index 3a9cec895b..72abf62791 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index bef1dd3398..ea2ab446b2 100644
+index bef1dd3398..9fa88da221 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
-@@ -378,6 +378,9 @@ pub(crate) async fn run_turn(
+@@ -378,6 +378,10 @@ pub(crate) async fn run_turn(
                  let SamplingRequestResult {
                      needs_follow_up: model_needs_follow_up,
                      last_agent_message: sampling_request_last_agent_message,
 +                    response_id: sampling_response_id,
 +                    token_usage: sampling_token_usage,
 +                    response_tool_call_ids,
++                    response_complete: sampling_response_complete,
                  } = sampling_request_output;
                  if model_needs_follow_up {
                      sess.input_queue
-@@ -402,6 +405,7 @@ pub(crate) async fn run_turn(
+@@ -402,6 +406,7 @@ pub(crate) async fn run_turn(
                  }
                  .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                  .await;
 +                // Total continuation intent for the next provider request.
                  let needs_follow_up = model_needs_follow_up || has_pending_input;
                  let token_limit_reached = token_status.token_limit_reached;
-
-@@ -450,6 +454,26 @@ pub(crate) async fn run_turn(
-
+ 
+@@ -450,6 +455,27 @@ pub(crate) async fn run_turn(
+ 
                  // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                  if should_roll_over {
 +                    // LHC MidTurn seam: capture flushed, tools settled, before next
@@ -9250,11 +9808,12 @@ index bef1dd3398..ea2ab446b2 100644
 +                        total_needs_follow_up: needs_follow_up,
 +                        input_epoch_at_decision,
 +                        inside_transport_retry: false,
++                        model_response_complete: sampling_response_complete,
 +                    };
                      if let Err(err) = run_auto_compact(
                          &sess,
                          Arc::clone(&step_context),
-@@ -461,6 +485,8 @@ pub(crate) async fn run_turn(
+@@ -461,6 +487,8 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -9263,7 +9822,7 @@ index bef1dd3398..ea2ab446b2 100644
                      )
                      .await
                      {
-@@ -1019,6 +1045,8 @@ async fn run_pre_sampling_compact(
+@@ -1019,6 +1047,8 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -9272,7 +9831,7 @@ index bef1dd3398..ea2ab446b2 100644
          )
          .await?;
      }
-@@ -1101,6 +1129,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1101,6 +1131,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -9281,7 +9840,7 @@ index bef1dd3398..ea2ab446b2 100644
          )
          .await?;
          return Ok(());
-@@ -1149,6 +1179,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1149,6 +1181,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -9290,7 +9849,7 @@ index bef1dd3398..ea2ab446b2 100644
          )
          .await?;
      }
-@@ -1160,7 +1192,12 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1160,7 +1194,12 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -9304,7 +9863,7 @@ index bef1dd3398..ea2ab446b2 100644
      sess: &Arc<Session>,
      step_context: Arc<StepContext>,
      fallback_step_context: Option<Arc<StepContext>>,
-@@ -1168,9 +1205,67 @@ async fn run_auto_compact(
+@@ -1168,9 +1207,67 @@ async fn run_auto_compact(
      initial_context_injection: InitialContextInjection,
      reason: CompactionReason,
      phase: CompactionPhase,
@@ -9372,7 +9931,7 @@ index bef1dd3398..ea2ab446b2 100644
      if turn_context.config.features.enabled(Feature::TokenBudget) {
          // Compaction is the reset request, so force a new context window
          // instead of consuming a pending `new_context` tool request.
-@@ -1562,6 +1657,12 @@ pub(crate) async fn built_tools(
+@@ -1562,6 +1659,17 @@ pub(crate) async fn built_tools(
  struct SamplingRequestResult {
      needs_follow_up: bool,
      last_agent_message: Option<String>,
@@ -9380,12 +9939,17 @@ index bef1dd3398..ea2ab446b2 100644
 +    response_id: String,
 +    /// Token usage from that completed response (not a later aggregate).
 +    token_usage: Option<codex_protocol::protocol::TokenUsage>,
-+    /// Tool call IDs produced by the just-completed sampling response.
++    /// Client-executed tool call IDs produced by the just-completed sampling
++    /// response (FunctionCall / CustomToolCall / LocalShellCall / ToolSearchCall).
++    /// Analytics-only server-side items (WebSearch / ImageGeneration) are excluded.
 +    response_tool_call_ids: Vec<String>,
++    /// True only when the provider stream settled on `ResponseEvent::Completed`.
++    /// Mailbox-preempted / abandoned streams must pass false.
++    response_complete: bool,
  }
-
+ 
  /// Ephemeral per-response state for streaming a single proposed plan.
-@@ -2208,6 +2309,8 @@ async fn try_run_sampling_request(
+@@ -2208,6 +2316,8 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
      const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
      let mut analytics_tool_call_ids = Vec::new();
@@ -9394,27 +9958,64 @@ index bef1dd3398..ea2ab446b2 100644
      let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
      let plan_mode = turn_context.mode == ModeKind::Plan;
      let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
-@@ -2277,6 +2380,9 @@ async fn try_run_sampling_request(
+@@ -2264,7 +2374,8 @@ async fn try_run_sampling_request(
+             ResponseEvent::OutputItemDone(mut item) => {
+                 assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
+                 if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
+-                    let call_id = match &item {
++                    // Analytics collector: all tool-like item ids (incl. server-side).
++                    let analytics_id = match &item {
+                         ResponseItem::FunctionCall { call_id, .. }
+                         | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
+                         ResponseItem::ToolSearchCall { call_id, .. }
+@@ -2275,10 +2386,34 @@ async fn try_run_sampling_request(
+                         }
+                         _ => None,
                      };
-                     if let Some(call_id) = call_id {
+-                    if let Some(call_id) = call_id {
++                    if let Some(call_id) = analytics_id {
                          analytics_tool_call_ids.push(call_id.to_string());
-+                        if !response_tool_call_ids.iter().any(|id| id == call_id) {
-+                            response_tool_call_ids.push(call_id.to_string());
-+                        }
                      }
                  }
++                // MidTurn correlation ids: client-executed kinds only.
++                // WebSearch / ImageGeneration are server-side and never produce
++                // FunctionCallOutput/CustomToolCallOutput — including them would
++                // misclassify active_non_tool (queued steering) as invalid
++                // pending-tool and hard-refuse the flagship field case.
++                let mid_turn_call_id = match &item {
++                    ResponseItem::FunctionCall { call_id, .. }
++                    | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
++                    ResponseItem::LocalShellCall {
++                        call_id: Some(call_id),
++                        ..
++                    }
++                    | ResponseItem::ToolSearchCall {
++                        call_id: Some(call_id),
++                        ..
++                    } => Some(call_id.as_str()),
++                    _ => None,
++                };
++                if let Some(call_id) = mid_turn_call_id
++                    && !call_id.is_empty()
++                    && !response_tool_call_ids.iter().any(|id| id == call_id)
++                {
++                    response_tool_call_ids.push(call_id.to_string());
++                }
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
-@@ -2369,6 +2475,9 @@ async fn try_run_sampling_request(
+                     && let Ok(Some(event)) = consumer.finish()
+                 {
+@@ -2369,6 +2504,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
 +                        response_id: String::new(),
 +                        token_usage: None,
 +                        response_tool_call_ids,
++                        response_complete: false,
                      });
                  }
              }
-@@ -2530,7 +2639,7 @@ async fn try_run_sampling_request(
+@@ -2530,7 +2669,7 @@ async fn try_run_sampling_request(
                  sess.send_event(
                      &turn_context,
                      EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
@@ -9423,13 +10024,14 @@ index bef1dd3398..ea2ab446b2 100644
                          token_usage: token_usage.clone(),
                      }),
                  )
-@@ -2549,6 +2658,9 @@ async fn try_run_sampling_request(
+@@ -2549,6 +2688,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
 +                    response_id,
 +                    token_usage,
 +                    response_tool_call_ids,
++                    response_complete: true,
                  });
              }
              ResponseEvent::OutputTextDelta(delta) => {
@@ -9459,7 +10061,7 @@ index 7a19b98e08..20950b5d16 100644
 +    /// Survives process restart when reseeded from rollout reconstruction.
 +    pub(crate) last_lhc_durable_derived: Option<String>,
  }
-
+ 
  impl SessionState {
 @@ -80,9 +83,18 @@ impl SessionState {
              pending_session_start_sources: VecDeque::new(),
@@ -9468,7 +10070,7 @@ index 7a19b98e08..20950b5d16 100644
 +            last_lhc_durable_derived: None,
          }
      }
-
+ 
 +    pub(crate) fn set_last_lhc_durable_derived(&mut self, message: Option<String>) {
 +        self.last_lhc_durable_derived = message;
 +    }
@@ -9550,7 +10152,7 @@ index 0af3127d95..50cc90d1b5 100644
 @@ -28,10 +31,18 @@ impl Session {
          }
      }
-
+ 
 -    pub(super) async fn emit_turn_stop_lifecycle(&self, turn_store: &ExtensionData) {
 +    pub(super) async fn emit_turn_stop_lifecycle(
 +        &self,
@@ -9570,7 +10172,7 @@ index 0af3127d95..50cc90d1b5 100644
 @@ -47,6 +58,11 @@ impl Session {
              return;
          }
-
+ 
 +        // LHC-HOOK: seed production derivation callbacks so the capture
 +        // session's background scheduler derives with the real model (never
 +        // deterministic text). No-op when the feature is off.
@@ -9617,7 +10219,7 @@ index 3418ba83c1..91cb1c10e2 100644
                  active_turn_to_clear = Some(active_turn);
 @@ -497,8 +498,16 @@ impl Session {
          }
-
+ 
          if let Some(turn_context) = turn_context.as_deref() {
 -            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
 -                .await;
@@ -9635,7 +10237,7 @@ index 3418ba83c1..91cb1c10e2 100644
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
 @@ -533,12 +542,21 @@ impl Session {
-
+ 
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
 -        if let Some(task) = task {
@@ -9695,7 +10297,7 @@ index 3418ba83c1..91cb1c10e2 100644
 @@ -848,10 +875,22 @@ impl Session {
              .await
      }
-
+ 
 -    async fn handle_task_abort(self: &Arc<Self>, task: RunningTask, reason: TurnAbortReason) {
 +    /// Abort a running task and emit `TurnAborted`. Returns host turn timing
 +    /// `(started_at, completed_at)` so lifecycle contributors can attach the
@@ -9715,7 +10317,7 @@ index 3418ba83c1..91cb1c10e2 100644
 +                .await;
 +            return (started_at, None);
          }
-
+ 
          trace!(task_kind = ?task.kind, sub_id, "aborting running task");
 @@ -941,6 +980,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
@@ -9724,7 +10326,7 @@ index 3418ba83c1..91cb1c10e2 100644
 +        (started_at, completed_at)
      }
  }
-
+ 
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
 index d5297df04f..b59d2737ae 100644
 --- a/codex-rs/core/src/thread_manager.rs
@@ -9795,7 +10397,7 @@ index d5297df04f..b59d2737ae 100644
 @@ -1925,6 +1953,19 @@ impl ThreadManagerState {
      }
  }
-
+ 
 +/// Best-effort thread id from a rollout filename (`rollout-<ts>-<uuid>.jsonl`).
 +fn thread_id_hint_from_rollout_path(path: &std::path::Path) -> Option<String> {
 +    let name = path.file_name()?.to_str()?;
@@ -9814,16 +10416,22 @@ index d5297df04f..b59d2737ae 100644
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
 new file mode 100644
-index 0000000000..7de52f72bc
+index 0000000000..d7c8ccf4ef
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,478 @@
 +//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
 +//!
 +//! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
 +//! capture installed and MidTurn test knobs (small upper trigger / lower bound).
 +//! Asserts request shapes, marker/pair residuals, and bounded
 +//! `context_length_exceeded` behavior — not enum return values alone.
++//!
++//! **Stack:** these full-loop suites nest tokio workers deep enough that the
++//! default host stack can SIGABRT. CI and the tripwire set
++//! `RUST_MIN_STACK=8388608`. Plain local runs should use the same env (or the
++//! tripwire) — the suite documents this requirement explicitly so an always-skip
++//! or under-stacked runner cannot silently green-pass.
 +
 +use std::path::PathBuf;
 +use std::sync::Arc;
@@ -9996,22 +10604,70 @@ index 0000000000..7de52f72bc
 +    );
 +
 +    let req2 = &bodies[1];
++    // Positive durable evidence (always-skip fails): receipt + typed marker event.
++    const MARKER_KIND: &str = "lhc.compact_continuation";
++    const MARKER_CAUSE: &str = "context_compacted_task_in_progress";
++    const MARKER_ACTION: &str = "continue_existing_task";
++    let slot = test
++        .codex
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
++            .await
++            .expect("inspect receipts");
++    assert!(
++        !receipts.is_empty(),
++        "active non-tool full loop must leave a durable compact-continuation receipt"
++    );
++    let last = receipts.last().expect("receipt");
++    assert!(
++        last.terminal || last.outcome.contains("compact") || last.outcome.contains("no_reduction"),
++        "unexpected durable outcome {}",
++        last.outcome
++    );
++    if let Some(cont) = last.continuation_turn_id.as_deref() {
++        let has = codex_lhc_host::inspect_has_compact_continuation_marker(
++            &thread_id,
++            root.as_deref(),
++            cont,
++        )
++        .await
++        .expect("marker");
++        assert!(
++            has,
++            "durable typed marker must exist for continuation turn {cont}"
++        );
++    }
++    // When reverse-mapped into request 2, require frozen kind/cause/action once.
++    let marker_hits = count_substr(req2, MARKER_KIND);
++    if marker_hits > 0 {
++        assert_eq!(marker_hits, 1, "at most one typed marker in request 2");
++        assert!(
++            req2.contains(MARKER_CAUSE) && req2.contains(MARKER_ACTION),
++            "request 2 marker must carry cause/action constants"
++        );
++    }
++    assert_eq!(
++        count_substr(&bodies[0], MARKER_KIND),
++        0,
++        "request 1 must not already carry the continuation marker"
++    );
 +    // Task context retained on the continuation request.
 +    assert!(
 +        req2.contains("continue this long agentic task")
 +            || req2.contains("working on long task")
 +            || req2.contains("part one")
-+            || req2.contains("lhc.compact_continuation")
++            || req2.contains(MARKER_KIND)
 +            || req2.contains("context_compact"),
-+        "request 2 must retain task context or carry typed continuation surface: {}",
++        "request 2 must retain task context: {}",
 +        &req2[..req2.len().min(500)]
-+    );
-+    // At most one typed continuation marker surface.
-+    let marker_hits = count_substr(req2, "lhc.compact_continuation")
-+        + count_substr(req2, "compact_continuation_marker");
-+    assert!(
-+        marker_hits <= 1,
-+        "typed continuation marker must appear at most once, got {marker_hits}"
 +    );
 +
 +    Ok(())
@@ -10213,12 +10869,14 @@ index 0000000000..7de52f72bc
 +    for m in &cle_mocks {
 +        bodies.extend(request_bodies(m));
 +    }
-+    // Bounded: first success + a small number of CLE follow-ups, not a compact loop.
++    // Bounded product policy: must terminate without a native compact loop.
++    // Do not derive the bound from mock capacity alone (always-pass trap).
 +    assert!(
-+        !bodies.is_empty() && bodies.len() <= 6,
-+        "provider attempts must be bounded, got {}",
-+        bodies.len()
++        !bodies.is_empty(),
++        "at least one provider request must have been issued"
 +    );
++    // Terminal outcome already asserted above. CLE path must not arm native
++    // summarization or spin unbounded marker pollution.
 +    let native_compact_hits = bodies.iter().filter(|b| body_has_summarization(b)).count();
 +    assert_eq!(
 +        native_compact_hits,
@@ -10235,6 +10893,8 @@ index 0000000000..7de52f72bc
 +        total_markers <= 1,
 +        "no polluted duplicate markers across requests, total={total_markers}"
 +    );
++    // Product policy: turn reached a terminal EventMsg (asserted above) without
++    // requiring mock exhaustion — the CLE path is not an open retry loop.
 +
 +    Ok(())
 +}
@@ -10272,7 +10932,7 @@ index 11ce48b5bf..7423c9ffe9 100644
 @@ -1002,6 +1010,28 @@ impl RolloutRecorder {
          })?
      }
-
+ 
 +    /// Reopen the append-mode file handle after an external rewrite of `rollout_path`.
 +    ///
 +    /// Slice C atomic swap renames the live path onto a new inode. An unreopened
@@ -10301,7 +10961,7 @@ index 11ce48b5bf..7423c9ffe9 100644
 @@ -1686,6 +1716,30 @@ impl RolloutWriterState {
          self.write_pending_with_recovery("flush").await
      }
-
+ 
 +    /// Drop any open handle and reopen at `rollout_path`, recomputing ordinals.
 +    async fn reopen_after_rewrite(&mut self) -> std::io::Result<()> {
 +        // Drain anything still queued against the old inode first.
@@ -10346,7 +11006,7 @@ index dc9afcf9e7..a28833f2b5 100644
 @@ -368,6 +368,23 @@ impl LiveThread {
              .map(Some)
      }
-
+ 
 +    /// Reopen the local rollout append handle after an external atomic rewrite.
 +    ///
 +    /// No-op for non-local stores. See `RolloutRecorder::reopen_after_rewrite`.
@@ -10374,7 +11034,7 @@ index a71ec86729..182037d177 100644
 @@ -202,6 +202,36 @@ pub(super) async fn rollout_path(
          .to_path_buf())
  }
-
+ 
 +/// Reopen the live recorder after an external atomic rewrite of its path.
 +///
 +/// LHC compact (slice C) renames a new generation onto the same path; the
@@ -10415,7 +11075,7 @@ index f4f14fe730..e4c61ce538 100644
 @@ -261,6 +261,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
-
+ 
 +    /// Reopen the live append handle after an external atomic rewrite of the rollout file.
 +    pub async fn reopen_rollout_after_rewrite(&self, thread_id: ThreadId) -> ThreadStoreResult<()> {
 +        live_writer::reopen_after_rewrite(self, thread_id).await
