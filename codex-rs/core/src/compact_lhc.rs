@@ -577,12 +577,24 @@ async fn try_run_mid_turn_compact_continuation(
     let recovery = match inspect_mid_turn_recovery_on_thread(&thread_id, root.clone()).await {
         Ok(r) => r,
         Err(err) => {
+            // Inspection failure must not clear durable state. Proceeding fresh
+            // is safe only when there is no held owner (runtime CAS refuses
+            // steal). When claim-only identity cannot be loaded, the resolver
+            // returns Err — do not re-enter with a live seam that permanent-
+            // wedges; surface as blocked without mutation.
+            if err.contains("claim-only") || err.contains("attempt intent") {
+                warn!(%err, "LHC MidTurn recovery identity inspect failed; refuse without clear");
+                return Ok(LhcCompactAttempt::MidTurnBlocked {
+                    reason: format!("durable recovery identity inspect failed: {err}"),
+                    next_provider_request_allowed: false,
+                });
+            }
             warn!(%err, "LHC MidTurn durable inspection failed; proceeding with fresh attempt");
             None
         }
     };
 
-    let (attempt_id, writer_claim, recovering) = if let Some(rec) = recovery {
+    let (attempt_id, writer_claim, stored_operation_identity) = if let Some(rec) = recovery {
         if matches!(rec.writer_claim, WriterClaim::Conflict) {
             return Ok(LhcCompactAttempt::MidTurnBlocked {
                 reason: format!(
@@ -599,14 +611,25 @@ async fn try_run_mid_turn_compact_continuation(
             "LHC MidTurn re-entering with durable owner attempt for repair/resume"
         );
         // Protocol: boundary repair requires active_non_tool continuation kind.
+        // Claim-only: build_host_facts prefers stored continuation/toolCallId.
         if rec.pending_boundary {
             continuation = WorkContinuation::ActiveNonTool;
+        } else if let Some(id) = rec.stored_identity.as_ref() {
+            // Re-enter with stored continuation kind + toolCallId (preserve-path).
+            continuation = match &id.continuation {
+                WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
+                    WorkContinuation::PendingCorrelatedToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        correlation_valid: true,
+                    }
+                }
+                other => other.clone(),
+            };
         }
-        (rec.attempt_id, rec.writer_claim, true)
+        (rec.attempt_id, rec.writer_claim, rec.stored_identity)
     } else {
-        (fresh_attempt_id, WriterClaim::None, false)
+        (fresh_attempt_id, WriterClaim::None, None)
     };
-    let _ = recovering;
 
     let req = MidTurnCompactContinuationRequest {
         thread_id: thread_id.clone(),
@@ -634,6 +657,7 @@ async fn try_run_mid_turn_compact_continuation(
                 None
             }
         },
+        stored_operation_identity,
         test_hooks: {
             #[cfg(any(test, feature = "test-util"))]
             {

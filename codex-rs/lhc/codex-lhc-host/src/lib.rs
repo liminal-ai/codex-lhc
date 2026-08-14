@@ -60,6 +60,7 @@ pub use compact_continuation::MidTurnRecoveryIdentity;
 pub use compact_continuation::MidTurnTestHooks;
 pub use compact_continuation::POST_MEASUREMENT_SOURCE;
 pub use compact_continuation::build_host_facts;
+pub use compact_continuation::inspect_compact_continuation_attempt_intent;
 pub use compact_continuation::inspect_compact_continuation_receipts;
 pub use compact_continuation::inspect_compact_continuation_writer_claim;
 pub use compact_continuation::inspect_has_compact_continuation_marker;

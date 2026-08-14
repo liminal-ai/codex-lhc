@@ -802,6 +802,7 @@ async fn mid_turn_run_auto_compact_one_writer_no_native_arms() {
         .set_feature_for_test(Feature::LhcCapture, true)
         .expect("enable");
     // No LhcCaptureSlot installed → MidTurnBlocked residual.
+    let history_before = session.clone_history().await.raw_items().count();
     let sess = Arc::new(session);
     let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
     let mut client = inert_model_client_session();
@@ -823,12 +824,9 @@ async fn mid_turn_run_auto_compact_one_writer_no_native_arms() {
         &CancellationToken::new(),
     )
     .await;
-    // next_provider_request_allowed is true for missing slot (incomplete facts)
-    // → Ok continue without native; or false → Err. Either way no native mutation.
+    // Missing slot → blocked residual. Ok continue (no native) or Err refuse.
     match result {
-        Ok(()) => {
-            // Continue without native — history unchanged shape check via no panic.
-        }
+        Ok(()) => {}
         Err(err) => {
             let msg = err.to_string();
             assert!(
@@ -837,6 +835,12 @@ async fn mid_turn_run_auto_compact_one_writer_no_native_arms() {
             );
         }
     }
+    // No native writer mutation of host history.
+    assert_eq!(
+        sess.clone_history().await.raw_items().count(),
+        history_before,
+        "one-writer MidTurn residual must not mutate host history via native arms"
+    );
 }
 
 /// Capture lag then recovery: incomplete handle → skip; after flush readiness,
@@ -1060,6 +1064,7 @@ async fn mid_turn_simultaneous_native_writer_conflict_fixture() {
     session
         .set_feature_for_test(Feature::LhcCapture, true)
         .expect("enable");
+    let history_before = session.clone_history().await.raw_items().count();
     let sess = Arc::new(session);
     let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
     let mut client = inert_model_client_session();
@@ -1084,6 +1089,11 @@ async fn mid_turn_simultaneous_native_writer_conflict_fixture() {
     .await;
     // Inert client never dialed (no panic / hang). Native arms must not run.
     let _ = err_or_ok;
+    assert_eq!(
+        sess.clone_history().await.raw_items().count(),
+        history_before,
+        "native writer conflict fixture must not mutate history"
+    );
 }
 
 #[test]
@@ -1415,6 +1425,21 @@ async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
         "unexpected outcome {}",
         last.outcome
     );
+    // NB4: product-path useful-reduction with compactable closed history.
+    // Host derives reduced=true for compact_continue_turn / degraded_compact
+    // installs (codex_lhc_host MidTurnCompactContinuationOutcome). Require a
+    // non-vacuous reduce outcome rather than no_reduction so always-skip or
+    // no-reduction regressions fail here.
+    assert!(
+        matches!(
+            last.outcome.as_str(),
+            "compact_continue_turn" | "degraded_compact"
+        ),
+        "installed active non-tool with compactable history must usefully reduce \
+         (host reduced==true path); got outcome={}",
+        last.outcome
+    );
+    assert!(!body.is_empty(), "useful-reduction install leaves a serving body");
     // Typed marker: durable event exists for the continuation turn, and the
     // receipt residual carries frozen kind/cause/action constants.
     let cont_turn = last
@@ -2291,11 +2316,13 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
     let _ = (pending, attempt_id);
 }
 
-/// B1: claim-only stale writer (no pending boundary) resumes/releases rather
-/// than hard-erroring forever.
+/// B1 / DR1: claim-only crash after preserve-path intent+claim leaves a real
+/// residual (intent row + held writer, no pending boundary). Live seam cannot
+/// recreate the response-scoped toolCallId; recovery loads stored identity and
+/// re-enters without attempt_conflict.
 #[tokio::test]
 #[serial]
-async fn mid_turn_claim_only_stale_writer_resumes_or_releases() {
+async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -2306,37 +2333,168 @@ async fn mid_turn_claim_only_stale_writer_resumes_or_releases() {
         .get::<LhcCaptureSlot>()
         .expect("slot");
     slot.set_mid_turn_test_upper_trigger(Some(100));
+    // Crash window: after claim/intent, fail at finalize release.
+    slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+        fail_finalize_at_release: true,
+        ..Default::default()
+    }));
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("handle");
-    seed_turns(&session, &tc, 10).await;
+    seed_turns(&session, &tc, 12).await;
+
+    // Preserve-path shape: response-scoped tool pair that MidTurn classifies as
+    // pending_correlated_tool_result { toolCallId: call-crash-X }.
+    let tool_x = "call-crash-X";
+    let pairs = [
+        ResponseItem::FunctionCall {
+            id: Some(codex_protocol::ResponseItemId::from_server(
+                "fc-crash-x".into(),
+            )),
+            name: "shell".into(),
+            namespace: None,
+            arguments: r#"{"cmd":"echo x"}"#.into(),
+            encrypted_function_args: None,
+            call_id: tool_x.into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: tool_x.into(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("x-out".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    session
+        .record_conversation_items_with_provenance(
+            &tc,
+            &pairs,
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
     inject_response_usage(&session, &tc, 5_000).await;
     handle.flush().await;
 
-    let thread_id = handle.thread_id().to_string();
-    let root_path = handle.root().map(std::path::Path::to_path_buf);
-    // Seed a claim-only held writer for a known attempt (host test-util helper).
-    codex_lhc_host::seed_mid_turn_writer_claim_for_tests(
-        &thread_id,
-        root_path.as_deref(),
-        "claim-only-1",
-    )
-    .expect("seed claim");
-    let claim =
-        codex_lhc_host::inspect_compact_continuation_writer_claim(&thread_id, root_path.as_deref())
-            .await
-            .expect("claim");
-    assert_eq!(claim.attempt_id.as_deref(), Some("claim-only-1"));
-
     let sess = Arc::new(session);
-    let attempt = try_run_lhc_compact_arm(
+    let epoch = decision_epoch(&sess);
+    let crash_attempt_id = "preserve-claim-only-crash";
+    let crashed = try_run_lhc_compact_arm(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
         /*manual*/ false,
         CompactionPhase::MidTurn,
         Some(mid_facts(
-            "fresh-id-ignored",
+            crash_attempt_id,
+            true,
+            epoch,
+            vec![tool_x.into()],
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("crash arm");
+    // Must leave residual, not succeed-and-release.
+    assert!(
+        matches!(
+            crashed,
+            LhcCompactAttempt::MidTurnBlocked { .. } | LhcCompactAttempt::MidTurnSkipped { .. }
+        ),
+        "finalize-at-release fault must leave residual, got {crashed:?}"
+    );
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+    let claim =
+        codex_lhc_host::inspect_compact_continuation_writer_claim(&thread_id, root_path.as_deref())
+            .await
+            .expect("claim");
+    assert_eq!(
+        claim.attempt_id.as_deref(),
+        Some(crash_attempt_id),
+        "claim-only residual must hold writer for owner attempt"
+    );
+    let pending = codex_lhc_host::inspect_pending_compact_continuation_boundary(
+        &thread_id,
+        root_path.as_deref(),
+    )
+    .await
+    .expect("pending");
+    // Preserve path typically has no continue-turn boundary; claim-only shape.
+    let _ = pending;
+    let identity = codex_lhc_host::inspect_compact_continuation_attempt_intent(
+        &thread_id,
+        root_path.as_deref(),
+        crash_attempt_id,
+    )
+    .await
+    .expect("inspect identity")
+    .expect("intent row must exist after claim");
+    match &identity.continuation {
+        WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
+            assert_eq!(tool_call_id, tool_x);
+        }
+        other => panic!("stored identity must be preserve-path, got {other:?}"),
+    }
+
+    // Clear fault hook; next live seam has different continuation (no tool X).
+    slot.set_mid_turn_test_hooks(None);
+    let repaired = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "live-seam-no-X",
+            true,
+            decision_epoch(&sess),
+            Vec::new(), // live ActiveNonTool — different kind
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("repair arm");
+
+    match repaired {
+        LhcCompactAttempt::Unavailable { reason } => {
+            panic!("claim-only preserve recovery must not Unavailable: {reason}");
+        }
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            assert!(
+                !reason.contains("attempt_conflict")
+                    && !reason.contains("different operation identity")
+                    && !reason.contains("owned by another"),
+                "must not permanent-wedge on identity conflict: {reason}"
+            );
+        }
+        LhcCompactAttempt::Installed { .. } | LhcCompactAttempt::MidTurnSkipped { .. } => {}
+    }
+
+    let claim_after =
+        codex_lhc_host::inspect_compact_continuation_writer_claim(&thread_id, root_path.as_deref())
+            .await
+            .expect("claim after");
+    // Owner released or still same owner repairing — never foreign steal.
+    if let Some(owner) = claim_after.attempt_id.as_deref() {
+        assert_eq!(owner, crash_attempt_id);
+    }
+
+    // Later fresh seam uses a fresh attempt id normally (no permanent wedge).
+    slot.set_mid_turn_test_hooks(None);
+    let fresh = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "fresh-after-claim-only",
             true,
             decision_epoch(&sess),
             Vec::new(),
@@ -2345,21 +2503,11 @@ async fn mid_turn_claim_only_stale_writer_resumes_or_releases() {
         &CancellationToken::new(),
     )
     .await
-    .expect("arm");
-
-    // Must not permanent-wedge as foreign conflict on the fresh id.
-    match attempt {
-        LhcCompactAttempt::Unavailable { reason } => {
-            panic!("claim-only resume must not Unavailable: {reason}");
-        }
-        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
-            assert!(
-                !reason.contains("owned by another attempt"),
-                "must re-enter same owner, not steal conflict: {reason}"
-            );
-        }
-        _ => {}
-    }
+    .expect("fresh arm");
+    assert!(
+        !matches!(fresh, LhcCompactAttempt::Unavailable { .. }),
+        "fresh seam after recovery must not native-fall-open: {fresh:?}"
+    );
 }
 
 /// B3: incomplete model response must skip MidTurn with no mutation.

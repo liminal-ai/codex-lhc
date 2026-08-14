@@ -287,6 +287,11 @@ pub struct MidTurnCompactContinuationRequest {
     pub model_response_complete: bool,
     /// Optional compact profile override (tests use small lower bounds).
     pub compact: Option<HostCompactOpts>,
+    /// When re-entering a durable owner attempt, supply the stored immutable
+    /// operation identity so policy/compact/actor/harness/continuation hash
+    /// matches. Mutable posture (seam, usage, estimate, capture, writer claim
+    /// host assertion) still comes from the live request fields above.
+    pub stored_operation_identity: Option<lhc::compact_continuation::StoredOperationIdentity>,
     /// Test-only fault injection for MidTurn host residual paths (degraded /
     /// invalid install). Production always leaves this `None`. The match arm
     /// that routes to SDK `test_support` is compiled only under
@@ -311,6 +316,9 @@ pub struct MidTurnTestHooks {
     pub fail_candidate_assembly: bool,
     /// Fail install before the write commits.
     pub fail_install_before_write: bool,
+    /// Fail finalize at writer release (claim held, intent present, no release).
+    /// Representative claim-only crash window for recovery evidence.
+    pub fail_finalize_at_release: bool,
 }
 
 /// Host-facing result of one MidTurn attempt.
@@ -341,7 +349,66 @@ pub fn thread_sqlite_path(thread_id: &str, root: Option<&Path>) -> Option<PathBu
 }
 
 /// Build validated host facts for the certified runtime.
+///
+/// When `stored_operation_identity` is present (same-attempt recovery), immutable
+/// fields are taken from storage so the intent hash matches; mutable posture
+/// (seam, usage, estimate, capture, writer claim, correlationValid) stays live.
+///
+/// Continuation: use `req.continuation` when the caller already forced
+/// `ActiveNonTool` for pending-boundary repair (stored boundary identity is
+/// always `active_non_tool`). Otherwise prefer the stored continuation so
+/// claim-only preserve-path re-entry keeps the response-scoped toolCallId.
 pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactContinuationHostFacts {
+    let (policy, actor, harness, compact, continuation) =
+        if let Some(id) = req.stored_operation_identity.as_ref() {
+            let stored_continuation = match &id.continuation {
+                WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
+                    // correlationValid is posture — rebuild true for recovery;
+                    // runtime re-proves the pair.
+                    WorkContinuation::PendingCorrelatedToolResult {
+                        tool_call_id: tool_call_id.clone(),
+                        correlation_valid: true,
+                    }
+                }
+                other => other.clone(),
+            };
+            let continuation = if matches!(req.continuation, WorkContinuation::ActiveNonTool)
+                && matches!(id.continuation, WorkContinuation::ActiveNonTool)
+            {
+                // Boundary repair: request already forced ActiveNonTool and
+                // stored identity agrees.
+                req.continuation.clone()
+            } else if matches!(req.continuation, WorkContinuation::ActiveNonTool)
+                && !matches!(id.continuation, WorkContinuation::ActiveNonTool)
+            {
+                // Unusual: host forced ActiveNonTool while stored identity is
+                // different (should not happen for real boundary rows). Prefer
+                // stored identity so we never permanent-wedge on hash mismatch.
+                stored_continuation
+            } else {
+                stored_continuation
+            };
+            (
+                id.policy.clone(),
+                id.actor.clone(),
+                id.harness.clone(),
+                id.compact.clone(),
+                continuation,
+            )
+        } else {
+            (
+                CompactContinuationPolicy {
+                    upper_trigger_tokens: req.upper_trigger_tokens.max(0),
+                    lower_target_tokens: req.lower_target_tokens.max(0),
+                    host_capability: CompactContinuationHostCapability::FullStateMachine,
+                },
+                COMPACT_CONTINUATION_ACTOR.into(),
+                HARNESS.into(),
+                req.compact.clone(),
+                req.continuation.clone(),
+            )
+        };
+
     CompactContinuationHostFacts {
         attempt_id: req.attempt_id.clone(),
         seam: mid_turn_seam(
@@ -357,19 +424,15 @@ pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactConti
             source: POST_MEASUREMENT_SOURCE.into(),
             domain: "source_labelled_estimate".into(),
         },
-        policy: CompactContinuationPolicy {
-            upper_trigger_tokens: req.upper_trigger_tokens.max(0),
-            lower_target_tokens: req.lower_target_tokens.max(0),
-            host_capability: CompactContinuationHostCapability::FullStateMachine,
-        },
-        continuation: req.continuation.clone(),
+        policy,
+        continuation,
         writer_claim: req.writer_claim,
         capture_complete: req.capture_complete,
         provider_identity_valid: req.provider_identity_valid,
         single_open_turn: Some(true),
-        actor: COMPACT_CONTINUATION_ACTOR.into(),
-        harness: HARNESS.into(),
-        compact: req.compact.clone(),
+        actor,
+        harness,
+        compact,
     }
 }
 
@@ -421,10 +484,12 @@ pub async fn inspect_compact_continuation_writer_claim(
 /// Durable recovery identity for the next MidTurn entry.
 ///
 /// When a pending/failed_repairable boundary or held LHC writer claim exists,
-/// the host must re-enter with that exact `attempt_id` and
-/// `active_non_tool` continuation (boundary repair). Never invents a lease or
-/// clears a foreign owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// the host must re-enter with that exact `attempt_id`. Boundary repair forces
+/// `active_non_tool` (protocol). Claim-only recovery re-enters with the
+/// **stored** immutable operation identity (continuation, policy, compact,
+/// actor/harness) so response-scoped preserve-path toolCallIds still match.
+/// Never invents a lease or clears a foreign owner.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MidTurnRecoveryIdentity {
     pub attempt_id: String,
     pub writer_claim: WriterClaim,
@@ -432,6 +497,33 @@ pub struct MidTurnRecoveryIdentity {
     pub pending_boundary: bool,
     /// True when only a same-owner writer claim is held (no pending boundary).
     pub claim_only: bool,
+    /// Stored immutable operation identity when an attempt-intent row exists.
+    /// Required for claim-only exact same-attempt re-entry; optional for
+    /// boundary repair (protocol still forces `active_non_tool`).
+    pub stored_identity: Option<lhc::compact_continuation::StoredOperationIdentity>,
+}
+
+/// Inspect durable attempt-intent / operation identity for recovery.
+pub async fn inspect_compact_continuation_attempt_intent(
+    thread_id: &str,
+    root: Option<&Path>,
+    attempt_id: &str,
+) -> Result<Option<lhc::compact_continuation::StoredOperationIdentity>, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect compact-continuation".to_string())?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::get_compact_continuation_attempt_intent(ref_, attempt_id).await
+    {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect attempt intent {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
 }
 
 /// Resolve same-attempt resume identity from durable SDK state.
@@ -439,6 +531,8 @@ pub struct MidTurnRecoveryIdentity {
 /// Returns `None` when the durable state is clean (caller uses the fresh
 /// response-scoped attempt id). Foreign held claims surface as
 /// `WriterClaim::Conflict` so the certified runtime refuses without stealing.
+/// Inspection failure on a claim-only owner is returned as `Err` so the host
+/// does not proceed with a live-seam identity that would permanent-wedge.
 pub async fn resolve_mid_turn_recovery_identity(
     thread_id: &str,
     root: Option<&Path>,
@@ -470,21 +564,55 @@ pub async fn resolve_mid_turn_recovery_identity(
         } else {
             WriterClaim::None
         };
+        // Best-effort load of stored identity for actor/policy/compact match.
+        // Boundary repair still forces ActiveNonTool continuation; missing
+        // identity is non-fatal here (boundary protocol is kind-fixed).
+        let stored_identity = match inspect_compact_continuation_attempt_intent(
+            thread_id,
+            root,
+            &boundary.attempt_id,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                // Do not clear state; boundary repair can still proceed with
+                // forced active_non_tool if identity inspect fails.
+                tracing::warn!(
+                    %err,
+                    attempt_id = %boundary.attempt_id,
+                    "LHC MidTurn boundary recovery: attempt intent inspect failed; continuing with protocol active_non_tool"
+                );
+                None
+            }
+        };
         return Ok(Some(MidTurnRecoveryIdentity {
             attempt_id: boundary.attempt_id,
             writer_claim,
             pending_boundary: true,
             claim_only: false,
+            stored_identity,
         }));
     }
 
     if claim.claim == lhc::compact_continuation::WriterClaimKind::Lhc {
         if let Some(owner) = claim.attempt_id {
+            // Claim-only: must load stored identity for exact same-attempt re-entry.
+            // Without it (or on corruption), surface Err so the host does not
+            // re-enter with a live seam that conflicts forever.
+            let stored_identity =
+                inspect_compact_continuation_attempt_intent(thread_id, root, &owner).await?;
+            let Some(stored_identity) = stored_identity else {
+                return Err(format!(
+                    "claim-only owner attempt {owner} has no durable attempt-intent row; refuse re-entry rather than synthesize identity"
+                ));
+            };
             return Ok(Some(MidTurnRecoveryIdentity {
                 attempt_id: owner,
                 writer_claim: WriterClaim::Lhc,
                 pending_boundary: false,
                 claim_only: true,
+                stored_identity: Some(stored_identity),
             }));
         }
     }
@@ -620,6 +748,7 @@ pub async fn run_mid_turn_compact_continuation(
                 force_install_succeeds: hooks.force_install_succeeds,
                 fail_candidate_assembly: hooks.fail_candidate_assembly,
                 fail_install_before_write: hooks.fail_install_before_write,
+                fail_finalize_at_release: hooks.fail_finalize_at_release,
                 ..CompactContinuationTestHooks::default()
             };
             run_compact_continuation_for_tests(ref_, facts, None, Some(mapped)).await

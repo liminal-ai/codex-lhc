@@ -388,10 +388,16 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
         ev_assistant_message("m1", "starting large context task"),
         first_done,
     ]);
-    // First success, then CLE failures via one-shot mounts (no exact total expect).
+    // Product policy: request_max_retries = 0 and ContextWindowExceeded is
+    // non-retryable (turn.rs returns Err immediately). Expected provider
+    // requests = 2: initial success (end_turn=false, MidTurn may compact) +
+    // exactly one CLE continuation attempt that terminates the turn.
+    // Mount more CLE failures than that so a retry treadmill would exceed the
+    // bound rather than stop only because mocks exhaust.
+    const EXPECTED_PROVIDER_REQUESTS: usize = 2;
     let first_mock = mount_sse_once(&server, first).await;
     let mut cle_mocks = Vec::new();
-    for i in 0..5 {
+    for i in 0..8 {
         cle_mocks.push(
             mount_sse_once(
                 &server,
@@ -447,11 +453,14 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
     for m in &cle_mocks {
         bodies.extend(request_bodies(m));
     }
-    // Bounded product policy: must terminate without a native compact loop.
-    // Do not derive the bound from mock capacity alone (always-pass trap).
-    assert!(
-        !bodies.is_empty(),
-        "at least one provider request must have been issued"
+    // Product-driven CLE bound from configured policy (request_max_retries=0):
+    // exact provider request count, not mock capacity.
+    assert_eq!(
+        bodies.len(),
+        EXPECTED_PROVIDER_REQUESTS,
+        "CLE path must issue exactly {EXPECTED_PROVIDER_REQUESTS} provider requests \
+         (initial success + one CLE continuation) with request_max_retries=0; got {}",
+        bodies.len()
     );
     // Terminal outcome already asserted above. CLE path must not arm native
     // summarization or spin unbounded marker pollution.
@@ -471,8 +480,27 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
         total_markers <= 1,
         "no polluted duplicate markers across requests, total={total_markers}"
     );
-    // Product policy: turn reached a terminal EventMsg (asserted above) without
-    // requiring mock exhaustion — the CLE path is not an open retry loop.
+
+    // Durable LHC compact-continuation receipts are product-bounded (at most one).
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
+            .await
+            .expect("inspect receipts");
+    assert!(
+        receipts.len() <= 1,
+        "CLE path must not leave an unbounded compact/receipt treadmill; receipts={}",
+        receipts.len()
+    );
 
     Ok(())
 }
