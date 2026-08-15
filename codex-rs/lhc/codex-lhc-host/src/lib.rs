@@ -5,6 +5,7 @@
 //! Chunk 3: live cert.
 
 mod band_shape;
+mod body_validation;
 mod capture;
 mod compact_bridge;
 mod compact_continuation;
@@ -24,6 +25,13 @@ pub use band_shape::BandShapeReport;
 pub use band_shape::DEFAULT_FULL_BAND_USER_TURNS;
 pub use band_shape::band_shaped_history_from_events;
 pub use band_shape::synthetic_minimal_band_history;
+pub use body_validation::BODY_SIZE_SOURCE;
+pub use body_validation::BodyValidationReport;
+pub use body_validation::BodyValidationSpec;
+pub use body_validation::ProtectedPairExpectation;
+pub use body_validation::capture_body_expectations;
+pub use body_validation::item_bytes_without_id;
+pub use body_validation::validate_next_request_body;
 pub use compact_bridge::COMPACT_MARKER_KEY_SEGMENT;
 pub use compact_bridge::CompactMarker;
 pub use compact_bridge::DerivedProvenance;
@@ -64,10 +72,12 @@ pub use compact_continuation::inspect_compact_continuation_attempt_intent;
 pub use compact_continuation::inspect_compact_continuation_receipts;
 pub use compact_continuation::inspect_compact_continuation_writer_claim;
 pub use compact_continuation::inspect_has_compact_continuation_marker;
+pub use compact_continuation::inspect_mid_turn_host_validation;
 pub use compact_continuation::inspect_pending_compact_continuation_boundary;
 pub use compact_continuation::mid_turn_seam;
 pub use compact_continuation::missing_provider_usage_authority;
 pub use compact_continuation::next_request_pressure;
+pub use compact_continuation::record_mid_turn_host_validation;
 pub use compact_continuation::resolve_mid_turn_recovery_identity;
 pub use compact_continuation::run_mid_turn_compact_continuation;
 #[cfg(feature = "test-util")]
@@ -84,6 +94,8 @@ pub use inference::lhc_inference_callbacks;
 /// Re-export certified compact-continuation types for core MidTurn wiring.
 pub use lhc::compact_continuation::CompactContinuationHostFacts;
 pub use lhc::compact_continuation::HostCompactOpts;
+pub use lhc::compact_continuation::HostValidationAck;
+pub use lhc::compact_continuation::HostValidationStatus;
 /// Re-export so core can pass live ModelClient-backed callbacks without a
 /// direct `lhc` path dep.
 pub use lhc::shared_tech::CompressDetailedTurnInput;
@@ -155,6 +167,7 @@ pub use rollout_reconcile::RolloutReconcileTrigger;
 pub use rollout_reconcile::classify_rollout_vs_thread;
 pub use rollout_reconcile::compacted_record_count;
 pub use rollout_reconcile::file_boundary_compact_point;
+pub use rollout_reconcile::host_validation_reload_block;
 pub use rollout_reconcile::is_native_append_polluted;
 pub use rollout_reconcile::read_thread_compact_point;
 pub use rollout_reconcile::reconcile_rollout_at_path;

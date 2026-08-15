@@ -61,10 +61,10 @@ index 78e6905ded..6e46cc1a68 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..937fecba7d
+index 0000000000..9f09f04a50
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,1795 @@
+@@ -0,0 +1,1990 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
@@ -684,12 +684,13 @@ index 0000000000..937fecba7d
 +        } else if let Some(id) = rec.stored_identity.as_ref() {
 +            // Re-enter with stored continuation kind + toolCallId (preserve-path).
 +            continuation = match &id.continuation {
-+                WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
-+                    WorkContinuation::PendingCorrelatedToolResult {
-+                        tool_call_id: tool_call_id.clone(),
-+                        correlation_valid: true,
-+                    }
-+                }
++                WorkContinuation::PendingCorrelatedToolResult {
++                    protected_tool_call_ids,
++                    ..
++                } => WorkContinuation::PendingCorrelatedToolResult {
++                    protected_tool_call_ids: protected_tool_call_ids.clone(),
++                    correlation_valid: true,
++                },
 +                other => other.clone(),
 +            };
 +        }
@@ -697,6 +698,53 @@ index 0000000000..937fecba7d
 +    } else {
 +        (fresh_attempt_id, WriterClaim::None, None)
 +    };
++
++    // LIM-67: capture live-history byte expectations for the protected pair
++    // set and required encrypted reasoning BEFORE the attempt mutates anything.
++    // The post-install materialized body is validated against these.
++    let protected_ids_for_validation: Vec<String> = match &continuation {
++        WorkContinuation::PendingCorrelatedToolResult {
++            protected_tool_call_ids,
++            ..
++        } => protected_tool_call_ids.clone(),
++        _ => Vec::new(),
++    };
++    let (protected_pair_expectations, required_encrypted_reasoning) =
++        codex_lhc_host::capture_body_expectations(&host_items, &protected_ids_for_validation);
++
++    // LIM-67: the host safe-runway threshold is the real bound the next
++    // materialized provider request must stay under — the Codex auto-compact
++    // scope limit when configured, else the full context window. Never a
++    // universal percentage, and never the advisory LHC lower target.
++    //
++    // Contract scope: the threshold governs pending-tool escalation
++    // classification (SDK policy field is optional elsewhere). Active
++    // non-tool seams keep their certified LIM-63 semantics and pass none.
++    let pending_tool_seam = matches!(
++        continuation,
++        WorkContinuation::PendingCorrelatedToolResult { .. }
++    );
++    let (safe_runway_threshold_tokens, safe_runway_threshold_source) = if pending_tool_seam {
++        match (
++            token_status.auto_compact_scope_limit,
++            token_status.full_context_window_limit,
++        ) {
++            (Some(limit), _) => (
++                Some(limit),
++                Some("codex_auto_compact_scope_limit".to_string()),
++            ),
++            (None, Some(limit)) => (Some(limit), Some("codex_context_window_limit".to_string())),
++            (None, None) => (None, None),
++        }
++    } else {
++        (None, None)
++    };
++    #[cfg(any(test, feature = "test-util"))]
++    let (safe_runway_threshold_tokens, safe_runway_threshold_source) =
++        match slot.mid_turn_test_safe_runway() {
++            Some(t) => (Some(t), Some("test_safe_runway".to_string())),
++            None => (safe_runway_threshold_tokens, safe_runway_threshold_source),
++        };
 +
 +    let req = MidTurnCompactContinuationRequest {
 +        thread_id: thread_id.clone(),
@@ -706,6 +754,8 @@ index 0000000000..937fecba7d
 +        post_measurement_tokens: post_measurement,
 +        upper_trigger_tokens: upper_trigger,
 +        lower_target_tokens: lower_target,
++        safe_runway_threshold_tokens,
++        safe_runway_threshold_source,
 +        continuation,
 +        writer_claim,
 +        capture_complete: true,
@@ -777,11 +827,27 @@ index 0000000000..937fecba7d
 +        slot.record_mid_turn_hysteresis(&attempt_id, p, outcome.reduced, &outcome.outcome_kind);
 +    }
 +
-+    if outcome.should_rewrite_host_rollout() {
++    // LIM-67: a protected-escalation install leaves the durable residual
++    // awaiting host validation (next request blocked). The host materializes
++    // the exact next provider request from the installed surface, validates
++    // it, and records ok/failed before any rollout rewrite or send.
++    let awaiting_host_validation = outcome.awaiting_host_validation();
++    if outcome.should_rewrite_host_rollout() || awaiting_host_validation {
 +        // Runtime installed a serving view in LHC; materialize through the
 +        // existing native-fidelity rewrite path. Host does not synthesize a
 +        // second continuation marker — CompactMarker here is fork bookkeeping
 +        // only (covered range + rewrite boundary).
++        let host_validation_spec = if awaiting_host_validation {
++            Some(codex_lhc_host::BodyValidationSpec {
++                attempt_id: attempt_id.clone(),
++                protected_tool_call_ids: protected_ids_for_validation.clone(),
++                protected_pairs: protected_pair_expectations.clone(),
++                required_encrypted_reasoning: required_encrypted_reasoning.clone(),
++                safe_runway_threshold_tokens,
++            })
++        } else {
++            None
++        };
 +        let thread_id = handle.thread_id().to_string();
 +        let root = handle.root().map(std::path::Path::to_path_buf);
 +        let (_initial_context, world_state_baseline) =
@@ -817,6 +883,7 @@ index 0000000000..937fecba7d
 +            world_state_baseline,
 +            reference_context_item,
 +            /*manual*/ false,
++            host_validation_spec,
 +            cancellation_token,
 +        )
 +        .await?;
@@ -869,6 +936,48 @@ index 0000000000..937fecba7d
 +/// and the thread exits; the caller then joins. Cancellation never detaches a
 +/// mutator — host apply is suppressed if the turn token cancelled during the
 +/// section.
++/// Record host full-body validation on a dedicated thread (SDK futures are
++/// `!Send`). Durable ok/failed acknowledgment for a protected-escalation
++/// attempt; never rolls the core install back.
++async fn record_host_validation_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    attempt_id: String,
++    ok: bool,
++    reason: Option<String>,
++) -> Result<(), String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let spawn = std::thread::Builder::new()
++        .name(format!("lhc-midturn-hv-{attempt_id}"))
++        .spawn(move || {
++            let rt = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(err) => {
++                    let _ = tx.send(Err(format!("runtime: {err}")));
++                    return;
++                }
++            };
++            let result = rt.block_on(codex_lhc_host::record_mid_turn_host_validation(
++                &thread_id,
++                root.as_deref(),
++                &attempt_id,
++                ok,
++                reason,
++            ));
++            let _ = tx.send(result.map(|_| ()));
++        });
++    if let Err(err) = spawn {
++        return Err(format!("spawn: {err}"));
++    }
++    match rx.await {
++        Ok(result) => result,
++        Err(_) => Err("host validation record thread dropped".into()),
++    }
++}
++
 +/// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
 +/// inspection futures are `!Send`).
 +async fn inspect_mid_turn_recovery_on_thread(
@@ -1200,6 +1309,7 @@ index 0000000000..937fecba7d
 +        world_state_baseline,
 +        reference_context_item,
 +        manual,
++        /*host_validation*/ None,
 +        cancellation_token,
 +    ))
 +    .await
@@ -1220,6 +1330,7 @@ index 0000000000..937fecba7d
 +    world_state_baseline: Option<std::sync::Arc<crate::context::world_state::WorldState>>,
 +    reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
 +    manual: bool,
++    host_validation: Option<codex_lhc_host::BodyValidationSpec>,
 +    cancellation_token: &CancellationToken,
 +) -> CodexResult<LhcCompactAttempt> {
 +    // LHC SDK futures are !Send — hop to a dedicated thread like produce does.
@@ -1348,6 +1459,90 @@ index 0000000000..937fecba7d
 +    for item in &mut materialize_result.items {
 +        if let RolloutItem::Compacted(compacted) = item {
 +            compacted.message = durable_message.clone();
++        }
++    }
++
++    // LIM-67 host full-body validation gate (protected escalation only).
++    // `install_history` is the exact item sequence the next provider request
++    // serves (identical to what the rewrite and in-memory install would use).
++    // Validate BEFORE the rollout rewrite / in-memory replacement; record the
++    // durable ok/failed acknowledgment through the certified SDK API. A failed
++    // (or unrecordable) validation leaves rollout and in-memory history on
++    // their prior generation and blocks the next provider request. It does NOT
++    // roll the installed LHC core view back.
++    if let Some(spec) = host_validation.as_ref() {
++        #[cfg(any(test, feature = "test-util"))]
++        let validation = if slot.mid_turn_test_force_body_validation_fail() {
++            Err("test-injected host body validation failure".to_string())
++        } else {
++            codex_lhc_host::validate_next_request_body(&install_history, spec)
++        };
++        #[cfg(not(any(test, feature = "test-util")))]
++        let validation = codex_lhc_host::validate_next_request_body(&install_history, spec);
++        match validation {
++            Ok(report) => {
++                match record_host_validation_on_thread(
++                    thread_id.clone(),
++                    root.clone(),
++                    spec.attempt_id.clone(),
++                    true,
++                    None,
++                )
++                .await
++                {
++                    Ok(()) => {
++                        info!(
++                            attempt_id = %spec.attempt_id,
++                            body_items = report.body_item_count,
++                            body_tokens = report.body_token_estimate,
++                            threshold = ?report.safe_runway_threshold_tokens,
++                            protected_pairs = report.protected_pair_count,
++                            reasoning_preserved = report.reasoning_preserved_count,
++                            "LHC MidTurn host full-body validation ok; proceeding to rewrite"
++                        );
++                    }
++                    Err(err) => {
++                        error!(
++                            %err,
++                            attempt_id = %spec.attempt_id,
++                            "LHC MidTurn host validation passed but durable ack write failed;                              blocking without rewrite (residual stays awaiting)"
++                        );
++                        return Ok(LhcCompactAttempt::MidTurnBlocked {
++                            reason: format!(
++                                "host validation ack write failed for attempt {}: {err}",
++                                spec.attempt_id
++                            ),
++                            next_provider_request_allowed: false,
++                        });
++                    }
++                }
++            }
++            Err(reason) => {
++                if let Err(err) = record_host_validation_on_thread(
++                    thread_id.clone(),
++                    root.clone(),
++                    spec.attempt_id.clone(),
++                    false,
++                    Some(reason.clone()),
++                )
++                .await
++                {
++                    error!(
++                        %err,
++                        attempt_id = %spec.attempt_id,
++                        "LHC MidTurn host-validation-failed record write failed; blocking anyway"
++                    );
++                }
++                error!(
++                    attempt_id = %spec.attempt_id,
++                    %reason,
++                    "LHC MidTurn host full-body validation FAILED; rollout and in-memory                      history stay on prior generation; next provider request blocked"
++                );
++                return Ok(LhcCompactAttempt::MidTurnBlocked {
++                    reason: format!("host full-body validation failed: {reason}"),
++                    next_provider_request_allowed: false,
++                });
++            }
 +        }
 +    }
 +
@@ -1862,10 +2057,10 @@ index 0000000000..937fecba7d
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..7341a8859a
+index 0000000000..26570eb21e
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,2630 @@
+@@ -0,0 +1,2944 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -2069,7 +2264,7 @@ index 0000000000..7341a8859a
 +}
 +
 +#[test]
-+fn parallel_tool_ids_deterministic_lexicographic_min() {
++fn parallel_tool_ids_form_complete_sorted_protected_set() {
 +    let items = vec![
 +        ResponseItem::FunctionCall {
 +            id: None,
@@ -2114,10 +2309,11 @@ index 0000000000..7341a8859a
 +        /*total_needs_follow_up*/ true,
 +    ) {
 +        WorkContinuation::PendingCorrelatedToolResult {
-+            tool_call_id,
++            protected_tool_call_ids,
 +            correlation_valid,
 +        } => {
-+            assert_eq!(tool_call_id, "a-call");
++            // Contract 2.0.0: the complete sorted response-scoped set.
++            assert_eq!(protected_tool_call_ids, vec!["a-call", "z-call"]);
 +            assert!(correlation_valid);
 +        }
 +        other => panic!("expected pending tool branch, got {other:?}"),
@@ -2170,10 +2366,10 @@ index 0000000000..7341a8859a
 +        /*total_needs_follow_up*/ true,
 +    ) {
 +        WorkContinuation::PendingCorrelatedToolResult {
-+            tool_call_id,
++            protected_tool_call_ids,
 +            correlation_valid,
 +        } => {
-+            assert_eq!(tool_call_id, "zzz-new");
++            assert_eq!(protected_tool_call_ids, vec!["zzz-new"]);
 +            assert!(correlation_valid);
 +        }
 +        other => panic!("expected zzz-new, got {other:?}"),
@@ -2529,10 +2725,10 @@ index 0000000000..7341a8859a
 +    let response_ids = vec!["call-tool-z".into(), "call-tool-a".into()];
 +    match work_continuation_for_mid_turn(&response_ids, &items, true) {
 +        WorkContinuation::PendingCorrelatedToolResult {
-+            tool_call_id,
++            protected_tool_call_ids,
 +            correlation_valid,
 +        } => {
-+            assert_eq!(tool_call_id, "call-tool-a");
++            assert_eq!(protected_tool_call_ids, vec!["call-tool-a", "call-tool-z"]);
 +            assert!(correlation_valid);
 +        }
 +        other => panic!("expected pending tool, got {other:?}"),
@@ -3307,7 +3503,10 @@ index 0000000000..7341a8859a
 +         (host reduced==true path); got outcome={}",
 +        last.outcome
 +    );
-+    assert!(!body.is_empty(), "useful-reduction install leaves a serving body");
++    assert!(
++        !body.is_empty(),
++        "useful-reduction install leaves a serving body"
++    );
 +    // Typed marker: durable event exists for the continuation turn, and the
 +    // receipt residual carries frozen kind/cause/action constants.
 +    let cont_turn = last
@@ -3452,10 +3651,14 @@ index 0000000000..7341a8859a
 +    let response_ids = vec!["call-tool-z".into(), "call-tool-a".into()];
 +    match work_continuation_for_mid_turn(&response_ids, &items_before, true) {
 +        WorkContinuation::PendingCorrelatedToolResult {
-+            tool_call_id,
++            protected_tool_call_ids,
 +            correlation_valid,
 +        } => {
-+            assert_eq!(tool_call_id, "call-tool-a", "lexicographic min branch id");
++            assert_eq!(
++                protected_tool_call_ids,
++                vec!["call-tool-a", "call-tool-z"],
++                "sorted unique protected set"
++            );
 +            assert!(correlation_valid);
 +        }
 +        other => panic!("expected pending tool, got {other:?}"),
@@ -4303,8 +4506,11 @@ index 0000000000..7341a8859a
 +    .expect("inspect identity")
 +    .expect("intent row must exist after claim");
 +    match &identity.continuation {
-+        WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
-+            assert_eq!(tool_call_id, tool_x);
++        WorkContinuation::PendingCorrelatedToolResult {
++            protected_tool_call_ids,
++            ..
++        } => {
++            assert_eq!(protected_tool_call_ids, &vec![tool_x.to_string()]);
 +        }
 +        other => panic!("stored identity must be preserve-path, got {other:?}"),
 +    }
@@ -4495,6 +4701,309 @@ index 0000000000..7341a8859a
 +    }
 +    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
 +    assert_eq!(history_before.len(), history_after.len());
++}
++
++// ── LIM-67: protected escalation + host full-body validation ────────────────
++
++/// Seed one open agentic turn shape for escalation: older big unprotected
++/// pairs, then the response-scoped protected pair.
++async fn seed_escalation_history(
++    session: &Session,
++    tc: &crate::session::turn_context::TurnContext,
++    protected_id: &str,
++) {
++    let mut items = Vec::new();
++    for i in 0..3 {
++        items.push(ResponseItem::FunctionCall {
++            id: None,
++            name: "shell".into(),
++            namespace: None,
++            arguments: format!("{{\"cmd\":\"old-{i}\"}}"),
++            encrypted_function_args: None,
++            call_id: format!("call-old-{i}"),
++            internal_chat_message_metadata_passthrough: None,
++        });
++        items.push(ResponseItem::FunctionCallOutput {
++            id: None,
++            call_id: format!("call-old-{i}"),
++            output: FunctionCallOutputPayload {
++                body: FunctionCallOutputBody::Text(format!("{}-OLD{i}", "tok ".repeat(1_200))),
++                success: Some(true),
++            },
++            internal_chat_message_metadata_passthrough: None,
++        });
++    }
++    items.push(ResponseItem::FunctionCall {
++        id: None,
++        name: "shell".into(),
++        namespace: None,
++        arguments: "{\"cmd\":\"protected\"}".into(),
++        encrypted_function_args: None,
++        call_id: protected_id.into(),
++        internal_chat_message_metadata_passthrough: None,
++    });
++    items.push(ResponseItem::FunctionCallOutput {
++        id: None,
++        call_id: protected_id.into(),
++        output: FunctionCallOutputPayload {
++            body: FunctionCallOutputBody::Text(format!("{}-PROTECTED", "tok ".repeat(400))),
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    });
++    session
++        .record_conversation_items_with_provenance(
++            tc,
++            &items,
++            codex_extension_api::RawItemProvenance::ModelOutput,
++        )
++        .await;
++}
++
++/// Escalated install: preserve is evaluated first and found unsafe against the
++/// host runway; core escalates through one protected boundary, the host
++/// validates the exact materialized body, records `ok`, and the reload gate
++/// stays clear.
++#[tokio::test]
++async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root.clone()).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    slot.set_mid_turn_test_safe_runway(Some(5_000));
++    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 2).await;
++    let protected_id = "call-prot-1";
++    seed_escalation_history(&session, &tc, protected_id).await;
++    inject_response_usage(&session, &tc, 4_800).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let epoch = decision_epoch(&sess);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "resp-esc-ok-1",
++            true,
++            epoch,
++            vec![protected_id.into()],
++            Some(sample_usage(4_800)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    let LhcCompactAttempt::Installed { body, .. } = attempt else {
++        panic!("protected escalation with safe maximal prune must install, got {attempt:?}");
++    };
++    assert!(!body.is_empty());
++
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++
++    // Durable receipt: escalated relief path with the protected set recorded.
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root.as_deref())
++            .await
++            .expect("receipts");
++    let last = receipts.last().expect("receipt");
++    assert!(
++        matches!(
++            last.receipt.relief_path.as_str(),
++            "protected_escalation" | "host_validation_awaiting"
++        ),
++        "escalated relief path, got {}",
++        last.receipt.relief_path.as_str()
++    );
++    assert_eq!(
++        last.receipt.residual.protected_tool_call_ids,
++        vec![protected_id.to_string()]
++    );
++    // One boundary + one typed marker for the escalation.
++    let cont = last
++        .continuation_turn_id
++        .as_deref()
++        .expect("continuation turn id");
++    assert!(
++        codex_lhc_host::inspect_has_compact_continuation_marker(&thread_id, root.as_deref(), cont)
++            .await
++            .expect("marker")
++    );
++
++    // Host validation recorded `ok` for the attempt; reload gate clear.
++    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
++        &thread_id,
++        root.as_deref(),
++        "resp-esc-ok-1",
++    )
++    .await
++    .expect("hv inspect")
++    .expect("hv row");
++    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
++    assert!(
++        codex_lhc_host::host_validation_reload_block(&thread_id, root.as_deref())
++            .await
++            .is_none(),
++        "ok validation must clear the reload gate"
++    );
++}
++
++/// Negative path: forced host body-validation failure after a successful core
++/// install records `failed`, blocks the next provider request without rolling
++/// core state back, deterministically gates reload regeneration, and replays
++/// idempotently (no second boundary or marker).
++#[tokio::test]
++async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root.clone()).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    slot.set_mid_turn_test_safe_runway(Some(5_000));
++    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
++    slot.set_mid_turn_test_force_body_validation_fail(true);
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 2).await;
++    let protected_id = "call-prot-hv";
++    seed_escalation_history(&session, &tc, protected_id).await;
++    inject_response_usage(&session, &tc, 4_800).await;
++    handle.flush().await;
++
++    let sess = Arc::new(session);
++    let epoch = decision_epoch(&sess);
++    let mid = mid_facts(
++        "resp-esc-fail-1",
++        true,
++        epoch,
++        vec![protected_id.into()],
++        Some(sample_usage(4_800)),
++    );
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid.clone()),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    match &attempt {
++        LhcCompactAttempt::MidTurnBlocked {
++            reason,
++            next_provider_request_allowed,
++        } => {
++            assert!(
++                reason.contains("host full-body validation failed"),
++                "{reason}"
++            );
++            assert!(
++                !next_provider_request_allowed,
++                "failed host validation must block the next provider request"
++            );
++        }
++        other => panic!("expected MidTurnBlocked on forced validation failure, got {other:?}"),
++    }
++
++    let thread_id = handle.thread_id().to_string();
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
++
++    // Durable failed row + reload gate engaged; core install retained.
++    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
++        &thread_id,
++        root_path.as_deref(),
++        "resp-esc-fail-1",
++    )
++    .await
++    .expect("hv inspect")
++    .expect("hv row");
++    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
++    let block = codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++        .await
++        .expect("failed validation must gate reload");
++    assert!(block.contains("resp-esc-fail-1"), "{block}");
++
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root_path.as_deref())
++            .await
++            .expect("receipts");
++    let last = receipts.last().expect("receipt");
++    let cont = last
++        .continuation_turn_id
++        .as_deref()
++        .expect("continuation turn id")
++        .to_string();
++    assert!(
++        codex_lhc_host::inspect_has_compact_continuation_marker(
++            &thread_id,
++            root_path.as_deref(),
++            &cont
++        )
++        .await
++        .expect("marker"),
++        "core install (boundary + marker) is retained after failed host validation"
++    );
++    let receipts_before = receipts.len();
++
++    // Replay the same attempt: terminal replay, no second boundary/marker, and
++    // the durable failed row is not overwritten.
++    let replay = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("replay arm");
++    assert!(
++        !matches!(replay, LhcCompactAttempt::Unavailable { .. }),
++        "replay must not fall open native"
++    );
++    let receipts_after =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root_path.as_deref())
++            .await
++            .expect("receipts");
++    assert_eq!(
++        receipts_after.len(),
++        receipts_before,
++        "same-attempt replay must not append a second receipt"
++    );
++    let hv_after = codex_lhc_host::inspect_mid_turn_host_validation(
++        &thread_id,
++        root_path.as_deref(),
++        "resp-esc-fail-1",
++    )
++    .await
++    .expect("hv inspect")
++    .expect("hv row");
++    assert_eq!(
++        hv_after.status,
++        codex_lhc_host::HostValidationStatus::Failed
++    );
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
@@ -10588,10 +11097,10 @@ index d5297df04f..b59d2737ae 100644
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
 new file mode 100644
-index 0000000000..f4b6349561
+index 0000000000..ca9df0717a
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,914 @@
 +//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
 +//!
 +//! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
@@ -10659,6 +11168,24 @@ index 0000000000..f4b6349561
 +) -> Arc<codex_extension_api::ExtensionRegistry<codex_core::config::Config>> {
 +    let mut builder = ExtensionRegistryBuilder::<codex_core::config::Config>::new();
 +    install_with_root(&mut builder, |_c| true, root);
++    Arc::new(builder.build())
++}
++
++/// Like [`lhc_extensions`] but with a real model label so capture identity
++/// matches the live turn identity (R2 encrypted-reasoning replay gate).
++fn lhc_extensions_with_model(
++    root: PathBuf,
++    model: &'static str,
++) -> Arc<codex_extension_api::ExtensionRegistry<codex_core::config::Config>> {
++    let mut builder = ExtensionRegistryBuilder::<codex_core::config::Config>::new();
++    codex_lhc_host::install_with_root_and_labels(
++        &mut builder,
++        |_c| true,
++        root,
++        move |_c| model.to_string(),
++        |_c| "none".into(),
++        |_c| None,
++    );
 +    Arc::new(builder.build())
 +}
 +
@@ -10845,9 +11372,16 @@ index 0000000000..f4b6349561
 +    Ok(())
 +}
 +
-+/// B. Pending parallel-tool full loop: reasoning + two tool calls settle via
-+/// real executor; MidTurn preserves pairs; request 2 completes same task;
-+/// no continuation marker; no native compact.
++/// B. Pending parallel-tool full loop under contract 2.0.0: reasoning + two
++/// tool calls settle via the real executor; the complete parallel set is
++/// protected. With this fixture's synthetic scope limit (500 tokens, far
++/// below the response usage) and no older prunable content, preserve cannot
++/// create safe runway and escalation has nothing eligible to prune — the
++/// certified outcome is a TRUTHFUL BOUNDED REFUSAL (`unsafe_runway`): the
++/// next provider request is blocked, both pairs stay verbatim in the
++/// canonical record, no continuation marker is fabricated, and no native
++/// compact runs (LIM-67 acceptance: protected results alone exceed budget /
++/// no eligible old results).
 +#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 +async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
 +    skip_if_no_network!(Ok(()));
@@ -10883,7 +11417,11 @@ index 0000000000..f4b6349561
 +        ev_assistant_message("m-tool-2", "both tools done, task complete"),
 +        ev_completed_with_tokens("resp-tool-2", /*total_tokens*/ 90),
 +    ]);
-+    let mock = mount_sse_sequence(&server, vec![first, second]).await;
++    // The certified outcome is a bounded refusal: request 2 must never be
++    // sent. Mount it as a recording sentinel (no expectation) so a defective
++    // second send is caught by its request count instead of a mock panic.
++    let mock = mount_sse_once(&server, first).await;
++    let sentinel = mount_sse_once(&server, second).await;
 +
 +    let model_provider = non_openai_model_provider(&server);
 +    let extensions = lhc_extensions(root);
@@ -10922,42 +11460,77 @@ index 0000000000..f4b6349561
 +            },
 +        })
 +        .await?;
-+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
++    let terminal = wait_for_event(&test.codex, |ev| {
++        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
++    })
++    .await;
++    assert!(
++        matches!(terminal, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
++        "bounded refusal must reach a clear terminal outcome"
++    );
 +
 +    let bodies = request_bodies(&mock);
++    // Truthful bounded refusal: the blocked continuation request is never sent.
 +    assert_eq!(
 +        bodies.len(),
-+        2,
-+        "exactly two provider requests (tool turn + continuation); got {}",
++        1,
++        "unsafe runway with no eligible relief must block the next provider request; got {}",
 +        bodies.len()
++    );
++    assert_eq!(
++        request_bodies(&sentinel).len(),
++        0,
++        "no second provider request may reach the sentinel mock after a bounded refusal"
 +    );
 +    assert!(
 +        !bodies.iter().any(|b| body_has_summarization(b)),
 +        "native compact must not run on pending-tool MidTurn path"
 +    );
++    // No marker was fabricated for the refused attempt.
++    assert_eq!(
++        count_substr(&bodies[0], "lhc.compact_continuation"),
++        0,
++        "refused pending-tool attempt must not fabricate a continuation marker"
++    );
 +
-+    let req2 = &bodies[1];
-+    // Both call/output pairs present on request 2.
-+    assert!(
-+        req2.contains("call-loop-z") && req2.contains("call-loop-a"),
-+        "request 2 must carry both tool call ids"
-+    );
-+    // Outputs settled by real executor.
-+    assert!(
-+        req2.contains("z-out") || req2.contains("function_call_output"),
-+        "request 2 should include settled tool outputs"
-+    );
-+    // Reasoning identity preserved into request 2 when reverse-mapped.
-+    // At minimum: no continuation marker on pending-tool branch.
++    // Durable truth: an unsafe_runway refusal receipt with the full protected
++    // set, no marker, and both pairs verbatim in the canonical record.
++    let slot = test
++        .codex
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    let thread_id = handle.thread_id().to_string();
++    let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
++            .await
++            .expect("inspect receipts");
++    let refusal = receipts
++        .iter()
++        .find(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("unsafe_runway"))
++        .expect("durable unsafe_runway refusal receipt");
 +    assert_eq!(
-+        count_substr(req2, "lhc.compact_continuation"),
-+        0,
-+        "pending-tool branch must not insert continuation marker"
++        refusal.receipt.residual.protected_tool_call_ids,
++        vec!["call-loop-a".to_string(), "call-loop-z".to_string()],
++        "refusal receipt records the complete sorted protected set"
 +    );
-+    assert_eq!(
-+        count_substr(req2, "context_compact_continue"),
-+        0,
-+        "pending-tool branch must not force context_compact_continue marker"
++    assert!(
++        !refusal.receipt.residual.marker_persisted,
++        "refused attempt must not persist a marker"
++    );
++    assert!(
++        refusal.receipt.residual.prior_serving_view_intact,
++        "refusal leaves the prior serving view intact"
++    );
++    let canonical = canonical_messages_blocking(&thread_id, lhc_data_root);
++    assert!(
++        canonical.iter().any(|m| m.contains("call-loop-z"))
++            && canonical.iter().any(|m| m.contains("call-loop-a")),
++        "both parallel pairs stay verbatim in the canonical record"
 +    );
 +
 +    Ok(())
@@ -11094,6 +11667,350 @@ index 0000000000..f4b6349561
 +        receipts.len() <= 1,
 +        "CLE path must not leave an unbounded compact/receipt treadmill; receipts={}",
 +        receipts.len()
++    );
++
++    Ok(())
++}
++
++// ── LIM-67: sustained protected escalation ──────────────────────────────────
++
++/// Read canonical LHC message content on a dedicated thread (SDK futures are
++/// `!Send`; the loop tests run on a multi-thread runtime).
++fn canonical_messages_blocking(thread_id: &str, root: Option<PathBuf>) -> Vec<String> {
++    let tid = thread_id.to_string();
++    std::thread::spawn(move || {
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("runtime");
++        rt.block_on(async move {
++            let surfaces = codex_lhc_host::read_materialize_surfaces(&tid, root.as_deref())
++                .await
++                .expect("materialize surfaces");
++            surfaces
++                .messages
++                .iter()
++                .map(|m| serde_json::to_string(m).unwrap_or_default())
++                .collect::<Vec<String>>()
++        })
++    })
++    .join()
++    .expect("canonical read thread")
++}
++
++fn hv_row_blocking(
++    thread_id: &str,
++    root: Option<PathBuf>,
++    attempt_id: &str,
++) -> Option<codex_lhc_host::HostValidationAck> {
++    let tid = thread_id.to_string();
++    let attempt = attempt_id.to_string();
++    std::thread::spawn(move || {
++        let rt = tokio::runtime::Builder::new_current_thread()
++            .enable_all()
++            .build()
++            .expect("runtime");
++        rt.block_on(async move {
++            codex_lhc_host::inspect_mid_turn_host_validation(&tid, root.as_deref(), &attempt)
++                .await
++                .expect("inspect host validation")
++        })
++    })
++    .join()
++    .expect("hv read thread")
++}
++
++/// Command whose OUTPUT carries the bulk (~8000 chars) with a distinctive
++/// marker LAST, while the call arguments stay small — matching real tool
++/// shapes (calls/reasoning are never visibility-prune targets; only result
++/// bodies shorten). The marker string never appears literally in the
++/// arguments (`%d` formatting), so its presence in a request body proves the
++/// verbatim OUTPUT survived and its absence proves the output was abridged.
++fn cycle_command(i: usize) -> String {
++    format!("yes tok | head -n 2000 | tr '\n' ' '; printf -- '-ENDPAY%d' {i}")
++}
++
++/// Approximate unpruned output volume per cycle (chars).
++const CYCLE_OUTPUT_CHARS: usize = 8_000;
++
++/// LIM-67 sustained proof: 22 deterministic tool cycles under a real Codex
++/// auto-compact scope limit. Provider usage follows a sawtooth (real relief
++/// lowers real usage; the mock emulates the post-relief drop), so the seam
++/// crosses the trigger on waves and LHC must repeatedly produce safe runway.
++///
++/// Proves: old unprotected tool-result bodies shorten across cycles; the
++/// latest protected pair stays byte-stable and ordered on every request;
++/// encrypted reasoning survives; canonical content stays retrievable; exactly
++/// one forced boundary + typed marker per escalation attempt; the full next
++/// request stays below the safe threshold; host validation resolves `ok` for
++/// every served escalation; no native compact path runs. Preserve-first also
++/// covers the closed-turn-bulk shape: closed tail turns are banded by ordinary
++/// preserve, so escalation's boundary never lands behind the candidate compact
++/// point (the Rust-stage disclosure case does not arise on this path).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    const CYCLES: usize = 22;
++    const SCOPE_LIMIT: i64 = 20_000;
++    /// Wave seams where the emulated provider usage approaches the scope
++    /// limit (post-relief responses drop back down, as a real provider would
++    /// after the request shrank).
++    const WAVE_SEAMS: [usize; 3] = [7, 14, 21];
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let root = lhc_root.path().to_path_buf();
++
++    let mut responses = Vec::new();
++    for i in 0..CYCLES {
++        let usage: i64 = if WAVE_SEAMS.contains(&i) {
++            19_600
++        } else {
++            10_000
++        };
++        let args = json!({
++            "command": cycle_command(i),
++            "timeout_ms": 10_000,
++        })
++        .to_string();
++        responses.push(sse(vec![
++            ev_response_created(&format!("resp-sus-{i}")),
++            ev_reasoning_item(
++                &format!("rsn-sus-{i}"),
++                &["sustained plan"],
++                &[&format!("reasoning cycle {i}")],
++            ),
++            ev_function_call(&format!("call-sus-{i}"), "shell_command", &args),
++            ev_completed_with_tokens(&format!("resp-sus-{i}"), usage),
++        ]));
++    }
++    responses.push(sse(vec![
++        ev_response_created("resp-sus-final"),
++        ev_assistant_message("m-sus-final", "sustained task complete"),
++        ev_completed_with_tokens("resp-sus-final", 300),
++    ]));
++    let mock = mount_sse_sequence(&server, responses).await;
++
++    let model_provider = non_openai_model_provider(&server);
++    let extensions = lhc_extensions_with_model(root, "gpt-5.5");
++    let cwd_for_policy = TempDir::new()?;
++    let cwd_path = cwd_for_policy.path().to_path_buf();
++    let mut builder = test_codex()
++        .with_extensions(extensions)
++        .with_config(move |config| {
++            config.model_provider = model_provider;
++            let _ = config.features.enable(Feature::LhcCapture);
++            let _ = config.features.disable(Feature::TokenBudget);
++            // The REAL host safe-runway source: the auto-compact scope limit
++            // doubles as the upper trigger and the safe-runway threshold.
++            config.model_auto_compact_token_limit = Some(SCOPE_LIMIT);
++            config.model_context_window = Some(200_000);
++            // Pin the model so capture identity matches turn identity and the
++            // R2 gate replays encrypted reasoning (production always has this).
++            config.model = Some("gpt-5.5".into());
++            config.compact_prompt = Some(SUMMARIZATION_PROMPT.into());
++        });
++    let test = builder.build(&server).await?;
++    let slot = test
++        .codex
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let _ = wait_for_handle(&slot, Duration::from_secs(30)).await;
++
++    let (sandbox_policy, permission_profile) =
++        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
++    test.codex
++        .submit(Op::UserInput {
++            items: vec![UserInput::Text {
++                text: "run the sustained tool loop".into(),
++                text_elements: Vec::new(),
++            }],
++            final_output_json_schema: None,
++            responsesapi_client_metadata: None,
++            additional_context: Default::default(),
++            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
++                environments: Some(local_selections(test.cwd_path().abs())),
++                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
++                sandbox_policy: Some(sandbox_policy),
++                permission_profile,
++                ..Default::default()
++            },
++        })
++        .await?;
++    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
++
++    let bodies = request_bodies(&mock);
++    assert_eq!(
++        bodies.len(),
++        CYCLES + 1,
++        "one provider request per tool cycle plus the final completion"
++    );
++    assert!(
++        !bodies.iter().any(|b| body_has_summarization(b)),
++        "no native compact path may run on any LIM-67 sustained cycle"
++    );
++
++    // Protected pair byte-stability at every seam: request k+1 carries cycle
++    // k's call id and its full output marker (protected at that seam).
++    for k in 0..CYCLES {
++        let req = &bodies[k + 1];
++        assert!(
++            req.contains(&format!("call-sus-{k}")),
++            "request {} must carry protected call id call-sus-{k}",
++            k + 1
++        );
++        assert!(
++            req.contains(&format!("-ENDPAY{k}\\n")) || req.contains(&format!("-ENDPAY{k}")),
++            "request {} must carry cycle {k}'s protected output verbatim (marker at end)",
++            k + 1
++        );
++    }
++
++    // Actual reduction at the first wave: the request after the seam-7 relief
++    // must be smaller than the one before it.
++    assert!(
++        bodies[8].len() < bodies[7].len(),
++        "wave-1 relief must shrink the next provider request ({} -> {})",
++        bodies[7].len(),
++        bodies[8].len()
++    );
++    // Escalation-driven visibility pruning is exact: the wave-1 escalation
++    // abridges every older unprotected output (their end markers vanish from
++    // the very next request) while the protected pair stays verbatim.
++    for i in 0..7 {
++        assert!(
++            !bodies[8].contains(&format!("-ENDPAY{i}")),
++            "request 8 must serve cycle {i}'s output abridged after the wave-1 escalation"
++        );
++    }
++    // Wave-2 escalation prunes the next stretch of now-unprotected outputs.
++    let wave2_dropped = (7..14)
++        .filter(|i| !bodies[15].contains(&format!("-ENDPAY{i}")))
++        .count();
++    assert!(
++        wave2_dropped >= 5,
++        "wave-2 escalation must abridge the older outputs; only {wave2_dropped} of 7 dropped"
++    );
++
++    // Actual reduction across repeated cycles: by the final request, early
++    // cycles' unprotected outputs remain abridged/banded — their end markers
++    // stay gone (degraded band fallbacks may retain a few members verbatim).
++    let final_req = bodies.last().expect("final request");
++    let early = 14usize;
++    let dropped_old_markers = (0..early)
++        .filter(|i| !final_req.contains(&format!("-ENDPAY{i}")))
++        .count();
++    assert!(
++        dropped_old_markers >= 6,
++        "sustained relief must keep old unprotected tool outputs short; only {dropped_old_markers} of {early} early markers dropped"
++    );
++    // The final request stays bounded — strictly below the accumulated
++    // unpruned payload volume and within the safe-runway order of magnitude.
++    let unpruned_chars: usize = CYCLES * CYCLE_OUTPUT_CHARS;
++    assert!(
++        final_req.len() < unpruned_chars,
++        "final request ({} chars) must be smaller than unpruned payload volume ({unpruned_chars} chars)",
++        final_req.len()
++    );
++    // The host-validated guarantee: every request that follows an escalated
++    // (host-validated) install stays below the safe-runway threshold. The
++    // degraded preserve path at seam 21 is not host-validated (LIM-67 gates
++    // escalations); offline derivation floors can keep it fatter.
++    for follow in [8usize, 15usize] {
++        assert!(
++            (bodies[follow].len() as i64) / 4 < SCOPE_LIMIT,
++            "request {follow} after a host-validated escalation (~{} est tokens) must stay below the safe-runway threshold",
++            bodies[follow].len() / 4
++        );
++    }
++
++    // Encrypted reasoning survives into the following request.
++    {
++        use base64::Engine as _;
++        let last_cycle = CYCLES - 1;
++        let expected_encrypted = base64::engine::general_purpose::STANDARD
++            .encode(format!("{}reasoning cycle {last_cycle}", "b".repeat(550)));
++        assert!(
++            final_req.contains(&expected_encrypted),
++            "final request must carry the prior response's encrypted reasoning verbatim"
++        );
++    }
++
++    // Durable receipts: escalations happened, each with exactly one boundary +
++    // typed marker; installs are truthful; no misreported install failures.
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    let thread_id = handle.thread_id().to_string();
++    let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
++            .await
++            .expect("inspect receipts");
++    let escalated: Vec<_> = receipts
++        .iter()
++        .filter(|r| {
++            matches!(
++                r.receipt.relief_path.as_str(),
++                "protected_escalation" | "host_validation_awaiting"
++            )
++        })
++        .collect();
++    assert!(
++        !escalated.is_empty(),
++        "sustained loop must include protected escalations; outcomes={:?}",
++        receipts
++            .iter()
++            .map(|r| (r.outcome.clone(), r.receipt.relief_path.as_str()))
++            .collect::<Vec<_>>()
++    );
++    for r in &escalated {
++        let cont = r
++            .continuation_turn_id
++            .as_deref()
++            .expect("escalated receipt must carry its continuation turn id");
++        let has_marker = codex_lhc_host::inspect_has_compact_continuation_marker(
++            &thread_id,
++            lhc_data_root.as_deref(),
++            cont,
++        )
++        .await
++        .expect("marker inspect");
++        assert!(
++            has_marker,
++            "exactly one typed marker per escalation ({cont})"
++        );
++        assert!(
++            !r.receipt.residual.protected_tool_call_ids.is_empty(),
++            "escalated receipt records its protected set"
++        );
++        // Host validation resolved ok for every served escalated install.
++        if r.receipt.residual.host_validation_status.as_str() == "awaiting" {
++            let row = hv_row_blocking(&thread_id, lhc_data_root.clone(), &r.attempt_id)
++                .expect("durable host-validation row for escalated install");
++            assert_eq!(
++                row.status,
++                codex_lhc_host::HostValidationStatus::Ok,
++                "served escalated install must have host validation recorded ok"
++            );
++        }
++    }
++    assert!(
++        !receipts
++            .iter()
++            .any(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("install_failed")),
++        "no misreported install failures across the sustained loop"
++    );
++
++    // Canonical content remains retrievable verbatim: the earliest cycle's
++    // full payload (marker included) still lives in the canonical record even
++    // though the served request abridged it.
++    let canonical = canonical_messages_blocking(&thread_id, lhc_data_root.clone());
++    assert!(
++        canonical.iter().any(|m| m.contains("-ENDPAY0")),
++        "canonical record must retain the earliest tool output verbatim"
 +    );
 +
 +    Ok(())

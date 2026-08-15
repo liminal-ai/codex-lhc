@@ -216,6 +216,82 @@ pub fn latest_compact_point_from_events(events: &[lhc::intake_stream::EventRecor
     best.or(Some(0))
 }
 
+/// LIM-67: durable host-validation reload gate.
+///
+/// When the newest compact-continuation receipt records an installed view
+/// whose full-body host validation is `awaiting` or `failed` (and the durable
+/// host-validation row has not since been recorded `ok`), the rollout must
+/// **stay on its prior generation**: regenerating it from the installed LHC
+/// surface would auto-install the unvalidated (or known-unsafe) body on
+/// reload. Returns the blocking description, or `None` when reload is clear.
+pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) -> Option<String> {
+    let root_buf = root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::gating::lhc_root);
+    let file_path = crate::session::thread_file_path(&root_buf, thread_id);
+    if !file_path.exists() {
+        return None;
+    }
+    let ref_ = lhc::threads::ThreadRef::file_path(file_path.to_string_lossy().into_owned());
+    let receipts =
+        match lhc::compact_continuation::list_compact_continuation_receipts(ref_.clone(), Some(1))
+            .await
+        {
+            lhc::shared_tech::errors::OpResult::Ok { value } => value,
+            lhc::shared_tech::errors::OpResult::Err { error } => {
+                // Inspection failure must not silently unblock: refuse regeneration.
+                return Some(format!(
+                    "host-validation inspect failed ({}: {}); refusing rollout regeneration",
+                    error.code.as_str(),
+                    error.reason
+                ));
+            }
+        };
+    let Some(latest) = receipts.first() else {
+        return None;
+    };
+    let status = latest.receipt.residual.host_validation_status;
+    let installed_pending = !latest.receipt.residual.prior_serving_view_intact
+        && matches!(
+            status,
+            lhc::shared_tech::compact_continuation::HostValidationStatusFact::Awaiting
+                | lhc::shared_tech::compact_continuation::HostValidationStatusFact::Failed
+        );
+    if !installed_pending {
+        return None;
+    }
+    // The durable host-validation row may have been resolved `ok` after the
+    // receipt was recorded (validated later in the same or a prior process).
+    match lhc::compact_continuation::get_compact_continuation_host_validation(
+        ref_,
+        &latest.attempt_id,
+    )
+    .await
+    {
+        lhc::shared_tech::errors::OpResult::Ok { value: Some(row) }
+            if row.status == lhc::compact_continuation::HostValidationStatus::Ok =>
+        {
+            None
+        }
+        lhc::shared_tech::errors::OpResult::Ok { value: row } => Some(format!(
+            "attempt {} installed a view whose host validation is {} (durable row: {:?});              rollout stays on prior generation until resolved or superseded",
+            latest.attempt_id,
+            match status {
+                lhc::shared_tech::compact_continuation::HostValidationStatusFact::Failed =>
+                    "failed",
+                _ => "awaiting",
+            },
+            row.map(|r| r.status),
+        )),
+        lhc::shared_tech::errors::OpResult::Err { error } => Some(format!(
+            "host-validation row inspect failed for attempt {} ({}: {}); refusing regeneration",
+            latest.attempt_id,
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
 /// Classify + regenerate when needed. Fail-open if the thread is unavailable.
 ///
 /// Loud `info!` names the trigger state on every rewrite.
@@ -240,6 +316,22 @@ pub async fn reconcile_rollout_at_path(
     let RolloutFileClass::NeedsRewrite(trigger) = class else {
         return ReconcileOutcome::Unchanged { reason: "ok" };
     };
+
+    // LIM-67: an installed-but-unvalidated (or validation-failed) protected
+    // escalation must not be auto-installed on reload. Deterministic refusal:
+    // the prior rollout generation remains authoritative.
+    if let Some(block) = host_validation_reload_block(thread_id, root).await {
+        warn!(
+            path = %path.display(),
+            thread_id,
+            ?trigger,
+            %block,
+            "LHC startup reconciliation: host-validation reload gate blocks regeneration"
+        );
+        return ReconcileOutcome::Unchanged {
+            reason: "host_validation_blocked",
+        };
+    }
 
     match regenerate_rollout_from_thread(path, thread_id, root, trigger, live_identity).await {
         Ok(items) => {

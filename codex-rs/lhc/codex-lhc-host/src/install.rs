@@ -201,6 +201,14 @@ pub struct LhcCaptureSlot {
     /// Production leaves this unset.
     #[cfg(any(test, feature = "test-util"))]
     mid_turn_test_hooks: Mutex<Option<crate::compact_continuation::MidTurnTestHooks>>,
+    /// Optional test-only safe-runway threshold override (tokens). Production
+    /// leaves this unset so the Codex auto-compact scope limit applies.
+    #[cfg(any(test, feature = "test-util"))]
+    mid_turn_test_safe_runway: Mutex<Option<i64>>,
+    /// Test-only: force the LIM-67 host full-body validation to fail after a
+    /// successful core install (negative-path evidence). Production unset.
+    #[cfg(any(test, feature = "test-util"))]
+    mid_turn_test_force_body_validation_fail: std::sync::atomic::AtomicBool,
 }
 
 impl LhcCaptureSlot {
@@ -229,6 +237,10 @@ impl LhcCaptureSlot {
             mid_turn_test_upper_trigger: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             mid_turn_test_hooks: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            mid_turn_test_safe_runway: Mutex::new(None),
+            #[cfg(any(test, feature = "test-util"))]
+            mid_turn_test_force_body_validation_fail: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -324,6 +336,38 @@ impl LhcCaptureSlot {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Install test-only safe-runway threshold for MidTurn (offline evidence).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_mid_turn_test_safe_runway(&self, threshold: Option<i64>) {
+        *self
+            .mid_turn_test_safe_runway
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = threshold;
+    }
+
+    /// Take MidTurn test safe-runway threshold without clearing.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn mid_turn_test_safe_runway(&self) -> Option<i64> {
+        *self
+            .mid_turn_test_safe_runway
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Test-only: force LIM-67 host body validation to fail (negative path).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_mid_turn_test_force_body_validation_fail(&self, fail: bool) {
+        self.mid_turn_test_force_body_validation_fail
+            .store(fail, Ordering::SeqCst);
+    }
+
+    /// Test-only: read the forced body-validation failure flag.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn mid_turn_test_force_body_validation_fail(&self) -> bool {
+        self.mid_turn_test_force_body_validation_fail
+            .load(Ordering::SeqCst)
     }
 
     /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.

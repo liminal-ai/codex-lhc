@@ -132,8 +132,12 @@ pub fn mid_turn_seam(
 ///   hook continuation, end_turn=false, etc.);
 /// - `none` only when no next provider request is planned.
 ///
-/// Parallel pairs stay intact. Branch id = lexicographically smallest
-/// non-empty response-scoped call_id (deterministic across retries).
+/// Contract 2.0.0: the branch carries the **complete sorted unique set** of
+/// response-scoped client-executed pending call IDs. Parallel pairs stay
+/// intact; every protected ID's call/result pair is preserved verbatim. When
+/// any response-scoped call lacks a settled correlated result the whole set is
+/// supplied with `correlation_valid: false` so the certified runtime refuses
+/// invalid correlation rather than forcing a non-tool boundary.
 pub fn work_continuation_for_mid_turn(
     response_tool_call_ids: &[String],
     history_items: &[ResponseItem],
@@ -173,27 +177,14 @@ pub fn work_continuation_for_mid_turn(
         })
         .collect();
 
-    let mut correlated: Vec<String> = response_ids
-        .iter()
-        .filter(|id| result_ids.contains(*id))
-        .cloned()
-        .collect();
-    correlated.sort();
-    correlated.dedup();
+    let all_correlated = response_ids.iter().all(|id| result_ids.contains(id));
 
-    if let Some(tool_call_id) = correlated.first().cloned() {
-        return WorkContinuation::PendingCorrelatedToolResult {
-            tool_call_id,
-            correlation_valid: true,
-        };
-    }
-
-    // Response produced tool calls but correlation is incomplete — still a
-    // pending-tool shape so the runtime can refuse invalid correlation rather
-    // than force a non-tool boundary.
+    // The protected set is the full sorted unique response-scoped set. A
+    // partially correlated response is supplied whole with correlation_valid
+    // false — the runtime's durable pair-set proof is the authority.
     WorkContinuation::PendingCorrelatedToolResult {
-        tool_call_id: response_ids[0].clone(),
-        correlation_valid: false,
+        protected_tool_call_ids: response_ids,
+        correlation_valid: all_correlated,
     }
 }
 
@@ -276,6 +267,13 @@ pub struct MidTurnCompactContinuationRequest {
     pub post_measurement_tokens: i64,
     pub upper_trigger_tokens: i64,
     pub lower_target_tokens: i64,
+    /// Host safe-runway threshold (LIM-67): the real bound the next materialized
+    /// provider request must stay under (Codex auto-compact scope limit or
+    /// configured runway). Distinct from the advisory LHC lower target.
+    pub safe_runway_threshold_tokens: Option<i64>,
+    /// Source label for the safe-runway threshold (e.g.
+    /// `codex_auto_compact_scope_limit`). Present iff the threshold is.
+    pub safe_runway_threshold_source: Option<String>,
     pub continuation: WorkContinuation,
     pub writer_claim: WriterClaim,
     pub capture_complete: bool,
@@ -340,6 +338,16 @@ impl MidTurnCompactContinuationOutcome {
     pub fn should_rewrite_host_rollout(&self) -> bool {
         self.installed && self.next_provider_request_allowed
     }
+
+    /// LIM-67: core installed a protected-escalation view and the durable
+    /// residual awaits the host's full-body validation. The host must
+    /// materialize the exact next provider request, validate it, and record
+    /// `ok`/`failed` before any rollout rewrite or provider send.
+    pub fn awaiting_host_validation(&self) -> bool {
+        self.installed
+            && self.run.receipt.residual.host_validation_status
+                == lhc::shared_tech::compact_continuation::HostValidationStatusFact::Awaiting
+    }
 }
 
 /// Resolve the on-disk thread path for the capture DB.
@@ -359,55 +367,64 @@ pub fn thread_sqlite_path(thread_id: &str, root: Option<&Path>) -> Option<PathBu
 /// always `active_non_tool`). Otherwise prefer the stored continuation so
 /// claim-only preserve-path re-entry keeps the response-scoped toolCallId.
 pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactContinuationHostFacts {
-    let (policy, actor, harness, compact, continuation) =
-        if let Some(id) = req.stored_operation_identity.as_ref() {
-            let stored_continuation = match &id.continuation {
-                WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
-                    // correlationValid is posture — rebuild true for recovery;
-                    // runtime re-proves the pair.
-                    WorkContinuation::PendingCorrelatedToolResult {
-                        tool_call_id: tool_call_id.clone(),
-                        correlation_valid: true,
-                    }
+    let (policy, actor, harness, compact, continuation) = if let Some(id) =
+        req.stored_operation_identity.as_ref()
+    {
+        let stored_continuation = match &id.continuation {
+            WorkContinuation::PendingCorrelatedToolResult {
+                protected_tool_call_ids,
+                ..
+            } => {
+                // correlationValid is posture — rebuild true for recovery;
+                // runtime re-proves the protected pair set.
+                WorkContinuation::PendingCorrelatedToolResult {
+                    protected_tool_call_ids: protected_tool_call_ids.clone(),
+                    correlation_valid: true,
                 }
-                other => other.clone(),
-            };
-            let continuation = if matches!(req.continuation, WorkContinuation::ActiveNonTool)
-                && matches!(id.continuation, WorkContinuation::ActiveNonTool)
-            {
-                // Boundary repair: request already forced ActiveNonTool and
-                // stored identity agrees.
-                req.continuation.clone()
-            } else if matches!(req.continuation, WorkContinuation::ActiveNonTool)
-                && !matches!(id.continuation, WorkContinuation::ActiveNonTool)
-            {
-                // Unusual: host forced ActiveNonTool while stored identity is
-                // different (should not happen for real boundary rows). Prefer
-                // stored identity so we never permanent-wedge on hash mismatch.
-                stored_continuation
-            } else {
-                stored_continuation
-            };
-            (
-                id.policy.clone(),
-                id.actor.clone(),
-                id.harness.clone(),
-                id.compact.clone(),
-                continuation,
-            )
-        } else {
-            (
-                CompactContinuationPolicy {
-                    upper_trigger_tokens: req.upper_trigger_tokens.max(0),
-                    lower_target_tokens: req.lower_target_tokens.max(0),
-                    host_capability: CompactContinuationHostCapability::FullStateMachine,
-                },
-                COMPACT_CONTINUATION_ACTOR.into(),
-                HARNESS.into(),
-                req.compact.clone(),
-                req.continuation.clone(),
-            )
+            }
+            other => other.clone(),
         };
+        let continuation = if matches!(req.continuation, WorkContinuation::ActiveNonTool)
+            && matches!(id.continuation, WorkContinuation::ActiveNonTool)
+        {
+            // Boundary repair: request already forced ActiveNonTool and
+            // stored identity agrees.
+            req.continuation.clone()
+        } else if matches!(req.continuation, WorkContinuation::ActiveNonTool)
+            && !matches!(id.continuation, WorkContinuation::ActiveNonTool)
+        {
+            // Unusual: host forced ActiveNonTool while stored identity is
+            // different (should not happen for real boundary rows). Prefer
+            // stored identity so we never permanent-wedge on hash mismatch.
+            stored_continuation
+        } else {
+            stored_continuation
+        };
+        (
+            id.policy.clone(),
+            id.actor.clone(),
+            id.harness.clone(),
+            id.compact.clone(),
+            continuation,
+        )
+    } else {
+        (
+            CompactContinuationPolicy {
+                upper_trigger_tokens: req.upper_trigger_tokens.max(0),
+                lower_target_tokens: req.lower_target_tokens.max(0),
+                host_capability: CompactContinuationHostCapability::FullStateMachine,
+                safe_runway_threshold_tokens: req.safe_runway_threshold_tokens.map(|t| t.max(0)),
+                safe_runway_threshold_source: req
+                    .safe_runway_threshold_source
+                    .clone()
+                    .filter(|s| !s.is_empty()),
+            },
+            COMPACT_CONTINUATION_ACTOR.into(),
+            HARNESS.into(),
+            req.compact.clone(),
+            req.continuation.clone(),
+        )
+    };
 
     CompactContinuationHostFacts {
         attempt_id: req.attempt_id.clone(),
@@ -705,6 +722,70 @@ pub async fn inspect_compact_continuation_receipts(
         OpResult::Ok { value } => Ok(value),
         OpResult::Err { error } => Err(format!(
             "inspect receipts {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
+/// Record the host's full-body validation result for one attempt (LIM-67).
+///
+/// Core installation and host validation are intentionally separate states:
+/// recording `failed` never rolls the installed LHC view back; it durably
+/// blocks the next provider request until repaired or superseded.
+pub async fn record_mid_turn_host_validation(
+    thread_id: &str,
+    root: Option<&Path>,
+    attempt_id: &str,
+    ok: bool,
+    reason: Option<String>,
+) -> Result<lhc::compact_continuation::HostValidationAck, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot record host validation".to_string())?;
+    if !path.exists() {
+        return Err(format!(
+            "LHC thread file missing for host validation: {}",
+            path.display()
+        ));
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    let status = if ok {
+        lhc::compact_continuation::HostValidationStatus::Ok
+    } else {
+        lhc::compact_continuation::HostValidationStatus::Failed
+    };
+    match lhc::compact_continuation::record_compact_continuation_host_validation(
+        ref_, attempt_id, status, reason, None,
+    )
+    .await
+    {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "record host validation {}: {}",
+            error.code.as_str(),
+            error.reason
+        )),
+    }
+}
+
+/// Inspect the durable host-validation row for one attempt (LIM-67).
+pub async fn inspect_mid_turn_host_validation(
+    thread_id: &str,
+    root: Option<&Path>,
+    attempt_id: &str,
+) -> Result<Option<lhc::compact_continuation::HostValidationAck>, String> {
+    let path = thread_sqlite_path(thread_id, root)
+        .ok_or_else(|| "LHC root missing; cannot inspect host validation".to_string())?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
+    match lhc::compact_continuation::get_compact_continuation_host_validation(ref_, attempt_id)
+        .await
+    {
+        OpResult::Ok { value } => Ok(value),
+        OpResult::Err { error } => Err(format!(
+            "inspect host validation {}: {}",
             error.code.as_str(),
             error.reason
         )),
@@ -1016,10 +1097,11 @@ mod tests {
         ];
         match work_continuation_from_history_tail(&items, true) {
             WorkContinuation::PendingCorrelatedToolResult {
-                tool_call_id,
+                protected_tool_call_ids,
                 correlation_valid,
             } => {
-                assert_eq!(tool_call_id, "call-a");
+                // Contract 2.0.0: the complete sorted parallel set is protected.
+                assert_eq!(protected_tool_call_ids, vec!["call-a", "call-b"]);
                 assert!(correlation_valid);
             }
             other => panic!("expected pending tool, got {other:?}"),
@@ -1096,10 +1178,10 @@ mod tests {
         ];
         match work_continuation_for_mid_turn(&["ts-1".into()], &items, true) {
             WorkContinuation::PendingCorrelatedToolResult {
-                tool_call_id,
+                protected_tool_call_ids,
                 correlation_valid,
             } => {
-                assert_eq!(tool_call_id, "ts-1");
+                assert_eq!(protected_tool_call_ids, vec!["ts-1"]);
                 assert!(correlation_valid);
             }
             other => panic!("expected valid pending tool, got {other:?}"),
@@ -1220,10 +1302,10 @@ mod tests {
             /*total_needs_follow_up*/ true,
         ) {
             WorkContinuation::PendingCorrelatedToolResult {
-                tool_call_id,
+                protected_tool_call_ids,
                 correlation_valid,
             } => {
-                assert_eq!(tool_call_id, "new-call");
+                assert_eq!(protected_tool_call_ids, vec!["new-call"]);
                 assert!(correlation_valid);
             }
             other => panic!("expected new-call branch, got {other:?}"),

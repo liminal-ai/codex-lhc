@@ -617,12 +617,13 @@ async fn try_run_mid_turn_compact_continuation(
         } else if let Some(id) = rec.stored_identity.as_ref() {
             // Re-enter with stored continuation kind + toolCallId (preserve-path).
             continuation = match &id.continuation {
-                WorkContinuation::PendingCorrelatedToolResult { tool_call_id, .. } => {
-                    WorkContinuation::PendingCorrelatedToolResult {
-                        tool_call_id: tool_call_id.clone(),
-                        correlation_valid: true,
-                    }
-                }
+                WorkContinuation::PendingCorrelatedToolResult {
+                    protected_tool_call_ids,
+                    ..
+                } => WorkContinuation::PendingCorrelatedToolResult {
+                    protected_tool_call_ids: protected_tool_call_ids.clone(),
+                    correlation_valid: true,
+                },
                 other => other.clone(),
             };
         }
@@ -630,6 +631,53 @@ async fn try_run_mid_turn_compact_continuation(
     } else {
         (fresh_attempt_id, WriterClaim::None, None)
     };
+
+    // LIM-67: capture live-history byte expectations for the protected pair
+    // set and required encrypted reasoning BEFORE the attempt mutates anything.
+    // The post-install materialized body is validated against these.
+    let protected_ids_for_validation: Vec<String> = match &continuation {
+        WorkContinuation::PendingCorrelatedToolResult {
+            protected_tool_call_ids,
+            ..
+        } => protected_tool_call_ids.clone(),
+        _ => Vec::new(),
+    };
+    let (protected_pair_expectations, required_encrypted_reasoning) =
+        codex_lhc_host::capture_body_expectations(&host_items, &protected_ids_for_validation);
+
+    // LIM-67: the host safe-runway threshold is the real bound the next
+    // materialized provider request must stay under — the Codex auto-compact
+    // scope limit when configured, else the full context window. Never a
+    // universal percentage, and never the advisory LHC lower target.
+    //
+    // Contract scope: the threshold governs pending-tool escalation
+    // classification (SDK policy field is optional elsewhere). Active
+    // non-tool seams keep their certified LIM-63 semantics and pass none.
+    let pending_tool_seam = matches!(
+        continuation,
+        WorkContinuation::PendingCorrelatedToolResult { .. }
+    );
+    let (safe_runway_threshold_tokens, safe_runway_threshold_source) = if pending_tool_seam {
+        match (
+            token_status.auto_compact_scope_limit,
+            token_status.full_context_window_limit,
+        ) {
+            (Some(limit), _) => (
+                Some(limit),
+                Some("codex_auto_compact_scope_limit".to_string()),
+            ),
+            (None, Some(limit)) => (Some(limit), Some("codex_context_window_limit".to_string())),
+            (None, None) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    #[cfg(any(test, feature = "test-util"))]
+    let (safe_runway_threshold_tokens, safe_runway_threshold_source) =
+        match slot.mid_turn_test_safe_runway() {
+            Some(t) => (Some(t), Some("test_safe_runway".to_string())),
+            None => (safe_runway_threshold_tokens, safe_runway_threshold_source),
+        };
 
     let req = MidTurnCompactContinuationRequest {
         thread_id: thread_id.clone(),
@@ -639,6 +687,8 @@ async fn try_run_mid_turn_compact_continuation(
         post_measurement_tokens: post_measurement,
         upper_trigger_tokens: upper_trigger,
         lower_target_tokens: lower_target,
+        safe_runway_threshold_tokens,
+        safe_runway_threshold_source,
         continuation,
         writer_claim,
         capture_complete: true,
@@ -710,11 +760,27 @@ async fn try_run_mid_turn_compact_continuation(
         slot.record_mid_turn_hysteresis(&attempt_id, p, outcome.reduced, &outcome.outcome_kind);
     }
 
-    if outcome.should_rewrite_host_rollout() {
+    // LIM-67: a protected-escalation install leaves the durable residual
+    // awaiting host validation (next request blocked). The host materializes
+    // the exact next provider request from the installed surface, validates
+    // it, and records ok/failed before any rollout rewrite or send.
+    let awaiting_host_validation = outcome.awaiting_host_validation();
+    if outcome.should_rewrite_host_rollout() || awaiting_host_validation {
         // Runtime installed a serving view in LHC; materialize through the
         // existing native-fidelity rewrite path. Host does not synthesize a
         // second continuation marker — CompactMarker here is fork bookkeeping
         // only (covered range + rewrite boundary).
+        let host_validation_spec = if awaiting_host_validation {
+            Some(codex_lhc_host::BodyValidationSpec {
+                attempt_id: attempt_id.clone(),
+                protected_tool_call_ids: protected_ids_for_validation.clone(),
+                protected_pairs: protected_pair_expectations.clone(),
+                required_encrypted_reasoning: required_encrypted_reasoning.clone(),
+                safe_runway_threshold_tokens,
+            })
+        } else {
+            None
+        };
         let thread_id = handle.thread_id().to_string();
         let root = handle.root().map(std::path::Path::to_path_buf);
         let (_initial_context, world_state_baseline) =
@@ -750,6 +816,7 @@ async fn try_run_mid_turn_compact_continuation(
             world_state_baseline,
             reference_context_item,
             /*manual*/ false,
+            host_validation_spec,
             cancellation_token,
         )
         .await?;
@@ -802,6 +869,48 @@ async fn try_run_mid_turn_compact_continuation(
 /// and the thread exits; the caller then joins. Cancellation never detaches a
 /// mutator — host apply is suppressed if the turn token cancelled during the
 /// section.
+/// Record host full-body validation on a dedicated thread (SDK futures are
+/// `!Send`). Durable ok/failed acknowledgment for a protected-escalation
+/// attempt; never rolls the core install back.
+async fn record_host_validation_on_thread(
+    thread_id: String,
+    root: Option<PathBuf>,
+    attempt_id: String,
+    ok: bool,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawn = std::thread::Builder::new()
+        .name(format!("lhc-midturn-hv-{attempt_id}"))
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = tx.send(Err(format!("runtime: {err}")));
+                    return;
+                }
+            };
+            let result = rt.block_on(codex_lhc_host::record_mid_turn_host_validation(
+                &thread_id,
+                root.as_deref(),
+                &attempt_id,
+                ok,
+                reason,
+            ));
+            let _ = tx.send(result.map(|_| ()));
+        });
+    if let Err(err) = spawn {
+        return Err(format!("spawn: {err}"));
+    }
+    match rx.await {
+        Ok(result) => result,
+        Err(_) => Err("host validation record thread dropped".into()),
+    }
+}
+
 /// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
 /// inspection futures are `!Send`).
 async fn inspect_mid_turn_recovery_on_thread(
@@ -1133,6 +1242,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         world_state_baseline,
         reference_context_item,
         manual,
+        /*host_validation*/ None,
         cancellation_token,
     ))
     .await
@@ -1153,6 +1263,7 @@ async fn install_lhc_compact_rewrite(
     world_state_baseline: Option<std::sync::Arc<crate::context::world_state::WorldState>>,
     reference_context_item: Option<codex_protocol::protocol::TurnContextItem>,
     manual: bool,
+    host_validation: Option<codex_lhc_host::BodyValidationSpec>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<LhcCompactAttempt> {
     // LHC SDK futures are !Send — hop to a dedicated thread like produce does.
@@ -1281,6 +1392,90 @@ async fn install_lhc_compact_rewrite(
     for item in &mut materialize_result.items {
         if let RolloutItem::Compacted(compacted) = item {
             compacted.message = durable_message.clone();
+        }
+    }
+
+    // LIM-67 host full-body validation gate (protected escalation only).
+    // `install_history` is the exact item sequence the next provider request
+    // serves (identical to what the rewrite and in-memory install would use).
+    // Validate BEFORE the rollout rewrite / in-memory replacement; record the
+    // durable ok/failed acknowledgment through the certified SDK API. A failed
+    // (or unrecordable) validation leaves rollout and in-memory history on
+    // their prior generation and blocks the next provider request. It does NOT
+    // roll the installed LHC core view back.
+    if let Some(spec) = host_validation.as_ref() {
+        #[cfg(any(test, feature = "test-util"))]
+        let validation = if slot.mid_turn_test_force_body_validation_fail() {
+            Err("test-injected host body validation failure".to_string())
+        } else {
+            codex_lhc_host::validate_next_request_body(&install_history, spec)
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let validation = codex_lhc_host::validate_next_request_body(&install_history, spec);
+        match validation {
+            Ok(report) => {
+                match record_host_validation_on_thread(
+                    thread_id.clone(),
+                    root.clone(),
+                    spec.attempt_id.clone(),
+                    true,
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        info!(
+                            attempt_id = %spec.attempt_id,
+                            body_items = report.body_item_count,
+                            body_tokens = report.body_token_estimate,
+                            threshold = ?report.safe_runway_threshold_tokens,
+                            protected_pairs = report.protected_pair_count,
+                            reasoning_preserved = report.reasoning_preserved_count,
+                            "LHC MidTurn host full-body validation ok; proceeding to rewrite"
+                        );
+                    }
+                    Err(err) => {
+                        error!(
+                            %err,
+                            attempt_id = %spec.attempt_id,
+                            "LHC MidTurn host validation passed but durable ack write failed;                              blocking without rewrite (residual stays awaiting)"
+                        );
+                        return Ok(LhcCompactAttempt::MidTurnBlocked {
+                            reason: format!(
+                                "host validation ack write failed for attempt {}: {err}",
+                                spec.attempt_id
+                            ),
+                            next_provider_request_allowed: false,
+                        });
+                    }
+                }
+            }
+            Err(reason) => {
+                if let Err(err) = record_host_validation_on_thread(
+                    thread_id.clone(),
+                    root.clone(),
+                    spec.attempt_id.clone(),
+                    false,
+                    Some(reason.clone()),
+                )
+                .await
+                {
+                    error!(
+                        %err,
+                        attempt_id = %spec.attempt_id,
+                        "LHC MidTurn host-validation-failed record write failed; blocking anyway"
+                    );
+                }
+                error!(
+                    attempt_id = %spec.attempt_id,
+                    %reason,
+                    "LHC MidTurn host full-body validation FAILED; rollout and in-memory                      history stay on prior generation; next provider request blocked"
+                );
+                return Ok(LhcCompactAttempt::MidTurnBlocked {
+                    reason: format!("host full-body validation failed: {reason}"),
+                    next_provider_request_allowed: false,
+                });
+            }
         }
     }
 

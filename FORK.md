@@ -23,11 +23,12 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`6232317`** — LIM-63 certified compact-continuation runtime
-  (schema v10 writer/boundary/receipt/attempt stores + read-only stored
-  operation-identity inspection) on the `feature/compact-continuation` line.
-  Descends the prior LIM-63A pin `98826c1` (marker/install gated on valid
-  candidate material only) and the retrieval pin `7062814` / `dd251ec`
+  Current pin: **`3a0f63f`** — LIM-67 contract 2.0.0 protected pending-tool
+  escalation (sorted `protectedToolCallIds` set, protected visibility-boundary
+  preview, atomic view+boundary install, schema v11 host-validation store +
+  ack APIs) on the `feature/compact-continuation` line. Descends the LIM-63
+  pin `6232317` (schema v10 runtime + stored operation-identity inspection),
+  the LIM-63A pin `98826c1`, and the retrieval pin `7062814` / `dd251ec`
   (byte-fitting slices, clean-tail token windows, rusqlite 0.37–0.39
   host-compat, bundled SQLite 3.51.3). Side-branch pin until the feature
   line folds into shared main; tripwire still requires a clean tree at the
@@ -490,9 +491,42 @@ request), **LHC is the single writer**. The certified SDK operation
 
 | Continuation branch | Behavior |
 |---------------------|----------|
-| `pending_correlated_tool_result` | Same canonical turn; tool call/result pair preserved verbatim; **no** continuation marker. Parallel calls stay intact; branch id = lexicographically smallest correlated `call_id`. |
+| `pending_correlated_tool_result` | Contract 2.0.0: the branch carries the **complete sorted unique set** of response-scoped client tool-call IDs (`protectedToolCallIds`). Ordinary preserve first (same canonical turn, all pairs verbatim, no marker). When preserve cannot create safe runway, **one protected escalation** (LIM-67): forced `context_compact_continue` boundary, protected visibility-boundary prune of older unprotected result bodies only, one typed marker, atomic view+boundary install. |
 | `active_non_tool` | Force LHC `context_compact_continue` boundary; compact; **one** typed marker; continue same Codex task. |
 | `none` | No continuation compact path. |
+
+### LIM-67 protected escalation + host full-body validation
+
+- The host supplies the **real safe-runway threshold**: the Codex
+  auto-compact scope limit (source `codex_auto_compact_scope_limit`) or the
+  context-window limit — never a percentage, never the advisory LHC lower
+  target.
+- A protected-escalation core install leaves the durable SDK residual
+  `hostValidationStatus = awaiting` with the next provider request blocked.
+  The host then materializes the **exact next-request item sequence** through
+  the existing rewrite materializer and validates it
+  (`codex_lhc_host::validate_next_request_body`): full tool
+  correlation/ordering, protected pairs byte-stable against the live
+  pre-attempt history (host provenance keys `id` /
+  `internal_chat_message_metadata_passthrough` normalized out), required
+  encrypted reasoning byte-exact (the materializer's certified canonical text
+  flattening is allowed), and complete-body size strictly below the runway
+  (`codex_materialized_body_o200k_estimate`).
+- `record_mid_turn_host_validation` records durable `ok`/`failed` (schema
+  v11). `ok` proceeds to rollout rewrite + in-memory install; `failed` (or an
+  unrecordable ack) leaves rollout and in-memory history on their **prior
+  generation**, blocks the next provider request, and never rolls the core
+  install back.
+- **Reload gate:** `codex_lhc_host::host_validation_reload_block` — when the
+  newest receipt records an installed view whose validation is
+  awaiting/failed (and no later `ok` row exists), startup reconciliation
+  refuses to regenerate the rollout from the installed surface
+  (`ReconcileOutcome::Unchanged { reason: "host_validation_blocked" }`).
+  A later safe attempt supersedes.
+- Evidence: `mid_turn_protected_escalation_validates_installs_and_clears_reload_gate`,
+  `mid_turn_host_validation_failed_blocks_send_and_gates_reload` (lib), and
+  the sustained `full_loop_sustained_protected_escalation_bounded` +
+  existing MidTurn loops (suite).
 
 Host obligations:
 
@@ -518,15 +552,18 @@ Host obligations:
   future is dropped on that worker thread and the thread exits; the host always
   joins. Host rewrite is suppressed if the turn token cancelled during the
   section. No detached mutator.
-- Continuation classification carries total follow-up intent and response-scoped
-  tool call IDs from the completed sampling response (not a history-tail rescan
-  as authority). Queued steering/mailbox alone is `active_non_tool`, not `none`.
+- Continuation classification carries total follow-up intent and the complete
+  sorted response-scoped tool call ID set from the completed sampling response
+  (not a history-tail rescan as authority). Queued steering/mailbox alone is
+  `active_non_tool`, not `none`.
 - Attempt identity uses the completed provider `response_id`; provider usage is
   that response's `token_usage` (cache split exact).
 - Kill-switch off (`lhc_capture = false`) restores native MidTurn behavior
   (visible `Unavailable` residual).
-- Schema v10 thread stores (writer claim, boundary, receipt, stage log) are
-  owned by the vendored pin; startup reconcile remains valid.
+- Schema v11 thread stores (writer claim, boundary, receipt, stage log,
+  host-validation ack) are owned by the vendored pin; startup reconcile
+  remains valid and additionally honors the LIM-67 host-validation reload
+  gate.
 
 Implementation: `codex-lhc-host::compact_continuation` +
 `core/src/compact_lhc.rs` MidTurn arm; evidence in
