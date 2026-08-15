@@ -42,6 +42,7 @@ use codex_lhc_host::model_context_token_estimate_from_rollout_items;
 use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
+use codex_lhc_host::rollback_rollout_after_failed_reopen;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
@@ -609,6 +610,17 @@ async fn install_lhc_compact_rewrite(
         }
     }
 
+    // Validate the exact history Codex will install. Materialization can add a
+    // live tail after the earlier produce-body check.
+    if let Some(reason) = body_exceeds_window(turn_context, &install_history) {
+        warn!(
+            %reason,
+            manual,
+            "LHC compact final install history over target; preserving current history"
+        );
+        return Ok(failed_attempt(reason));
+    }
+
     // Rewrite the rollout file (replaces append of Compacted). Failure leaves
     // the old file authoritative and does not commit the planned window.
     // Durable install is required when a live path exists — no in-memory-only
@@ -644,11 +656,24 @@ async fn install_lhc_compact_rewrite(
                             %err,
                             path = %path.display(),
                             "LHC recorder reopen after rewrite failed after retry; \
-                             not claiming Installed (orphan inode risk)"
+                             restoring prior rollout generation"
                         );
-                        return Ok(failed_attempt(format!(
-                            "recorder reopen after rewrite failed: {err}"
-                        )));
+                        return match rollback_rollout_after_failed_reopen(path) {
+                            Ok(()) => Ok(failed_attempt(format!(
+                                "recorder reopen after rewrite failed; prior generation restored: {err}"
+                            ))),
+                            Err(rollback_err) => {
+                                error!(
+                                    %rollback_err,
+                                    path = %path.display(),
+                                    "LHC durability unknown: recorder reopen and rollout rollback both failed"
+                                );
+                                Ok(failed_attempt(format!(
+                                    "durability unknown: recorder reopen failed ({err}); \
+                                     prior-generation rollback failed ({rollback_err})"
+                                )))
+                            }
+                        };
                     }
                 }
                 info!(

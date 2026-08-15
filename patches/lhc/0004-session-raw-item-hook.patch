@@ -1073,7 +1073,7 @@ index 0000000000..086351b058
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 5dd12bc91b..af5f33c8fa 100644
+index 5dd12bc91b..c6d5fee913 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -1380,6 +1380,9 @@ impl Session {
@@ -1293,40 +1293,7 @@ index 5dd12bc91b..af5f33c8fa 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3679,6 +3818,32 @@ impl Session {
-         state.advance_auto_compact_window()
-     }
- 
-+    /// Plan next auto-compact window ids without committing (transactional install).
-+    pub(crate) async fn plan_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
-+        let state = self.state.lock().await;
-+        state.plan_auto_compact_window_advance()
-+    }
-+
-+    /// Commit a planned auto-compact window advance after successful replacement.
-+    pub(crate) async fn commit_auto_compact_window_advance(
-+        &self,
-+        window_number: u64,
-+        ids: AutoCompactWindowIds,
-+    ) {
-+        let mut state = self.state.lock().await;
-+        state.commit_auto_compact_window_advance(window_number, ids);
-+    }
-+
-+    pub(crate) async fn auto_compact_window_number(&self) -> u64 {
-+        let state = self.state.lock().await;
-+        state.auto_compact_window_number()
-+    }
-+
-+    pub(crate) async fn auto_compact_window_ids(&self) -> AutoCompactWindowIds {
-+        let state = self.state.lock().await;
-+        state.auto_compact_window_ids()
-+    }
-+
-     pub(crate) async fn request_new_context_window(&self) {
-         let mut state = self.state.lock().await;
-         state.request_new_context_window();
-@@ -3961,9 +4126,13 @@ impl Session {
+@@ -3961,9 +4100,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1343,7 +1310,7 @@ index 5dd12bc91b..af5f33c8fa 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -3983,8 +4152,13 @@ impl Session {
+@@ -3983,8 +4126,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1359,7 +1326,7 @@ index 5dd12bc91b..af5f33c8fa 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4229,3 +4403,14 @@ mod elicitation_holders_tests;
+@@ -4229,3 +4377,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

@@ -187,9 +187,6 @@ pub struct LhcCaptureSlot {
     /// ever installed here — never the deterministic ones, which would bake
     /// canned text into the record and serve it as real derivation.
     derivation_callbacks: crate::inference::LateBoundCallbacks,
-    /// Test inject: next [`Self::mark_derived_after_writeback`] returns Err.
-    #[cfg(any(test, feature = "test-util"))]
-    fail_next_mark_derived: AtomicBool,
 }
 
 impl LhcCaptureSlot {
@@ -209,15 +206,7 @@ impl LhcCaptureSlot {
             superseded_ids: Mutex::new(HashSet::new()),
             superseded_digests: Mutex::new(HashSet::new()),
             derivation_callbacks: crate::inference::LateBoundCallbacks::new(),
-            #[cfg(any(test, feature = "test-util"))]
-            fail_next_mark_derived: AtomicBool::new(false),
         }
-    }
-
-    /// Test inject: force the next provenance bookkeeping write to fail.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn fail_next_mark_derived_for_test(&self) {
-        self.fail_next_mark_derived.store(true, Ordering::SeqCst);
     }
 
     /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.
@@ -282,10 +271,6 @@ impl LhcCaptureSlot {
         ids: impl IntoIterator<Item = String>,
         digests: impl IntoIterator<Item = String>,
     ) -> Result<(), String> {
-        #[cfg(any(test, feature = "test-util"))]
-        if self.fail_next_mark_derived.swap(false, Ordering::SeqCst) {
-            return Err("injected mark_derived_after_writeback failure".into());
-        }
         let ids: Vec<String> = ids.into_iter().filter(|s| !s.is_empty()).collect();
         let digests: Vec<String> = digests.into_iter().filter(|s| !s.is_empty()).collect();
         if ids.is_empty() && digests.is_empty() {

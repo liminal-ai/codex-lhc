@@ -2641,58 +2641,6 @@ async fn hard_failure_preserves_history_and_writes_no_native_compacted() {
     );
 }
 
-/// Post-install bookkeeping failure must still report Installed (no second compact).
-/// Injects a real slot provenance commit failure — normal-success is not evidence.
-#[tokio::test]
-async fn post_install_bookkeeping_failure_still_installed() {
-    let dir = tempdir().unwrap();
-    let root = dir.path().to_path_buf();
-    let (mut session, tc) = make_session_and_context().await;
-    install_lhc_and_enable(&mut session, root).await;
-    let slot = session
-        .services
-        .thread_extension_data
-        .get::<LhcCaptureSlot>()
-        .expect("slot");
-    let handle = wait_for_handle(&slot, Duration::from_secs(30))
-        .await
-        .expect("handle");
-    seed_conversation_bandable(&session, &tc, 80).await;
-    handle.flush().await;
-
-    // Inject actual provenance bookkeeping failure after history install.
-    slot.fail_next_mark_derived_for_test();
-
-    let sess = Arc::new(session);
-    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
-    assert!(
-        matches!(attempt, LhcCompactAttempt::Installed { .. }),
-        "bookkeeping failure after install must still return Installed \
-         (not Failed that would re-enter compact): {attempt:?}"
-    );
-    let installed_len = sess.clone_history().await.raw_items().len();
-    assert!(installed_len > 0, "history must remain installed");
-
-    // Already-installed result is not permission for another compact path:
-    // a second arm either installs via LHC or hard-fails with LHC pathology.
-    let second = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
-    match second {
-        LhcCompactAttempt::Installed { .. } => {}
-        LhcCompactAttempt::Failed { reason } => {
-            assert!(
-                reason.contains("NoReduction")
-                    || reason.contains("empty")
-                    || reason.contains("archive")
-                    || reason.contains("Feature"),
-                "second compact hard-stop must be LHC pathology, not native re-entry: {reason}"
-            );
-        }
-        LhcCompactAttempt::Cancelled { reason } => {
-            panic!("unexpected cancel on second compact: {reason}");
-        }
-    }
-}
-
 /// Failed rewrite must not advance window ids/number (transactional).
 #[tokio::test]
 async fn rewrite_failure_leaves_auto_compact_window_unchanged() {

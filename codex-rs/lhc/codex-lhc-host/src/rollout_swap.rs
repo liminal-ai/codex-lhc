@@ -149,6 +149,58 @@ pub fn atomic_rewrite_rollout(rollout_path: &Path, items: &[RolloutItem]) -> std
     Ok(())
 }
 
+/// Restore the retained prior generation after the recorder cannot reopen the
+/// newly installed rollout.
+///
+/// The recorder still owns the prior generation's inode. Moving `*.prev` back
+/// to the active path restores agreement between the live append handle and
+/// the path without changing in-memory history.
+pub fn rollback_rollout_after_failed_reopen(rollout_path: &Path) -> std::io::Result<()> {
+    let paths = SwapPaths::for_rollout(rollout_path);
+    let parent = paths.active.parent().ok_or_else(|| {
+        IoError::other(format!(
+            "rollout path has no parent: {}",
+            paths.active.display()
+        ))
+    })?;
+    let mut rejected = rollout_path.as_os_str().to_os_string();
+    rejected.push(".rejected-tmp");
+    let rejected = PathBuf::from(rejected);
+
+    if !paths.prev.exists() {
+        return Err(IoError::other(format!(
+            "rollback after failed reopen: prior generation missing at {}",
+            paths.prev.display()
+        )));
+    }
+
+    if paths.active.exists() {
+        if rejected.exists() {
+            std::fs::remove_file(&rejected)?;
+        }
+        std::fs::rename(&paths.active, &rejected)?;
+    }
+
+    if let Err(err) = std::fs::rename(&paths.prev, &paths.active) {
+        if rejected.exists() && !paths.active.exists() {
+            let _ = std::fs::rename(&rejected, &paths.active);
+        }
+        return Err(err);
+    }
+    fsync_dir(parent)?;
+
+    if rejected.exists()
+        && let Err(err) = std::fs::remove_file(&rejected)
+    {
+        tracing::warn!(
+            %err,
+            path = %rejected.display(),
+            "LHC: failed to remove rejected rollout generation after reopen rollback"
+        );
+    }
+    Ok(())
+}
+
 /// Model-visible history that resume rebuilds from a materialized rollout:
 /// `Compacted.replacement_history` (bands) followed by post-boundary
 /// `ResponseItem`s (and inter-agent communications converted to model input).

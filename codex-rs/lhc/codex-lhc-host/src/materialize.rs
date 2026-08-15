@@ -534,16 +534,12 @@ fn emit_band_entry(
     if u.content.is_empty() {
         return;
     }
-    // Chunk at the model-visible per-item cap so a single raw band cannot
-    // install as one 24k–58k+ token ResponseItem (context contract).
-    for item in crate::compact_bridge::message_items_for_text("user", &u.content) {
-        model_stream.push(item.clone());
-        out.push(RolloutItem::ResponseItem(item.into()));
-    }
+    let item = user_text_message(&u.content);
+    model_stream.push(item.clone());
+    out.push(RolloutItem::ResponseItem(item.into()));
 }
 
 fn user_text_message(text: &str) -> ResponseItem {
-    // Keep a single-item helper for tail/display paths that already bound size.
     ResponseItem::Message {
         id: None,
         role: "user".into(),
