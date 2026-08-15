@@ -1480,10 +1480,10 @@ fn bundled_models_json_roundtrips() {
     );
 }
 
-/// Remote/cache catalogs with no explicit limit use regular Codex policy:
-/// 90% of the model context window (244800 for 272k).
+/// A short-context remote/cache entry cannot erase the higher GPT-5.6 working
+/// window and capability deliberately shipped by Codex-LHC.
 #[tokio::test]
-async fn gpt_5_6_remote_null_auto_compact_resolves_to_regular_90_percent_default() {
+async fn gpt_5_6_remote_short_context_preserves_bundled_lhc_defaults() {
     for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         let mut remote = remote_model(slug, "Remote GPT-5.6", /*priority*/ 0);
         remote.auto_compact_token_limit = None;
@@ -1497,14 +1497,21 @@ async fn gpt_5_6_remote_null_auto_compact_resolves_to_regular_90_percent_default
         let model = manager.get_model_info(slug, &config).await;
 
         assert_eq!(
-            model.auto_compact_token_limit, None,
-            "{slug}: remote null remains unset so regular context-window policy applies"
+            model.context_window,
+            Some(370_000),
+            "{slug}: working window"
         );
         assert_eq!(
-            model.auto_compact_token_limit(),
-            Some(244_800),
-            "{slug}: regular default must resolve to 90% of 272k"
+            model.max_context_window,
+            Some(1_050_000),
+            "{slug}: capability ceiling"
         );
+        assert_eq!(
+            model.auto_compact_token_limit,
+            Some(350_000),
+            "{slug}: LHC compact trigger"
+        );
+        assert_eq!(model.auto_compact_token_limit(), Some(350_000));
     }
 }
 

@@ -13640,19 +13640,65 @@ index 3b6d62393e..07e96d985e 100644
        "comp_hash": "3000",
        "reasoning_summary_format": "experimental",
        "default_reasoning_summary": "none",
+diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
+index 45835c37cd..19b641e328 100644
+--- a/codex-rs/models-manager/src/manager.rs
++++ b/codex-rs/models-manager/src/manager.rs
+@@ -660,7 +660,7 @@ pub(crate) fn construct_model_info_from_candidates(
+     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
+     let remote = find_model_by_longest_prefix(model, candidates)
+         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
+-    let model_info = if let Some(remote) = remote {
++    let mut model_info = if let Some(remote) = remote {
+         ModelInfo {
+             slug: model.to_string(),
+             used_fallback_model_metadata: false,
+@@ -669,6 +669,32 @@ pub(crate) fn construct_model_info_from_candidates(
+     } else {
+         model_info::model_info_from_slug(model)
+     };
++
++    // A remote catalog can advertise the short-context pricing profile as the
++    // model's whole capability. Preserve higher working-window and capability
++    // metadata deliberately shipped by this binary, so runtime overrides remain
++    // usable after cache refresh. Values stay catalog-driven, never hard-coded.
++    if let Ok(bundled) = crate::bundled_models_response()
++        && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
++            .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
++    {
++        model_info.max_context_window = match (
++            model_info.max_context_window,
++            bundled_model.max_context_window,
++        ) {
++            (Some(remote), Some(bundled)) => Some(remote.max(bundled)),
++            (remote, bundled) => remote.or(bundled),
++        };
++        let remote_context = model_info.context_window.unwrap_or_default();
++        let bundled_context = bundled_model.context_window.unwrap_or_default();
++        if bundled_context >= remote_context {
++            model_info.context_window = bundled_model.context_window.or(model_info.context_window);
++            model_info.auto_compact_token_limit = bundled_model
++                .auto_compact_token_limit
++                .or(model_info.auto_compact_token_limit);
++        }
++    }
++
+     model_info::with_config_overrides(model_info, config)
+ }
+ 
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 8669a0a34f..4bdf5b2e97 100644
+index 8669a0a34f..26ec8bd812 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
-@@ -1479,3 +1479,89 @@ fn bundled_models_json_roundtrips() {
+@@ -1479,3 +1479,96 @@ fn bundled_models_json_roundtrips() {
          "bundled models.json should contain at least one model"
      );
  }
 +
-+/// Remote/cache catalogs with no explicit limit use regular Codex policy:
-+/// 90% of the model context window (244800 for 272k).
++/// A short-context remote/cache entry cannot erase the higher GPT-5.6 working
++/// window and capability deliberately shipped by Codex-LHC.
 +#[tokio::test]
-+async fn gpt_5_6_remote_null_auto_compact_resolves_to_regular_90_percent_default() {
++async fn gpt_5_6_remote_short_context_preserves_bundled_lhc_defaults() {
 +    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
 +        let mut remote = remote_model(slug, "Remote GPT-5.6", /*priority*/ 0);
 +        remote.auto_compact_token_limit = None;
@@ -13666,14 +13712,21 @@ index 8669a0a34f..4bdf5b2e97 100644
 +        let model = manager.get_model_info(slug, &config).await;
 +
 +        assert_eq!(
-+            model.auto_compact_token_limit, None,
-+            "{slug}: remote null remains unset so regular context-window policy applies"
++            model.context_window,
++            Some(370_000),
++            "{slug}: working window"
 +        );
 +        assert_eq!(
-+            model.auto_compact_token_limit(),
-+            Some(244_800),
-+            "{slug}: regular default must resolve to 90% of 272k"
++            model.max_context_window,
++            Some(1_050_000),
++            "{slug}: capability ceiling"
 +        );
++        assert_eq!(
++            model.auto_compact_token_limit,
++            Some(350_000),
++            "{slug}: LHC compact trigger"
++        );
++        assert_eq!(model.auto_compact_token_limit(), Some(350_000));
 +    }
 +}
 +

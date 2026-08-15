@@ -660,7 +660,7 @@ pub(crate) fn construct_model_info_from_candidates(
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
-    let model_info = if let Some(remote) = remote {
+    let mut model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
@@ -669,6 +669,32 @@ pub(crate) fn construct_model_info_from_candidates(
     } else {
         model_info::model_info_from_slug(model)
     };
+
+    // A remote catalog can advertise the short-context pricing profile as the
+    // model's whole capability. Preserve higher working-window and capability
+    // metadata deliberately shipped by this binary, so runtime overrides remain
+    // usable after cache refresh. Values stay catalog-driven, never hard-coded.
+    if let Ok(bundled) = crate::bundled_models_response()
+        && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
+            .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
+    {
+        model_info.max_context_window = match (
+            model_info.max_context_window,
+            bundled_model.max_context_window,
+        ) {
+            (Some(remote), Some(bundled)) => Some(remote.max(bundled)),
+            (remote, bundled) => remote.or(bundled),
+        };
+        let remote_context = model_info.context_window.unwrap_or_default();
+        let bundled_context = bundled_model.context_window.unwrap_or_default();
+        if bundled_context >= remote_context {
+            model_info.context_window = bundled_model.context_window.or(model_info.context_window);
+            model_info.auto_compact_token_limit = bundled_model
+                .auto_compact_token_limit
+                .or(model_info.auto_compact_token_limit);
+        }
+    }
+
     model_info::with_config_overrides(model_info, config)
 }
 
