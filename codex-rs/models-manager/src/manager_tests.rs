@@ -1482,11 +1482,10 @@ fn bundled_models_json_roundtrips() {
     );
 }
 
-/// Remote/cache catalogs can return `auto_compact_token_limit=null` for gpt-5.6,
-/// which would otherwise resolve to 90% of 272k (=244800). Fork pins 230000
-/// after remote resolution and before user config overrides.
+/// Remote/cache catalogs with no explicit limit use regular Codex policy:
+/// 90% of the model context window (244800 for 272k).
 #[tokio::test]
-async fn gpt_5_6_remote_null_auto_compact_resolves_to_230k_fork_default() {
+async fn gpt_5_6_remote_null_auto_compact_resolves_to_regular_90_percent_default() {
     for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         let mut remote = remote_model(slug, "Remote GPT-5.6", /*priority*/ 0);
         remote.auto_compact_token_limit = None;
@@ -1500,24 +1499,18 @@ async fn gpt_5_6_remote_null_auto_compact_resolves_to_230k_fork_default() {
         let model = manager.get_model_info(slug, &config).await;
 
         assert_eq!(
-            model.auto_compact_token_limit,
-            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-            "{slug}: fork default must win over remote null field"
+            model.auto_compact_token_limit, None,
+            "{slug}: remote null remains unset so regular context-window policy applies"
         );
         assert_eq!(
             model.auto_compact_token_limit(),
-            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-            "{slug}: resolved auto_compact_token_limit() must be 230000 (not 244800)"
-        );
-        assert_ne!(
-            model.auto_compact_token_limit(),
             Some(244_800),
-            "{slug}: must not fall through to 90% of 272k"
+            "{slug}: regular default must resolve to 90% of 272k"
         );
     }
 }
 
-/// Explicit user `model_auto_compact_token_limit` still wins over the fork default.
+/// Explicit user `model_auto_compact_token_limit` still wins over the regular default.
 #[tokio::test]
 async fn gpt_5_6_explicit_user_auto_compact_override_wins() {
     let mut remote = remote_model("gpt-5.6-sol", "Remote", /*priority*/ 0);
@@ -1536,14 +1529,14 @@ async fn gpt_5_6_explicit_user_auto_compact_override_wins() {
     assert_eq!(
         model.auto_compact_token_limit,
         Some(180_000),
-        "explicit user config must win over fork 230k default"
+        "explicit user config must win over the regular 90% default"
     );
     assert_eq!(model.auto_compact_token_limit(), Some(180_000));
 }
 
-/// Bundled catalog field remains 230000 (independent of the runtime pin).
+/// Bundled catalog leaves the limit unset so context-window policy owns it.
 #[test]
-fn gpt_5_6_bundled_catalog_auto_compact_is_230k() {
+fn gpt_5_6_bundled_catalog_uses_regular_context_window_default() {
     let bundled = crate::bundled_models_response().expect("bundled parses");
     for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         let model = bundled
@@ -1552,9 +1545,13 @@ fn gpt_5_6_bundled_catalog_auto_compact_is_230k() {
             .find(|m| m.slug == slug)
             .unwrap_or_else(|| panic!("bundled missing {slug}"));
         assert_eq!(
-            model.auto_compact_token_limit,
-            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-            "{slug}: models.json field must stay 230000"
+            model.auto_compact_token_limit, None,
+            "{slug}: models.json must defer to the regular context-window default"
+        );
+        assert_eq!(
+            model.auto_compact_token_limit(),
+            Some(244_800),
+            "{slug}: bundled model must resolve to 90% of 272k"
         );
     }
 }

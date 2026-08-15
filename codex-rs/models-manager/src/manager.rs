@@ -651,28 +651,6 @@ fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Opt
     find_model_by_longest_prefix(suffix, candidates)
 }
 
-/// Fork production default for gpt-5.6 family auto-compact trigger (tokens).
-///
-/// Remote/cache catalogs can replace bundled metadata and return
-/// `auto_compact_token_limit=null`, which otherwise resolves to 90% of the
-/// context window (244800 for 272k). Enforce 230000 after remote candidate
-/// resolution and **before** explicit user config overrides so
-/// `model_auto_compact_token_limit` can still win.
-pub const GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT: i64 = 230_000;
-
-/// True when `slug` is a gpt-5.6 family model (sol/terra/luna and suffixes).
-pub fn is_gpt_5_6_family(slug: &str) -> bool {
-    let base = slug.rsplit('/').next().unwrap_or(slug);
-    base == "gpt-5.6" || base.starts_with("gpt-5.6-")
-}
-
-/// Apply the fork 230k default after remote resolution, before user overrides.
-pub(crate) fn apply_gpt_5_6_fork_auto_compact_default(model: &mut ModelInfo) {
-    if is_gpt_5_6_family(&model.slug) {
-        model.auto_compact_token_limit = Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT);
-    }
-}
-
 pub(crate) fn construct_model_info_from_candidates(
     model: &str,
     candidates: &[ModelInfo],
@@ -682,7 +660,7 @@ pub(crate) fn construct_model_info_from_candidates(
     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
     let remote = find_model_by_longest_prefix(model, candidates)
         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
-    let mut model_info = if let Some(remote) = remote {
+    let model_info = if let Some(remote) = remote {
         ModelInfo {
             slug: model.to_string(),
             used_fallback_model_metadata: false,
@@ -691,8 +669,6 @@ pub(crate) fn construct_model_info_from_candidates(
     } else {
         model_info::model_info_from_slug(model)
     };
-    // After remote/cache candidate resolution, before explicit user overrides.
-    apply_gpt_5_6_fork_auto_compact_default(&mut model_info);
     model_info::with_config_overrides(model_info, config)
 }
 

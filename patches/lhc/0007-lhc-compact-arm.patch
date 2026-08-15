@@ -6613,10 +6613,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..685c8f74ba
+index 0000000000..8985d41eb8
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2968 @@
+@@ -0,0 +1,2964 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -8965,11 +8965,9 @@ index 0000000000..685c8f74ba
 +
 +// ── Emergency triage: strict LHC policy evidence ───────────────────────────
 +
-+/// Production default auto-compact threshold for gpt-5.6 catalog models is
-+/// exactly 230_000 tokens (authoritative models.json field; clamped by 90% of
-+/// context window but 230k < 90% of 272k so it sticks).
++/// Production gpt-5.6 models use regular Codex policy: 90% of 272k.
 +#[test]
-+fn gpt_5_6_auto_compact_threshold_is_exactly_230_000() {
++fn gpt_5_6_auto_compact_threshold_is_regular_244_800() {
 +    use codex_models_manager::ModelsManagerConfig;
 +    use codex_models_manager::bundled_models_response;
 +    use codex_models_manager::test_support::construct_model_info_offline_for_tests;
@@ -8983,9 +8981,8 @@ index 0000000000..685c8f74ba
 +            .find(|m| m.slug == slug)
 +            .unwrap_or_else(|| panic!("bundled catalog missing {slug}"));
 +        assert_eq!(
-+            catalog.auto_compact_token_limit,
-+            Some(230_000),
-+            "{slug}: models.json field must be 230_000"
++            catalog.auto_compact_token_limit, None,
++            "{slug}: models.json must defer to regular context-window policy"
 +        );
 +
 +        let config = ModelsManagerConfig {
@@ -8998,8 +8995,8 @@ index 0000000000..685c8f74ba
 +        let model = construct_model_info_offline_for_tests(slug, &config);
 +        assert_eq!(
 +            model.auto_compact_token_limit(),
-+            Some(230_000),
-+            "{slug}: resolved auto_compact_token_limit() must be 230_000"
++            Some(244_800),
++            "{slug}: resolved auto_compact_token_limit() must be 90% of 272k"
 +        );
 +    }
 +}
@@ -9428,15 +9425,14 @@ index 0000000000..685c8f74ba
 +    );
 +}
 +
-+/// Successful LHC compact body must clear the 230k production trigger under
-+/// production scope (not report success while still above the auto limit).
++/// Successful LHC compact body must clear the regular 244.8k production trigger.
 +#[tokio::test]
-+async fn successful_lhc_compact_clears_230k_trigger() {
++async fn successful_lhc_compact_clears_regular_trigger() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, mut tc) = make_session_and_context().await;
-+    // Production gpt-5.6 trigger.
-+    tc.model_info.auto_compact_token_limit = Some(230_000);
++    // Regular Codex policy for a 272k model.
++    tc.model_info.auto_compact_token_limit = Some(244_800);
 +    tc.model_info.context_window = Some(272_000);
 +    tc.model_info.max_context_window = Some(272_000);
 +
@@ -9459,14 +9455,14 @@ index 0000000000..685c8f74ba
 +    };
 +    let body_tokens = codex_lhc_host::estimate_response_items_tokens(&body);
 +    assert!(
-+        body_tokens <= 230_000,
-+        "successful LHC body must clear the 230k trigger (body_tokens={body_tokens})"
++        body_tokens <= 244_800,
++        "successful LHC body must clear the 244.8k trigger (body_tokens={body_tokens})"
 +    );
 +    let installed = sess.clone_history().await.into_raw_items();
 +    let installed_tokens = codex_lhc_host::estimate_response_items_tokens(&installed);
 +    assert!(
-+        installed_tokens <= 230_000,
-+        "installed history must also clear 230k (tokens={installed_tokens})"
++        installed_tokens <= 244_800,
++        "installed history must also clear 244.8k (tokens={installed_tokens})"
 +    );
 +}
 +
@@ -13228,102 +13224,19 @@ index 4bf5295eaa..5c52d9d039 100644
  mod compact_remote;
  mod compact_remote_parity;
  mod compact_resume_fork;
-diff --git a/codex-rs/models-manager/models.json b/codex-rs/models-manager/models.json
-index fef0db08bd..742becb6ab 100644
---- a/codex-rs/models-manager/models.json
-+++ b/codex-rs/models-manager/models.json
-@@ -26,7 +26,7 @@
-       "auto_review_model_override": null,
-       "context_window": 272000,
-       "max_context_window": 272000,
--      "auto_compact_token_limit": null,
-+      "auto_compact_token_limit": 230000,
-       "comp_hash": "3000",
-       "reasoning_summary_format": "experimental",
-       "default_reasoning_summary": "none",
-@@ -141,7 +141,7 @@
-       "auto_review_model_override": null,
-       "context_window": 272000,
-       "max_context_window": 272000,
--      "auto_compact_token_limit": null,
-+      "auto_compact_token_limit": 230000,
-       "comp_hash": "3000",
-       "reasoning_summary_format": "experimental",
-       "default_reasoning_summary": "none",
-@@ -254,7 +254,7 @@
-       "auto_review_model_override": null,
-       "context_window": 272000,
-       "max_context_window": 272000,
--      "auto_compact_token_limit": null,
-+      "auto_compact_token_limit": 230000,
-       "comp_hash": "3000",
-       "reasoning_summary_format": "experimental",
-       "default_reasoning_summary": "none",
-diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
-index 45835c37cd..0209bb039d 100644
---- a/codex-rs/models-manager/src/manager.rs
-+++ b/codex-rs/models-manager/src/manager.rs
-@@ -651,6 +651,28 @@ fn find_model_by_namespaced_suffix(model: &str, candidates: &[ModelInfo]) -> Opt
-     find_model_by_longest_prefix(suffix, candidates)
- }
- 
-+/// Fork production default for gpt-5.6 family auto-compact trigger (tokens).
-+///
-+/// Remote/cache catalogs can replace bundled metadata and return
-+/// `auto_compact_token_limit=null`, which otherwise resolves to 90% of the
-+/// context window (244800 for 272k). Enforce 230000 after remote candidate
-+/// resolution and **before** explicit user config overrides so
-+/// `model_auto_compact_token_limit` can still win.
-+pub const GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT: i64 = 230_000;
-+
-+/// True when `slug` is a gpt-5.6 family model (sol/terra/luna and suffixes).
-+pub fn is_gpt_5_6_family(slug: &str) -> bool {
-+    let base = slug.rsplit('/').next().unwrap_or(slug);
-+    base == "gpt-5.6" || base.starts_with("gpt-5.6-")
-+}
-+
-+/// Apply the fork 230k default after remote resolution, before user overrides.
-+pub(crate) fn apply_gpt_5_6_fork_auto_compact_default(model: &mut ModelInfo) {
-+    if is_gpt_5_6_family(&model.slug) {
-+        model.auto_compact_token_limit = Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT);
-+    }
-+}
-+
- pub(crate) fn construct_model_info_from_candidates(
-     model: &str,
-     candidates: &[ModelInfo],
-@@ -660,7 +682,7 @@ pub(crate) fn construct_model_info_from_candidates(
-     // retry for namespaced slugs like `custom/gpt-5.3-codex`.
-     let remote = find_model_by_longest_prefix(model, candidates)
-         .or_else(|| find_model_by_namespaced_suffix(model, candidates));
--    let model_info = if let Some(remote) = remote {
-+    let mut model_info = if let Some(remote) = remote {
-         ModelInfo {
-             slug: model.to_string(),
-             used_fallback_model_metadata: false,
-@@ -669,6 +691,8 @@ pub(crate) fn construct_model_info_from_candidates(
-     } else {
-         model_info::model_info_from_slug(model)
-     };
-+    // After remote/cache candidate resolution, before explicit user overrides.
-+    apply_gpt_5_6_fork_auto_compact_default(&mut model_info);
-     model_info::with_config_overrides(model_info, config)
- }
- 
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 0768d1e4c4..e901620a08 100644
+index 0768d1e4c4..864adbefd3 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
-@@ -1481,3 +1481,80 @@ fn bundled_models_json_roundtrips() {
+@@ -1481,3 +1481,77 @@ fn bundled_models_json_roundtrips() {
          "bundled models.json should contain at least one model"
      );
  }
 +
-+/// Remote/cache catalogs can return `auto_compact_token_limit=null` for gpt-5.6,
-+/// which would otherwise resolve to 90% of 272k (=244800). Fork pins 230000
-+/// after remote resolution and before user config overrides.
++/// Remote/cache catalogs with no explicit limit use regular Codex policy:
++/// 90% of the model context window (244800 for 272k).
 +#[tokio::test]
-+async fn gpt_5_6_remote_null_auto_compact_resolves_to_230k_fork_default() {
++async fn gpt_5_6_remote_null_auto_compact_resolves_to_regular_90_percent_default() {
 +    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
 +        let mut remote = remote_model(slug, "Remote GPT-5.6", /*priority*/ 0);
 +        remote.auto_compact_token_limit = None;
@@ -13337,24 +13250,18 @@ index 0768d1e4c4..e901620a08 100644
 +        let model = manager.get_model_info(slug, &config).await;
 +
 +        assert_eq!(
-+            model.auto_compact_token_limit,
-+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-+            "{slug}: fork default must win over remote null field"
++            model.auto_compact_token_limit, None,
++            "{slug}: remote null remains unset so regular context-window policy applies"
 +        );
 +        assert_eq!(
 +            model.auto_compact_token_limit(),
-+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-+            "{slug}: resolved auto_compact_token_limit() must be 230000 (not 244800)"
-+        );
-+        assert_ne!(
-+            model.auto_compact_token_limit(),
 +            Some(244_800),
-+            "{slug}: must not fall through to 90% of 272k"
++            "{slug}: regular default must resolve to 90% of 272k"
 +        );
 +    }
 +}
 +
-+/// Explicit user `model_auto_compact_token_limit` still wins over the fork default.
++/// Explicit user `model_auto_compact_token_limit` still wins over the regular default.
 +#[tokio::test]
 +async fn gpt_5_6_explicit_user_auto_compact_override_wins() {
 +    let mut remote = remote_model("gpt-5.6-sol", "Remote", /*priority*/ 0);
@@ -13373,14 +13280,14 @@ index 0768d1e4c4..e901620a08 100644
 +    assert_eq!(
 +        model.auto_compact_token_limit,
 +        Some(180_000),
-+        "explicit user config must win over fork 230k default"
++        "explicit user config must win over the regular 90% default"
 +    );
 +    assert_eq!(model.auto_compact_token_limit(), Some(180_000));
 +}
 +
-+/// Bundled catalog field remains 230000 (independent of the runtime pin).
++/// Bundled catalog leaves the limit unset so context-window policy owns it.
 +#[test]
-+fn gpt_5_6_bundled_catalog_auto_compact_is_230k() {
++fn gpt_5_6_bundled_catalog_uses_regular_context_window_default() {
 +    let bundled = crate::bundled_models_response().expect("bundled parses");
 +    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
 +        let model = bundled
@@ -13389,9 +13296,13 @@ index 0768d1e4c4..e901620a08 100644
 +            .find(|m| m.slug == slug)
 +            .unwrap_or_else(|| panic!("bundled missing {slug}"));
 +        assert_eq!(
-+            model.auto_compact_token_limit,
-+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
-+            "{slug}: models.json field must stay 230000"
++            model.auto_compact_token_limit, None,
++            "{slug}: models.json must defer to the regular context-window default"
++        );
++        assert_eq!(
++            model.auto_compact_token_limit(),
++            Some(244_800),
++            "{slug}: bundled model must resolve to 90% of 272k"
 +        );
 +    }
 +}
