@@ -463,13 +463,6 @@ impl CaptureHandle {
         self.inner.degraded.load(Ordering::Relaxed)
     }
 
-    /// Test-only: force the degraded latch after content has already been
-    /// flushed, so compact can prove degraded capture alone is not a hard stop.
-    #[cfg(any(test, feature = "test-util"))]
-    pub fn force_degraded_for_test(&self) {
-        self.latch_degraded("test_force");
-    }
-
     #[cfg(any(test, feature = "test-util"))]
     pub async fn list_events(&self) -> Result<Vec<lhc::intake_stream::EventRecord>, String> {
         let (tx, rx) = oneshot::channel();

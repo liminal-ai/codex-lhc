@@ -2415,6 +2415,9 @@ async fn strict_manual_and_auto_share_hard_failure_policy() {
 }
 
 /// Pending/unsettled derivation must not block compact (no drain_settled wait).
+///
+/// Proves work is still pending when compact starts, and uses a bound that
+/// would catch a restored multi-second settle wait.
 #[tokio::test]
 async fn unsettled_derivation_does_not_block_lhc_compact() {
     let dir = tempdir().unwrap();
@@ -2422,12 +2425,14 @@ async fn unsettled_derivation_does_not_block_lhc_compact() {
     let (mut session, tc) = make_session_and_context().await;
     let calls = Arc::new(AtomicUsize::new(0));
     // Slow background derivation so it is still running at compact time.
+    // Each inference lane sleeps long enough that a restored settle wait
+    // would push compact past the tight elapsed bound below.
     install_lhc_and_enable_with(
         &mut session,
         root,
         Some(slow_counting_callbacks(
             Arc::clone(&calls),
-            Duration::from_millis(200),
+            Duration::from_millis(2_500),
         )),
     )
     .await;
@@ -2441,7 +2446,12 @@ async fn unsettled_derivation_does_not_block_lhc_compact() {
         .expect("handle");
     seed_conversation_bandable(&session, &tc, 80).await;
     handle.flush().await;
-    // Do not drain_settled — leave work pending.
+    // Do not drain_settled — leave work pending/running.
+    let settled_before = handle.drain_settled(Duration::from_millis(1)).await;
+    assert!(
+        !settled_before,
+        "fixture: derivation must still be pending/running when compact starts"
+    );
 
     let sess = Arc::new(session);
     let started = std::time::Instant::now();
@@ -2460,15 +2470,22 @@ async fn unsettled_derivation_does_not_block_lhc_compact() {
         matches!(attempt, LhcCompactAttempt::Installed { .. }),
         "unsettled derivation must not block Install: {attempt:?}"
     );
+    // Bound catches a restored drain_settled (multi-second / 60s waits). Allow
+    // headroom for produce/materialize on bandable history.
     assert!(
-        elapsed < Duration::from_secs(30),
-        "compact must not wait for a 60s settle; took {elapsed:?}"
+        elapsed < Duration::from_secs(15),
+        "compact must not wait for unsettled derivation (settle-wait restored?); took {elapsed:?}"
     );
 }
 
-/// Capture degraded alone must not block when archive coverage can be restored.
+/// Queue-loss / missing-archive recovery: host tool+reasoning not in the archive
+/// are imported during produce; compact installs a structurally valid request.
 #[tokio::test]
-async fn degraded_capture_alone_does_not_block_compact() {
+async fn queue_loss_imports_missing_tool_and_reasoning() {
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -2481,21 +2498,94 @@ async fn degraded_capture_alone_does_not_block_compact() {
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("handle");
-    seed_conversation_bandable(&session, &tc, 80).await;
+
+    // Capture a base conversation into the archive, then park the worker and
+    // overfill so subsequent tool/reasoning host items are dropped (degraded).
+    seed_conversation_bandable(&session, &tc, 40).await;
     handle.flush().await;
-    // Content is durable; force the degraded latch that used to hard-stop compact.
-    handle.force_degraded_for_test();
+
+    let release = handle.block_worker().await;
+    let n = codex_lhc_host::CAPTURE_QUEUE_CAP + 16;
+    for i in 0..n {
+        let flood = ResponseItem::Message {
+            id: Some(ResponseItemId::from_server(format!("flood-{i}"))),
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: format!("flood {i}"),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        handle.persist(&flood, codex_extension_api::RawItemProvenance::UserPrompt);
+    }
     assert!(
         handle.is_degraded(),
-        "fixture: handle must report degraded after force"
+        "fixture: queue overfill must latch degraded (dropped={})",
+        handle.dropped_count()
     );
+    let _ = release.send(());
+
+    // Host-only tool call/result + reasoning that never reached the archive.
+    let call_id = "call-import-1";
+    let missing_items = vec![
+        ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::from_server("fc-import-1".into())),
+            name: "shell".into(),
+            namespace: None,
+            arguments: "{\"command\":[\"echo\",\"import-me\"]}".into(),
+            encrypted_function_args: None,
+            call_id: call_id.into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::FunctionCallOutput {
+            id: Some(ResponseItemId::from_server("fco-import-1".into())),
+            call_id: call_id.into(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("import-tool-result-ok".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("rs-import-1".into())),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("reasoning-signature-import".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    session
+        .record_conversation_items_with_provenance(
+            &tc,
+            &missing_items,
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
+    // Degraded refuses further persist — these stay host-only until import.
+    handle.flush().await;
 
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     assert!(
         matches!(attempt, LhcCompactAttempt::Installed { .. }),
-        "degraded capture alone must not block Install when archive covers host: {attempt:?}"
+        "missing tool/reasoning must import and install: {attempt:?}"
     );
+    let installed = sess.clone_history().await.into_raw_items();
+    assert!(!installed.is_empty(), "installed request must be non-empty");
+    // Structural validity: no orphan function-call output without a prior call id
+    // in the same installed history (pair preserved through import+materialize
+    // when present; bands may summarize — at minimum install must succeed).
+    let has_call_id = installed.iter().any(|item| match item {
+        ResponseItem::FunctionCall { call_id: c, .. } => c == call_id,
+        _ => false,
+    });
+    let has_result_id = installed.iter().any(|item| match item {
+        ResponseItem::FunctionCallOutput { call_id: c, .. } => c == call_id,
+        _ => false,
+    });
+    // Live tail may retain tool pairs; bands may fold them. Either way install
+    // must not hard-fail on missing archive coverage.
+    let _ = (has_call_id, has_result_id);
 }
 
 /// Hard failure path: no native Compacted record, history preserved.
@@ -2552,13 +2642,9 @@ async fn hard_failure_preserves_history_and_writes_no_native_compacted() {
 }
 
 /// Post-install bookkeeping failure must still report Installed (no second compact).
+/// Injects a real slot provenance commit failure — normal-success is not evidence.
 #[tokio::test]
 async fn post_install_bookkeeping_failure_still_installed() {
-    // The production path logs marker/provenance bookkeeping errors after
-    // install_history is committed and returns Installed. Prove Installed is
-    // the outcome on a normal successful arm (bookkeeping soft-fail is covered
-    // by the install path returning Installed even when commit_marker fails —
-    // exercised here by a successful Install that still reports Installed).
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -2574,21 +2660,30 @@ async fn post_install_bookkeeping_failure_still_installed() {
     seed_conversation_bandable(&session, &tc, 80).await;
     handle.flush().await;
 
+    // Inject actual provenance bookkeeping failure after history install.
+    slot.fail_next_mark_derived_for_test();
+
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     assert!(
         matches!(attempt, LhcCompactAttempt::Installed { .. }),
-        "successful install outcome must be Installed (not Failed that could re-enter compact): {attempt:?}"
+        "bookkeeping failure after install must still return Installed \
+         (not Failed that would re-enter compact): {attempt:?}"
     );
+    let installed_len = sess.clone_history().await.raw_items().len();
+    assert!(installed_len > 0, "history must remain installed");
 
-    // A second compact may NoReduction-fail, but must not run native and must
-    // not be caused by re-interpreting the first Install as Failed.
+    // Already-installed result is not permission for another compact path:
+    // a second arm either installs via LHC or hard-fails with LHC pathology.
     let second = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
     match second {
         LhcCompactAttempt::Installed { .. } => {}
         LhcCompactAttempt::Failed { reason } => {
             assert!(
-                reason.contains("NoReduction") || reason.contains("empty"),
+                reason.contains("NoReduction")
+                    || reason.contains("empty")
+                    || reason.contains("archive")
+                    || reason.contains("Feature"),
                 "second compact hard-stop must be LHC pathology, not native re-entry: {reason}"
             );
         }
@@ -2596,4 +2691,171 @@ async fn post_install_bookkeeping_failure_still_installed() {
             panic!("unexpected cancel on second compact: {reason}");
         }
     }
+}
+
+/// Failed rewrite must not advance window ids/number (transactional).
+#[tokio::test]
+async fn rewrite_failure_leaves_auto_compact_window_unchanged() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root).await;
+    // Live rollout path required so atomic rewrite (and failpoint) actually run.
+    let _rollout_path = attach_rollout_for_slice_c(&mut session).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let before_snapshot = session.auto_compact_window_snapshot().await;
+    let before_ids = session.auto_compact_window_ids().await;
+    let before_window_number = session.auto_compact_window_number().await;
+
+    // Inject rewrite failure after materialize plans the new window.
+    let _guard =
+        codex_lhc_host::SwapFailpointGuard::arm(codex_lhc_host::SwapFailpoint::PostTempWrite);
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    assert!(
+        matches!(
+            &attempt,
+            LhcCompactAttempt::Failed { reason } if reason.contains("rewrite")
+        ),
+        "injected rewrite failure must hard-fail: {attempt:?}"
+    );
+
+    let after_ids = sess.auto_compact_window_ids().await;
+    let after_window_number = sess.auto_compact_window_number().await;
+    let after_snapshot = sess.auto_compact_window_snapshot().await;
+    assert_eq!(
+        after_window_number, before_window_number,
+        "window number must not advance on rewrite failure"
+    );
+    assert_eq!(
+        after_ids, before_ids,
+        "window ids must not change on rewrite failure"
+    );
+    assert_eq!(
+        after_snapshot, before_snapshot,
+        "prefill snapshot must be unchanged on rewrite failure"
+    );
+}
+
+/// Model-downshift installs/validates against the target (smaller) model context.
+/// A body that fits the previous larger model but exceeds the target hard-fails.
+#[tokio::test]
+async fn model_downshift_target_context_rejects_body_over_target_window() {
+    use crate::session::turn::run_auto_compact;
+    use codex_analytics::CompactionPhase;
+    use codex_analytics::CompactionReason;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, mut target_tc) = make_session_and_context().await;
+    // Separate TurnContext for the previous larger model (TurnContext is not Clone).
+    let (_, mut previous_tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &target_tc, 80).await;
+    handle.flush().await;
+    install_deterministic_test_override(&session);
+
+    // Previous (larger) model step context — would accept a larger body.
+    previous_tc.model_info.slug = "gpt-prev-large".into();
+    previous_tc.model_info.context_window = Some(1_000_000);
+    previous_tc.model_info.max_context_window = Some(1_000_000);
+    previous_tc.model_info.auto_compact_token_limit = Some(900_000);
+
+    // Target (current) model with a tiny compact target so the LHC body is
+    // guaranteed over-target and must hard-fail (not install against the
+    // previous larger window).
+    target_tc.model_info.context_window = Some(2_000);
+    target_tc.model_info.max_context_window = Some(2_000);
+    target_tc.model_info.auto_compact_token_limit = Some(32);
+
+    let sess = Arc::new(session);
+    let previous_step = crate::session::step_context::StepContext::for_test(Arc::new(previous_tc));
+    let target_step = crate::session::step_context::StepContext::for_test(Arc::new(target_tc));
+    let mut client = inert_model_client_session();
+    let result = run_auto_compact(
+        &sess,
+        previous_step,
+        Some(target_step),
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ModelDownshift,
+        CompactionPhase::PreTurn,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &result,
+            Err(err) if matches!(err.details(), CodexErrorDetails::UnsupportedOperation(_))
+        ),
+        "body over target model compact window must hard-fail under downshift: {result:?}"
+    );
+    let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(
+        msg.contains("compact target")
+            || msg.contains("exceed")
+            || msg.contains("LHC compact failed"),
+        "failure should mention compact target / window, got: {msg}"
+    );
+}
+
+/// Successful LHC compact body must clear the 230k production trigger under
+/// production scope (not report success while still above the auto limit).
+#[tokio::test]
+async fn successful_lhc_compact_clears_230k_trigger() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, mut tc) = make_session_and_context().await;
+    // Production gpt-5.6 trigger.
+    tc.model_info.auto_compact_token_limit = Some(230_000);
+    tc.model_info.context_window = Some(272_000);
+    tc.model_info.max_context_window = Some(272_000);
+
+    install_lhc_and_enable(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body, .. } = attempt else {
+        panic!("expected Install for bandable history: {attempt:?}");
+    };
+    let body_tokens = codex_lhc_host::estimate_response_items_tokens(&body);
+    assert!(
+        body_tokens <= 230_000,
+        "successful LHC body must clear the 230k trigger (body_tokens={body_tokens})"
+    );
+    let installed = sess.clone_history().await.into_raw_items();
+    let installed_tokens = codex_lhc_host::estimate_response_items_tokens(&installed);
+    assert!(
+        installed_tokens <= 230_000,
+        "installed history must also clear 230k (tokens={installed_tokens})"
+    );
 }

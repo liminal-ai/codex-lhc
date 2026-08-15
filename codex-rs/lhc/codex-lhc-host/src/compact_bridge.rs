@@ -252,58 +252,108 @@ pub fn content_identity_digest(item: &ResponseItem) -> String {
     item_digest(&stripped)
 }
 
-/// Cheap char/4 token estimate (same order as LHC `estimate_tokens`).
-pub fn estimate_response_items_tokens(items: &[ResponseItem]) -> i64 {
-    let chars: usize = items
-        .iter()
-        .map(|item| match item {
-            ResponseItem::Message { content, .. } => content
-                .iter()
-                .map(|c| match c {
-                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.len()
-                    }
-                    ContentItem::InputImage { image_url, .. } => image_url.len(),
-                    ContentItem::InputAudio { audio_url } => audio_url.len(),
-                })
-                .sum::<usize>(),
-            _ => 64,
-        })
-        .sum();
+/// Hard per-item token cap for model-visible context (context contract).
+///
+/// Char/4 estimate; enforced when materializing LHC served/band text into
+/// host `ResponseItem`s so a single raw band cannot land as one 24k–58k item.
+pub const MAX_MODEL_VISIBLE_ITEM_TOKENS: i64 = 10_000;
+
+/// Character budget corresponding to [`MAX_MODEL_VISIBLE_ITEM_TOKENS`] (char/4).
+pub const MAX_MODEL_VISIBLE_ITEM_CHARS: usize = (MAX_MODEL_VISIBLE_ITEM_TOKENS as usize) * 4;
+
+/// Cheap char/4 token estimate for one `ResponseItem` (same order as LHC).
+pub fn estimate_response_item_tokens(item: &ResponseItem) -> i64 {
+    let chars: usize = match item {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .map(|c| match c {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => text.len(),
+                ContentItem::InputImage { image_url, .. } => image_url.len(),
+                ContentItem::InputAudio { audio_url } => audio_url.len(),
+            })
+            .sum(),
+        _ => 64,
+    };
     (chars / 4) as i64
 }
 
-/// Map LHC's served LLM request context to host `ResponseItem`s (law 6: typed roles).
-pub fn llm_request_context_to_response_items(ctx: &LlmRequestContext) -> Vec<ResponseItem> {
-    ctx.messages
-        .iter()
-        .filter_map(|msg| {
-            let text = msg
-                .content
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<Vec<_>>()
-                .join("");
-            if text.is_empty() {
-                return None;
-            }
-            let role = match msg.role {
-                LlmRequestContextRole::User => "user",
-                LlmRequestContextRole::Assistant => "assistant",
-            };
-            Some(ResponseItem::Message {
-                id: None,
-                role: role.into(),
-                content: vec![if role == "assistant" {
-                    ContentItem::OutputText { text }
-                } else {
-                    ContentItem::InputText { text }
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            })
+/// Cheap char/4 token estimate (same order as LHC `estimate_tokens`).
+pub fn estimate_response_items_tokens(items: &[ResponseItem]) -> i64 {
+    items.iter().map(estimate_response_item_tokens).sum()
+}
+
+/// Split plain text on UTF-8 char boundaries so each piece is ≤ the per-item
+/// char budget. Full fidelity: concatenation in order recovers the original.
+pub fn split_text_to_item_cap(text: &str) -> Vec<String> {
+    if text.len() <= MAX_MODEL_VISIBLE_ITEM_CHARS {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.len() <= MAX_MODEL_VISIBLE_ITEM_CHARS {
+            chunks.push(rest.to_string());
+            break;
+        }
+        let mut end = MAX_MODEL_VISIBLE_ITEM_CHARS;
+        while end > 0 && !rest.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            end = rest.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        }
+        chunks.push(rest[..end].to_string());
+        rest = &rest[end..];
+    }
+    chunks
+}
+
+/// Map one role+text into one or more Message items under the per-item cap.
+pub fn message_items_for_text(role: &str, text: &str) -> Vec<ResponseItem> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let assistant = role == "assistant";
+    split_text_to_item_cap(text)
+        .into_iter()
+        .map(|chunk| ResponseItem::Message {
+            id: None,
+            role: role.into(),
+            content: vec![if assistant {
+                ContentItem::OutputText { text: chunk }
+            } else {
+                ContentItem::InputText { text: chunk }
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
         })
         .collect()
+}
+
+/// Map LHC's served LLM request context to host `ResponseItem`s (law 6: typed roles).
+///
+/// Each served message is chunked so no single emitted item exceeds
+/// [`MAX_MODEL_VISIBLE_ITEM_TOKENS`]. Order is preserved; concatenation of
+/// consecutive same-role chunks recovers the original served text.
+pub fn llm_request_context_to_response_items(ctx: &LlmRequestContext) -> Vec<ResponseItem> {
+    let mut out = Vec::new();
+    for msg in &ctx.messages {
+        let text = msg
+            .content
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        if text.is_empty() {
+            continue;
+        }
+        let role = match msg.role {
+            LlmRequestContextRole::User => "user",
+            LlmRequestContextRole::Assistant => "assistant",
+        };
+        out.extend(message_items_for_text(role, &text));
+    }
+    out
 }
 
 /// Parse host ResponseItemId from a codex id-primary idempotency key.
@@ -430,10 +480,92 @@ pub fn derived_ids_from_archive(events: &[EventRecord]) -> HashSet<String> {
     out
 }
 
-fn is_coverage_candidate(item: &ResponseItem) -> bool {
+/// Classification of a host item for archive coverage / import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageClass {
+    /// Provider-bearing content the mapper can round-trip; must be covered.
+    Required,
+    /// Native compact artifacts or empty/no-op items — exclude by design.
+    Excluded,
+    /// Present on the host but cannot be safely represented — hard failure.
+    Unrepresentable,
+}
+
+/// Classify a host item for degraded recovery / archive coverage.
+///
+/// Required items are every provider-bearing shape the LHC mapper/materializer
+/// can safely round-trip (messages, reasoning, tool calls/results, …). Native
+/// compact artifacts and empty triggers are excluded by provenance/kind. Types
+/// the mapper drops with no safe representation are hard failures (never silent
+/// omit when they appear as host content).
+pub fn classify_coverage(item: &ResponseItem) -> CoverageClass {
     match item {
-        ResponseItem::Message { role, .. } => role == "user" || role == "assistant",
-        _ => false,
+        ResponseItem::Message { role, .. } if role == "user" || role == "assistant" => {
+            CoverageClass::Required
+        }
+        // System / other roles are not provider conversation content for compact.
+        ResponseItem::Message { .. } => CoverageClass::Excluded,
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. }
+        | ResponseItem::AgentMessage { .. }
+        | ResponseItem::AdditionalTools { .. } => CoverageClass::Required,
+        // Native compact / no-op artifacts — not import targets.
+        ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::CompactionTrigger {} => CoverageClass::Excluded,
+        // Mapper emits nothing — silent omit would drop provider-adjacent content.
+        ResponseItem::Other => CoverageClass::Unrepresentable,
+    }
+}
+
+fn is_coverage_candidate(item: &ResponseItem) -> bool {
+    matches!(classify_coverage(item), CoverageClass::Required)
+}
+
+/// Hard-failure reason when host history carries an unrepresentable item type.
+pub fn unrepresentable_host_items_gap(host_items: &[ResponseItem]) -> Option<String> {
+    let bad: Vec<&'static str> = host_items
+        .iter()
+        .filter(|i| matches!(classify_coverage(i), CoverageClass::Unrepresentable))
+        .map(host_item_kind_name)
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "host history contains {} item type(s) LHC cannot safely round-trip: {}",
+        bad.len(),
+        bad.join(", ")
+    ))
+}
+
+fn host_item_kind_name(item: &ResponseItem) -> &'static str {
+    match item {
+        ResponseItem::Message { .. } => "Message",
+        ResponseItem::AgentMessage { .. } => "AgentMessage",
+        ResponseItem::Reasoning { .. } => "Reasoning",
+        ResponseItem::LocalShellCall { .. } => "LocalShellCall",
+        ResponseItem::FunctionCall { .. } => "FunctionCall",
+        ResponseItem::FunctionCallOutput { .. } => "FunctionCallOutput",
+        ResponseItem::CustomToolCall { .. } => "CustomToolCall",
+        ResponseItem::CustomToolCallOutput { .. } => "CustomToolCallOutput",
+        ResponseItem::ToolSearchCall { .. } => "ToolSearchCall",
+        ResponseItem::ToolSearchOutput { .. } => "ToolSearchOutput",
+        ResponseItem::WebSearchCall { .. } => "WebSearchCall",
+        ResponseItem::ImageGenerationCall { .. } => "ImageGenerationCall",
+        ResponseItem::AdditionalTools { .. } => "AdditionalTools",
+        ResponseItem::Compaction { .. } => "Compaction",
+        ResponseItem::ContextCompaction { .. } => "ContextCompaction",
+        ResponseItem::CompactionTrigger {} => "CompactionTrigger",
+        ResponseItem::Other => "Other",
     }
 }
 
@@ -564,6 +696,9 @@ pub fn host_history_coverage_gap_with_provenance(
     events: &[EventRecord],
     derived: &DerivedProvenance,
 ) -> Option<String> {
+    if let Some(reason) = unrepresentable_host_items_gap(host_items) {
+        return Some(reason);
+    }
     let missing = host_items_missing_from_archive_with_provenance(host_items, events, derived);
     if missing.is_empty() {
         return None;
@@ -575,11 +710,11 @@ pub fn host_history_coverage_gap_with_provenance(
     let excluded = derived.ids.len() + derived.digests.len();
     if events.is_empty() {
         return Some(format!(
-            "host has {candidates} message candidate(s) but archive is empty (resume/fork without import?)"
+            "host has {candidates} provider-bearing candidate(s) but archive is empty (resume/fork without import?)"
         ));
     }
     Some(format!(
-        "{}/{} host message(s) missing from archive by identity (derived_excluded={excluded})",
+        "{}/{} host provider-bearing item(s) missing from archive by identity (derived_excluded={excluded})",
         missing.len(),
         candidates
     ))
@@ -588,6 +723,9 @@ pub fn host_history_coverage_gap_with_provenance(
 /// Import **only** the given host items (identity-missing natives) into the archive.
 /// Callers must pass the output of [`host_items_missing_from_archive`] — never the
 /// full post-compact body.
+///
+/// If a required candidate maps to zero events, this is a hard failure (never a
+/// silent skip) so tool/reasoning pairing cannot be dropped without notice.
 pub async fn import_host_items_into_archive(
     session: &mut LhcSession,
     host_items: &[ResponseItem],
@@ -595,6 +733,10 @@ pub async fn import_host_items_into_archive(
     use crate::idempotency::OccurrenceTracker;
     use crate::mapping::map_item;
     use codex_extension_api::RawItemProvenance;
+
+    if let Some(reason) = unrepresentable_host_items_gap(host_items) {
+        return Err(reason);
+    }
 
     let mut tracker = OccurrenceTracker::new();
     // Seed from existing keys so anon occurrences do not collide.
@@ -604,16 +746,32 @@ pub async fn import_host_items_into_archive(
     }
     let mut n = 0usize;
     for item in host_items {
+        if !is_coverage_candidate(item) {
+            continue;
+        }
         let provenance = match item {
             ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
             ResponseItem::Message { role, .. } if role == "assistant" => {
                 RawItemProvenance::ModelOutput
             }
+            ResponseItem::Reasoning { .. }
+            | ResponseItem::FunctionCall { .. }
+            | ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::LocalShellCall { .. }
+            | ResponseItem::CustomToolCall { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchCall { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+            | ResponseItem::WebSearchCall { .. }
+            | ResponseItem::ImageGenerationCall { .. } => RawItemProvenance::ModelOutput,
             _ => RawItemProvenance::HostContext,
         };
         let mapped = map_item(&session.thread_id, item, provenance, &mut tracker, None);
         if mapped.is_empty() {
-            continue;
+            return Err(format!(
+                "cannot safely import host {} into archive (mapper produced zero events)",
+                host_item_kind_name(item)
+            ));
         }
         let inputs: Vec<_> = mapped.into_iter().map(|m| m.input).collect();
         session.submit_events(&inputs).await?;
@@ -712,6 +870,12 @@ pub async fn produce_lhc_compact_with_provenance(
         &events,
     );
 
+    // Unrepresentable provider-adjacent types hard-fail (never silent omit).
+    if let Some(reason) = unrepresentable_host_items_gap(host_items) {
+        session.close().await;
+        return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(reason));
+    }
+
     // Import only identity-missing *native* items; never the served body (H1).
     let missing = host_items_missing_from_archive_with_provenance(host_items, &events, &derived);
     if !missing.is_empty() {
@@ -737,14 +901,14 @@ pub async fn produce_lhc_compact_with_provenance(
             if !still.is_empty() {
                 session.close().await;
                 return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
-                    "{} host message(s) still missing after import",
+                    "{} host provider-bearing item(s) still missing after import",
                     still.len()
                 )));
             }
         } else {
             session.close().await;
             return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
-                "{} host message(s) missing from archive by identity",
+                "{} host provider-bearing item(s) missing from archive by identity",
                 missing.len()
             )));
         }
@@ -1678,5 +1842,160 @@ mod tests {
                 panic!("expected Ok via fallback ladder, got {other:?}");
             }
         }
+    }
+
+    #[test]
+    fn coverage_requires_tools_and_reasoning_excludes_native_compact() {
+        let reasoning = ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("r1".into())),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("enc".into()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let call = ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::from_server("fc1".into())),
+            name: "shell".into(),
+            namespace: None,
+            arguments: "{}".into(),
+            encrypted_function_args: None,
+            call_id: "call-1".into(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let result = ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".into(),
+            output: codex_protocol::models::FunctionCallOutputPayload {
+                body: codex_protocol::models::FunctionCallOutputBody::Text("ok".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let native = ResponseItem::Compaction {
+            id: None,
+            encrypted_content: "native".into(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        assert_eq!(classify_coverage(&reasoning), CoverageClass::Required);
+        assert_eq!(classify_coverage(&call), CoverageClass::Required);
+        assert_eq!(classify_coverage(&result), CoverageClass::Required);
+        assert_eq!(classify_coverage(&native), CoverageClass::Excluded);
+        assert_eq!(
+            classify_coverage(&ResponseItem::Other),
+            CoverageClass::Unrepresentable
+        );
+        assert!(unrepresentable_host_items_gap(&[ResponseItem::Other]).is_some());
+    }
+
+    #[test]
+    fn missing_tool_and_reasoning_are_coverage_candidates() {
+        let call = ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::from_server("fc-miss".into())),
+            name: "shell".into(),
+            namespace: None,
+            arguments: "{\"cmd\":\"echo\"}".into(),
+            encrypted_function_args: None,
+            call_id: "c-miss".into(),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let reasoning = ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("rs-miss".into())),
+            summary: vec![],
+            content: None,
+            encrypted_content: Some("sig".into()),
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let missing = host_items_missing_from_archive(&[call.clone(), reasoning.clone()], &[]);
+        assert_eq!(
+            missing.len(),
+            2,
+            "tool+reasoning must be coverage candidates"
+        );
+        assert!(matches!(missing[0], ResponseItem::FunctionCall { .. }));
+        assert!(matches!(missing[1], ResponseItem::Reasoning { .. }));
+    }
+
+    #[test]
+    fn item_cap_split_preserves_order_and_reassembly() {
+        let pad = "x".repeat(MAX_MODEL_VISIBLE_ITEM_CHARS + 1234);
+        let original = format!("HEAD{pad}TAIL");
+        let chunks = split_text_to_item_cap(&original);
+        assert!(chunks.len() >= 2, "oversized text must split");
+        for c in &chunks {
+            assert!(
+                c.len() <= MAX_MODEL_VISIBLE_ITEM_CHARS,
+                "chunk len {} exceeds cap",
+                c.len()
+            );
+        }
+        assert_eq!(chunks.concat(), original, "exact reassembly");
+
+        let items = message_items_for_text("user", &original);
+        assert_eq!(items.len(), chunks.len());
+        for item in &items {
+            assert!(
+                estimate_response_item_tokens(item) <= MAX_MODEL_VISIBLE_ITEM_TOKENS,
+                "each item must honor the 10k token cap"
+            );
+        }
+        let rejoined: String = items
+            .iter()
+            .map(|item| match item {
+                ResponseItem::Message { content, .. } => content
+                    .iter()
+                    .map(|c| match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            text.as_str()
+                        }
+                        _ => "",
+                    })
+                    .collect::<String>(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(rejoined, original);
+    }
+
+    #[test]
+    fn llm_request_context_map_chunks_oversized_messages() {
+        use lhc::shared_tech::LlmRequestContextMessage;
+        use lhc::shared_tech::LlmRequestContextPart;
+        use lhc::shared_tech::LlmRequestContextPartType;
+
+        let big = "y".repeat(MAX_MODEL_VISIBLE_ITEM_CHARS + 50);
+        let ctx = LlmRequestContext {
+            thread_id: "chunk-tid".into(),
+            messages: vec![LlmRequestContextMessage {
+                role: LlmRequestContextRole::User,
+                content: vec![LlmRequestContextPart {
+                    type_: LlmRequestContextPartType::Text,
+                    text: big.clone(),
+                }],
+            }],
+        };
+        let items = llm_request_context_to_response_items(&ctx);
+        assert!(items.len() >= 2, "oversized served message must chunk");
+        for item in &items {
+            assert!(
+                estimate_response_item_tokens(item) <= MAX_MODEL_VISIBLE_ITEM_TOKENS,
+                "mapped item exceeds 10k token cap"
+            );
+        }
+        let rejoined: String = items
+            .iter()
+            .map(|item| match item {
+                ResponseItem::Message { content, .. } => content
+                    .iter()
+                    .map(|c| match c {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            text.as_str()
+                        }
+                        _ => "",
+                    })
+                    .collect::<String>(),
+                _ => String::new(),
+            })
+            .collect();
+        assert_eq!(rejoined, big, "chunk order must reassemble served text");
     }
 }

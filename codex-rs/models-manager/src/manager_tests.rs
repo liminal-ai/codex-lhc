@@ -1481,3 +1481,80 @@ fn bundled_models_json_roundtrips() {
         "bundled models.json should contain at least one model"
     );
 }
+
+/// Remote/cache catalogs can return `auto_compact_token_limit=null` for gpt-5.6,
+/// which would otherwise resolve to 90% of 272k (=244800). Fork pins 230000
+/// after remote resolution and before user config overrides.
+#[tokio::test]
+async fn gpt_5_6_remote_null_auto_compact_resolves_to_230k_fork_default() {
+    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let mut remote = remote_model(slug, "Remote GPT-5.6", /*priority*/ 0);
+        remote.auto_compact_token_limit = None;
+        remote.context_window = Some(272_000);
+        remote.max_context_window = Some(272_000);
+
+        let manager = static_manager_for_tests(ModelsResponse {
+            models: vec![remote],
+        });
+        let config = ModelsManagerConfig::default();
+        let model = manager.get_model_info(slug, &config).await;
+
+        assert_eq!(
+            model.auto_compact_token_limit,
+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
+            "{slug}: fork default must win over remote null field"
+        );
+        assert_eq!(
+            model.auto_compact_token_limit(),
+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
+            "{slug}: resolved auto_compact_token_limit() must be 230000 (not 244800)"
+        );
+        assert_ne!(
+            model.auto_compact_token_limit(),
+            Some(244_800),
+            "{slug}: must not fall through to 90% of 272k"
+        );
+    }
+}
+
+/// Explicit user `model_auto_compact_token_limit` still wins over the fork default.
+#[tokio::test]
+async fn gpt_5_6_explicit_user_auto_compact_override_wins() {
+    let mut remote = remote_model("gpt-5.6-sol", "Remote", /*priority*/ 0);
+    remote.auto_compact_token_limit = None;
+    remote.context_window = Some(272_000);
+    remote.max_context_window = Some(272_000);
+
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote],
+    });
+    let config = ModelsManagerConfig {
+        model_auto_compact_token_limit: Some(180_000),
+        ..ModelsManagerConfig::default()
+    };
+    let model = manager.get_model_info("gpt-5.6-sol", &config).await;
+    assert_eq!(
+        model.auto_compact_token_limit,
+        Some(180_000),
+        "explicit user config must win over fork 230k default"
+    );
+    assert_eq!(model.auto_compact_token_limit(), Some(180_000));
+}
+
+/// Bundled catalog field remains 230000 (independent of the runtime pin).
+#[test]
+fn gpt_5_6_bundled_catalog_auto_compact_is_230k() {
+    let bundled = crate::bundled_models_response().expect("bundled parses");
+    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+        let model = bundled
+            .models
+            .iter()
+            .find(|m| m.slug == slug)
+            .unwrap_or_else(|| panic!("bundled missing {slug}"));
+        assert_eq!(
+            model.auto_compact_token_limit,
+            Some(GPT_5_6_FORK_AUTO_COMPACT_TOKEN_LIMIT),
+            "{slug}: models.json field must stay 230000"
+        );
+    }
+}

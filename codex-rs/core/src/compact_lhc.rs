@@ -491,11 +491,15 @@ async fn install_lhc_compact_rewrite(
         }
     };
 
+    // Lookup error is a hard failure (not in-memory-only success). Ok(None) is
+    // the intentional ephemeral / non-persistent session contract.
     let rollout_path = match sess.current_rollout_path().await {
         Ok(p) => p,
         Err(err) => {
-            warn!(%err, "current_rollout_path failed; continuing without rewrite");
-            None
+            error!(%err, "current_rollout_path failed; hard stop (no in-memory-only install)");
+            return Ok(failed_attempt(format!(
+                "current_rollout_path failed: {err}"
+            )));
         }
     };
 
@@ -522,7 +526,9 @@ async fn install_lhc_compact_rewrite(
             git: None,
         });
 
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+    // Plan window advance; commit only after successful replacement so failed
+    // construction/rewrite leaves IDs, number, prefill, and one-shot flags alone.
+    let (window_number, window_ids) = sess.plan_auto_compact_window_advance().await;
 
     let world_state_value = world_state_baseline
         .as_ref()
@@ -604,9 +610,9 @@ async fn install_lhc_compact_rewrite(
     }
 
     // Rewrite the rollout file (replaces append of Compacted). Failure leaves
-    // the old file authoritative. Durable install is required when a live path
-    // exists — no in-memory-only install that would desync resume.
-    // NO append fallback path / native Compacted record.
+    // the old file authoritative and does not commit the planned window.
+    // Durable install is required when a live path exists — no in-memory-only
+    // install that would desync resume. NO append fallback / native Compacted.
     if let Some(path) = rollout_path.as_ref() {
         if let Err(err) = sess.flush_rollout().await {
             error!(
@@ -617,17 +623,33 @@ async fn install_lhc_compact_rewrite(
         }
         match atomic_rewrite_rollout(path, &materialize_result.items) {
             Ok(()) => {
-                // Reopen the append handle onto the new inode.
-                if let Some(live_thread) = sess.live_thread()
-                    && let Err(err) = live_thread.reopen_rollout_after_rewrite().await
-                {
-                    // History rewrite is durable; reopen failure is bookkeeping.
-                    error!(
-                        %err,
-                        path = %path.display(),
-                        "LHC recorder reopen after rewrite failed; subsequent \
-                         appends may target the orphaned prior generation"
-                    );
+                // Reopen the append handle onto the new inode. Orphan-inode
+                // reopen is not soft bookkeeping — retry once, then hard-fail
+                // without claiming a healthy Installed outcome.
+                if let Some(live_thread) = sess.live_thread() {
+                    let reopen = live_thread.reopen_rollout_after_rewrite().await;
+                    let reopen = match reopen {
+                        Ok(()) => Ok(()),
+                        Err(err) => {
+                            warn!(
+                                %err,
+                                path = %path.display(),
+                                "LHC recorder reopen after rewrite failed; retrying once"
+                            );
+                            live_thread.reopen_rollout_after_rewrite().await
+                        }
+                    };
+                    if let Err(err) = reopen {
+                        error!(
+                            %err,
+                            path = %path.display(),
+                            "LHC recorder reopen after rewrite failed after retry; \
+                             not claiming Installed (orphan inode risk)"
+                        );
+                        return Ok(failed_attempt(format!(
+                            "recorder reopen after rewrite failed: {err}"
+                        )));
+                    }
                 }
                 info!(
                     path = %path.display(),
@@ -659,6 +681,9 @@ async fn install_lhc_compact_rewrite(
         Some(durable_message),
     )
     .await;
+    // Commit the planned window only with successful replacement.
+    sess.commit_auto_compact_window_advance(window_number, window_ids)
+        .await;
     sess.recompute_token_usage(turn_context).await;
 
     let installed = sess.clone_history().await;
@@ -809,34 +834,30 @@ fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[
     }
 }
 
+/// Effective compact success target: minimum of the applicable auto-compact
+/// limit and the effective provider window for the target model. A body still
+/// above the auto-compact trigger cannot report success (treadmill guard).
+fn effective_compact_target_tokens(turn_context: &TurnContext) -> Option<i64> {
+    let auto_limit = turn_context
+        .config
+        .model_auto_compact_token_limit
+        .or_else(|| turn_context.model_info.auto_compact_token_limit());
+    let provider_window = turn_context.model_context_window();
+    match (auto_limit, provider_window) {
+        (Some(a), Some(w)) => Some(a.min(w)),
+        (Some(a), None) => Some(a),
+        (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
+}
+
 fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
-    let window = turn_context.model_context_window().or_else(|| {
-        turn_context
-            .config
-            .model_auto_compact_token_limit
-            .or_else(|| turn_context.model_info.auto_compact_token_limit())
-    })?;
-    // Cheap char/4 estimate (same order as LHC estimate_tokens).
-    let chars: usize = body
-        .iter()
-        .map(|item| match item {
-            ResponseItem::Message { content, .. } => content
-                .iter()
-                .map(|c| match c {
-                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.len()
-                    }
-                    ContentItem::InputImage { image_url, .. } => image_url.len(),
-                    ContentItem::InputAudio { audio_url } => audio_url.len(),
-                })
-                .sum::<usize>(),
-            _ => 64,
-        })
-        .sum();
-    let est_tokens = (chars / 4) as i64;
-    if est_tokens > window {
+    let target = effective_compact_target_tokens(turn_context)?;
+    let est_tokens = estimate_response_items_tokens(body);
+    if est_tokens > target {
         Some(format!(
-            "estimated body tokens {est_tokens} exceed context window {window}"
+            "estimated body tokens {est_tokens} exceed compact target {target} \
+             (min of auto-compact limit and provider window)"
         ))
     } else {
         None

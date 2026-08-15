@@ -75,13 +75,32 @@ impl AutoCompactWindow {
     }
 
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.window_number = self.window_number.saturating_add(1);
-        self.ids.previous_window_id = Some(self.ids.window_id);
-        self.ids.window_id = Uuid::now_v7();
+        let planned = self.plan_advance();
+        self.commit_advance(planned.0, planned.1);
+        planned
+    }
+
+    /// Compute the next window number/ids without mutating state.
+    ///
+    /// Pair with [`Self::commit_advance`] so failed compact construction/rewrite
+    /// leaves IDs, number, prefill, and one-shot flags unchanged.
+    pub(super) fn plan_advance(&self) -> (u64, AutoCompactWindowIds) {
+        let window_number = self.window_number.saturating_add(1);
+        let ids = AutoCompactWindowIds {
+            first_window_id: self.ids.first_window_id,
+            previous_window_id: Some(self.ids.window_id),
+            window_id: Uuid::now_v7(),
+        };
+        (window_number, ids)
+    }
+
+    /// Commit a previously planned advance after successful replacement.
+    pub(super) fn commit_advance(&mut self, window_number: u64, ids: AutoCompactWindowIds) {
+        self.window_number = window_number;
+        self.ids = ids;
         self.new_context_window_requested = false;
         self.token_budget_reminder_delivered = false;
         self.auto_compact_fallback_delivered = false;
-        (self.window_number, self.ids)
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {

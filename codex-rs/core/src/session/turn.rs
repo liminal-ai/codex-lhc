@@ -1167,7 +1167,7 @@ async fn maybe_run_previous_model_inline_compact(
 pub(crate) async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
-    _fallback_step_context: Option<Arc<StepContext>>,
+    fallback_step_context: Option<Arc<StepContext>>,
     _client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
@@ -1176,13 +1176,20 @@ pub(crate) async fn run_auto_compact(
 ) -> CodexResult<()> {
     // Trigger telemetry fields only — not used by the strict LHC install path.
     let _ = (reason, phase);
-    let turn_context = &step_context.turn;
+    // Model-downshift / comp-hash callers pass previous-model step_context and
+    // current/target model as fallback_step_context. Strict LHC must install and
+    // validate against the target model identity/window when provided so exact
+    // identity replay drops incompatible encrypted reasoning for the new model.
+    let turn_context = fallback_step_context
+        .as_ref()
+        .map(|step| step.turn.as_ref())
+        .unwrap_or(step_context.turn.as_ref());
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
     // LHC-HOOK: strict LHC-only compact (no TokenBudget / remote / local).
     // Trigger/telemetry may differ from manual; eligibility/failure may not.
     crate::compact_lhc::run_strict_lhc_compact(
         sess,
-        turn_context.as_ref(),
+        turn_context,
         initial_context_injection,
         /*manual*/ false,
         cancellation_token,
