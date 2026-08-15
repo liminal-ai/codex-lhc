@@ -1192,16 +1192,10 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     // I2: re-seed slot from durable CompactedItem record (resume / crash window).
     reseed_slot_from_durable_session(sess.as_ref(), &slot).await;
 
-    // F-L4: like-for-like baseline = current model-context size.
+    // Diagnostic like-for-like baseline = current model-context size.
     // Prefer the rollout file's dual-format extract (what resume would rebuild).
-    // When the live host history is substantially larger (rollout lag, or a
-    // test that seeded a tiny pre-rewrite file then grew the host), fall back
-    // to the host stream so we do not false-positive NoReduction.
-    //
-    // Slice E Part 1: NoReduction is a pathology tripwire, not a size optimizer.
-    // When the rollout is native-append-polluted (more than one Compacted record
-    // — appended Compacted after/atop an LHC rewrite), a NORMALIZATION rewrite
-    // proceeds regardless of the size comparison.
+    // A larger compact body is reported but never blocks compaction; imperfect
+    // reduction is not catastrophic and later compacts can improve it.
     let host_est = estimate_response_items_tokens(&host_items);
     let (rollout_est, native_append_polluted) = match sess.current_rollout_path().await {
         Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
@@ -1257,32 +1251,16 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         return Ok(failed_attempt("LHC compact produced empty body"));
     }
 
-    // F-L4: refuse only genuine pathology — materialized body larger than the
-    // current rollout model-context (like-for-like). Equal/smaller installs.
-    // Exception (slice E): native-append-polluted multi-Compacted files get a
-    // NORMALIZATION rewrite even when body > baseline — the size guard is not a
-    // size optimizer. Never falls through to native compact.
     let body_token_estimate = estimate_response_items_tokens(&produce_body);
     if body_token_estimate > baseline_tokens {
-        if native_append_polluted {
-            info!(
-                body_tokens = body_token_estimate,
-                rollout_model_context_tokens = baseline_tokens,
-                items_body = produce_body.len(),
-                manual,
-                "LHC compact NORMALIZATION rewrite: native-append-polluted rollout \
-                 (multiple Compacted records); skipping NoReduction size guard"
-            );
-        } else {
-            let reason = format!(
-                "NoReduction: body_tokens={body_token_estimate} \
-                 rollout_model_context_tokens={baseline_tokens} \
-                 items_body={} (materialized body larger than current model-context)",
-                produce_body.len()
-            );
-            warn!(%reason, manual, "LHC compact body grew vs rollout model-context; hard stop");
-            return Ok(failed_attempt(reason));
-        }
+        warn!(
+            body_tokens = body_token_estimate,
+            rollout_model_context_tokens = baseline_tokens,
+            items_body = produce_body.len(),
+            native_append_polluted,
+            manual,
+            "LHC compact did not reduce this estimate; proceeding with the usable compact"
+        );
     }
 
     let (_initial_context, world_state_baseline) =
