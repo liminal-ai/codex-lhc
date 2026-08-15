@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..a8e3c7a251
+index 0000000000..b831fd0195
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2128 @@
+@@ -0,0 +1,2165 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -123,6 +123,7 @@ index 0000000000..a8e3c7a251
 +use std::time::Duration;
 +
 +use codex_analytics::CompactionPhase;
++use codex_analytics::CompactionTrigger;
 +use codex_features::Feature;
 +use codex_history::RolloutItem;
 +use codex_lhc_host::CompactBoundaryMeta;
@@ -159,6 +160,8 @@ index 0000000000..a8e3c7a251
 +use codex_lhc_host::work_continuation_for_mid_turn;
 +use codex_protocol::error::CodexErr;
 +use codex_protocol::error::Result as CodexResult;
++use codex_protocol::items::ContextCompactionItem;
++use codex_protocol::items::TurnItem;
 +use codex_protocol::models::ContentItem;
 +use codex_protocol::models::ResponseItem;
 +use codex_protocol::protocol::SessionMeta;
@@ -172,6 +175,10 @@ index 0000000000..a8e3c7a251
 +
 +use crate::compact::InitialContextInjection;
 +use crate::compact::build_compaction_initial_context;
++use crate::hook_runtime::PostCompactHookOutcome;
++use crate::hook_runtime::PreCompactHookOutcome;
++use crate::hook_runtime::run_post_compact_hooks;
++use crate::hook_runtime::run_pre_compact_hooks;
 +use crate::session::context_window::context_window_token_status;
 +use crate::session::session::Session;
 +use crate::session::turn_context::TurnContext;
@@ -346,16 +353,32 @@ index 0000000000..a8e3c7a251
 +/// Native TokenBudget / remote / local compact is never reachable.
 +pub(crate) async fn run_strict_lhc_compact(
 +    sess: &Arc<Session>,
-+    turn_context: &TurnContext,
++    turn_context: &Arc<TurnContext>,
 +    initial_context_injection: InitialContextInjection,
 +    manual: bool,
 +    phase: CompactionPhase,
 +    mid_turn: Option<MidTurnSeamFacts>,
 +    cancellation_token: &CancellationToken,
 +) -> CodexResult<()> {
++    let trigger = if manual {
++        CompactionTrigger::Manual
++    } else {
++        CompactionTrigger::Auto
++    };
++    match run_pre_compact_hooks(sess, turn_context, trigger).await {
++        PreCompactHookOutcome::Continue => {}
++        PreCompactHookOutcome::Stopped => {
++            info!(
++                manual,
++                "PreCompact hook stopped LHC compact; skipping compact (no native fallback)"
++            );
++            return Err(CodexErr::TurnAborted);
++        }
++    }
++
 +    match try_run_lhc_compact_arm(
 +        sess,
-+        turn_context,
++        turn_context.as_ref(),
 +        initial_context_injection,
 +        manual,
 +        phase,
@@ -365,8 +388,22 @@ index 0000000000..a8e3c7a251
 +    .await?
 +    {
 +        LhcCompactAttempt::Installed { .. } => {
++            let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
++            sess.emit_turn_item_started(turn_context.as_ref(), &compaction_item)
++                .await;
++            sess.emit_turn_item_completed(turn_context.as_ref(), compaction_item)
++                .await;
 +            crate::tasks::emit_compact_metric(&sess.services.session_telemetry, "lhc", manual);
-+            Ok(())
++            match run_post_compact_hooks(sess, turn_context, trigger).await {
++                PostCompactHookOutcome::Continue => Ok(()),
++                PostCompactHookOutcome::Stopped => {
++                    info!(
++                        manual,
++                        "PostCompact hook stopped after LHC compact; treating as TurnAborted"
++                    );
++                    Err(CodexErr::TurnAborted)
++                }
++            }
 +        }
 +        LhcCompactAttempt::Cancelled { reason } => {
 +            debug!(%reason, manual, "LHC compact cancelled; not falling back to native");
@@ -6665,10 +6702,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..6c5869132b
+index 0000000000..f7d68702ce
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2975 @@
+@@ -0,0 +1,3080 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -6701,6 +6738,7 @@ index 0000000000..6c5869132b
 +use crate::session::context_window::context_window_token_status;
 +use crate::session::session::Session;
 +use crate::session::tests::make_session_and_context;
++use crate::session::tests::make_session_and_context_with_rx;
 +use crate::tasks::CompactTask;
 +use crate::tasks::SessionTask;
 +use codex_lhc_host::InferenceCallbacks;
@@ -9335,7 +9373,7 @@ index 0000000000..6c5869132b
 +
 +    let result = crate::compact_lhc::run_strict_lhc_compact(
 +        &sess,
-+        &tc,
++        &Arc::new(tc),
 +        InitialContextInjection::DoNotInject,
 +        /*manual*/ true,
 +        codex_analytics::CompactionPhase::StandaloneTurn,
@@ -9643,6 +9681,110 @@ index 0000000000..6c5869132b
 +            panic!("StandaloneTurn returned MidTurn residual: {reason}");
 +        }
 +    }
++}
++
++fn drain_context_compaction_counts(
++    rx: &async_channel::Receiver<codex_protocol::protocol::Event>,
++) -> (usize, usize) {
++    use codex_protocol::items::TurnItem;
++    use codex_protocol::protocol::EventMsg;
++    let mut started = 0;
++    let mut completed = 0;
++    while let Ok(event) = rx.try_recv() {
++        match event.msg {
++            EventMsg::ItemStarted(e) if matches!(e.item, TurnItem::ContextCompaction(_)) => {
++                started += 1;
++            }
++            EventMsg::ItemCompleted(e) if matches!(e.item, TurnItem::ContextCompaction(_)) => {
++                completed += 1;
++            }
++            _ => {}
++        }
++    }
++    (started, completed)
++}
++
++/// Successful LHC install emits exactly one ContextCompaction start+complete pair.
++#[tokio::test]
++async fn installed_emits_one_context_compaction_started_and_completed() {
++    let dir = tempdir().unwrap();
++    let (sess_arc, tc_arc, rx) = make_session_and_context_with_rx().await;
++    let mut session = match Arc::try_unwrap(sess_arc) {
++        Ok(session) => session,
++        Err(_) => panic!("unique session"),
++    };
++    let tc = match Arc::try_unwrap(tc_arc) {
++        Ok(tc) => tc,
++        Err(_) => panic!("unique turn context"),
++    };
++    install_lhc_and_enable(&mut session, dir.path().to_path_buf()).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++    install_deterministic_test_override(&session);
++    let _ = drain_context_compaction_counts(&rx);
++
++    let result = crate::compact_lhc::run_strict_lhc_compact(
++        &Arc::new(session),
++        &Arc::new(tc),
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++        codex_analytics::CompactionPhase::StandaloneTurn,
++        /*mid_turn*/ None,
++        &CancellationToken::new(),
++    )
++    .await;
++    assert!(result.is_ok(), "expected successful install: {result:?}");
++    assert_eq!(
++        drain_context_compaction_counts(&rx),
++        (1, 1),
++        "Installed must emit one ContextCompaction started+completed pair"
++    );
++}
++
++/// Hard-fail path (no LHC) must not announce ContextCompaction.
++#[tokio::test]
++async fn hard_failure_emits_no_context_compaction_items() {
++    let (sess_arc, tc_arc, rx) = make_session_and_context_with_rx().await;
++    let session = match Arc::try_unwrap(sess_arc) {
++        Ok(session) => session,
++        Err(_) => panic!("unique session"),
++    };
++    let tc = match Arc::try_unwrap(tc_arc) {
++        Ok(tc) => tc,
++        Err(_) => panic!("unique turn context"),
++    };
++    let _ = drain_context_compaction_counts(&rx);
++
++    let result = crate::compact_lhc::run_strict_lhc_compact(
++        &Arc::new(session),
++        &Arc::new(tc),
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++        codex_analytics::CompactionPhase::StandaloneTurn,
++        /*mid_turn*/ None,
++        &CancellationToken::new(),
++    )
++    .await;
++    assert!(
++        matches!(
++            &result,
++            Err(err) if matches!(err.details(), CodexErrorDetails::UnsupportedOperation(_))
++        ),
++        "strict compact without LHC must hard-fail: {result:?}"
++    );
++    assert_eq!(
++        drain_context_compaction_counts(&rx),
++        (0, 0),
++        "skip/fail must not emit ContextCompaction"
++    );
 +}
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
 index b32181c988..7cdcefa853 100644
@@ -11590,7 +11732,7 @@ index beb48f4a38..bb2f4035c9 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 6c2dc1496a..1a11b20061 100644
+index 6c2dc1496a..2acbe79048 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -7,9 +7,6 @@ use crate::client::ModelClientSession;
@@ -11733,8 +11875,8 @@ index 6c2dc1496a..1a11b20061 100644
 +    // identity replay drops incompatible encrypted reasoning for the new model.
 +    let turn_context = fallback_step_context
 +        .as_ref()
-+        .map(|step| step.turn.as_ref())
-+        .unwrap_or(step_context.turn.as_ref());
++        .map(|step| &step.turn)
++        .unwrap_or(&step_context.turn);
      let _profile_guard = turn_context.turn_timing_state.begin_compaction();
 -    if turn_context.config.features.enabled(Feature::TokenBudget) {
 -        // Compaction is the reset request, so force a new context window
@@ -11885,7 +12027,7 @@ index 6c2dc1496a..1a11b20061 100644
                          ResponseItem::FunctionCall { call_id, .. }
                          | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                          ResponseItem::ToolSearchCall { call_id, .. }
-@@ -2272,10 +2286,34 @@ async fn try_run_sampling_request(
+@@ -2272,10 +2286,35 @@ async fn try_run_sampling_request(
                          }
                          _ => None,
                      };
@@ -11905,11 +12047,12 @@ index 6c2dc1496a..1a11b20061 100644
 +                    ResponseItem::LocalShellCall {
 +                        call_id: Some(call_id),
 +                        ..
-+                    }
-+                    | ResponseItem::ToolSearchCall {
-+                        call_id: Some(call_id),
-+                        ..
 +                    } => Some(call_id.as_str()),
++                    ResponseItem::ToolSearchCall {
++                        call_id: Some(call_id),
++                        execution,
++                        ..
++                    } if execution == "client" => Some(call_id.as_str()),
 +                    _ => None,
 +                };
 +                if let Some(call_id) = mid_turn_call_id
@@ -11921,7 +12064,7 @@ index 6c2dc1496a..1a11b20061 100644
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                      && let Ok(Some(event)) = consumer.finish()
                  {
-@@ -2366,6 +2404,10 @@ async fn try_run_sampling_request(
+@@ -2366,6 +2405,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
@@ -11932,7 +12075,7 @@ index 6c2dc1496a..1a11b20061 100644
                      });
                  }
              }
-@@ -2527,7 +2569,7 @@ async fn try_run_sampling_request(
+@@ -2527,7 +2570,7 @@ async fn try_run_sampling_request(
                  sess.send_event(
                      &turn_context,
                      EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
@@ -11941,7 +12084,7 @@ index 6c2dc1496a..1a11b20061 100644
                          token_usage: token_usage.clone(),
                      }),
                  )
-@@ -2546,6 +2588,10 @@ async fn try_run_sampling_request(
+@@ -2546,6 +2589,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
@@ -12060,7 +12203,7 @@ index 7a19b98e08..bbb4d23616 100644
          self.auto_compact_window.request_new_context_window();
      }
 diff --git a/codex-rs/core/src/tasks/compact.rs b/codex-rs/core/src/tasks/compact.rs
-index 1c7de737eb..faa127908e 100644
+index 1c7de737eb..4eda12a587 100644
 --- a/codex-rs/core/src/tasks/compact.rs
 +++ b/codex-rs/core/src/tasks/compact.rs
 @@ -2,15 +2,10 @@ use std::sync::Arc;
@@ -12140,7 +12283,7 @@ index 1c7de737eb..faa127908e 100644
 +        // LHC-HOOK: strict LHC-only compact (no TokenBudget / remote / local).
 +        crate::compact_lhc::run_strict_lhc_compact(
 +            &session,
-+            ctx.as_ref(),
++            &ctx,
 +            crate::compact::InitialContextInjection::DoNotInject,
 +            /*manual*/ true,
 +            codex_analytics::CompactionPhase::StandaloneTurn,
@@ -12726,10 +12869,10 @@ index 02e555ced0..04dc517227 100644
  
 diff --git a/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
 new file mode 100644
-index 0000000000..840b3df428
+index 0000000000..ef7acf5166
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
-@@ -0,0 +1,900 @@
+@@ -0,0 +1,907 @@
 +//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
 +//!
 +//! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
@@ -13133,7 +13276,12 @@ index 0000000000..840b3df428
 +            .expect("inspect receipts");
 +    let refusal = receipts
 +        .iter()
-+        .find(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("unsafe_runway"))
++        .find(|r| {
++            r.receipt
++                .refuse_code
++                .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
++                == Some("unsafe_runway")
++        })
 +        .expect("durable unsafe_runway refusal receipt");
 +    assert_eq!(
 +        refusal.receipt.residual.protected_tool_call_ids,
@@ -13613,9 +13761,11 @@ index 0000000000..840b3df428
 +        }
 +    }
 +    assert!(
-+        !receipts
-+            .iter()
-+            .any(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("install_failed")),
++        !receipts.iter().any(|r| r
++            .receipt
++            .refuse_code
++            .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
++            == Some("install_failed")),
 +        "no misreported install failures across the sustained loop"
 +    );
 +
