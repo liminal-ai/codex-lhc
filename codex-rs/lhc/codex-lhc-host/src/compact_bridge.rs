@@ -28,7 +28,6 @@ use lhc::intake_stream::MessageEventInput;
 use lhc::sdk::CompactReceipt;
 use lhc::sdk::LlmRequestContext;
 use lhc::sdk::OpResult;
-use lhc::shared_tech::ErrorCode;
 use lhc::shared_tech::InferenceCallbacks;
 use lhc::shared_tech::LlmRequestContextRole;
 use lhc::shared_tech::logging::DerivationLogEventKind;
@@ -892,47 +891,23 @@ pub async fn produce_lhc_compact_with_provenance(
 
     let archive_tip = archive_tip_identity(&events);
 
-    // A normal background derivation may commit between compact preparation and
-    // the atomic view replacement. The SDK correctly rejects that stale
-    // candidate. Rebuild from the new source state instead of turning routine
-    // derivation progress into a terminal host compact failure.
-    const MAX_STALE_PREPARED_RETRIES: usize = 2;
-    let mut stale_prepared_retries = 0usize;
-    let receipt = loop {
-        match session
-            .lhc
-            .thread_view
-            .compact(
-                session.thread_ref.clone(),
-                CompactOpts {
-                    profile: None,
-                    params: None,
-                    signal: None,
-                },
-            )
-            .await
-        {
-            OpResult::Ok { value } => break value,
-            OpResult::Err { error }
-                if error.code == ErrorCode::StalePreparedCompact
-                    && stale_prepared_retries < MAX_STALE_PREPARED_RETRIES =>
-            {
-                stale_prepared_retries += 1;
-                warn!(
-                    attempt = stale_prepared_retries,
-                    max_retries = MAX_STALE_PREPARED_RETRIES,
-                    reason = %error.reason,
-                    "LHC compact candidate became stale; rebuilding from current state"
-                );
-                if let Err(cancelled) = check_cancel(cancel.as_deref()) {
-                    session.close().await;
-                    return Err(cancelled);
-                }
-            }
-            OpResult::Err { error } => {
-                session.close().await;
-                return Err(LhcCompactUnavailable::CompactFailed(error.reason));
-            }
+    let receipt = match session
+        .lhc
+        .thread_view
+        .compact(
+            session.thread_ref.clone(),
+            CompactOpts {
+                profile: None,
+                params: None,
+                signal: None,
+            },
+        )
+        .await
+    {
+        OpResult::Ok { value } => value,
+        OpResult::Err { error } => {
+            session.close().await;
+            return Err(LhcCompactUnavailable::CompactFailed(error.reason));
         }
     };
 

@@ -23,16 +23,14 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`3a0f63f`** — LIM-67 contract 2.0.0 protected pending-tool
-  escalation (sorted `protectedToolCallIds` set, protected visibility-boundary
-  preview, atomic view+boundary install, schema v11 host-validation store +
-  ack APIs) on the `feature/compact-continuation` line. Descends the LIM-63
-  pin `6232317` (schema v10 runtime + stored operation-identity inspection),
-  the LIM-63A pin `98826c1`, and the retrieval pin `7062814` / `dd251ec`
-  (byte-fitting slices, clean-tail token windows, rusqlite 0.37–0.39
-  host-compat, bundled SQLite 3.51.3). Side-branch pin until the feature
-  line folds into shared main; tripwire still requires a clean tree at the
-  pin and full mid-turn / full-loop layers.
+  Current pin: **`2cb04a5`** — LIM-67 contract 2.0.0 protected pending-tool
+  escalation plus non-blocking prepared-view activation. Normal derivation,
+  re-derivation, and source progress cannot cancel a compact. The pin includes
+  sorted `protectedToolCallIds`, protected visibility-boundary preview, atomic
+  view+boundary activation, and the schema v11 host-validation store + ack
+  APIs on shared `main`. It descends the LIM-63 pin `6232317`, LIM-63A pin
+  `98826c1`, and retrieval pin `7062814` / `dd251ec`. The tripwire requires a
+  clean tree at the pin and full mid-turn / full-loop layers.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
