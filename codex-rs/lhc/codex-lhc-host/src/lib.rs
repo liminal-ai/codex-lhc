@@ -51,6 +51,7 @@ pub use compact_bridge::produce_lhc_compact_with_provenance;
 pub use compact_bridge::read_materialize_surfaces;
 pub use inference::LateBoundCallbacks;
 pub use inference::LhcInferenceError;
+pub use inference::inert_non_deriving_inference_callbacks;
 pub use inference::lhc_inference_callbacks;
 /// Re-export so core can pass live ModelClient-backed callbacks without a
 /// direct `lhc` path dep.

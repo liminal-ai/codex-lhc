@@ -5,13 +5,25 @@
 //!   callbacks via [`produce_lhc_compact`] with a ModelClient-built
 //!   [`InferenceCallbacks`]. This function never silently returns canned text
 //!   for the live arm (R2).
+//! - **Inert / non-deriving**: production seam when the pinned derivation model
+//!   is unavailable. Returns immediate `Err` with no text — never canned
+//!   derivation content. Compact proceeds on existing bands / full-fidelity
+//!   residue.
 //!
 //! The ModelClient → InferenceCallbacks adapter lives in `codex-core`
 //! (`lhc_model_inference_callbacks`) so the adapter crate does not take a
 //! reverse dependency on core.
 
+use std::sync::Arc;
+
+use lhc::shared_tech::CompressDetailedTurnInput;
 use lhc::shared_tech::InferenceCallbacks;
+use lhc::shared_tech::InferenceResult;
+use lhc::shared_tech::SmoothPromptInput;
+use lhc::shared_tech::SummarizeChunkBriefInput;
+use lhc::shared_tech::SummarizeToolResultInput;
 use lhc::shared_tech::create_deterministic_inference_callbacks;
+use lhc::shared_tech::derivation::BoxFuture;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LhcInferenceError {
@@ -46,6 +58,29 @@ pub fn lhc_inference_callbacks(live: bool) -> Result<InferenceCallbacks, LhcInfe
     Ok(create_deterministic_inference_callbacks())
 }
 
+/// Smallest safe production seam when derivation inference is unavailable.
+///
+/// Every lane returns an immediate `Err` with no text. Compact may still open a
+/// session that requires an `InferenceCallbacks` object; this satisfies that
+/// type without seeding or persisting canned derivation output.
+pub fn inert_non_deriving_inference_callbacks() -> InferenceCallbacks {
+    const REASON: &str = "derivation inference unavailable (inert non-deriving seam)";
+    fn err_future() -> BoxFuture<InferenceResult> {
+        Box::pin(async {
+            InferenceResult::Err {
+                reason: REASON.into(),
+                request_messages: None,
+            }
+        })
+    }
+    InferenceCallbacks {
+        smooth_prompt: Arc::new(move |_input: SmoothPromptInput| err_future()),
+        summarize_tool_result: Arc::new(move |_input: SummarizeToolResultInput| err_future()),
+        compress_detailed_turn: Arc::new(move |_input: CompressDetailedTurnInput| err_future()),
+        summarize_chunk_brief: Arc::new(move |_input: SummarizeChunkBriefInput| err_future()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,6 +95,23 @@ mod tests {
         match lhc_inference_callbacks(true) {
             Ok(_) => panic!("live must not return deterministic callbacks"),
             Err(err) => assert_eq!(err, LhcInferenceError::LiveNotConfigured),
+        }
+    }
+
+    #[tokio::test]
+    async fn inert_returns_err_without_text() {
+        let cb = inert_non_deriving_inference_callbacks();
+        match (cb.smooth_prompt)(SmoothPromptInput {
+            text: "hello".into(),
+        })
+        .await
+        {
+            InferenceResult::Err { reason, .. } => {
+                assert!(reason.contains("inert"), "{reason}");
+            }
+            InferenceResult::Ok { text, .. } => {
+                panic!("inert must not produce text, got {text}")
+            }
         }
     }
 }
@@ -85,12 +137,10 @@ mod tests {
 /// (`DrainStoppedBecause::InFlight` plus claim-expiry wake timers).
 ///
 /// The wait is **unbounded**, and that is deliberate. A terminal failure is
-/// permanent for that derivation, and the compact arm now treats any terminal
-/// failure as a refusal (L2) — so timing out here would poison a thread for its
+/// permanent for that derivation; timing out here would poison a thread for its
 /// whole life over a transient startup race. Instead the derivation simply
-/// waits; if the model never becomes available, the *caller's* bounded
-/// `drain_settled` fails open and LHC's claim lease releases the work. Bounded
-/// where a user is waiting, patient where nobody is.
+/// waits. Compact does **not** wait for settlement — readiness affects quality
+/// only (fallback bands / residue). LHC's claim lease releases abandoned work.
 #[derive(Clone)]
 pub struct LateBoundCallbacks {
     slot: std::sync::Arc<std::sync::Mutex<Option<InferenceCallbacks>>>,

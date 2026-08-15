@@ -770,11 +770,9 @@ pub async fn produce_lhc_compact_with_provenance(
         );
     }
 
-    // No drain here. Derivation runs in the background as intake commits, on
-    // the capture session's scheduler (`SdkMode::Background`); the caller waits
-    // for it to settle via `CaptureHandle::drain_settled` before reaching this
-    // point. Draining inline was a host doing LHC's job at the worst possible
-    // moment — see FORK.md §"The drain correction".
+    // No drain here. Derivation readiness affects quality only; compact uses
+    // the fallback ladder for unready/terminal work. Callers must not wait on
+    // drain_settled as a compact prerequisite.
     check_cancel(cancel.as_deref())?;
 
     let archive_tip = archive_tip_identity(&events);
