@@ -22,6 +22,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_analytics::CompactionPhase;
+use codex_analytics::CompactionTrigger;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_lhc_host::CompactBoundaryMeta;
@@ -58,6 +59,8 @@ use codex_lhc_host::token_usage_to_provider_usage_authority;
 use codex_lhc_host::work_continuation_for_mid_turn;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::items::ContextCompactionItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionMeta;
@@ -71,6 +74,10 @@ use tracing::warn;
 
 use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
+use crate::hook_runtime::PostCompactHookOutcome;
+use crate::hook_runtime::PreCompactHookOutcome;
+use crate::hook_runtime::run_post_compact_hooks;
+use crate::hook_runtime::run_pre_compact_hooks;
 use crate::session::context_window::context_window_token_status;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -245,16 +252,32 @@ pub(crate) enum LhcCompactAttempt {
 /// Native TokenBudget / remote / local compact is never reachable.
 pub(crate) async fn run_strict_lhc_compact(
     sess: &Arc<Session>,
-    turn_context: &TurnContext,
+    turn_context: &Arc<TurnContext>,
     initial_context_injection: InitialContextInjection,
     manual: bool,
     phase: CompactionPhase,
     mid_turn: Option<MidTurnSeamFacts>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
+    let trigger = if manual {
+        CompactionTrigger::Manual
+    } else {
+        CompactionTrigger::Auto
+    };
+    match run_pre_compact_hooks(sess, turn_context, trigger).await {
+        PreCompactHookOutcome::Continue => {}
+        PreCompactHookOutcome::Stopped => {
+            info!(
+                manual,
+                "PreCompact hook stopped LHC compact; skipping compact (no native fallback)"
+            );
+            return Err(CodexErr::TurnAborted);
+        }
+    }
+
     match try_run_lhc_compact_arm(
         sess,
-        turn_context,
+        turn_context.as_ref(),
         initial_context_injection,
         manual,
         phase,
@@ -264,8 +287,22 @@ pub(crate) async fn run_strict_lhc_compact(
     .await?
     {
         LhcCompactAttempt::Installed { .. } => {
+            let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+            sess.emit_turn_item_started(turn_context.as_ref(), &compaction_item)
+                .await;
+            sess.emit_turn_item_completed(turn_context.as_ref(), compaction_item)
+                .await;
             crate::tasks::emit_compact_metric(&sess.services.session_telemetry, "lhc", manual);
-            Ok(())
+            match run_post_compact_hooks(sess, turn_context, trigger).await {
+                PostCompactHookOutcome::Continue => Ok(()),
+                PostCompactHookOutcome::Stopped => {
+                    info!(
+                        manual,
+                        "PostCompact hook stopped after LHC compact; treating as TurnAborted"
+                    );
+                    Err(CodexErr::TurnAborted)
+                }
+            }
         }
         LhcCompactAttempt::Cancelled { reason } => {
             debug!(%reason, manual, "LHC compact cancelled; not falling back to native");

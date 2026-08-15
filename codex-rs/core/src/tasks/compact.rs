@@ -33,7 +33,7 @@ impl SessionTask for CompactTask {
         // LHC-HOOK: strict LHC-only compact (no TokenBudget / remote / local).
         crate::compact_lhc::run_strict_lhc_compact(
             &session,
-            ctx.as_ref(),
+            &ctx,
             crate::compact::InitialContextInjection::DoNotInject,
             /*manual*/ true,
             codex_analytics::CompactionPhase::StandaloneTurn,

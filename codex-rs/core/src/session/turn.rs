@@ -1210,8 +1210,8 @@ pub(crate) async fn run_auto_compact(
     // identity replay drops incompatible encrypted reasoning for the new model.
     let turn_context = fallback_step_context
         .as_ref()
-        .map(|step| step.turn.as_ref())
-        .unwrap_or(step_context.turn.as_ref());
+        .map(|step| &step.turn)
+        .unwrap_or(&step_context.turn);
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
     // LHC-HOOK: strict LHC-only compact with MidTurn continuation semantics.
     // Native TokenBudget / remote / local compact is never reachable.
@@ -2301,11 +2301,12 @@ async fn try_run_sampling_request(
                     ResponseItem::LocalShellCall {
                         call_id: Some(call_id),
                         ..
-                    }
-                    | ResponseItem::ToolSearchCall {
-                        call_id: Some(call_id),
-                        ..
                     } => Some(call_id.as_str()),
+                    ResponseItem::ToolSearchCall {
+                        call_id: Some(call_id),
+                        execution,
+                        ..
+                    } if execution == "client" => Some(call_id.as_str()),
                     _ => None,
                 };
                 if let Some(call_id) = mid_turn_call_id

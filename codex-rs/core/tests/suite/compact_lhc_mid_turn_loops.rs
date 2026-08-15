@@ -401,7 +401,12 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
             .expect("inspect receipts");
     let refusal = receipts
         .iter()
-        .find(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("unsafe_runway"))
+        .find(|r| {
+            r.receipt
+                .refuse_code
+                .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
+                == Some("unsafe_runway")
+        })
         .expect("durable unsafe_runway refusal receipt");
     assert_eq!(
         refusal.receipt.residual.protected_tool_call_ids,
@@ -881,9 +886,11 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
         }
     }
     assert!(
-        !receipts
-            .iter()
-            .any(|r| r.receipt.refuse_code.map(|c| c.as_str()) == Some("install_failed")),
+        !receipts.iter().any(|r| r
+            .receipt
+            .refuse_code
+            .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
+            == Some("install_failed")),
         "no misreported install failures across the sustained loop"
     );
 

@@ -30,6 +30,7 @@ use crate::compact::InitialContextInjection;
 use crate::session::context_window::context_window_token_status;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::tasks::CompactTask;
 use crate::tasks::SessionTask;
 use codex_lhc_host::InferenceCallbacks;
@@ -2664,7 +2665,7 @@ async fn hard_failure_preserves_history_and_writes_no_native_compacted() {
 
     let result = crate::compact_lhc::run_strict_lhc_compact(
         &sess,
-        &tc,
+        &Arc::new(tc),
         InitialContextInjection::DoNotInject,
         /*manual*/ true,
         codex_analytics::CompactionPhase::StandaloneTurn,
@@ -2972,4 +2973,108 @@ async fn blocked_capture_flush_does_not_hang_lhc_compact() {
             panic!("StandaloneTurn returned MidTurn residual: {reason}");
         }
     }
+}
+
+fn drain_context_compaction_counts(
+    rx: &async_channel::Receiver<codex_protocol::protocol::Event>,
+) -> (usize, usize) {
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::protocol::EventMsg;
+    let mut started = 0;
+    let mut completed = 0;
+    while let Ok(event) = rx.try_recv() {
+        match event.msg {
+            EventMsg::ItemStarted(e) if matches!(e.item, TurnItem::ContextCompaction(_)) => {
+                started += 1;
+            }
+            EventMsg::ItemCompleted(e) if matches!(e.item, TurnItem::ContextCompaction(_)) => {
+                completed += 1;
+            }
+            _ => {}
+        }
+    }
+    (started, completed)
+}
+
+/// Successful LHC install emits exactly one ContextCompaction start+complete pair.
+#[tokio::test]
+async fn installed_emits_one_context_compaction_started_and_completed() {
+    let dir = tempdir().unwrap();
+    let (sess_arc, tc_arc, rx) = make_session_and_context_with_rx().await;
+    let mut session = match Arc::try_unwrap(sess_arc) {
+        Ok(session) => session,
+        Err(_) => panic!("unique session"),
+    };
+    let tc = match Arc::try_unwrap(tc_arc) {
+        Ok(tc) => tc,
+        Err(_) => panic!("unique turn context"),
+    };
+    install_lhc_and_enable(&mut session, dir.path().to_path_buf()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+    install_deterministic_test_override(&session);
+    let _ = drain_context_compaction_counts(&rx);
+
+    let result = crate::compact_lhc::run_strict_lhc_compact(
+        &Arc::new(session),
+        &Arc::new(tc),
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(result.is_ok(), "expected successful install: {result:?}");
+    assert_eq!(
+        drain_context_compaction_counts(&rx),
+        (1, 1),
+        "Installed must emit one ContextCompaction started+completed pair"
+    );
+}
+
+/// Hard-fail path (no LHC) must not announce ContextCompaction.
+#[tokio::test]
+async fn hard_failure_emits_no_context_compaction_items() {
+    let (sess_arc, tc_arc, rx) = make_session_and_context_with_rx().await;
+    let session = match Arc::try_unwrap(sess_arc) {
+        Ok(session) => session,
+        Err(_) => panic!("unique session"),
+    };
+    let tc = match Arc::try_unwrap(tc_arc) {
+        Ok(tc) => tc,
+        Err(_) => panic!("unique turn context"),
+    };
+    let _ = drain_context_compaction_counts(&rx);
+
+    let result = crate::compact_lhc::run_strict_lhc_compact(
+        &Arc::new(session),
+        &Arc::new(tc),
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        codex_analytics::CompactionPhase::StandaloneTurn,
+        /*mid_turn*/ None,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &result,
+            Err(err) if matches!(err.details(), CodexErrorDetails::UnsupportedOperation(_))
+        ),
+        "strict compact without LHC must hard-fail: {result:?}"
+    );
+    assert_eq!(
+        drain_context_compaction_counts(&rx),
+        (0, 0),
+        "skip/fail must not emit ContextCompaction"
+    );
 }
