@@ -3818,6 +3818,32 @@ impl Session {
         state.advance_auto_compact_window()
     }
 
+    /// Plan next auto-compact window ids without committing (transactional install).
+    pub(crate) async fn plan_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
+        let state = self.state.lock().await;
+        state.plan_auto_compact_window_advance()
+    }
+
+    /// Commit a planned auto-compact window advance after successful replacement.
+    pub(crate) async fn commit_auto_compact_window_advance(
+        &self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) {
+        let mut state = self.state.lock().await;
+        state.commit_auto_compact_window_advance(window_number, ids);
+    }
+
+    pub(crate) async fn auto_compact_window_number(&self) -> u64 {
+        let state = self.state.lock().await;
+        state.auto_compact_window_number()
+    }
+
+    pub(crate) async fn auto_compact_window_ids(&self) -> AutoCompactWindowIds {
+        let state = self.state.lock().await;
+        state.auto_compact_window_ids()
+    }
+
     pub(crate) async fn request_new_context_window(&self) {
         let mut state = self.state.lock().await;
         state.request_new_context_window();

@@ -7,9 +7,6 @@ use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::InitialContextInjection;
-use crate::compact::run_inline_auto_compact_task;
-use crate::compact_remote::run_inline_remote_auto_compact_task;
-use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -47,7 +44,6 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
-use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
@@ -75,7 +71,6 @@ use codex_features::Feature;
 use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_login::CodexAuth;
-use codex_model_provider::RemoteCompactionSupport;
 use codex_protocol::ResponseItemId;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
@@ -1203,140 +1198,36 @@ pub(crate) async fn run_auto_compact(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     fallback_step_context: Option<Arc<StepContext>>,
-    client_session: &mut ModelClientSession,
+    _client_session: &mut ModelClientSession,
     initial_context_injection: InitialContextInjection,
     reason: CompactionReason,
     phase: CompactionPhase,
     mid_turn: Option<crate::compact_lhc::MidTurnSeamFacts>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<()> {
-    let turn_context = &step_context.turn;
+    // Trigger telemetry fields only — not used by the strict LHC install path.
+    let _ = (reason, phase);
+    // Model-downshift / comp-hash callers pass previous-model step_context and
+    // current/target model as fallback_step_context. Strict LHC must install and
+    // validate against the target model identity/window when provided so exact
+    // identity replay drops incompatible encrypted reasoning for the new model.
+    let turn_context = fallback_step_context
+        .as_ref()
+        .map(|step| step.turn.as_ref())
+        .unwrap_or(step_context.turn.as_ref());
     let _profile_guard = turn_context.turn_timing_state.begin_compaction();
-    // LHC-HOOK: compact arm above TokenBudget (Chunk 2b).
-    // MidTurn + LHC enabled: one writer — never silently fall open to native.
-    match crate::compact_lhc::try_run_lhc_compact_arm(
+    // LHC-HOOK: strict LHC-only compact with MidTurn continuation semantics.
+    // Native TokenBudget / remote / local compact is never reachable.
+    crate::compact_lhc::run_strict_lhc_compact(
         sess,
-        turn_context.as_ref(),
-        initial_context_injection.clone(),
+        turn_context,
+        initial_context_injection,
         /*manual*/ false,
         phase,
         mid_turn,
         cancellation_token,
     )
-    .await?
-    {
-        crate::compact_lhc::LhcCompactAttempt::Installed { .. } => {
-            crate::tasks::emit_compact_metric(
-                &sess.services.session_telemetry,
-                "lhc",
-                /*manual*/ false,
-            );
-            return Ok(());
-        }
-        crate::compact_lhc::LhcCompactAttempt::MidTurnSkipped { reason } => {
-            tracing::info!(%reason, "LHC MidTurn compact-continuation skipped; continue without native");
-            return Ok(());
-        }
-        crate::compact_lhc::LhcCompactAttempt::MidTurnBlocked {
-            reason,
-            next_provider_request_allowed,
-        } => {
-            tracing::error!(
-                %reason,
-                next_provider_request_allowed,
-                "LHC MidTurn compact-continuation blocked; native fallback refused"
-            );
-            if !next_provider_request_allowed {
-                return Err(CodexErr::UnsupportedOperation(format!(
-                    "LHC MidTurn compact-continuation blocked next provider request: {reason}"
-                )));
-            }
-            // Allowed to continue without native mutation.
-            return Ok(());
-        }
-        crate::compact_lhc::LhcCompactAttempt::Unavailable { reason } => {
-            if matches!(phase, CompactionPhase::MidTurn) && sess.enabled(Feature::LhcCapture) {
-                // Defensive: MidTurn with LHC on must not reach native.
-                tracing::error!(
-                    %reason,
-                    "LHC MidTurn unavailable while LhcCapture on; refusing native fallback"
-                );
-                return Err(CodexErr::UnsupportedOperation(format!(
-                    "LHC MidTurn unavailable (no native fallback): {reason}"
-                )));
-            }
-            tracing::debug!(%reason, "LHC auto-compact arm unavailable; native ladder continues");
-        }
-    }
-    if turn_context.config.features.enabled(Feature::TokenBudget) {
-        // Compaction is the reset request, so force a new context window
-        // instead of consuming a pending `new_context` tool request.
-        crate::compact_token_budget::run_inline_auto_compact_task(
-            Arc::clone(sess),
-            step_context,
-            initial_context_injection,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    match turn_context.provider.capabilities().remote_compaction {
-        RemoteCompactionSupport::V2
-            if turn_context
-                .config
-                .features
-                .enabled(Feature::RemoteCompactionV2) =>
-        {
-            emit_compact_metric(
-                &sess.services.session_telemetry,
-                "remote_v2",
-                /*manual*/ false,
-            );
-            run_inline_remote_auto_compact_task_v2(
-                Arc::clone(sess),
-                step_context,
-                fallback_step_context,
-                client_session,
-                initial_context_injection,
-                reason,
-                phase,
-            )
-            .await?;
-        }
-        RemoteCompactionSupport::V1 | RemoteCompactionSupport::V2 => {
-            emit_compact_metric(
-                &sess.services.session_telemetry,
-                "remote",
-                /*manual*/ false,
-            );
-            run_inline_remote_auto_compact_task(
-                Arc::clone(sess),
-                step_context,
-                fallback_step_context,
-                client_session.turn_state(),
-                initial_context_injection,
-                reason,
-                phase,
-            )
-            .await?;
-        }
-        RemoteCompactionSupport::Unsupported => {
-            emit_compact_metric(
-                &sess.services.session_telemetry,
-                "local",
-                /*manual*/ false,
-            );
-            run_inline_auto_compact_task(
-                Arc::clone(sess),
-                Arc::clone(turn_context),
-                initial_context_injection,
-                reason,
-                phase,
-            )
-            .await?;
-        }
-    }
-    Ok(())
+    .await
 }
 
 pub(super) fn collect_explicit_app_ids_from_skill_items(

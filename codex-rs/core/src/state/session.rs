@@ -216,6 +216,18 @@ impl SessionState {
         self.auto_compact_window.advance()
     }
 
+    pub(crate) fn plan_auto_compact_window_advance(&self) -> (u64, AutoCompactWindowIds) {
+        self.auto_compact_window.plan_advance()
+    }
+
+    pub(crate) fn commit_auto_compact_window_advance(
+        &mut self,
+        window_number: u64,
+        ids: AutoCompactWindowIds,
+    ) {
+        self.auto_compact_window.commit_advance(window_number, ids);
+    }
+
     pub(crate) fn request_new_context_window(&mut self) {
         self.auto_compact_window.request_new_context_window();
     }

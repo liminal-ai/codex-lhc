@@ -896,6 +896,10 @@ async fn slice_d_l2_mid_turn_abort_then_rewrite() {
 
     seed_conversation_bandable(&session, &tc, 80).await;
     handle.flush().await;
+    assert!(
+        handle.drain_settled(Duration::from_secs(120)).await,
+        "fixture derivations must settle before asserting a successful rewrite"
+    );
 
     let sess = Arc::new(session);
     let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;

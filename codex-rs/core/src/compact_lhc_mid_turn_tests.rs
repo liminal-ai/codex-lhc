@@ -513,7 +513,7 @@ async fn mid_turn_lhc_unavailable_does_not_native_fallback_via_auto_ladder() {
 }
 
 #[tokio::test]
-async fn mid_turn_feature_off_allows_native_path_unavailable() {
+async fn mid_turn_feature_off_stops_without_native_fallback() {
     let (mut session, tc) = make_session_and_context().await;
     session
         .set_feature_for_test(Feature::LhcCapture, false)
@@ -531,10 +531,63 @@ async fn mid_turn_feature_off_allows_native_path_unavailable() {
     .await
     .expect("arm");
     match attempt {
-        LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::Failed { reason } => {
             assert!(reason.contains("LhcCapture off"), "{reason}");
         }
-        other => panic!("expected Unavailable (native allowed), got {other:?}"),
+        other => panic!("expected strict failure with native disabled, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mid_turn_blocked_capture_flush_stops_without_hanging_or_native() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    let release = handle.block_worker().await;
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let started = std::time::Instant::now();
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(5),
+        try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "blocked-flush",
+                true,
+                epoch,
+                Vec::new(),
+                Some(sample_usage(5_000)),
+            )),
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("blocked capture worker must not hang MidTurn compact")
+    .expect("arm");
+    drop(release);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    match attempt {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(reason.contains("capture flush"), "{reason}");
+            assert!(!next_provider_request_allowed);
+        }
+        other => panic!("blocked capture flush must block without native fallback: {other:?}"),
     }
 }
 
@@ -590,8 +643,10 @@ async fn mid_turn_active_non_tool_runs_certified_runtime() {
             assert!(!reason.is_empty());
             let _ = next_provider_request_allowed;
         }
-        LhcCompactAttempt::Unavailable { reason } => {
-            panic!("MidTurn must not Unavailable when LHC on: {reason}");
+        LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::Failed { reason }
+        | LhcCompactAttempt::Cancelled { reason } => {
+            panic!("MidTurn must not hard-stop when LHC is healthy: {reason}");
         }
     }
 }
@@ -2010,8 +2065,10 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
             | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
                 assert!(!reason.is_empty(), "degradation residual must be truthful");
             }
-            LhcCompactAttempt::Unavailable { reason } => {
-                panic!("degraded path must not native-fall-open: {reason}");
+            LhcCompactAttempt::Unavailable { reason }
+            | LhcCompactAttempt::Failed { reason }
+            | LhcCompactAttempt::Cancelled { reason } => {
+                panic!("degraded MidTurn path must use explicit MidTurn outcome: {reason}");
             }
         }
     }
@@ -2317,8 +2374,10 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
                 "must not permanently wedge: {reason}"
             );
         }
-        LhcCompactAttempt::Unavailable { reason } => {
-            panic!("repair must not Unavailable: {reason}");
+        LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::Failed { reason }
+        | LhcCompactAttempt::Cancelled { reason } => {
+            panic!("repair must use explicit MidTurn outcome: {reason}");
         }
     }
     let _ = (pending, attempt_id);
@@ -2473,8 +2532,10 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
     .expect("repair arm");
 
     match repaired {
-        LhcCompactAttempt::Unavailable { reason } => {
-            panic!("claim-only preserve recovery must not Unavailable: {reason}");
+        LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::Failed { reason }
+        | LhcCompactAttempt::Cancelled { reason } => {
+            panic!("claim-only preserve recovery must use explicit MidTurn outcome: {reason}");
         }
         LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
             assert!(

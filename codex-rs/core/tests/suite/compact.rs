@@ -1615,6 +1615,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+//
+// Fork policy: auto compact is strict LHC-only. Without an LHC capture slot the
+// production ladder hard-fails (visible turn error) and never issues a native
+// summarization request. History from completed turns is preserved.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn auto_compact_runs_after_token_limit_hit() {
@@ -1632,17 +1636,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
         ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
 
-    let sse3 = sse(vec![
-        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
-        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
-    ]);
-    let sse4 = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
-    ]);
-    let prefixed_auto_summary = AUTO_SUMMARY_TEXT;
-
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
+    // No native summary SSE — a third model request would mean native compact leaked.
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -1651,7 +1646,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex;
 
     codex
         .submit(Op::UserInput {
@@ -1683,6 +1679,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .await
         .unwrap();
 
+    // Over threshold: pre-turn auto compact on the next user turn hard-fails LHC
+    // (no capture slot in this fixture) without native fallback.
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
@@ -1699,120 +1697,145 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .await
         .unwrap();
 
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let mut saw_lhc_error = false;
+    let mut saw_turn_complete = false;
+    for _ in 0..20 {
+        let ev = wait_for_event(&codex, |_| true).await;
+        match &ev {
+            EventMsg::Error(err) => {
+                let msg = err.message.to_ascii_lowercase();
+                if msg.contains("lhc") || msg.contains("compact") {
+                    saw_lhc_error = true;
+                }
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_lhc_error || saw_turn_complete,
+        "threshold hit must produce a visible turn outcome (error and/or complete)"
+    );
 
     let requests = request_log.requests();
     let request_bodies: Vec<String> = requests
         .iter()
         .map(|request| request.body_json().to_string())
         .collect();
-    assert_eq!(
-        request_bodies.len(),
-        4,
-        "expected user turns, a compaction request, and the follow-up turn; got {}",
-        request_bodies.len()
-    );
-    let auto_compact_count = request_bodies
+    let native_summary_count = request_bodies
         .iter()
         .filter(|body| body_contains_text(body, SUMMARIZATION_PROMPT))
         .count();
     assert_eq!(
-        auto_compact_count, 1,
-        "expected exactly one auto compact request"
-    );
-    let auto_compact_index = request_bodies
-        .iter()
-        .enumerate()
-        .find_map(|(idx, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(idx))
-        .expect("auto compact request missing");
-    assert_eq!(
-        auto_compact_index, 2,
-        "auto compact should add a third request"
-    );
-
-    let follow_up_index = request_bodies
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(idx, body)| {
-            (body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT))
-                .then_some(idx)
-        })
-        .expect("follow-up request missing");
-    assert_eq!(follow_up_index, 3, "follow-up request should be last");
-
-    let body_first = requests[0].body_json();
-    let body_auto = requests[auto_compact_index].body_json();
-    let body_follow_up = requests[follow_up_index].body_json();
-    let instructions = body_auto
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    let baseline_instructions = body_first
-        .get("instructions")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    assert_eq!(
-        instructions, baseline_instructions,
-        "auto compact should keep the standard developer instructions",
-    );
-
-    let input_auto = body_auto.get("input").and_then(|v| v.as_array()).unwrap();
-    let last_auto = input_auto
-        .last()
-        .expect("auto compact request should append a user message");
-    assert_eq!(
-        last_auto.get("type").and_then(|v| v.as_str()),
-        Some("message")
-    );
-    assert_eq!(last_auto.get("role").and_then(|v| v.as_str()), Some("user"));
-    let last_text = last_auto
-        .get("content")
-        .and_then(|v| v.as_array())
-        .and_then(|items| items.first())
-        .and_then(|item| item.get("text"))
-        .and_then(|text| text.as_str())
-        .unwrap_or_default();
-    assert_eq!(
-        last_text, SUMMARIZATION_PROMPT,
-        "auto compact should send the summarization prompt as a user message",
-    );
-
-    let input_follow_up = body_follow_up
-        .get("input")
-        .and_then(|v| v.as_array())
-        .unwrap();
-    let user_texts: Vec<String> = input_follow_up
-        .iter()
-        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
-        .filter(|item| item.get("role").and_then(|v| v.as_str()) == Some("user"))
-        .filter_map(|item| {
-            item.get("content")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|entry| entry.get("text"))
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string)
-        })
-        .collect();
-    assert!(
-        user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
-        "auto compact follow-up request should include the first user message"
+        native_summary_count, 0,
+        "strict LHC must never issue a native summarization request; bodies={request_bodies:?}"
     );
     assert!(
-        user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
-        "auto compact follow-up request should include the second user message"
+        request_bodies.len() <= 2,
+        "expected only the two completed user turns as model requests (no compact/follow-up); got {}",
+        request_bodies.len()
     );
     assert!(
-        user_texts.iter().any(|text| text == POST_AUTO_USER_MSG),
-        "auto compact follow-up request should include the new user message"
+        request_bodies.iter().any(|b| b.contains(FIRST_AUTO_MSG)),
+        "first user turn must have reached the model"
     );
     assert!(
-        user_texts
+        request_bodies.iter().any(|b| b.contains(SECOND_AUTO_MSG)),
+        "second user turn must have reached the model"
+    );
+    assert!(
+        !request_bodies
             .iter()
-            .any(|text| text.contains(prefixed_auto_summary)),
-        "auto compact follow-up request should include the summary message"
+            .any(|b| b.contains(POST_AUTO_USER_MSG)),
+        "third turn must not reach the model after LHC auto-compact hard-fail"
+    );
+}
+
+/// Manual `Op::Compact` routes through the same strict LHC path (not TokenBudget
+/// / remote / local). Without LHC capture it hard-fails visibly and does not
+/// issue a native summarization request.
+#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn manual_op_compact_routes_to_strict_lhc_not_native() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+    let sse1 = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 1_200),
+    ]);
+    // Only the seed turn is expected to hit the model. A native compact leak
+    // would POST a second /responses body containing SUMMARIZATION_PROMPT.
+    let request_log = mount_sse_sequence(&server, vec![sse1]).await;
+    let model_provider = non_openai_model_provider(&server);
+
+    let mut builder = test_codex().with_config(move |config| {
+        config.model_provider = model_provider;
+        set_test_compact_prompt(config);
+        // Keep LHC capture off so CompactTask hard-fails without a slot (same
+        // strict surface as production when capture is unavailable).
+        let _ = config.features.disable(Feature::LhcCapture);
+    });
+    let test = builder.build(&server).await.unwrap();
+    let codex = test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "seed before manual compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .unwrap();
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests_before_compact = request_log.requests().len();
+
+    codex.submit(Op::Compact).await.expect("submit Op::Compact");
+
+    let mut saw_error = false;
+    for _ in 0..20 {
+        let ev = wait_for_event(&codex, |_| true).await;
+        match &ev {
+            EventMsg::Error(err) => {
+                let msg = err.message.to_ascii_lowercase();
+                if msg.contains("lhc") || msg.contains("compact") || msg.contains("unsupported") {
+                    saw_error = true;
+                    break;
+                }
+            }
+            EventMsg::TurnComplete(_) => break,
+            _ => {}
+        }
+    }
+    assert!(
+        saw_error,
+        "manual Op::Compact without LHC must hard-fail visibly"
+    );
+
+    let requests = request_log.requests();
+    let bodies: Vec<String> = requests.iter().map(|r| r.body_json().to_string()).collect();
+    assert_eq!(
+        bodies
+            .iter()
+            .filter(|b| body_contains_text(b, SUMMARIZATION_PROMPT))
+            .count(),
+        0,
+        "manual Compact must not issue native summarization: {bodies:?}"
+    );
+    assert_eq!(
+        requests.len(),
+        requests_before_compact,
+        "Op::Compact must not issue additional model requests (before={requests_before_compact}, after={})",
+        requests.len()
     );
 }
 

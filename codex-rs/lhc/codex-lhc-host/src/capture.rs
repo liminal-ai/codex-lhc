@@ -371,6 +371,26 @@ impl CaptureHandle {
         let _ = rx.await;
     }
 
+    /// Best-effort flush with a hard deadline.
+    ///
+    /// Compact must not wait unbounded for a busy or wedged capture worker.
+    /// A timeout here is fail-open: the caller continues to produce/import/
+    /// coverage. It is not a licence to start native compact, and it does not
+    /// detach a writer — the worker still owns any in-flight persist.
+    ///
+    /// Returns `true` only when the worker acknowledged the flush. Enqueue
+    /// timeout (full queue / stuck worker), a closed worker, or a dropped /
+    /// late ack all return `false`.
+    pub async fn flush_within(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (tx, rx) = oneshot::channel();
+        match tokio::time::timeout_at(deadline, self.inner.tx.send(CaptureCmd::Flush(tx))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => return false,
+        }
+        matches!(tokio::time::timeout_at(deadline, rx).await, Ok(Ok(())))
+    }
+
     /// Wait, bounded, for background derivation to settle on this thread.
     ///
     /// Returns `false` if it did not settle in time, which the caller treats as

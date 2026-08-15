@@ -1,7 +1,9 @@
 //! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 //!
-//! Ladder: above `Feature::TokenBudget` (manual + auto). Fail-open when the
-//! archive is missing, degraded, or compact fails.
+//! Fork policy (strict): manual `/compact` and every automatic compact caller
+//! share one LHC-only outcome surface. Native TokenBudget / remote / local
+//! compact is not reachable. Recoverable degraded conditions continue via
+//! fallback bands / full-fidelity residue; only genuine hard stops fail.
 //!
 //! Marker is committed only after durable write-back. Body is never re-ingested.
 //!
@@ -38,6 +40,7 @@ use codex_lhc_host::commit_compact_marker;
 use codex_lhc_host::content_identity_digest;
 use codex_lhc_host::estimate_response_items_tokens;
 use codex_lhc_host::history_from_materialized_items;
+use codex_lhc_host::inert_non_deriving_inference_callbacks;
 use codex_lhc_host::item_stable_id;
 use codex_lhc_host::materialize_rollout;
 use codex_lhc_host::missing_provider_usage_authority;
@@ -47,6 +50,7 @@ use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance;
 use codex_lhc_host::read_materialize_surfaces;
 use codex_lhc_host::resolve_mid_turn_recovery_identity;
+use codex_lhc_host::rollback_rollout_after_failed_reopen;
 use codex_lhc_host::run_mid_turn_compact_continuation;
 use codex_lhc_host::token_usage_to_provider_usage_authority;
 use codex_lhc_host::work_continuation_for_mid_turn;
@@ -70,6 +74,18 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Best-effort capture flush before produce. Must stay well below the produce
+/// bound so a wedged worker cannot hide the compact deadline.
+#[cfg(not(test))]
+const COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const COMPACT_FLUSH_BOUND: Duration = Duration::from_millis(200);
+/// MidTurn tests run alongside background capture work; keep their bound long
+/// enough for healthy workers while still proving a blocked worker cannot hang.
+#[cfg(not(test))]
+const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(2);
 
 /// Process-wide MidTurn worker timeout override used only by offline tests.
 /// `None` restores the production 120s bound.
@@ -195,19 +211,91 @@ pub(crate) enum LhcCompactAttempt {
         #[allow(dead_code)]
         marker: CompactMarker,
     },
-    /// Arm did not install; caller may fall open to native **except** at
-    /// `CompactionPhase::MidTurn` when LHC is enabled (one-writer choke).
+    /// Hard stop: preserve current history. Never permission for native compact.
+    Failed { reason: String },
+    /// The LHC arm could not run. Strict dispatch treats this as a hard stop;
+    /// it is never permission for native compact.
     Unavailable { reason: String },
+    /// Turn cancellation. Not permission for native compact.
+    Cancelled { reason: String },
     /// MidTurn compact-continuation explicitly skipped (transport retry, below
     /// trigger, hysteresis). No host mutation; next provider request allowed.
     MidTurnSkipped { reason: String },
-    /// MidTurn compact-continuation refused or failed in a way that must not
-    /// fall open to native compaction. When `next_provider_request_allowed` is
-    /// false the turn must stop before the next provider request.
+    /// MidTurn compact-continuation refused or failed. Native compact remains
+    /// unreachable; the flag controls only whether sampling may continue.
     MidTurnBlocked {
         reason: String,
         next_provider_request_allowed: bool,
     },
+}
+
+/// Shared strict dispatch for manual `CompactTask` and every automatic path.
+/// Native TokenBudget / remote / local compact is never reachable.
+pub(crate) async fn run_strict_lhc_compact(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    initial_context_injection: InitialContextInjection,
+    manual: bool,
+    phase: CompactionPhase,
+    mid_turn: Option<MidTurnSeamFacts>,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<()> {
+    match try_run_lhc_compact_arm(
+        sess,
+        turn_context,
+        initial_context_injection,
+        manual,
+        phase,
+        mid_turn,
+        cancellation_token,
+    )
+    .await?
+    {
+        LhcCompactAttempt::Installed { .. } => {
+            crate::tasks::emit_compact_metric(&sess.services.session_telemetry, "lhc", manual);
+            Ok(())
+        }
+        LhcCompactAttempt::Cancelled { reason } => {
+            debug!(%reason, manual, "LHC compact cancelled; not falling back to native");
+            Err(CodexErr::TurnAborted)
+        }
+        LhcCompactAttempt::Failed { reason } | LhcCompactAttempt::Unavailable { reason } => {
+            error!(%reason, manual, "LHC compact hard failure; preserving history (no native compact)");
+            Err(CodexErr::UnsupportedOperation(format!(
+                "LHC compact failed: {reason}"
+            )))
+        }
+        LhcCompactAttempt::MidTurnSkipped { reason } => {
+            info!(%reason, "LHC MidTurn compact-continuation skipped; continuing without native compact");
+            Ok(())
+        }
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            if next_provider_request_allowed {
+                warn!(%reason, "LHC MidTurn compact-continuation blocked mutation; continuing without native compact");
+                Ok(())
+            } else {
+                error!(%reason, "LHC MidTurn compact-continuation blocked next provider request");
+                Err(CodexErr::UnsupportedOperation(format!(
+                    "LHC MidTurn compact-continuation blocked next provider request: {reason}"
+                )))
+            }
+        }
+    }
+}
+
+fn cancelled_attempt(reason: impl Into<String>) -> LhcCompactAttempt {
+    LhcCompactAttempt::Cancelled {
+        reason: reason.into(),
+    }
+}
+
+fn failed_attempt(reason: impl Into<String>) -> LhcCompactAttempt {
+    LhcCompactAttempt::Failed {
+        reason: reason.into(),
+    }
 }
 
 // LHC-HOOK: LHC compact arm entry (manual + auto ladders).
@@ -310,9 +398,9 @@ pub async fn reconcile_rollout_before_history_load(
 // J1: production default is real ModelClient inference (pinned model, lowest
 // effort). Deterministic callbacks are never the silent default — tests must
 // call [`try_run_lhc_compact_arm_with_callbacks`] or install a cfg(test)
-// override. If the real client cannot be resolved, fail open to the native
-// ladder (Unavailable) for non-MidTurn phases — never substitute canned text.
-// At MidTurn with LHC enabled, unavailable is a hard block (one-writer).
+// override. If the real client cannot be resolved, compact continues with the
+// inert non-deriving seam (existing bands / residue) — never canned text and
+// never native compact.
 #[tracing::instrument(level = "info", skip_all, fields(manual = manual, phase = ?phase))]
 pub(crate) async fn try_run_lhc_compact_arm(
     sess: &Arc<Session>,
@@ -341,9 +429,9 @@ pub(crate) async fn try_run_lhc_compact_arm(
             warn!(
                 %reason,
                 manual,
-                "LHC compact inference unavailable; failing open to native arms"
+                "LHC derivation model unavailable; compact continues with inert non-deriving seam"
             );
-            return Ok(LhcCompactAttempt::Unavailable { reason });
+            inert_non_deriving_inference_callbacks()
         }
     };
     try_run_lhc_compact_arm_with_callbacks_and_cancel(
@@ -399,10 +487,9 @@ async fn try_run_mid_turn_compact_continuation(
         });
     }
     if !sess.enabled(Feature::LhcCapture) {
-        // Kill-switch: MidTurn native may proceed when LHC is off.
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "Feature::LhcCapture off (MidTurn native path allowed)".into(),
-        });
+        return Ok(failed_attempt(
+            "Feature::LhcCapture off; native compact is disabled in this fork",
+        ));
     }
 
     let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
@@ -437,12 +524,22 @@ async fn try_run_mid_turn_compact_continuation(
         });
     }
 
-    // Capture flush before decision (settled seam). Incomplete flush → skip.
-    handle.flush().await;
-    let capture_complete = !handle.is_degraded();
-    if !capture_complete {
-        return Ok(LhcCompactAttempt::MidTurnSkipped {
-            reason: "capture incomplete after flush; no mutation".into(),
+    // Capture flush before decision (settled seam). A wedged worker must not
+    // hide the compact deadline. MidTurn cannot proceed with an unconfirmed
+    // protected suffix, so timeout blocks sampling without native fallback.
+    if !handle.flush_within(MIDTURN_COMPACT_FLUSH_BOUND).await {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: format!(
+                "capture flush did not complete within {}ms; protected suffix unconfirmed",
+                MIDTURN_COMPACT_FLUSH_BOUND.as_millis()
+            ),
+            next_provider_request_allowed: false,
+        });
+    }
+    if handle.is_degraded() {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "capture degraded after flush; protected suffix unconfirmed".into(),
+            next_provider_request_allowed: false,
         });
     }
 
@@ -1031,17 +1128,10 @@ async fn run_mid_turn_on_thread(
 
 /// N3: the arm, bound to the **turn's own** cancellation token.
 ///
-/// When the user aborts a turn, derivation must stop — not keep billing
-/// inference for a turn nobody is waiting on. Before this the arm only ever saw
-/// its own private `AtomicBool`, set solely by `COMPACT_THREAD_TIMEOUT`;
-/// `CompactTask::run` bound its token as `_cancellation_token` and
-/// `run_auto_compact` had none at all. Production was saved from installing a
-/// post-abort compact only by the hard `handle.abort()` 100 ms later
-/// (`GRACEFULL_INTERRUPTION_TIMEOUT_MS`), and the detached derivation worker
-/// survived that and kept spending.
-///
-/// Cancellation is a fail-open per law 3: no partial install, no marker, native
-/// ladder unaffected.
+/// When the user aborts a turn, produce must stop — no partial install, no
+/// marker. Cancellation is cancellation, not permission to compact natively.
+/// Background capture-session derivation may continue (session work); the
+/// abandoned compact worker is cancelled via the shared flag.
 pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
@@ -1051,61 +1141,42 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     cancellation_token: &CancellationToken,
 ) -> CodexResult<LhcCompactAttempt> {
     if cancellation_token.is_cancelled() {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "turn cancelled before LHC compact started".into(),
-        });
+        return Ok(cancelled_attempt(
+            "turn cancelled before LHC compact started",
+        ));
     }
     if !sess.enabled(Feature::LhcCapture) {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "Feature::LhcCapture off".into(),
-        });
+        return Ok(failed_attempt("Feature::LhcCapture off"));
     }
 
     let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "no LhcCaptureSlot (capture not opened)".into(),
-        });
+        return Ok(failed_attempt("no LhcCaptureSlot (capture not opened)"));
     };
     let Some(handle) = slot.get() else {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "capture handle not ready".into(),
-        });
+        return Ok(failed_attempt("capture handle not ready"));
     };
+
+    // Degraded capture is not a hard stop: flush what we can, then rely on
+    // archive-coverage validation + host import to retain current content.
+    // Flush is bounded — a busy/wedged capture worker must not stall compact
+    // before the produce timeout starts.
     if handle.is_degraded() {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "capture degraded".into(),
-        });
-    }
-
-    handle.flush().await;
-
-    // Derivation runs in the background as intake commits (LHC's own scheduler,
-    // `SdkMode::Background`). All the arm does is wait, bounded, for it to
-    // settle — and fail open if it has not. This replaces the compact-time
-    // drain loop, which existed only because the SDK was misconfigured to
-    // `Manual` and its scheduler was inert; see FORK.md §"The drain correction".
-    let settled = tokio::select! {
-        biased;
-        () = cancellation_token.cancelled() => {
-            return Ok(LhcCompactAttempt::Unavailable {
-                reason: "turn cancelled while waiting for background derivation".into(),
-            });
-        }
-        ok = handle.drain_settled(SETTLE_WAIT) => ok,
-    };
-    if !settled {
         warn!(
             manual,
-            wait_s = SETTLE_WAIT.as_secs(),
-            "LHC background derivation did not settle in time; failing open"
+            "LHC capture is degraded; compact continues (flush + import + coverage check)"
         );
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: format!(
-                "background derivation not settled within {}s",
-                SETTLE_WAIT.as_secs()
-            ),
-        });
     }
+    if !handle.flush_within(COMPACT_FLUSH_BOUND).await {
+        warn!(
+            manual,
+            timeout_ms = COMPACT_FLUSH_BOUND.as_millis() as u64,
+            "LHC capture flush did not complete in time; compact continues (import + coverage)"
+        );
+    }
+
+    // Derivation readiness affects quality only. Do not wait for
+    // drain_settled — pending/running/terminal-failed work uses the fallback
+    // ladder (less-derived bands, full-fidelity residue).
 
     let thread_id = handle.thread_id().to_string();
     let root = handle.root().map(std::path::Path::to_path_buf);
@@ -1173,23 +1244,24 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     {
         Ok(v) => v,
         Err(err) => {
-            warn!(%err, manual, "LHC compact unavailable; failing open to native arms");
-            return Ok(LhcCompactAttempt::Unavailable { reason: err });
+            if is_cancel_reason(&err) {
+                return Ok(cancelled_attempt(err));
+            }
+            warn!(%err, manual, "LHC compact hard failure; preserving history");
+            return Ok(failed_attempt(err));
         }
     };
 
     let produce_body = produced.body.clone();
     if produce_body.is_empty() {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "LHC compact produced empty body".into(),
-        });
+        return Ok(failed_attempt("LHC compact produced empty body"));
     }
 
     // F-L4: refuse only genuine pathology — materialized body larger than the
     // current rollout model-context (like-for-like). Equal/smaller installs.
     // Exception (slice E): native-append-polluted multi-Compacted files get a
     // NORMALIZATION rewrite even when body > baseline — the size guard is not a
-    // size optimizer.
+    // size optimizer. Never falls through to native compact.
     let body_token_estimate = estimate_response_items_tokens(&produce_body);
     if body_token_estimate > baseline_tokens {
         if native_append_polluted {
@@ -1208,8 +1280,8 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
                  items_body={} (materialized body larger than current model-context)",
                 produce_body.len()
             );
-            warn!(%reason, manual, "LHC compact body grew vs rollout model-context; failing open");
-            return Ok(LhcCompactAttempt::Unavailable { reason });
+            warn!(%reason, manual, "LHC compact body grew vs rollout model-context; hard stop");
+            return Ok(failed_attempt(reason));
         }
     }
 
@@ -1218,8 +1290,8 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
 
     // Token bound against the produce body (window check for served view). R8.
     if let Some(reason) = body_exceeds_window(turn_context, &produce_body) {
-        warn!(%reason, "LHC compact body over window; fail open");
-        return Ok(LhcCompactAttempt::Unavailable { reason });
+        warn!(%reason, "LHC compact body over window; hard stop");
+        return Ok(failed_attempt(reason));
     }
 
     let reference_context_item = match &initial_context_injection {
@@ -1248,6 +1320,11 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     .await
 }
 
+fn is_cancel_reason(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("cancel") || lower.contains("aborted")
+}
+
 /// Materialize → atomic rewrite → in-memory bands+tail install.
 ///
 /// Extracted from the arm entry so the main future stays under the rustc
@@ -1267,6 +1344,12 @@ async fn install_lhc_compact_rewrite(
     cancellation_token: &CancellationToken,
 ) -> CodexResult<LhcCompactAttempt> {
     // LHC SDK futures are !Send — hop to a dedicated thread like produce does.
+    if cancellation_token.is_cancelled() {
+        return Ok(cancelled_attempt(
+            "turn cancelled before LHC compact install",
+        ));
+    }
+
     let surfaces = match read_materialize_surfaces_on_thread(
         thread_id.clone(),
         root.clone(),
@@ -1276,18 +1359,23 @@ async fn install_lhc_compact_rewrite(
     {
         Ok(s) => s,
         Err(err) => {
-            warn!(%err, manual, "LHC materialize surfaces unavailable; failing open");
-            return Ok(LhcCompactAttempt::Unavailable {
-                reason: format!("materialize surfaces: {err}"),
-            });
+            if is_cancel_reason(&err) {
+                return Ok(cancelled_attempt(err));
+            }
+            warn!(%err, manual, "LHC materialize surfaces unavailable; hard stop");
+            return Ok(failed_attempt(format!("materialize surfaces: {err}")));
         }
     };
 
+    // Lookup error is a hard failure (not in-memory-only success). Ok(None) is
+    // the intentional ephemeral / non-persistent session contract.
     let rollout_path = match sess.current_rollout_path().await {
         Ok(p) => p,
         Err(err) => {
-            warn!(%err, "current_rollout_path failed; continuing without rewrite");
-            None
+            error!(%err, "current_rollout_path failed; hard stop (no in-memory-only install)");
+            return Ok(failed_attempt(format!(
+                "current_rollout_path failed: {err}"
+            )));
         }
     };
 
@@ -1314,7 +1402,9 @@ async fn install_lhc_compact_rewrite(
             git: None,
         });
 
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
+    // Plan window advance; commit only after successful replacement so failed
+    // construction/rewrite leaves IDs, number, prefill, and one-shot flags alone.
+    let (window_number, window_ids) = sess.plan_auto_compact_window_advance().await;
 
     let world_state_value = world_state_baseline
         .as_ref()
@@ -1359,9 +1449,9 @@ async fn install_lhc_compact_rewrite(
     // resume-from-rewritten-file rebuilds.
     let mut install_history = history_from_materialized_items(&materialize_result.items);
     if install_history.is_empty() {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "materialize produced empty install history (bands+tail)".into(),
-        });
+        return Ok(failed_attempt(
+            "materialize produced empty install history (bands+tail)",
+        ));
     }
     for item in &mut install_history {
         if item_stable_id(item).is_none()
@@ -1372,9 +1462,9 @@ async fn install_lhc_compact_rewrite(
     }
     let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
     if assigned_ids.is_empty() {
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: "derived provenance: no stable ids for install history".into(),
-        });
+        return Ok(failed_attempt(
+            "derived provenance: no stable ids for install history",
+        ));
     }
     let digests: Vec<String> = install_history
         .iter()
@@ -1393,6 +1483,35 @@ async fn install_lhc_compact_rewrite(
         if let RolloutItem::Compacted(compacted) = item {
             compacted.message = durable_message.clone();
         }
+    }
+
+    // Validate the exact history Codex will install. Materialization can add a
+    // live tail after the earlier produce-body check. For protected MidTurn
+    // escalation, persist the failed host-validation state before blocking.
+    if let Some(reason) = body_exceeds_window(turn_context, &install_history) {
+        warn!(
+            %reason,
+            manual,
+            "LHC compact final install history over target; preserving current history"
+        );
+        if let Some(spec) = host_validation.as_ref() {
+            if let Err(err) = record_host_validation_on_thread(
+                thread_id.clone(),
+                root.clone(),
+                spec.attempt_id.clone(),
+                false,
+                Some(reason.clone()),
+            )
+            .await
+            {
+                error!(%err, attempt_id = %spec.attempt_id, "failed to persist over-window host validation refusal");
+            }
+            return Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason,
+                next_provider_request_allowed: false,
+            });
+        }
+        return Ok(failed_attempt(reason));
     }
 
     // LIM-67 host full-body validation gate (protected escalation only).
@@ -1480,8 +1599,9 @@ async fn install_lhc_compact_rewrite(
     }
 
     // Rewrite the rollout file (replaces append of Compacted). Failure leaves
-    // the old file authoritative; session continues; next compact retries.
-    // NO append fallback path.
+    // the old file authoritative and does not commit the planned window.
+    // Durable install is required when a live path exists — no in-memory-only
+    // install that would desync resume. NO append fallback / native Compacted.
     if let Some(path) = rollout_path.as_ref() {
         if let Err(err) = sess.flush_rollout().await {
             error!(
@@ -1492,16 +1612,46 @@ async fn install_lhc_compact_rewrite(
         }
         match atomic_rewrite_rollout(path, &materialize_result.items) {
             Ok(()) => {
-                // Reopen the append handle onto the new inode.
-                if let Some(live_thread) = sess.live_thread()
-                    && let Err(err) = live_thread.reopen_rollout_after_rewrite().await
-                {
-                    error!(
-                        %err,
-                        path = %path.display(),
-                        "LHC recorder reopen after rewrite failed; subsequent \
-                         appends may target the orphaned prior generation"
-                    );
+                // Reopen the append handle onto the new inode. Orphan-inode
+                // reopen is not soft bookkeeping — retry once, then hard-fail
+                // without claiming a healthy Installed outcome.
+                if let Some(live_thread) = sess.live_thread() {
+                    let reopen = live_thread.reopen_rollout_after_rewrite().await;
+                    let reopen = match reopen {
+                        Ok(()) => Ok(()),
+                        Err(err) => {
+                            warn!(
+                                %err,
+                                path = %path.display(),
+                                "LHC recorder reopen after rewrite failed; retrying once"
+                            );
+                            live_thread.reopen_rollout_after_rewrite().await
+                        }
+                    };
+                    if let Err(err) = reopen {
+                        error!(
+                            %err,
+                            path = %path.display(),
+                            "LHC recorder reopen after rewrite failed after retry; \
+                             restoring prior rollout generation"
+                        );
+                        return match rollback_rollout_after_failed_reopen(path) {
+                            Ok(()) => Ok(failed_attempt(format!(
+                                "recorder reopen after rewrite failed; prior generation restored: {err}"
+                            ))),
+                            Err(rollback_err) => {
+                                error!(
+                                    %rollback_err,
+                                    path = %path.display(),
+                                    "LHC durability unknown: recorder reopen and rollout rollback both failed"
+                                );
+                                Ok(failed_attempt(format!(
+                                    "durability unknown: recorder reopen failed ({err}); \
+                                     prior-generation rollback failed ({rollback_err})"
+                                )))
+                            }
+                        };
+                    }
                 }
                 info!(
                     path = %path.display(),
@@ -1514,8 +1664,9 @@ async fn install_lhc_compact_rewrite(
                     %err,
                     path = %path.display(),
                     "LHC rollout rewrite failed; old file remains authoritative; \
-                     next compact will retry (no append fallback)"
+                     preserving in-memory history (no native compact)"
                 );
+                return Ok(failed_attempt(format!("rollout rewrite failed: {err}")));
             }
         }
     } else {
@@ -1532,6 +1683,9 @@ async fn install_lhc_compact_rewrite(
         Some(durable_message),
     )
     .await;
+    // Commit the planned window only with successful replacement.
+    sess.commit_auto_compact_window_advance(window_number, window_ids)
+        .await;
     sess.recompute_token_usage(turn_context).await;
 
     let installed = sess.clone_history().await;
@@ -1545,14 +1699,17 @@ async fn install_lhc_compact_rewrite(
         )));
     }
 
-    // Process-local slot (fast path); durable already on CompactedItem in rewritten file.
+    // Validated history is installed. Later marker/provenance bookkeeping
+    // failures must not return an outcome that can run another compactor.
     if let Err(err) =
         slot.mark_derived_after_writeback(assigned_ids.iter().cloned(), digests.iter().cloned())
     {
-        warn!(%err, manual, "LHC compact failed to record derived provenance on slot");
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: format!("derived provenance record failed: {err}"),
-        });
+        warn!(
+            %err,
+            manual,
+            "LHC compact: derived provenance slot bookkeeping failed after install; \
+             recording degradation (history remains installed)"
+        );
     }
 
     // LHC archive: small constant-size note only (I1). Digests stay off the model path.
@@ -1560,12 +1717,9 @@ async fn install_lhc_compact_rewrite(
         warn!(
             %err,
             manual,
-            "LHC compact archive note commit failed after write-back; failing open \
-             (durable derived record already on CompactedItem + slot)"
+            "LHC compact archive note commit failed after write-back; recording \
+             degradation (history remains installed; no second compact)"
         );
-        return Ok(LhcCompactAttempt::Unavailable {
-            reason: format!("marker commit failed after write-back: {err}"),
-        });
     }
 
     info!(
@@ -1594,13 +1748,6 @@ async fn install_lhc_compact_rewrite(
     })
 }
 
-/// Bound on waiting for LHC's background scheduler to settle before a compact.
-///
-/// This is a *wait*, not a work loop — the drain is already running and this
-/// only asks when it is done. Kept well under `COMPACT_THREAD_TIMEOUT` so the
-/// arm fails open to the native ladder rather than being killed by the caller.
-const SETTLE_WAIT: Duration = Duration::from_secs(60);
-
 /// Hand the LHC capture slot the **production** derivation callbacks that its
 /// background scheduler derives with.
 ///
@@ -1609,8 +1756,8 @@ const SETTLE_WAIT: Duration = Duration::from_secs(60);
 /// compact arm uses, so background derivation can never be the path that
 /// quietly persists deterministic text into the durable record (J1). If the
 /// derivation model is unavailable the capture session's `LateBoundCallbacks`
-/// stay unseeded: queued inference work waits rather than failing terminally,
-/// and the arm's bounded settle-wait fails open at compact time.
+/// stay unseeded (waiting, not terminal Err). Compact does not wait on that
+/// work and does not seed inert Err callbacks into the capture session.
 pub(crate) async fn seed_lhc_derivation_callbacks(sess: &Session) {
     if !sess.enabled(Feature::LhcCapture) {
         return;
@@ -1698,34 +1845,30 @@ fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[
     }
 }
 
+/// Effective compact success target: minimum of the applicable auto-compact
+/// limit and the effective provider window for the target model. A body still
+/// above the auto-compact trigger cannot report success (treadmill guard).
+fn effective_compact_target_tokens(turn_context: &TurnContext) -> Option<i64> {
+    let auto_limit = turn_context
+        .config
+        .model_auto_compact_token_limit
+        .or_else(|| turn_context.model_info.auto_compact_token_limit());
+    let provider_window = turn_context.model_context_window();
+    match (auto_limit, provider_window) {
+        (Some(a), Some(w)) => Some(a.min(w)),
+        (Some(a), None) => Some(a),
+        (None, Some(w)) => Some(w),
+        (None, None) => None,
+    }
+}
+
 fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
-    let window = turn_context.model_context_window().or_else(|| {
-        turn_context
-            .config
-            .model_auto_compact_token_limit
-            .or_else(|| turn_context.model_info.auto_compact_token_limit())
-    })?;
-    // Cheap char/4 estimate (same order as LHC estimate_tokens).
-    let chars: usize = body
-        .iter()
-        .map(|item| match item {
-            ResponseItem::Message { content, .. } => content
-                .iter()
-                .map(|c| match c {
-                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.len()
-                    }
-                    ContentItem::InputImage { image_url, .. } => image_url.len(),
-                    ContentItem::InputAudio { audio_url } => audio_url.len(),
-                })
-                .sum::<usize>(),
-            _ => 64,
-        })
-        .sum();
-    let est_tokens = (chars / 4) as i64;
-    if est_tokens > window {
+    let target = effective_compact_target_tokens(turn_context)?;
+    let est_tokens = estimate_response_items_tokens(body);
+    if est_tokens > target {
         Some(format!(
-            "estimated body tokens {est_tokens} exceed context window {window}"
+            "estimated body tokens {est_tokens} exceed compact target {target} \
+             (min of auto-compact limit and provider window)"
         ))
     } else {
         None
@@ -1886,7 +2029,7 @@ async fn produce_lhc_compact_on_thread(
         () = turn_cancel.cancelled() => {
             cancel.store(true, Ordering::SeqCst);
             drop(join);
-            warn!("LHC compact cancelled by turn abort; stopping derivation and failing open");
+            warn!("LHC compact cancelled by turn abort; stopping produce (no native fallback)");
             return Err("lhc-compact cancelled by turn abort".into());
         }
         r = tokio::time::timeout(thread_timeout, rx) => r,
@@ -1929,7 +2072,7 @@ async fn produce_lhc_compact_on_thread(
             drop(join);
             warn!(
                 timeout_ms = thread_timeout.as_millis() as u64,
-                "lhc-compact timed out; detaching worker thread and failing open"
+                "lhc-compact timed out; detaching worker thread (hard stop, no native)"
             );
             Err(format!(
                 "lhc-compact timed out after {}ms",
