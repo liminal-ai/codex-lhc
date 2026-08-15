@@ -99,8 +99,7 @@ OpenAI's long-context pricing and consume rate limits faster.
 ## Per-session LHC compact bands
 
 Band allocation is runtime configuration, not compiled policy. The fork default
-is equal allocation, and a session can override it through `-c` or a Codex
-profile:
+is equal allocation, and a session can override it through `-c`:
 
 ```toml
 [lhc_compact.percentages]
