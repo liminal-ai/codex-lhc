@@ -577,6 +577,34 @@ impl Default for LcAdaptiveServiceTierConfig {
     }
 }
 
+/// Per-session LHC compact band allocation.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct LhcCompactPercentages {
+    pub full: f64,
+    pub smooth: f64,
+    pub detailed: f64,
+    pub brief: f64,
+}
+
+impl Default for LhcCompactPercentages {
+    fn default() -> Self {
+        Self {
+            full: 25.0,
+            smooth: 25.0,
+            detailed: 25.0,
+            brief: 25.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, JsonSchema, TS, Default)]
+#[serde(deny_unknown_fields)]
+pub struct LhcCompactConfig {
+    #[serde(default)]
+    pub percentages: LhcCompactPercentages,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]

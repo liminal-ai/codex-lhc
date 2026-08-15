@@ -32,6 +32,8 @@ use lhc::shared_tech::InferenceCallbacks;
 use lhc::shared_tech::LlmRequestContextRole;
 use lhc::shared_tech::logging::DerivationLogEventKind;
 use lhc::shared_tech::logging::DerivationLogQuery;
+use lhc::shared_tech::view::PartialViewProfilePercentages;
+use lhc::shared_tech::view::ViewCompactParams;
 use lhc::thread_view::CompactOpts;
 use serde_json::Map;
 use serde_json::Value;
@@ -76,6 +78,43 @@ pub fn is_compact_marker_idempotency_key(key: &str) -> bool {
 ///
 /// Marker is **not** yet in the archive — call [`commit_compact_marker`] after
 /// durable write-back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LhcBandPercentages {
+    pub full: f64,
+    pub smooth: f64,
+    pub detailed: f64,
+    pub brief: f64,
+}
+
+impl Default for LhcBandPercentages {
+    fn default() -> Self {
+        Self {
+            full: 25.0,
+            smooth: 25.0,
+            detailed: 25.0,
+            brief: 25.0,
+        }
+    }
+}
+
+impl LhcBandPercentages {
+    fn compact_opts(self) -> CompactOpts {
+        CompactOpts {
+            profile: None,
+            params: Some(ViewCompactParams {
+                lower_bound: None,
+                percentages: Some(PartialViewProfilePercentages {
+                    full: Some(self.full),
+                    smooth: Some(self.smooth),
+                    detailed: Some(self.detailed),
+                    brief: Some(self.brief),
+                }),
+            }),
+            signal: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LhcCompactResult {
     pub body: Vec<ResponseItem>,
@@ -799,6 +838,29 @@ pub async fn produce_lhc_compact_with_provenance(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     session_derived: &DerivedProvenance,
 ) -> Result<LhcCompactResult, LhcCompactUnavailable> {
+    produce_lhc_compact_with_provenance_and_percentages(
+        thread_id,
+        root,
+        host_items,
+        import_missing,
+        inference,
+        cancel,
+        session_derived,
+        LhcBandPercentages::default(),
+    )
+    .await
+}
+
+pub async fn produce_lhc_compact_with_provenance_and_percentages(
+    thread_id: &str,
+    root: Option<&Path>,
+    host_items: &[ResponseItem],
+    import_missing: bool,
+    inference: InferenceCallbacks,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    session_derived: &DerivedProvenance,
+    percentages: LhcBandPercentages,
+) -> Result<LhcCompactResult, LhcCompactUnavailable> {
     check_cancel(cancel.as_deref())?;
 
     let (mut session, _) = LhcSession::open_with_inference(thread_id, None, root, inference)
@@ -894,14 +956,7 @@ pub async fn produce_lhc_compact_with_provenance(
     let receipt = match session
         .lhc
         .thread_view
-        .compact(
-            session.thread_ref.clone(),
-            CompactOpts {
-                profile: None,
-                params: None,
-                signal: None,
-            },
-        )
+        .compact(session.thread_ref.clone(), percentages.compact_opts())
         .await
     {
         OpResult::Ok { value } => value,
@@ -1278,6 +1333,35 @@ mod tests {
 
         let events2 = list_archive(root, tid).await;
         assert_eq!(marker_count(&events2), 1, "marker must be retry-idempotent");
+    }
+
+    #[tokio::test]
+    async fn per_session_band_percentages_reach_compact_receipt() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-session-percentages";
+        let host = seed_thread(root, tid).await;
+        let result = produce_lhc_compact_with_provenance_and_percentages(
+            tid,
+            Some(root),
+            &host,
+            false,
+            lhc_inference_callbacks(false).unwrap(),
+            None,
+            &DerivedProvenance::default(),
+            LhcBandPercentages {
+                full: 10.0,
+                smooth: 20.0,
+                detailed: 30.0,
+                brief: 40.0,
+            },
+        )
+        .await
+        .expect("custom compact");
+        assert_eq!(result.receipt.config.full, 10.0);
+        assert_eq!(result.receipt.config.smooth, 20.0);
+        assert_eq!(result.receipt.config.detailed, 30.0);
+        assert_eq!(result.receipt.config.brief, 40.0);
     }
 
     /// F5: two distinct compacts → two markers; two retries of one → one.

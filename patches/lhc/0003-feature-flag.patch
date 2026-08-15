@@ -1,5 +1,5 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index d05a206097..382b2d337e 100644
+index d05a206097..7cebcecba8 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
 @@ -615,6 +615,9 @@
@@ -12,7 +12,7 @@ index d05a206097..382b2d337e 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -1582,6 +1585,30 @@
+@@ -1582,9 +1585,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -43,7 +43,58 @@ index d05a206097..382b2d337e 100644
      "LegacyAppPathString": {
        "type": "string"
      },
-@@ -5373,6 +5400,9 @@
++    "LhcCompactConfig": {
++      "additionalProperties": false,
++      "properties": {
++        "percentages": {
++          "allOf": [
++            {
++              "$ref": "#/definitions/LhcCompactPercentages"
++            }
++          ],
++          "default": {
++            "brief": 25.0,
++            "detailed": 25.0,
++            "full": 25.0,
++            "smooth": 25.0
++          }
++        }
++      },
++      "type": "object"
++    },
++    "LhcCompactPercentages": {
++      "additionalProperties": false,
++      "description": "Per-session LHC compact band allocation.",
++      "properties": {
++        "brief": {
++          "format": "double",
++          "type": "number"
++        },
++        "detailed": {
++          "format": "double",
++          "type": "number"
++        },
++        "full": {
++          "format": "double",
++          "type": "number"
++        },
++        "smooth": {
++          "format": "double",
++          "type": "number"
++        }
++      },
++      "required": [
++        "brief",
++        "detailed",
++        "full",
++        "smooth"
++      ],
++      "type": "object"
++    },
+     "MarketplaceConfig": {
+       "additionalProperties": false,
+       "properties": {
+@@ -5373,6 +5448,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -53,7 +104,7 @@ index d05a206097..382b2d337e 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -5676,6 +5706,14 @@
+@@ -5676,6 +5754,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -64,6 +115,14 @@ index d05a206097..382b2d337e 100644
 +        }
 +      ],
 +      "description": "Optional LC Adaptive Service Tier cost control. When enabled, this owns request tier selection using the prepared long-context request size."
++    },
++    "lhc_compact": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/LhcCompactConfig"
++        }
++      ],
++      "description": "Per-session LHC compact band allocation."
 +    },
      "log_dir": {
        "allOf": [

@@ -1612,6 +1612,54 @@
     "LegacyAppPathString": {
       "type": "string"
     },
+    "LhcCompactConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "percentages": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/LhcCompactPercentages"
+            }
+          ],
+          "default": {
+            "brief": 25.0,
+            "detailed": 25.0,
+            "full": 25.0,
+            "smooth": 25.0
+          }
+        }
+      },
+      "type": "object"
+    },
+    "LhcCompactPercentages": {
+      "additionalProperties": false,
+      "description": "Per-session LHC compact band allocation.",
+      "properties": {
+        "brief": {
+          "format": "double",
+          "type": "number"
+        },
+        "detailed": {
+          "format": "double",
+          "type": "number"
+        },
+        "full": {
+          "format": "double",
+          "type": "number"
+        },
+        "smooth": {
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "brief",
+        "detailed",
+        "full",
+        "smooth"
+      ],
+      "type": "object"
+    },
     "MarketplaceConfig": {
       "additionalProperties": false,
       "properties": {
@@ -5713,6 +5761,14 @@
         }
       ],
       "description": "Optional LC Adaptive Service Tier cost control. When enabled, this owns request tier selection using the prepared long-context request size."
+    },
+    "lhc_compact": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LhcCompactConfig"
+        }
+      ],
+      "description": "Per-session LHC compact band allocation."
     },
     "log_dir": {
       "allOf": [

@@ -29,6 +29,7 @@ use codex_lhc_host::CompactMarker;
 use codex_lhc_host::DEFAULT_LOWER_TARGET_TOKENS;
 use codex_lhc_host::DerivedProvenance;
 use codex_lhc_host::InferenceCallbacks;
+use codex_lhc_host::LhcBandPercentages;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::LhcCompactResult;
 use codex_lhc_host::MaterializeInput;
@@ -37,6 +38,7 @@ use codex_lhc_host::WorkContinuation;
 use codex_lhc_host::WriterClaim;
 use codex_lhc_host::atomic_rewrite_rollout;
 use codex_lhc_host::commit_compact_marker;
+use codex_lhc_host::compact_opts_with_band_percentages;
 use codex_lhc_host::content_identity_digest;
 use codex_lhc_host::estimate_response_items_tokens;
 use codex_lhc_host::history_from_materialized_items;
@@ -47,7 +49,7 @@ use codex_lhc_host::missing_provider_usage_authority;
 use codex_lhc_host::model_context_token_estimate_from_rollout_items;
 use codex_lhc_host::next_request_pressure;
 use codex_lhc_host::parse_rollout_items;
-use codex_lhc_host::produce_lhc_compact_with_provenance;
+use codex_lhc_host::produce_lhc_compact_with_provenance_and_percentages;
 use codex_lhc_host::read_materialize_surfaces;
 use codex_lhc_host::resolve_mid_turn_recovery_identity;
 use codex_lhc_host::rollback_rollout_after_failed_reopen;
@@ -86,6 +88,16 @@ const COMPACT_FLUSH_BOUND: Duration = Duration::from_millis(200);
 const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(2);
+
+fn configured_band_percentages(turn_context: &TurnContext) -> LhcBandPercentages {
+    let percentages = turn_context.config.lhc_compact.percentages;
+    LhcBandPercentages {
+        full: percentages.full,
+        smooth: percentages.smooth,
+        detailed: percentages.detailed,
+        brief: percentages.brief,
+    }
+}
 
 /// Process-wide MidTurn worker timeout override used only by offline tests.
 /// `None` restores the production 120s bound.
@@ -795,13 +807,15 @@ async fn try_run_mid_turn_compact_continuation(
         inside_transport_retry: false,
         model_response_complete: mid.model_response_complete,
         compact: {
+            let configured =
+                compact_opts_with_band_percentages(configured_band_percentages(turn_context));
             #[cfg(any(test, feature = "test-util"))]
             {
-                slot.mid_turn_test_compact()
+                slot.mid_turn_test_compact().or(Some(configured))
             }
             #[cfg(not(any(test, feature = "test-util")))]
             {
-                None
+                Some(configured)
             }
         },
         stored_operation_identity,
@@ -1232,6 +1246,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         callbacks,
         Arc::clone(&cancel),
         session_derived,
+        configured_band_percentages(turn_context),
         cancellation_token,
     )
     .await
@@ -1954,6 +1969,7 @@ async fn produce_lhc_compact_on_thread(
     callbacks: codex_lhc_host::InferenceCallbacks,
     cancel: Arc<AtomicBool>,
     session_derived: DerivedProvenance,
+    percentages: LhcBandPercentages,
     turn_cancel: &CancellationToken,
 ) -> Result<LhcCompactResult, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1967,7 +1983,7 @@ async fn produce_lhc_compact_on_thread(
                     .build()
                     .map_err(|e| format!("runtime: {e}"))?;
                 rt.block_on(async move {
-                    produce_lhc_compact_with_provenance(
+                    produce_lhc_compact_with_provenance_and_percentages(
                         &thread_id,
                         root.as_deref(),
                         &host_items,
@@ -1975,6 +1991,7 @@ async fn produce_lhc_compact_on_thread(
                         callbacks,
                         Some(cancel_thread),
                         &session_derived,
+                        percentages,
                     )
                     .await
                     .map_err(|e| e.to_string())

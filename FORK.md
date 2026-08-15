@@ -96,6 +96,23 @@ compact trigger. Their catalog capability ceiling remains 1.05M so operators
 using an API key can opt into a larger window. Requests above 272K use
 OpenAI's long-context pricing and consume rate limits faster.
 
+## Per-session LHC compact bands
+
+Band allocation is runtime configuration, not compiled policy. The fork default
+is equal allocation, and a session can override it through `-c` or a Codex
+profile:
+
+```toml
+[lhc_compact.percentages]
+full = 25
+smooth = 25
+detailed = 25
+brief = 25
+```
+
+All values must be non-negative and sum to 100. The selected mix applies to
+manual, automatic, and mid-turn LHC compact paths for that session.
+
 ## Touchpoint inventory (core lines owned by the fork)
 
 Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
@@ -140,6 +157,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
 | 32 | `cli/Cargo.toml` | Codex-LHC product release version reported by `codex --version` | `0001-workspace-member` |
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
+| 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3

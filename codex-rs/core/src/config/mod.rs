@@ -93,6 +93,7 @@ use codex_protocol::config_types::AltScreenMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ForcedLoginMethod;
 use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+use codex_protocol::config_types::LhcCompactConfig;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
@@ -575,6 +576,9 @@ pub struct Config {
     /// LC Adaptive Service Tier cost control. When enabled, it owns effective
     /// request tier selection; `service_tier` remains the manual fallback.
     pub lc_adaptive_service_tier: LcAdaptiveServiceTierConfig,
+
+    /// Per-session LHC compact band allocation.
+    pub lhc_compact: LhcCompactConfig,
 
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
@@ -3766,6 +3770,25 @@ impl Config {
                 None => Some(service_tier),
             }
         });
+        let lhc_compact = cfg.lhc_compact.unwrap_or_default();
+        let percentages = lhc_compact.percentages;
+        let percentage_values = [
+            percentages.full,
+            percentages.smooth,
+            percentages.detailed,
+            percentages.brief,
+        ];
+        if percentage_values
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+            || percentage_values.iter().sum::<f64>() != 100.0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "lhc_compact.percentages must be non-negative and sum to 100",
+            ));
+        }
+
         let mut lc_adaptive_service_tier = cfg.lc_adaptive_service_tier.unwrap_or_default();
         if lc_adaptive_service_tier.threshold <= 0 {
             return Err(std::io::Error::new(
@@ -3995,6 +4018,7 @@ impl Config {
             model,
             service_tier,
             lc_adaptive_service_tier,
+            lhc_compact,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,

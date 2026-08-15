@@ -637,21 +637,32 @@ pub async fn resolve_mid_turn_recovery_identity(
     Ok(None)
 }
 
-/// Test-oriented compact opts that use a small lower bound so banded compact
-/// can run offline without 120k tokens of seed history.
-pub fn test_compact_opts(lower_bound: f64) -> HostCompactOpts {
+pub fn compact_opts_with_band_percentages(
+    percentages: crate::compact_bridge::LhcBandPercentages,
+) -> HostCompactOpts {
     HostCompactOpts {
         profile: Some("continuation".into()),
         params: Some(ViewCompactParams {
-            lower_bound: Some(lower_bound),
+            lower_bound: None,
             percentages: Some(PartialViewProfilePercentages {
-                full: Some(25.0),
-                smooth: Some(25.0),
-                detailed: Some(25.0),
-                brief: Some(25.0),
+                full: Some(percentages.full),
+                smooth: Some(percentages.smooth),
+                detailed: Some(percentages.detailed),
+                brief: Some(percentages.brief),
             }),
         }),
     }
+}
+
+/// Test-oriented compact opts that use a small lower bound so banded compact
+/// can run offline without 120k tokens of seed history.
+pub fn test_compact_opts(lower_bound: f64) -> HostCompactOpts {
+    let mut opts =
+        compact_opts_with_band_percentages(crate::compact_bridge::LhcBandPercentages::default());
+    if let Some(params) = opts.params.as_mut() {
+        params.lower_bound = Some(lower_bound);
+    }
+    opts
 }
 
 /// Test-only: seed a held LHC writer claim without going through claim_lhc_writer.

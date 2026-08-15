@@ -80,6 +80,8 @@ use codex_model_provider_info::WireApi;
 use codex_models_manager::bundled_models_response;
 use codex_network_proxy::NetworkMode;
 use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+use codex_protocol::config_types::LhcCompactConfig;
+use codex_protocol::config_types::LhcCompactPercentages;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
@@ -9504,6 +9506,60 @@ async fn lc_adaptive_service_tier_rejects_non_positive_threshold() -> std::io::R
     .expect_err("non-positive LC Adaptive Service Tier threshold must fail");
 
     assert!(err.to_string().contains("threshold must be positive"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn lhc_compact_percentages_are_session_configurable() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg.lhc_compact = Some(LhcCompactConfig {
+        percentages: LhcCompactPercentages {
+            full: 10.0,
+            smooth: 20.0,
+            detailed: 30.0,
+            brief: 40.0,
+        },
+    });
+    let cwd = fixture.cwd_path();
+    let codex_home = fixture.codex_home();
+    let config = Config::load_from_base_config_with_overrides(
+        fixture.cfg,
+        ConfigOverrides {
+            cwd: Some(cwd),
+            ..Default::default()
+        },
+        codex_home,
+    )
+    .await?;
+    assert_eq!(config.lhc_compact.percentages.full, 10.0);
+    assert_eq!(config.lhc_compact.percentages.brief, 40.0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lhc_compact_percentages_must_sum_to_100() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg.lhc_compact = Some(LhcCompactConfig {
+        percentages: LhcCompactPercentages {
+            full: 25.0,
+            smooth: 25.0,
+            detailed: 25.0,
+            brief: 20.0,
+        },
+    });
+    let cwd = fixture.cwd_path();
+    let codex_home = fixture.codex_home();
+    let err = Config::load_from_base_config_with_overrides(
+        fixture.cfg,
+        ConfigOverrides {
+            cwd: Some(cwd),
+            ..Default::default()
+        },
+        codex_home,
+    )
+    .await
+    .expect_err("invalid per-session band mix must fail");
+    assert!(err.to_string().contains("sum to 100"));
     Ok(())
 }
 
