@@ -62,6 +62,12 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 
 const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Best-effort capture flush before produce. Must stay well below the produce
+/// bound so a wedged worker cannot hide the compact deadline.
+#[cfg(not(test))]
+const COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const COMPACT_FLUSH_BOUND: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub(crate) enum LhcCompactAttempt {
@@ -293,13 +299,21 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
 
     // Degraded capture is not a hard stop: flush what we can, then rely on
     // archive-coverage validation + host import to retain current content.
+    // Flush is bounded — a busy/wedged capture worker must not stall compact
+    // before the produce timeout starts.
     if handle.is_degraded() {
         warn!(
             manual,
             "LHC capture is degraded; compact continues (flush + import + coverage check)"
         );
     }
-    handle.flush().await;
+    if !handle.flush_within(COMPACT_FLUSH_BOUND).await {
+        warn!(
+            manual,
+            timeout_ms = COMPACT_FLUSH_BOUND.as_millis() as u64,
+            "LHC capture flush did not complete in time; compact continues (import + coverage)"
+        );
+    }
 
     // Derivation readiness affects quality only. Do not wait for
     // drain_settled — pending/running/terminal-failed work uses the fallback

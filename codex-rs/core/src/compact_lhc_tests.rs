@@ -2807,3 +2807,115 @@ async fn successful_lhc_compact_clears_230k_trigger() {
         "installed history must also clear 230k (tokens={installed_tokens})"
     );
 }
+
+/// Exact hang from the 9fdbca74ec canary: compact awaited unbounded
+/// `CaptureHandle::flush()` before produce, so a parked/wedged capture worker
+/// never reached the 120s produce timeout.
+///
+/// Pending capture work plus a blocked worker must still finish in bounded
+/// time via fallback/import/coverage. Hard failure preserves history. Neither
+/// outcome may append a native Compacted record.
+#[tokio::test]
+async fn blocked_capture_flush_does_not_hang_lhc_compact() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    let history_before = session.clone_history().await.into_raw_items();
+    let thread_id = handle.thread_id().to_string();
+
+    // Park the worker so the arm's flush cannot be acknowledged. Queue one
+    // more persist behind the park so capture work is pending.
+    let release = handle.block_worker().await;
+    handle.persist(
+        &ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: "pending-behind-blocked-worker".into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        codex_extension_api::RawItemProvenance::UserPrompt,
+    );
+
+    let sess = Arc::new(session);
+    let started = std::time::Instant::now();
+    let attempt = tokio::time::timeout(
+        Duration::from_secs(25),
+        run_arm_deterministic(&sess, &tc, /*manual*/ true),
+    )
+    .await
+    .expect("blocked capture flush must complete compact in bound");
+    let elapsed = started.elapsed();
+    drop(release);
+
+    assert!(
+        elapsed < Duration::from_secs(25),
+        "blocked capture flush must not hang compact; took {elapsed:?}"
+    );
+
+    let file_items = codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse rollout");
+    let compacted: Vec<&codex_history::CompactedItem> = file_items
+        .iter()
+        .filter_map(|item| match item {
+            codex_history::RolloutItem::Compacted(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        compacted
+            .iter()
+            .all(|c| c.message.contains("lhc_compact_durable")),
+        "no native Compacted records allowed: {compacted:?}"
+    );
+
+    match attempt {
+        LhcCompactAttempt::Installed { marker, .. } => {
+            assert!(
+                marker.body_item_count > 0,
+                "installed LHC marker must describe a served body: {marker:?}"
+            );
+            assert!(
+                archive_has_compact_marker(&thread_id, Some(root.as_path())).await,
+                "reducing LHC body must install an LHC marker"
+            );
+            assert_eq!(
+                compacted.len(),
+                1,
+                "LHC rewrite writes exactly one LHC Compacted boundary"
+            );
+        }
+        LhcCompactAttempt::Failed { reason } => {
+            let history_after = sess.clone_history().await.into_raw_items();
+            assert!(
+                response_items_structurally_equal(&history_before, &history_after),
+                "hard failure must preserve history: {reason}"
+            );
+            assert!(
+                compacted.is_empty(),
+                "hard failure must not write a Compacted record: {reason}"
+            );
+            assert!(
+                !archive_has_compact_marker(&thread_id, Some(root.as_path())).await,
+                "hard failure must not commit an LHC marker: {reason}"
+            );
+        }
+        LhcCompactAttempt::Cancelled { reason } => {
+            panic!("blocked flush is not cancellation: {reason}");
+        }
+    }
+}
