@@ -90,7 +90,7 @@ jobs:
         working-directory: codex-rs
         env:
           RUST_MIN_STACK: "8388608"
-        run: cargo test --locked -p codex-core --lib "compact_lhc::tests::"
+        run: cargo test --locked -p codex-core --lib "compact_lhc::tests::" -- --test-threads=1
 
       - name: Test resume and regeneration matrix
         working-directory: codex-rs

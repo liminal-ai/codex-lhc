@@ -128,7 +128,7 @@ jobs:
 
           - Candidate workflow: ${CANDIDATE_RUN_ID}
           - Platform smoke workflow: ${SMOKE_RUN_ID}
-          - LHC thread schema: v6
+          - LHC thread schema: v11
           - Capture: enabled by default
 
           This is not an official OpenAI release. Verify release-manifest.json

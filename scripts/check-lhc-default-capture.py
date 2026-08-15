@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Prove that a bare `codex exec` captures a real turn into LHC."""
+from __future__ import annotations
 
 import argparse
 import json

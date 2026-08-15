@@ -54,7 +54,7 @@ def main() -> None:
         "sourceCommit": args.source_commit,
         "upstreamCodexCommit": args.upstream_commit,
         "lhcSdkCommit": args.lhc_sdk_commit,
-        "lhcThreadSchema": 6,
+        "lhcThreadSchema": 11,
         "buildRunId": args.run_id,
         "captureDefault": "on",
         "artifacts": artifacts,
