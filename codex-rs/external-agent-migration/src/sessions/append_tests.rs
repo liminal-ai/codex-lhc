@@ -7,7 +7,9 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ContextCompactedEvent;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::security_risk::SecurityRiskScore;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 
 #[test]
 fn returns_the_missing_suffix_from_its_visible_boundary() {
@@ -62,9 +64,17 @@ fn requires_a_strict_nonempty_model_prefix() {
             event.started_at = Some(9_999);
         }
     }
+    let security_risk = RolloutItem::SecurityRiskScore(SecurityRiskScore {
+        scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+        sampled_at: None,
+    });
+    metadata_changed.push(security_risk.clone());
     assert!(model_transcripts_match(&history, &metadata_changed));
     assert!(!model_transcripts_match(&source, &history));
     assert!(plan_append(&source, &metadata_changed).is_some());
+    let mut source_with_security_risk = source.clone();
+    source_with_security_risk.push(security_risk);
+    assert!(plan_append(&source_with_security_risk, &metadata_changed).is_none());
 
     for event in [
         EventMsg::ContextCompacted(ContextCompactedEvent),

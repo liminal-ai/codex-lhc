@@ -1,7 +1,9 @@
 use crate::config::edit::ConfigEdit;
 use crate::config::edit::ConfigEditsBuilder;
 use crate::config::edit::apply_blocking;
+use crate::context::ContextualUserFragment;
 use crate::plugins::plugins_manager_for_config;
+use crate::session::multi_agents::resolve_usage_hints;
 use assert_matches::assert_matches;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
@@ -77,6 +79,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
 use codex_model_provider_info::WireApi;
 use codex_models_manager::bundled_models_response;
 use codex_network_proxy::NetworkMode;
+use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
@@ -87,6 +90,7 @@ use codex_protocol::models::BUILT_IN_PERMISSION_PROFILE_WORKSPACE;
 use codex_protocol::models::ManagedFileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxEnforcement;
+use codex_protocol::openai_models::MultiAgentRoleMessages;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSandboxEntry;
@@ -159,6 +163,7 @@ fn http_mcp(url: &str) -> McpServerConfig {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -521,7 +526,7 @@ async fn load_config_resolves_non_prefixed_mcp_tool_servers() -> std::io::Result
 
         assert_eq!(config.non_prefixed_mcp_tool_servers, expected_servers);
         assert_eq!(config.prefix_mcp_tool_names(), expected_prefix);
-        let plugins_manager = plugins_manager_for_config(&config);
+        let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
         let mcp_config = config.to_mcp_config(&plugins_manager).await;
         assert_eq!(mcp_config.prefix_mcp_tool_names, expected_prefix);
         assert_eq!(
@@ -5233,7 +5238,7 @@ async fn rebuild_preserving_session_layers_refreshes_plugin_derived_mcp_config()
     let config = thread_config
         .rebuild_preserving_session_layers(&refreshed_config)
         .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5295,7 +5300,7 @@ enabled = true
         .codex_home(codex_home.path().to_path_buf())
         .build()
         .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5363,7 +5368,7 @@ url = "https://sample.example/mcp"
         )
         .build()
         .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -5465,7 +5470,7 @@ enabled = true
         )
         .build()
         .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     let configured_servers = mcp_config.mcp_server_catalog.configured_servers();
 
@@ -6482,7 +6487,7 @@ async fn to_mcp_config_preserves_apps_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     config.apps_mcp_product_sku = Some("tpp".to_string());
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
@@ -6509,7 +6514,7 @@ async fn to_mcp_config_flows_mcp_tool_prefix_from_feature() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert!(mcp_config.prefix_mcp_tool_names);
@@ -6545,7 +6550,7 @@ async fn to_mcp_config_flows_mcp_2026_feature_from_config() -> std::io::Result<(
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(mcp_config.protocol_mode, codex_mcp::McpProtocolMode::Legacy);
@@ -6569,7 +6574,7 @@ async fn to_mcp_config_preserves_auth_elicitation_feature_from_config() -> std::
         codex_home.abs(),
     )
     .await?;
-    let plugins_manager = plugins_manager_for_config(&config);
+    let plugins_manager = plugins_manager_for_config(&config, /*auth_mode*/ None);
 
     let mcp_config = config.to_mcp_config(&plugins_manager).await;
     assert_eq!(
@@ -6882,6 +6887,7 @@ async fn replace_mcp_servers_streamable_http_serializes_bearer_token() -> anyhow
                 bearer_token_env_var: Some("MCP_TOKEN".to_string()),
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -6925,6 +6931,7 @@ startup_timeout_sec = 2.0
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            ..
         } => {
             assert_eq!(url, "https://example.com/mcp");
             assert_eq!(bearer_token_env_var.as_deref(), Some("MCP_TOKEN"));
@@ -6954,6 +6961,7 @@ async fn replace_mcp_servers_streamable_http_serializes_custom_headers() -> anyh
                     "X-Auth".to_string(),
                     "DOCS_AUTH".to_string(),
                 )])),
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7038,6 +7046,7 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
                     "X-Auth".to_string(),
                     "DOCS_AUTH".to_string(),
                 )])),
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7075,6 +7084,7 @@ async fn replace_mcp_servers_streamable_http_removes_optional_sections() -> anyh
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7114,6 +7124,7 @@ url = "https://example.com/mcp"
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            ..
         } => {
             assert_eq!(url, "https://example.com/mcp");
             assert!(bearer_token_env_var.is_none());
@@ -7147,6 +7158,7 @@ async fn replace_mcp_servers_streamable_http_isolates_headers_between_servers() 
                         "X-Auth".to_string(),
                         "DOCS_AUTH".to_string(),
                     )])),
+                    http_headers_helper: None,
                 },
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                 enabled: true,
@@ -7425,6 +7437,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
                 bearer_token_env_var: None,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
             enabled: true,
@@ -7440,6 +7453,7 @@ async fn replace_mcp_servers_streamable_http_serializes_oauth_resource() -> anyh
             scopes: None,
             oauth: Some(McpServerOAuthConfig {
                 client_id: Some("eci-prd-pub-codex-123".to_string()),
+                callback_port: None,
             }),
             oauth_resource: Some("https://resource.example.com".to_string()),
             tools: HashMap::new(),
@@ -9439,6 +9453,61 @@ async fn config_toml_legacy_fast_service_tier_uses_priority_request_value() -> s
 }
 
 #[tokio::test]
+async fn lc_adaptive_service_tier_normalizes_runtime_tiers() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg.lc_adaptive_service_tier = Some(LcAdaptiveServiceTierConfig {
+        enabled: true,
+        threshold: 272_000,
+        below: "fast".to_string(),
+        at_or_above: "default".to_string(),
+    });
+
+    let cwd = fixture.cwd_path();
+    let codex_home = fixture.codex_home();
+    let config = Config::load_from_base_config_with_overrides(
+        fixture.cfg,
+        ConfigOverrides {
+            cwd: Some(cwd),
+            ..Default::default()
+        },
+        codex_home,
+    )
+    .await?;
+
+    assert!(config.lc_adaptive_service_tier.enabled);
+    assert_eq!(config.lc_adaptive_service_tier.threshold, 272_000);
+    assert_eq!(config.lc_adaptive_service_tier.below, "priority");
+    assert_eq!(config.lc_adaptive_service_tier.at_or_above, "default");
+    Ok(())
+}
+
+#[tokio::test]
+async fn lc_adaptive_service_tier_rejects_non_positive_threshold() -> std::io::Result<()> {
+    let mut fixture = create_test_fixture()?;
+    fixture.cfg.lc_adaptive_service_tier = Some(LcAdaptiveServiceTierConfig {
+        enabled: true,
+        threshold: 0,
+        ..LcAdaptiveServiceTierConfig::default()
+    });
+
+    let cwd = fixture.cwd_path();
+    let codex_home = fixture.codex_home();
+    let err = Config::load_from_base_config_with_overrides(
+        fixture.cfg,
+        ConfigOverrides {
+            cwd: Some(cwd),
+            ..Default::default()
+        },
+        codex_home,
+    )
+    .await
+    .expect_err("non-positive LC Adaptive Service Tier threshold must fail");
+
+    assert!(err.to_string().contains("threshold must be positive"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn fast_default_opt_out_notice_config_is_respected() -> std::io::Result<()> {
     let fixture = create_test_fixture()?;
     let mut cfg = fixture.cfg.clone();
@@ -10981,17 +11050,29 @@ max_concurrent_threads_per_session = 17
 
     let config = resolve_multi_agent_v2_config(&config_toml);
     let concurrency_guidance = "There are 17 available concurrency slots, meaning that up to 17 agents can be active at once, including you.";
-    let expected_suffix = format!(
-        "{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\n{DEFAULT_MULTI_AGENT_V2_WAIT_AGENT_USAGE_HINT_TEXT}\n\n{concurrency_guidance}"
+    assert!(config.wait_agent_enabled);
+    for wait_agent_enabled in [true, false] {
+        let mut config = config.clone();
+        config.wait_agent_enabled = wait_agent_enabled;
+        let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+        for hint in [usage_hints.root, usage_hints.subagent] {
+            let hint = hint.expect("default usage hints should be present").body();
+            assert!(hint.contains(concurrency_guidance));
+            assert_eq!(
+                hint.contains("When calling `wait_agent`, prefer longer waits"),
+                wait_agent_enabled
+            );
+        }
+    }
+
+    let usage_hints = resolve_usage_hints(
+        &config,
+        Some(&MultiAgentRoleMessages {
+            root: Some(String::new()),
+            subagent: Some(String::new()),
+        }),
     );
-    assert!(
-        [
-            config.root_agent_usage_hint_text,
-            config.subagent_usage_hint_text,
-        ]
-        .into_iter()
-        .all(|hint| hint.is_some_and(|hint| hint.contains(expected_suffix.as_str())))
-    );
+    assert!(usage_hints.root.is_none() && usage_hints.subagent.is_none());
 }
 
 #[test]
@@ -11016,6 +11097,23 @@ expose_spawn_agent_model_overrides = true
         config.subagent_usage_hint_text.as_deref(),
         Some("Subagent guidance.")
     );
+    let usage_hints = resolve_usage_hints(
+        &config,
+        Some(&MultiAgentRoleMessages {
+            root: Some("Catalog root base.".to_string()),
+            subagent: Some("Catalog subagent base.".to_string()),
+        }),
+    );
+    assert_eq!(
+        (
+            usage_hints.root.map(|hint| hint.body()),
+            usage_hints.subagent.map(|hint| hint.body()),
+        ),
+        (
+            Some("Root guidance.".to_string()),
+            Some("Subagent guidance.".to_string()),
+        )
+    );
 }
 
 #[test]
@@ -11023,18 +11121,39 @@ fn multi_agent_v2_exposes_model_overrides_by_default() {
     let config_toml =
         toml::from_str(r#"[features.multi_agent_v2]"#).expect("multi-agent v2 config should parse");
 
-    let config = resolve_multi_agent_v2_config(&config_toml);
+    let mut config = resolve_multi_agent_v2_config(&config_toml);
     assert!(config.expose_spawn_agent_model_overrides);
-    assert!(
-        [
-            config.root_agent_usage_hint_text,
-            config.subagent_usage_hint_text,
-        ]
-        .into_iter()
-        .all(|hint| hint.is_some_and(|hint| {
-            hint.ends_with(DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT)
-        }))
-    );
+    let usage_hints = resolve_usage_hints(&config, /*catalog*/ None);
+    config.expose_spawn_agent_model_overrides = false;
+    let usage_hints_without_model_overrides = resolve_usage_hints(&config, /*catalog*/ None);
+
+    for (hint, hint_without_model_overrides) in [
+        (usage_hints.root, usage_hints_without_model_overrides.root),
+        (
+            usage_hints.subagent,
+            usage_hints_without_model_overrides.subagent,
+        ),
+    ] {
+        let hint = hint.expect("default usage hints should be present").body();
+        let hint_without_model_overrides = hint_without_model_overrides
+            .expect("default usage hints should be present without model overrides")
+            .body();
+
+        let model_override_guidance = hint
+            .strip_prefix(hint_without_model_overrides.as_str())
+            .expect("model-override guidance should extend the base usage hint");
+        for required_fragment in [
+            "Full-history forks",
+            "`fork_turns`",
+            "`model`",
+            "`reasoning_effort`",
+        ] {
+            assert!(
+                model_override_guidance.contains(required_fragment),
+                "model-override guidance should contain {required_fragment}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -11098,7 +11217,7 @@ subagent_developer_instructions = "  \t  "
 }
 
 #[tokio::test]
-async fn multi_agent_v2_empty_usage_hint_overrides_clear_default_hints() -> std::io::Result<()> {
+async fn multi_agent_v2_empty_usage_hint_overrides_are_preserved() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     std::fs::write(
         codex_home.path().join(CONFIG_TOML_FILE),
@@ -11115,8 +11234,22 @@ subagent_usage_hint_text = ""
         .build()
         .await?;
 
-    assert_eq!(config.multi_agent_v2.root_agent_usage_hint_text, None);
-    assert_eq!(config.multi_agent_v2.subagent_usage_hint_text, None);
+    let usage_hints = resolve_usage_hints(
+        &config.multi_agent_v2,
+        Some(&MultiAgentRoleMessages {
+            root: Some("catalog root".to_string()),
+            subagent: Some("catalog subagent".to_string()),
+        }),
+    );
+    assert_eq!(
+        (
+            config.multi_agent_v2.root_agent_usage_hint_text.as_deref(),
+            config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+            usage_hints.root,
+            usage_hints.subagent,
+        ),
+        (Some(""), Some(""), None, None)
+    );
 
     Ok(())
 }

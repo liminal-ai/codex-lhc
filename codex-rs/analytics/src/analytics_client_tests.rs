@@ -77,6 +77,8 @@ use crate::facts::PluginInstallRequested;
 use crate::facts::PluginInstallRequestedInput;
 use crate::facts::PluginInstallRequestedPlugin;
 use crate::facts::PluginInstallSource;
+use crate::facts::PluginMeasurementRow;
+use crate::facts::PluginMeasurementsInput;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::PluginUsedInput;
@@ -182,6 +184,7 @@ use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::test_path_buf;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -813,6 +816,18 @@ async fn ingest_completed_command_execution_item(
         .await;
 }
 
+fn plugin_measurements(rows: Vec<PluginMeasurementRow>) -> PluginMeasurementsInput {
+    PluginMeasurementsInput {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        item_id: "item-1".to_string(),
+        plugin_id: "sample@openai-curated".to_string(),
+        execution_id: "execution-1".to_string(),
+        operation: "security_scan".to_string(),
+        rows,
+    }
+}
+
 fn sample_initialize_fact(connection_id: u64) -> AnalyticsFact {
     AnalyticsFact::Initialize {
         connection_id,
@@ -1163,7 +1178,7 @@ fn accepted_line_fingerprints_event_serializes_expected_shape() {
                 repo_hash: Some("repo-hash-1".to_string()),
                 accepted_added_lines: 42,
                 accepted_deleted_lines: 40,
-                line_fingerprints: Vec::new(),
+                line_fingerprints: [],
             },
         },
     ));
@@ -2595,6 +2610,78 @@ async fn item_lifecycle_notifications_publish_command_execution_event() {
         "codex-tui"
     );
     assert_eq!(payload[0]["event_params"]["thread_source"], "user");
+}
+
+#[tokio::test]
+async fn plugin_measurement_batch_emits_directly_and_filters_invalid_rows() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut events = Vec::new();
+    let mut too_many_dimensions = BTreeMap::new();
+    for index in 0..9 {
+        too_many_dimensions.insert(format!("dimension_{index}"), "allowed".to_string());
+    }
+    let measurements = plugin_measurements(vec![
+        PluginMeasurementRow {
+            measurement_name: "finding_count".to_string(),
+            number_value: 3.0,
+            dimensions: BTreeMap::from([("severity".to_string(), "high".to_string())]),
+        },
+        PluginMeasurementRow {
+            measurement_name: "non_finite".to_string(),
+            number_value: f64::NAN,
+            dimensions: BTreeMap::new(),
+        },
+        PluginMeasurementRow {
+            measurement_name: "too_many_dimensions".to_string(),
+            number_value: 1.0,
+            dimensions: too_many_dimensions,
+        },
+        PluginMeasurementRow {
+            measurement_name: "files_scanned".to_string(),
+            number_value: 17.0,
+            dimensions: BTreeMap::new(),
+        },
+    ]);
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::PluginMeasurements(measurements)),
+            &mut events,
+        )
+        .await;
+    let payload = serde_json::to_value(&events).expect("serialize events");
+    assert_eq!(
+        payload,
+        json!([
+            {
+                "event_type": "codex_plugin_measurement_event",
+                "event_params": {
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "plugin_id": "sample@openai-curated",
+                    "execution_id": "execution-1",
+                    "operation": "security_scan",
+                    "measurement_name": "finding_count",
+                    "number_value": 3.0,
+                    "dimensions": {"severity": "high"},
+                },
+            },
+            {
+                "event_type": "codex_plugin_measurement_event",
+                "event_params": {
+                    "thread_id": "thread-1",
+                    "turn_id": "turn-1",
+                    "item_id": "item-1",
+                    "plugin_id": "sample@openai-curated",
+                    "execution_id": "execution-1",
+                    "operation": "security_scan",
+                    "measurement_name": "files_scanned",
+                    "number_value": 17.0,
+                    "dimensions": null,
+                },
+            },
+        ])
+    );
 }
 
 #[tokio::test]
@@ -4973,6 +5060,86 @@ async fn turn_event_counts_completed_tool_items() {
     );
     assert_eq!(payload["event_params"]["web_search_count"], json!(1));
     assert_eq!(payload["event_params"]["image_generation_count"], json!(1));
+}
+
+#[tokio::test]
+async fn completed_background_tool_item_emits_after_turn_event() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut out = Vec::new();
+
+    ingest_turn_prerequisites(
+        &mut reducer,
+        &mut out,
+        /*include_initialize*/ true,
+        /*include_resolved_config*/ true,
+        /*include_started*/ true,
+        /*include_token_usage*/ false,
+    )
+    .await;
+
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(ServerNotification::ItemStarted(
+                ItemStartedNotification {
+                    thread_id: "thread-2".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    started_at_ms: 998,
+                    item: sample_command_execution_item(
+                        CommandExecutionStatus::InProgress,
+                        /*exit_code*/ None,
+                        /*duration_ms*/ None,
+                    ),
+                },
+            ))),
+            &mut out,
+        )
+        .await;
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
+                "thread-2",
+                "turn-2",
+                AppServerTurnStatus::Completed,
+                /*codex_error_info*/ None,
+            ))),
+            &mut out,
+        )
+        .await;
+
+    assert_eq!(
+        out.iter()
+            .filter(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+            .count(),
+        1
+    );
+    reducer
+        .ingest(
+            AnalyticsFact::Notification(Box::new(ServerNotification::ItemCompleted(
+                ItemCompletedNotification {
+                    thread_id: "thread-2".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    completed_at_ms: 1_000,
+                    item: sample_command_execution_item(
+                        CommandExecutionStatus::Completed,
+                        Some(0),
+                        Some(1),
+                    ),
+                },
+            ))),
+            &mut out,
+        )
+        .await;
+
+    assert_eq!(
+        out.iter()
+            .filter(|event| matches!(event, TrackEventRequest::TurnEvent(_)))
+            .count(),
+        1
+    );
+    assert!(
+        out.iter()
+            .any(|event| matches!(event, TrackEventRequest::CommandExecution(_)))
+    );
 }
 
 #[tokio::test]

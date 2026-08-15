@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use crate::facts::AcceptedLineFingerprint;
 use crate::facts::AppInvocation;
 use crate::facts::ArtifactOperation;
 use crate::facts::ArtifactOperationLifecycle;
@@ -46,6 +45,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -76,6 +76,7 @@ pub(crate) enum TrackEventRequest {
     TurnSteer(CodexTurnSteerEventRequest),
     ArtifactOperation(CodexArtifactOperationEventRequest),
     CommandExecution(CodexCommandExecutionEventRequest),
+    PluginMeasurement(CodexPluginMeasurementEventRequest),
     FileChange(CodexFileChangeEventRequest),
     McpToolCall(CodexMcpToolCallEventRequest),
     DynamicToolCall(CodexDynamicToolCallEventRequest),
@@ -160,6 +161,7 @@ impl TrackEventRequest {
             Self::SkillInvocation(event) => event.event_params.plugin_id.is_some(),
             Self::McpToolCall(event) => event.event_params.plugin_id.is_some(),
             Self::ArtifactOperation(event) => !event.event_params.plugin_id.is_empty(),
+            Self::PluginMeasurement(event) => !event.event_params.plugin_id.is_empty(),
             _ => false,
         }
     }
@@ -176,7 +178,9 @@ pub(crate) struct CodexAcceptedLineFingerprintsEventParams {
     pub(crate) repo_hash: Option<String>,
     pub(crate) accepted_added_lines: u64,
     pub(crate) accepted_deleted_lines: u64,
-    pub(crate) line_fingerprints: Vec<AcceptedLineFingerprint>,
+    // Analytics ingestion and warehouse schemas require this field on the wire.
+    // Keep it statically empty; line fingerprints are no longer generated.
+    pub(crate) line_fingerprints: [(); 0],
 }
 
 #[derive(Serialize)]
@@ -748,6 +752,25 @@ pub(crate) struct CodexCommandExecutionEventParams {
 pub(crate) struct CodexCommandExecutionEventRequest {
     pub(crate) event_type: &'static str,
     pub(crate) event_params: CodexCommandExecutionEventParams,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventParams {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) plugin_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) operation: String,
+    pub(crate) measurement_name: String,
+    pub(crate) number_value: f64,
+    pub(crate) dimensions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexPluginMeasurementEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: CodexPluginMeasurementEventParams,
 }
 
 #[derive(Serialize)]

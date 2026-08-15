@@ -20,8 +20,10 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::security_risk::SecurityRiskScore;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::Write;
@@ -427,6 +429,60 @@ async fn load_rollout_items_preserves_legacy_guardian_assessment_lines() -> std:
     assert_eq!(assessment.id, "guardian-1");
     assert_eq!(assessment.turn_id, "turn-1");
     assert_eq!(assessment.started_at_ms, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_rollout_items_preserves_security_risk_scores() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let thread_id = ThreadId::new();
+    let security_risk = SecurityRiskScore {
+        scores: BTreeMap::from([
+            ("action_risk".to_string(), 0.76),
+            ("data_exfiltration".to_string(), 0.31),
+        ]),
+        sampled_at: None,
+    };
+    let security_risk_item = RolloutItem::SecurityRiskScore(security_risk.clone());
+    for history_mode in [ThreadHistoryMode::Legacy, ThreadHistoryMode::Paginated] {
+        assert!(crate::is_persisted_rollout_item(
+            &security_risk_item,
+            history_mode
+        ));
+    }
+
+    let mut file = File::create(&rollout_path)?;
+    for (ordinal, item) in [
+        paginated_session_meta_item(thread_id, home.path()),
+        security_risk_item,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = RolloutLine {
+            timestamp: "2026-07-09T00:00:00Z".to_string(),
+            ordinal: Some(ordinal as u64),
+            item,
+        };
+        writeln!(
+            file,
+            "{}",
+            serde_json::to_string(&line).map_err(std::io::Error::other)?
+        )?;
+    }
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 2);
+    let RolloutItem::SecurityRiskScore(persisted_security_risk) = &items[1] else {
+        panic!("expected security risk score rollout item");
+    };
+    assert_eq!(persisted_security_risk, &security_risk);
 
     Ok(())
 }

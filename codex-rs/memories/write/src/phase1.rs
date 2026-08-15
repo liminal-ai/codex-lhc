@@ -417,6 +417,7 @@ mod job {
                 | RolloutItem::Compacted(_)
                 | RolloutItem::TurnContext(_)
                 | RolloutItem::WorldState(_)
+                | RolloutItem::SecurityRiskScore(_)
                 | RolloutItem::EventMsg(_) => None,
             })
             .collect::<Vec<_>>();
@@ -672,7 +673,9 @@ mod tests {
     use super::*;
     use codex_protocol::AgentPath;
     use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::security_risk::SecurityRiskScore;
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeMap;
 
     #[test]
     fn serializes_memory_rollout_with_agents_removed_but_environment_kept() {
@@ -722,6 +725,10 @@ mod tests {
         let serialized = job::serialize_filtered_rollout_response_items(&[
             RolloutItem::ResponseItem(mixed_contextual_message.into()),
             RolloutItem::ResponseItem(skill_message.into()),
+            RolloutItem::SecurityRiskScore(SecurityRiskScore {
+                scores: BTreeMap::from([("action_risk".to_string(), 0.92)]),
+                sampled_at: None,
+            }),
             RolloutItem::ResponseItem(subagent_message.clone().into()),
         ])
         .expect("serialize");

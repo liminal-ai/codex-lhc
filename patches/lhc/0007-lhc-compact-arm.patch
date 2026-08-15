@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index 83f1f0d651..97dc03ac63 100644
+index 4bb5e435f8..c9ed2d398b 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -3822,6 +3822,22 @@ impl ThreadRequestProcessor {
+@@ -4070,6 +4070,22 @@ impl ThreadRequestProcessor {
          &self,
          stored_thread: StoredThread,
      ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
@@ -25,8 +25,31 @@ index 83f1f0d651..97dc03ac63 100644
          if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
              let model_context = self
                  .thread_store
+diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
+index 20d64d21ba..8839d3bcda 100644
+--- a/codex-rs/config/src/config_toml.rs
++++ b/codex-rs/config/src/config_toml.rs
+@@ -39,6 +39,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+ use codex_model_provider_info::OPENAI_PROVIDER_ID;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::config_types::ForcedLoginMethod;
++use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+ use codex_protocol::config_types::Personality;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::SandboxMode;
+@@ -361,6 +362,10 @@ pub struct ConfigToml {
+     /// `default`, `priority`, or `flex`; legacy `fast` also works).
+     pub service_tier: Option<String>,
+ 
++    /// Optional LC Adaptive Service Tier cost control. When enabled, this owns
++    /// request tier selection using the prepared long-context request size.
++    pub lc_adaptive_service_tier: Option<LcAdaptiveServiceTierConfig>,
++
+     /// Base URL for requests to ChatGPT (as opposed to the OpenAI API).
+     pub chatgpt_base_url: Option<String>,
+ 
 diff --git a/codex-rs/core/Cargo.toml b/codex-rs/core/Cargo.toml
-index 78e6905ded..6e46cc1a68 100644
+index ff683fb5f9..463a91c5d3 100644
 --- a/codex-rs/core/Cargo.toml
 +++ b/codex-rs/core/Cargo.toml
 @@ -4,6 +4,11 @@ license.workspace = true
@@ -41,7 +64,7 @@ index 78e6905ded..6e46cc1a68 100644
  [lib]
  name = "codex_core"
  path = "src/lib.rs"
-@@ -51,6 +56,8 @@ codex-execpolicy = { workspace = true }
+@@ -52,6 +57,8 @@ codex-execpolicy = { workspace = true }
  codex-git-utils = { workspace = true }
  codex-history = { workspace = true }
  codex-hooks = { workspace = true }
@@ -50,7 +73,7 @@ index 78e6905ded..6e46cc1a68 100644
  codex-http-client = { workspace = true }
  codex-install-context = { workspace = true }
  codex-network-proxy = { workspace = true }
-@@ -139,6 +146,8 @@ codex-shell-escalation = { workspace = true }
+@@ -140,6 +147,8 @@ codex-shell-escalation = { workspace = true }
  [dev-dependencies]
  assert_cmd = { workspace = true }
  assert_matches = { workspace = true }
@@ -61,7 +84,7 @@ index 78e6905ded..6e46cc1a68 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..4653fd4d56
+index 0000000000..b1845f37c6
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
 @@ -0,0 +1,2111 @@
@@ -1453,7 +1476,7 @@ index 0000000000..4653fd4d56
 +
 +    let world_state_value = world_state_baseline
 +        .as_ref()
-+        .map(|ws| ws.snapshot().into_value());
++        .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 +
 +    // Provisional boundary message (host ids filled after history extract).
 +    let provisional_message = marker.to_durable_writeback_record();
@@ -2178,10 +2201,10 @@ index 0000000000..4653fd4d56
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..3a88765795
+index 0000000000..b0f7305be8
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3005 @@
+@@ -0,0 +1,3006 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -2615,6 +2638,7 @@ index 0000000000..3a88765795
 +                /*trigger_turn*/ false,
 +            ),
 +            /*parent_turn_id*/ None,
++            /*root_turn_id*/ None,
 +        )
 +        .await;
 +    let history_version_after = session.clone_history().await.history_version();
@@ -6613,10 +6637,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..8985d41eb8
+index 0000000000..6c5869132b
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,2964 @@
+@@ -0,0 +1,2975 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -8965,9 +8989,9 @@ index 0000000000..8985d41eb8
 +
 +// ── Emergency triage: strict LHC policy evidence ───────────────────────────
 +
-+/// Production gpt-5.6 models use regular Codex policy: 90% of 272k.
++/// Production gpt-5.6 models use the Codex-LHC 370k window and 350k trigger.
 +#[test]
-+fn gpt_5_6_auto_compact_threshold_is_regular_244_800() {
++fn gpt_5_6_auto_compact_threshold_is_lhc_350_000() {
 +    use codex_models_manager::ModelsManagerConfig;
 +    use codex_models_manager::bundled_models_response;
 +    use codex_models_manager::test_support::construct_model_info_offline_for_tests;
@@ -8981,8 +9005,19 @@ index 0000000000..8985d41eb8
 +            .find(|m| m.slug == slug)
 +            .unwrap_or_else(|| panic!("bundled catalog missing {slug}"));
 +        assert_eq!(
-+            catalog.auto_compact_token_limit, None,
-+            "{slug}: models.json must defer to regular context-window policy"
++            catalog.context_window,
++            Some(370_000),
++            "{slug}: models.json must use the 370k working window"
++        );
++        assert_eq!(
++            catalog.max_context_window,
++            Some(1_050_000),
++            "{slug}: models.json must retain the full capability ceiling"
++        );
++        assert_eq!(
++            catalog.auto_compact_token_limit,
++            Some(350_000),
++            "{slug}: models.json must use the 350k LHC trigger"
 +        );
 +
 +        let config = ModelsManagerConfig {
@@ -8995,8 +9030,8 @@ index 0000000000..8985d41eb8
 +        let model = construct_model_info_offline_for_tests(slug, &config);
 +        assert_eq!(
 +            model.auto_compact_token_limit(),
-+            Some(244_800),
-+            "{slug}: resolved auto_compact_token_limit() must be 90% of 272k"
++            Some(350_000),
++            "{slug}: resolved auto_compact_token_limit() must be 350k"
 +        );
 +    }
 +}
@@ -9425,16 +9460,16 @@ index 0000000000..8985d41eb8
 +    );
 +}
 +
-+/// Successful LHC compact body must clear the regular 244.8k production trigger.
++/// Successful LHC compact body must clear the 350k production trigger.
 +#[tokio::test]
 +async fn successful_lhc_compact_clears_regular_trigger() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, mut tc) = make_session_and_context().await;
-+    // Regular Codex policy for a 272k model.
-+    tc.model_info.auto_compact_token_limit = Some(244_800);
-+    tc.model_info.context_window = Some(272_000);
-+    tc.model_info.max_context_window = Some(272_000);
++    // Codex-LHC policy for GPT-5.6 long-context operation.
++    tc.model_info.auto_compact_token_limit = Some(350_000);
++    tc.model_info.context_window = Some(370_000);
++    tc.model_info.max_context_window = Some(1_050_000);
 +
 +    install_lhc_and_enable(&mut session, root).await;
 +    let slot = session
@@ -9455,14 +9490,14 @@ index 0000000000..8985d41eb8
 +    };
 +    let body_tokens = codex_lhc_host::estimate_response_items_tokens(&body);
 +    assert!(
-+        body_tokens <= 244_800,
-+        "successful LHC body must clear the 244.8k trigger (body_tokens={body_tokens})"
++        body_tokens <= 350_000,
++        "successful LHC body must clear the 350k trigger (body_tokens={body_tokens})"
 +    );
 +    let installed = sess.clone_history().await.into_raw_items();
 +    let installed_tokens = codex_lhc_host::estimate_response_items_tokens(&installed);
 +    assert!(
-+        installed_tokens <= 244_800,
-+        "installed history must also clear 244.8k (tokens={installed_tokens})"
++        installed_tokens <= 350_000,
++        "installed history must also clear 350k (tokens={installed_tokens})"
 +    );
 +}
 +
@@ -9579,6 +9614,271 @@ index 0000000000..8985d41eb8
 +        | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
 +            panic!("StandaloneTurn returned MidTurn residual: {reason}");
 +        }
++    }
++}
+diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
+index b32181c988..0df42f222f 100644
+--- a/codex-rs/core/src/config/config_tests.rs
++++ b/codex-rs/core/src/config/config_tests.rs
+@@ -79,6 +79,7 @@ use codex_model_provider_info::OLLAMA_OSS_PROVIDER_ID;
+ use codex_model_provider_info::WireApi;
+ use codex_models_manager::bundled_models_response;
+ use codex_network_proxy::NetworkMode;
++use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+ use codex_protocol::config_types::ModelProviderAuthInfo;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+ use codex_protocol::config_types::ServiceTier;
+@@ -9451,6 +9452,61 @@ async fn config_toml_legacy_fast_service_tier_uses_priority_request_value() -> s
+     Ok(())
+ }
+ 
++#[tokio::test]
++async fn lc_adaptive_service_tier_normalizes_runtime_tiers() -> std::io::Result<()> {
++    let mut fixture = create_test_fixture()?;
++    fixture.cfg.lc_adaptive_service_tier = Some(LcAdaptiveServiceTierConfig {
++        enabled: true,
++        threshold: 272_000,
++        below: "fast".to_string(),
++        at_or_above: "default".to_string(),
++    });
++
++    let cwd = fixture.cwd_path();
++    let codex_home = fixture.codex_home();
++    let config = Config::load_from_base_config_with_overrides(
++        fixture.cfg,
++        ConfigOverrides {
++            cwd: Some(cwd),
++            ..Default::default()
++        },
++        codex_home,
++    )
++    .await?;
++
++    assert!(config.lc_adaptive_service_tier.enabled);
++    assert_eq!(config.lc_adaptive_service_tier.threshold, 272_000);
++    assert_eq!(config.lc_adaptive_service_tier.below, "priority");
++    assert_eq!(config.lc_adaptive_service_tier.at_or_above, "default");
++    Ok(())
++}
++
++#[tokio::test]
++async fn lc_adaptive_service_tier_rejects_non_positive_threshold() -> std::io::Result<()> {
++    let mut fixture = create_test_fixture()?;
++    fixture.cfg.lc_adaptive_service_tier = Some(LcAdaptiveServiceTierConfig {
++        enabled: true,
++        threshold: 0,
++        ..LcAdaptiveServiceTierConfig::default()
++    });
++
++    let cwd = fixture.cwd_path();
++    let codex_home = fixture.codex_home();
++    let err = Config::load_from_base_config_with_overrides(
++        fixture.cfg,
++        ConfigOverrides {
++            cwd: Some(cwd),
++            ..Default::default()
++        },
++        codex_home,
++    )
++    .await
++    .expect_err("non-positive LC Adaptive Service Tier threshold must fail");
++
++    assert!(err.to_string().contains("threshold must be positive"));
++    Ok(())
++}
++
+ #[tokio::test]
+ async fn fast_default_opt_out_notice_config_is_respected() -> std::io::Result<()> {
+     let fixture = create_test_fixture()?;
+diff --git a/codex-rs/core/src/config/mod.rs b/codex-rs/core/src/config/mod.rs
+index 2361fea0cd..dbaf27590a 100644
+--- a/codex-rs/core/src/config/mod.rs
++++ b/codex-rs/core/src/config/mod.rs
+@@ -92,6 +92,7 @@ use codex_models_manager::ModelsManagerConfig;
+ use codex_protocol::config_types::AltScreenMode;
+ use codex_protocol::config_types::AutoCompactTokenLimitScope;
+ use codex_protocol::config_types::ForcedLoginMethod;
++use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+ use codex_protocol::config_types::Personality;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+@@ -571,6 +572,10 @@ pub struct Config {
+     /// `default` means the user explicitly selected standard routing.
+     pub service_tier: Option<String>,
+ 
++    /// LC Adaptive Service Tier cost control. When enabled, it owns effective
++    /// request tier selection; `service_tier` remains the manual fallback.
++    pub lc_adaptive_service_tier: LcAdaptiveServiceTierConfig,
++
+     /// Model used specifically for review sessions.
+     pub review_model: Option<String>,
+ 
+@@ -3761,6 +3766,30 @@ impl Config {
+                 None => Some(service_tier),
+             }
+         });
++        let mut lc_adaptive_service_tier = cfg.lc_adaptive_service_tier.unwrap_or_default();
++        if lc_adaptive_service_tier.threshold <= 0 {
++            return Err(std::io::Error::new(
++                std::io::ErrorKind::InvalidInput,
++                "lc_adaptive_service_tier.threshold must be positive",
++            ));
++        }
++        for (field, value) in [
++            ("below", &mut lc_adaptive_service_tier.below),
++            ("at_or_above", &mut lc_adaptive_service_tier.at_or_above),
++        ] {
++            if value == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
++                continue;
++            }
++            let Some(tier) = ServiceTier::from_request_value(value) else {
++                return Err(std::io::Error::new(
++                    std::io::ErrorKind::InvalidInput,
++                    format!(
++                        "lc_adaptive_service_tier.{field} must be fast, priority, flex, or default"
++                    ),
++                ));
++            };
++            *value = tier.request_value().to_string();
++        }
+ 
+         let compact_prompt = compact_prompt.or(cfg.compact_prompt).and_then(|value| {
+             let trimmed = value.trim();
+@@ -3965,6 +3994,7 @@ impl Config {
+         let config = Self {
+             model,
+             service_tier,
++            lc_adaptive_service_tier,
+             review_model,
+             model_context_window: cfg.model_context_window,
+             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+diff --git a/codex-rs/core/src/lc_adaptive_service_tier.rs b/codex-rs/core/src/lc_adaptive_service_tier.rs
+new file mode 100644
+index 0000000000..e8c85ad76c
+--- /dev/null
++++ b/codex-rs/core/src/lc_adaptive_service_tier.rs
+@@ -0,0 +1,123 @@
++use crate::client_common::Prompt;
++use crate::context_manager::estimate_item_token_count;
++use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
++use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
++use codex_protocol::config_types::ServiceTier;
++use codex_utils_string::approx_token_count;
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct LcAdaptiveServiceTierDecision {
++    pub(crate) service_tier: Option<String>,
++    pub(crate) estimated_context_tokens: Option<i64>,
++}
++
++fn normalized_request_tier(value: &str) -> String {
++    if value == SERVICE_TIER_DEFAULT_REQUEST_VALUE {
++        return value.to_string();
++    }
++    ServiceTier::from_request_value(value)
++        .map(|tier| tier.request_value().to_string())
++        .unwrap_or_else(|| value.to_string())
++}
++
++fn tier_for_context_tokens(config: &LcAdaptiveServiceTierConfig, context_tokens: i64) -> String {
++    let configured = if context_tokens < config.threshold {
++        &config.below
++    } else {
++        &config.at_or_above
++    };
++    normalized_request_tier(configured)
++}
++
++fn estimate_prepared_context_tokens(prompt: &Prompt) -> i64 {
++    let instruction_tokens =
++        i64::try_from(approx_token_count(&prompt.base_instructions.text)).unwrap_or(i64::MAX);
++    let input_tokens = prompt
++        .input
++        .iter()
++        .map(estimate_item_token_count)
++        .fold(0_i64, i64::saturating_add);
++    let tool_tokens = serde_json::to_string(prompt.tools.as_ref())
++        .ok()
++        .map(|tools| i64::try_from(approx_token_count(&tools)).unwrap_or(i64::MAX))
++        .unwrap_or_default();
++    let output_schema_tokens = prompt
++        .output_schema
++        .as_ref()
++        .and_then(|schema| serde_json::to_string(schema).ok())
++        .map(|schema| i64::try_from(approx_token_count(&schema)).unwrap_or(i64::MAX))
++        .unwrap_or_default();
++
++    instruction_tokens
++        .saturating_add(input_tokens)
++        .saturating_add(tool_tokens)
++        .saturating_add(output_schema_tokens)
++}
++
++/// Resolve the request tier without mutating session or operator configuration.
++///
++/// Context grows between compacts, causing one Fast → Default transition. A
++/// later compact produces a smaller prepared request, naturally restoring Fast.
++pub(crate) fn resolve_lc_adaptive_service_tier(
++    config: &LcAdaptiveServiceTierConfig,
++    configured_service_tier: Option<String>,
++    prompt: &Prompt,
++) -> LcAdaptiveServiceTierDecision {
++    if !config.enabled {
++        return LcAdaptiveServiceTierDecision {
++            service_tier: configured_service_tier,
++            estimated_context_tokens: None,
++        };
++    }
++
++    let estimated_context_tokens = estimate_prepared_context_tokens(prompt);
++    LcAdaptiveServiceTierDecision {
++        service_tier: Some(tier_for_context_tokens(config, estimated_context_tokens)),
++        estimated_context_tokens: Some(estimated_context_tokens),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn enabled_config() -> LcAdaptiveServiceTierConfig {
++        LcAdaptiveServiceTierConfig {
++            enabled: true,
++            threshold: 272_000,
++            below: "fast".to_string(),
++            at_or_above: "default".to_string(),
++        }
++    }
++
++    #[test]
++    fn disabled_preserves_manual_service_tier() {
++        let decision = resolve_lc_adaptive_service_tier(
++            &LcAdaptiveServiceTierConfig::default(),
++            Some("priority".to_string()),
++            &Prompt::default(),
++        );
++        assert_eq!(decision.service_tier.as_deref(), Some("priority"));
++        assert_eq!(decision.estimated_context_tokens, None);
++    }
++
++    #[test]
++    fn below_threshold_uses_fast_request_tier() {
++        let config = enabled_config();
++        assert_eq!(tier_for_context_tokens(&config, 271_999), "priority");
++    }
++
++    #[test]
++    fn threshold_and_above_use_default_request_tier() {
++        let config = enabled_config();
++        assert_eq!(tier_for_context_tokens(&config, 272_000), "default");
++        assert_eq!(tier_for_context_tokens(&config, 350_000), "default");
++    }
++
++    #[test]
++    fn compacted_request_naturally_returns_to_fast() {
++        let config = enabled_config();
++        assert_eq!(tier_for_context_tokens(&config, 300_000), "default");
++        assert_eq!(tier_for_context_tokens(&config, 120_000), "priority");
 +    }
 +}
 diff --git a/codex-rs/core/src/lhc_inference_bridge.rs b/codex-rs/core/src/lhc_inference_bridge.rs
@@ -10209,11 +10509,11 @@ index 0000000000..ec49dd1d75
 +    }
 +}
 diff --git a/codex-rs/core/src/lib.rs b/codex-rs/core/src/lib.rs
-index 816af473d7..f751890e89 100644
+index e8335a4486..59e886a674 100644
 --- a/codex-rs/core/src/lib.rs
 +++ b/codex-rs/core/src/lib.rs
-@@ -20,11 +20,14 @@ pub use session::SteerInputError;
- pub use session::TurnInput;
+@@ -26,11 +26,15 @@ pub use codex_protocol::turn_input::TurnStartOptions;
+ pub use responses_metadata::CodexResponsesMetadata;
  pub use turn_metadata::detached_memory_responses_metadata;
  mod codex_thread;
 +mod compact_lhc;
@@ -10223,15 +10523,16 @@ index 816af473d7..f751890e89 100644
  mod compact_remote_history;
  mod compact_remote_v2;
  mod compact_token_budget;
++mod lc_adaptive_service_tier;
 +mod lhc_inference_bridge;
- mod user_message_admission;
+ pub use codex_protocol::protocol::EnvironmentConfig;
  pub use codex_thread::BackgroundTerminalInfo;
  pub use codex_thread::CodexThread;
 diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/session/input_queue.rs
-index 9f35a335e2..a270663c88 100644
+index 1238cab10d..e7a4e53a90 100644
 --- a/codex-rs/core/src/session/input_queue.rs
 +++ b/codex-rs/core/src/session/input_queue.rs
-@@ -10,6 +10,8 @@ use serde::Deserialize;
+@@ -11,6 +11,8 @@ use serde::Deserialize;
  use serde::Serialize;
  use std::collections::VecDeque;
  use std::sync::Arc;
@@ -10240,7 +10541,7 @@ index 9f35a335e2..a270663c88 100644
  use tokio::sync::Mutex;
  use tokio::sync::watch;
  
-@@ -42,6 +44,9 @@ pub(crate) struct TurnInputQueue {
+@@ -77,6 +79,9 @@ pub(crate) struct TurnInputQueue {
  pub(crate) struct InputQueue {
      activity_tx: watch::Sender<InputQueueActivity>,
      mailbox_pending_mails: Mutex<VecDeque<PendingMailboxCommunication>>,
@@ -10250,7 +10551,7 @@ index 9f35a335e2..a270663c88 100644
  }
  
  struct PendingMailboxCommunication {
-@@ -56,9 +61,20 @@ impl InputQueue {
+@@ -92,9 +97,20 @@ impl InputQueue {
          Self {
              activity_tx,
              mailbox_pending_mails: Mutex::new(VecDeque::new()),
@@ -10271,15 +10572,15 @@ index 9f35a335e2..a270663c88 100644
      pub(crate) async fn subscribe_activity(
          &self,
          turn_state: Option<&Mutex<TurnState>>,
-@@ -95,6 +111,7 @@ impl InputQueue {
-                 parent_turn_id,
+@@ -133,6 +149,7 @@ impl InputQueue {
+                 root_turn_id,
                  _diagnostics_guard: PENDING_MAILBOX_MESSAGES.track(),
              });
 +        self.bump_input_epoch();
          self.activity_tx.send_replace(InputQueueActivity::Mailbox);
      }
  
-@@ -203,11 +220,15 @@ impl InputQueue {
+@@ -254,11 +271,15 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
      ) {
@@ -10295,7 +10596,7 @@ index 9f35a335e2..a270663c88 100644
          self.activity_tx.send_replace(InputQueueActivity::Steer);
      }
  
-@@ -216,7 +237,11 @@ impl InputQueue {
+@@ -267,7 +288,11 @@ impl InputQueue {
          turn_state: &Mutex<TurnState>,
          input: Vec<TurnInput>,
      ) {
@@ -10307,7 +10608,7 @@ index 9f35a335e2..a270663c88 100644
      }
  
      pub(crate) async fn take_pending_input_for_turn_state(
-@@ -327,6 +352,7 @@ mod tests {
+@@ -431,6 +456,7 @@ mod tests {
          let (mut activity_rx, pending_activity) =
              input_queue.subscribe_activity(/*turn_state*/ None).await;
          assert_eq!(pending_activity, None);
@@ -10315,23 +10616,23 @@ index 9f35a335e2..a270663c88 100644
  
          let mail_one = make_mail(
              AgentPath::root(),
-@@ -337,6 +363,7 @@ mod tests {
-         input_queue
-             .enqueue_mailbox_communication(mail_one, /*parent_turn_id*/ None)
+@@ -443,6 +469,7 @@ mod tests {
+                 mail_one, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+             )
              .await;
 +        assert_eq!(input_queue.input_epoch(), 1);
          let mail_two = make_mail(
              AgentPath::root(),
              AgentPath::try_from("/root/worker").expect("agent path"),
-@@ -346,6 +373,7 @@ mod tests {
-         input_queue
-             .enqueue_mailbox_communication(mail_two, /*parent_turn_id*/ None)
+@@ -454,6 +481,7 @@ mod tests {
+                 mail_two, /*parent_turn_id*/ None, /*root_turn_id*/ None,
+             )
              .await;
 +        assert_eq!(input_queue.input_epoch(), 2);
  
          activity_rx.changed().await.expect("mailbox update");
          assert_eq!(
-@@ -354,6 +382,31 @@ mod tests {
+@@ -462,6 +490,31 @@ mod tests {
          );
      }
  
@@ -10365,10 +10666,10 @@ index 9f35a335e2..a270663c88 100644
          let input_queue = InputQueue::new();
 diff --git a/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
 new file mode 100644
-index 0000000000..7fb6f47dbb
+index 0000000000..e10618a447
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
-@@ -0,0 +1,775 @@
+@@ -0,0 +1,776 @@
 +//! Band-shape model-tolerance harness (Chunk 2a/2b → round 6 / K2).
 +//!
 +//! **Dry-run:** install a real `lhc.compact`-produced body (via the production
@@ -10875,7 +11176,8 @@ index 0000000000..7fb6f47dbb
 +    let auth_manager = codex_login::AuthManager::shared_from_config(
 +        &config, /*enable_codex_api_key_env*/ true,
 +    )
-+    .await;
++    .await
++    .expect("initialize auth manager");
 +    let auth = auth_manager.auth().await.expect("ChatGPT auth required");
 +    eprintln!(
 +        "lhc band-shape live K2: auth={:?} model={LHC_DERIVATION_MODEL} source_events={source_events} body_items={}",
@@ -11145,10 +11447,10 @@ index 0000000000..7fb6f47dbb
 +    );
 +}
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index bfe89311fe..b319bb7cd5 100644
+index dfd6ca1bb9..0bb66f5aa9 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -1285,6 +1285,8 @@ impl Session {
+@@ -1297,6 +1297,8 @@ impl Session {
                      ),
                  ),
                  executed_tool_calls,
@@ -11158,10 +11460,10 @@ index bfe89311fe..b319bb7cd5 100644
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index 3a9cec895b..72abf62791 100644
+index beb48f4a38..bb2f4035c9 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5895,6 +5895,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5920,6 +5920,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -11170,7 +11472,7 @@ index 3a9cec895b..72abf62791 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
-@@ -8151,6 +8153,8 @@ where
+@@ -8117,6 +8119,8 @@ where
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -11180,7 +11482,7 @@ index 3a9cec895b..72abf62791 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index bef1dd3398..45bb9bc57d 100644
+index 6c2dc1496a..1a11b20061 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -7,9 +7,6 @@ use crate::client::ModelClientSession;
@@ -11265,7 +11567,7 @@ index bef1dd3398..45bb9bc57d 100644
                      )
                      .await
                      {
-@@ -1019,6 +1042,8 @@ async fn run_pre_sampling_compact(
+@@ -1016,6 +1039,8 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -11274,7 +11576,7 @@ index bef1dd3398..45bb9bc57d 100644
          )
          .await?;
      }
-@@ -1101,6 +1126,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1098,6 +1123,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -11283,7 +11585,7 @@ index bef1dd3398..45bb9bc57d 100644
          )
          .await?;
          return Ok(());
-@@ -1149,6 +1176,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1146,6 +1173,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -11292,7 +11594,7 @@ index bef1dd3398..45bb9bc57d 100644
          )
          .await?;
      }
-@@ -1160,86 +1189,45 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1157,86 +1186,45 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -11410,7 +11712,7 @@ index bef1dd3398..45bb9bc57d 100644
  }
  
  pub(super) fn collect_explicit_app_ids_from_skill_items(
-@@ -1562,6 +1550,17 @@ pub(crate) async fn built_tools(
+@@ -1559,6 +1547,17 @@ pub(crate) async fn built_tools(
  struct SamplingRequestResult {
      needs_follow_up: bool,
      last_agent_message: Option<String>,
@@ -11428,7 +11730,35 @@ index bef1dd3398..45bb9bc57d 100644
  }
  
  /// Ephemeral per-response state for streaming a single proposed plan.
-@@ -2208,6 +2207,8 @@ async fn try_run_sampling_request(
+@@ -2178,6 +2177,18 @@ async fn try_run_sampling_request(
+         .features
+         .enabled(Feature::ConcurrentReasoningSummaries)
+         && turn_context.provider.info().is_openai();
++    let lc_service_tier = crate::lc_adaptive_service_tier::resolve_lc_adaptive_service_tier(
++        &turn_context.config.lc_adaptive_service_tier,
++        turn_context.config.service_tier.clone(),
++        prompt,
++    );
++    trace!(
++        enabled = turn_context.config.lc_adaptive_service_tier.enabled,
++        threshold = turn_context.config.lc_adaptive_service_tier.threshold,
++        estimated_context_tokens = ?lc_service_tier.estimated_context_tokens,
++        effective_service_tier = ?lc_service_tier.service_tier,
++        "LC Adaptive Service Tier resolved request tier"
++    );
+     let mut stream = client_session
+         .stream(
+             prompt,
+@@ -2185,7 +2196,7 @@ async fn try_run_sampling_request(
+             &turn_context.session_telemetry,
+             turn_context.reasoning_effort.clone(),
+             turn_context.reasoning_summary,
+-            turn_context.config.service_tier.clone(),
++            lc_service_tier.service_tier,
+             responses_metadata,
+             &inference_trace,
+         )
+@@ -2205,6 +2216,8 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
      const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
      let mut analytics_tool_call_ids = Vec::new();
@@ -11437,7 +11767,7 @@ index bef1dd3398..45bb9bc57d 100644
      let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
      let plan_mode = turn_context.mode == ModeKind::Plan;
      let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
-@@ -2264,7 +2265,8 @@ async fn try_run_sampling_request(
+@@ -2261,7 +2274,8 @@ async fn try_run_sampling_request(
              ResponseEvent::OutputItemDone(mut item) => {
                  assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                  if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -11447,7 +11777,7 @@ index bef1dd3398..45bb9bc57d 100644
                          ResponseItem::FunctionCall { call_id, .. }
                          | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                          ResponseItem::ToolSearchCall { call_id, .. }
-@@ -2275,10 +2277,34 @@ async fn try_run_sampling_request(
+@@ -2272,10 +2286,34 @@ async fn try_run_sampling_request(
                          }
                          _ => None,
                      };
@@ -11483,7 +11813,7 @@ index bef1dd3398..45bb9bc57d 100644
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                      && let Ok(Some(event)) = consumer.finish()
                  {
-@@ -2369,6 +2395,10 @@ async fn try_run_sampling_request(
+@@ -2366,6 +2404,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
@@ -11494,7 +11824,7 @@ index bef1dd3398..45bb9bc57d 100644
                      });
                  }
              }
-@@ -2530,7 +2560,7 @@ async fn try_run_sampling_request(
+@@ -2527,7 +2569,7 @@ async fn try_run_sampling_request(
                  sess.send_event(
                      &turn_context,
                      EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
@@ -11503,7 +11833,7 @@ index bef1dd3398..45bb9bc57d 100644
                          token_usage: token_usage.clone(),
                      }),
                  )
-@@ -2549,6 +2579,10 @@ async fn try_run_sampling_request(
+@@ -2546,6 +2588,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
@@ -11714,7 +12044,7 @@ index 1c7de737eb..faa127908e 100644
      }
  }
 diff --git a/codex-rs/core/src/tasks/lifecycle.rs b/codex-rs/core/src/tasks/lifecycle.rs
-index 0af3127d95..50cc90d1b5 100644
+index cde3fc7d72..4f2f485273 100644
 --- a/codex-rs/core/src/tasks/lifecycle.rs
 +++ b/codex-rs/core/src/tasks/lifecycle.rs
 @@ -14,12 +14,15 @@ impl Session {
@@ -11753,7 +12083,7 @@ index 0af3127d95..50cc90d1b5 100644
                      session_store: &self.services.session_extension_data,
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
-@@ -47,6 +58,11 @@ impl Session {
+@@ -56,6 +67,11 @@ impl Session {
              return;
          }
  
@@ -11765,7 +12095,7 @@ index 0af3127d95..50cc90d1b5 100644
          for contributor in self.services.extensions.thread_lifecycle_contributors() {
              contributor
                  .on_thread_idle(codex_extension_api::ThreadIdleInput {
-@@ -62,11 +78,16 @@ impl Session {
+@@ -71,11 +87,16 @@ impl Session {
          &self,
          reason: TurnAbortReason,
          turn_store: &ExtensionData,
@@ -11783,15 +12113,15 @@ index 0af3127d95..50cc90d1b5 100644
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index 3418ba83c1..91cb1c10e2 100644
+index cc71acb3b5..be8f1d150e 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
-@@ -484,12 +484,13 @@ impl Session {
+@@ -495,12 +495,13 @@ impl Session {
          let mut aborted_turn = false;
          let mut active_turn_to_clear = None;
          let mut turn_context = None;
 +        let mut abort_timing = None;
-         if let Some(mut active_turn) = self.take_active_turn().await {
+         if let Some(mut active_turn) = self.take_active_turn(&reason).await {
              let task = active_turn.task.take();
              aborted_turn = task.is_some();
              turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -11801,7 +12131,7 @@ index 3418ba83c1..91cb1c10e2 100644
              }
              if aborted_turn {
                  active_turn_to_clear = Some(active_turn);
-@@ -497,8 +498,16 @@ impl Session {
+@@ -508,8 +509,16 @@ impl Session {
          }
  
          if let Some(turn_context) = turn_context.as_deref() {
@@ -11820,7 +12150,7 @@ index 3418ba83c1..91cb1c10e2 100644
          }
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-@@ -533,12 +542,21 @@ impl Session {
+@@ -550,12 +559,21 @@ impl Session {
  
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -11847,7 +12177,7 @@ index 3418ba83c1..91cb1c10e2 100644
          }
          // Let interrupted tasks observe cancellation before dropping pending approvals, or an
          // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-@@ -766,8 +784,13 @@ impl Session {
+@@ -786,8 +804,13 @@ impl Session {
              ThreadIdleCause::Completed
          };
          let event = if let Some(reason) = abort_reason {
@@ -11863,7 +12193,7 @@ index 3418ba83c1..91cb1c10e2 100644
              EventMsg::TurnAborted(TurnAbortedEvent {
                  turn_id: Some(turn_context.sub_id.clone()),
                  reason,
-@@ -781,8 +804,12 @@ impl Session {
+@@ -801,8 +824,12 @@ impl Session {
                  .time_to_first_token_ms()
                  .await;
              let error = turn_context.terminal_error.lock().await.clone();
@@ -11878,7 +12208,7 @@ index 3418ba83c1..91cb1c10e2 100644
              EventMsg::TurnComplete(TurnCompleteEvent {
                  turn_id: turn_context.sub_id.clone(),
                  last_agent_message,
-@@ -848,10 +875,22 @@ impl Session {
+@@ -877,10 +904,22 @@ impl Session {
              .await
      }
  
@@ -11903,7 +12233,7 @@ index 3418ba83c1..91cb1c10e2 100644
          }
  
          trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-@@ -941,6 +980,7 @@ impl Session {
+@@ -970,6 +1009,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
              warn!("failed to flush rollout after emitting terminal turn event: {err}");
          }
@@ -11912,10 +12242,10 @@ index 3418ba83c1..91cb1c10e2 100644
  }
  
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index d5297df04f..b59d2737ae 100644
+index 42b14e3400..4bdb9f2e22 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
-@@ -941,7 +941,9 @@ impl ThreadManager {
+@@ -943,7 +943,9 @@ impl ThreadManager {
          parent_trace: Option<W3cTraceContext>,
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
@@ -11926,7 +12256,7 @@ index d5297df04f..b59d2737ae 100644
          Box::pin(self.resume_thread_with_history(
              config,
              initial_history,
-@@ -1015,7 +1017,9 @@ impl ThreadManager {
+@@ -1017,7 +1019,9 @@ impl ThreadManager {
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
          let agent_control = self.agent_control_for_config(&config);
@@ -11937,7 +12267,7 @@ index d5297df04f..b59d2737ae 100644
          let (session_source, thread_source) = initial_history
              .get_resumed_session_sources()
              .unwrap_or_else(|| (self.state.session_source.clone(), None));
-@@ -1105,7 +1109,9 @@ impl ThreadManager {
+@@ -1127,7 +1131,9 @@ impl ThreadManager {
          S: Into<ForkSnapshot>,
      {
          let snapshot = snapshot.into();
@@ -11948,7 +12278,7 @@ index d5297df04f..b59d2737ae 100644
          self.fork_thread_from_history(
              snapshot,
              config,
-@@ -1120,7 +1126,29 @@ impl ThreadManager {
+@@ -1142,7 +1148,29 @@ impl ThreadManager {
      async fn initial_history_from_rollout_path(
          &self,
          rollout_path: PathBuf,
@@ -11978,7 +12308,7 @@ index d5297df04f..b59d2737ae 100644
          let requested_rollout_path = rollout_path.clone();
          let stored_thread = self
              .state
-@@ -1925,6 +1953,19 @@ impl ThreadManagerState {
+@@ -1948,6 +1976,19 @@ impl ThreadManagerState {
      }
  }
  
@@ -11999,10 +12329,10 @@ index d5297df04f..b59d2737ae 100644
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
-index 99de88ae02..88965c100e 100644
+index 02e555ced0..04dc517227 100644
 --- a/codex-rs/core/tests/suite/compact.rs
 +++ b/codex-rs/core/tests/suite/compact.rs
-@@ -1615,6 +1615,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
+@@ -1577,6 +1577,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
  }
  
  // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
@@ -12013,7 +12343,7 @@ index 99de88ae02..88965c100e 100644
  #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
  #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
  async fn auto_compact_runs_after_token_limit_hit() {
-@@ -1632,17 +1636,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
+@@ -1594,17 +1598,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
          ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
      ]);
  
@@ -12033,7 +12363,7 @@ index 99de88ae02..88965c100e 100644
  
      let model_provider = non_openai_model_provider(&server);
  
-@@ -1651,7 +1646,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
+@@ -1613,7 +1608,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
          set_test_compact_prompt(config);
          config.model_auto_compact_token_limit = Some(200_000);
      });
@@ -12042,8 +12372,8 @@ index 99de88ae02..88965c100e 100644
 +    let codex = test.codex;
  
      codex
-         .submit(Op::UserInput {
-@@ -1683,6 +1679,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
+         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+@@ -1633,6 +1629,8 @@ async fn auto_compact_runs_after_token_limit_hit() {
          .await
          .unwrap();
  
@@ -12052,7 +12382,7 @@ index 99de88ae02..88965c100e 100644
      wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
  
      codex
-@@ -1699,120 +1697,145 @@ async fn auto_compact_runs_after_token_limit_hit() {
+@@ -1643,120 +1641,139 @@ async fn auto_compact_runs_after_token_limit_hit() {
          .await
          .unwrap();
  
@@ -12136,9 +12466,7 @@ index 99de88ae02..88965c100e 100644
 -    assert_eq!(
 -        instructions, baseline_instructions,
 -        "auto compact should keep the standard developer instructions",
-+        native_summary_count, 0,
-+        "strict LHC must never issue a native summarization request; bodies={request_bodies:?}"
-     );
+-    );
 -
 -    let input_auto = body_auto.get("input").and_then(|v| v.as_array()).unwrap();
 -    let last_auto = input_auto
@@ -12147,7 +12475,9 @@ index 99de88ae02..88965c100e 100644
 -    assert_eq!(
 -        last_auto.get("type").and_then(|v| v.as_str()),
 -        Some("message")
--    );
++        native_summary_count, 0,
++        "strict LHC must never issue a native summarization request; bodies={request_bodies:?}"
+     );
 -    assert_eq!(last_auto.get("role").and_then(|v| v.as_str()), Some("user"));
 -    let last_text = last_auto
 -        .get("content")
@@ -12233,16 +12563,10 @@ index 99de88ae02..88965c100e 100644
 +    let codex = test.codex;
 +
 +    codex
-+        .submit(Op::UserInput {
-+            items: vec![UserInput::Text {
-+                text: "seed before manual compact".into(),
-+                text_elements: Vec::new(),
-+            }],
-+            final_output_json_schema: None,
-+            responsesapi_client_metadata: None,
-+            additional_context: Default::default(),
-+            thread_settings: Default::default(),
-+        })
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "seed before manual compact".into(),
++            text_elements: Vec::new(),
++        }]))
 +        .await
 +        .unwrap();
 +    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -12294,10 +12618,10 @@ index 99de88ae02..88965c100e 100644
  
 diff --git a/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
 new file mode 100644
-index 0000000000..ca9df0717a
+index 0000000000..840b3df428
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
-@@ -0,0 +1,914 @@
+@@ -0,0 +1,900 @@
 +//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
 +//!
 +//! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
@@ -12316,6 +12640,7 @@ index 0000000000..ca9df0717a
 +use std::time::Duration;
 +
 +use anyhow::Result;
++use codex_core::TurnInputRequest;
 +use codex_extension_api::ExtensionRegistryBuilder;
 +use codex_features::Feature;
 +use codex_lhc_host::LhcCaptureSlot;
@@ -12326,7 +12651,6 @@ index 0000000000..ca9df0717a
 +use codex_model_provider_info::built_in_model_providers;
 +use codex_protocol::models::PermissionProfile;
 +use codex_protocol::protocol::EventMsg;
-+use codex_protocol::protocol::Op;
 +use codex_protocol::user_input::UserInput;
 +use core_test_support::PathExt;
 +use core_test_support::responses::ev_assistant_message;
@@ -12455,16 +12779,10 @@ index 0000000000..ca9df0717a
 +    arm_midturn_knobs(&test.codex).await;
 +
 +    test.codex
-+        .submit(Op::UserInput {
-+            items: vec![UserInput::Text {
-+                text: "continue this long agentic task".into(),
-+                text_elements: Vec::new(),
-+            }],
-+            final_output_json_schema: None,
-+            responsesapi_client_metadata: None,
-+            additional_context: Default::default(),
-+            thread_settings: Default::default(),
-+        })
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "continue this long agentic task".into(),
++            text_elements: Vec::new(),
++        }]))
 +        .await?;
 +    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 +
@@ -12640,22 +12958,21 @@ index 0000000000..ca9df0717a
 +    let (sandbox_policy, permission_profile) =
 +        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 +    test.codex
-+        .submit(Op::UserInput {
-+            items: vec![UserInput::Text {
++        .start_or_steer_turn(
++            TurnInputRequest::user_input(vec![UserInput::Text {
 +                text: "run two parallel tools then continue".into(),
 +                text_elements: Vec::new(),
-+            }],
-+            final_output_json_schema: None,
-+            responsesapi_client_metadata: None,
-+            additional_context: Default::default(),
-+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-+                environments: Some(local_selections(test.cwd_path().abs())),
-+                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
-+                sandbox_policy: Some(sandbox_policy),
-+                permission_profile,
-+                ..Default::default()
-+            },
-+        })
++            }])
++            .with_thread_settings(
++                codex_protocol::protocol::ThreadSettingsOverrides {
++                    environments: Some(local_selections(test.cwd_path().abs())),
++                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
++                    sandbox_policy: Some(sandbox_policy),
++                    permission_profile,
++                    ..Default::default()
++                },
++            ),
++        )
 +        .await?;
 +    let terminal = wait_for_event(&test.codex, |ev| {
 +        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
@@ -12791,16 +13108,10 @@ index 0000000000..ca9df0717a
 +    arm_midturn_knobs(&test.codex).await;
 +
 +    test.codex
-+        .submit(Op::UserInput {
-+            items: vec![UserInput::Text {
-+                text: "push context until exceeded".into(),
-+                text_elements: Vec::new(),
-+            }],
-+            final_output_json_schema: None,
-+            responsesapi_client_metadata: None,
-+            additional_context: Default::default(),
-+            thread_settings: Default::default(),
-+        })
++        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
++            text: "push context until exceeded".into(),
++            text_elements: Vec::new(),
++        }]))
 +        .await?;
 +
 +    // Terminal: TurnComplete or Error — not an infinite loop.
@@ -13019,22 +13330,21 @@ index 0000000000..ca9df0717a
 +    let (sandbox_policy, permission_profile) =
 +        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
 +    test.codex
-+        .submit(Op::UserInput {
-+            items: vec![UserInput::Text {
++        .start_or_steer_turn(
++            TurnInputRequest::user_input(vec![UserInput::Text {
 +                text: "run the sustained tool loop".into(),
 +                text_elements: Vec::new(),
-+            }],
-+            final_output_json_schema: None,
-+            responsesapi_client_metadata: None,
-+            additional_context: Default::default(),
-+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-+                environments: Some(local_selections(test.cwd_path().abs())),
-+                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
-+                sandbox_policy: Some(sandbox_policy),
-+                permission_profile,
-+                ..Default::default()
-+            },
-+        })
++            }])
++            .with_thread_settings(
++                codex_protocol::protocol::ThreadSettingsOverrides {
++                    environments: Some(local_selections(test.cwd_path().abs())),
++                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
++                    sandbox_policy: Some(sandbox_policy),
++                    permission_profile,
++                    ..Default::default()
++                },
++            ),
++        )
 +        .await?;
 +    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 +
@@ -13213,7 +13523,7 @@ index 0000000000..ca9df0717a
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 4bf5295eaa..5c52d9d039 100644
+index 4aa10fdc7b..e5ea98cbb7 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
 @@ -54,6 +54,7 @@ mod code_mode_elicitation;
@@ -13224,11 +13534,117 @@ index 4bf5295eaa..5c52d9d039 100644
  mod compact_remote;
  mod compact_remote_parity;
  mod compact_resume_fork;
+diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
+index dfbb6d6859..50c8aae2eb 100644
+--- a/codex-rs/core/tests/suite/model_switching.rs
++++ b/codex-rs/core/tests/suite/model_switching.rs
+@@ -10,6 +10,7 @@ use codex_login::CodexAuth;
+ use codex_models_manager::bundled_models_response;
+ use codex_models_manager::manager::RefreshStrategy;
+ use codex_protocol::config_types::CollaborationMode;
++use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+ use codex_protocol::config_types::ModeKind;
+ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+@@ -544,6 +545,50 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
+     Ok(())
+ }
+ 
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn lc_adaptive_service_tier_reaches_http_request_seam() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let resp_mock = mount_sse_sequence(
++        &server,
++        vec![sse_completed("resp-fast"), sse_completed("resp-default")],
++    )
++    .await;
++
++    let mut fast_builder = test_codex().with_config(|config| {
++        config.lc_adaptive_service_tier = LcAdaptiveServiceTierConfig {
++            enabled: true,
++            threshold: i64::MAX,
++            below: "priority".to_string(),
++            at_or_above: "default".to_string(),
++        };
++    });
++    let fast = fast_builder.build(&server).await?;
++    fast.submit_turn("short context").await?;
++
++    let mut default_builder = test_codex().with_config(|config| {
++        config.lc_adaptive_service_tier = LcAdaptiveServiceTierConfig {
++            enabled: true,
++            threshold: 1,
++            below: "priority".to_string(),
++            at_or_above: "default".to_string(),
++        };
++    });
++    let default = default_builder.build(&server).await?;
++    default.submit_turn("long context").await?;
++
++    let requests = resp_mock.requests();
++    assert_eq!(requests.len(), 2, "expected one request from each session");
++    assert_eq!(
++        requests[0].body_json()["service_tier"].as_str(),
++        Some("priority")
++    );
++    assert_eq!(requests[1].body_json().get("service_tier"), None);
++
++    Ok(())
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/models-manager/models.json b/codex-rs/models-manager/models.json
+index 3b6d62393e..07e96d985e 100644
+--- a/codex-rs/models-manager/models.json
++++ b/codex-rs/models-manager/models.json
+@@ -23,9 +23,9 @@
+       "include_plugin_usage_instructions": true,
+       "include_apps_usage_instructions": true,
+       "auto_review_model_override": null,
+-      "context_window": 272000,
+-      "max_context_window": 272000,
+-      "auto_compact_token_limit": null,
++      "context_window": 370000,
++      "max_context_window": 1050000,
++      "auto_compact_token_limit": 350000,
+       "comp_hash": "3000",
+       "reasoning_summary_format": "experimental",
+       "default_reasoning_summary": "none",
+@@ -137,9 +137,9 @@
+       "include_plugin_usage_instructions": true,
+       "include_apps_usage_instructions": true,
+       "auto_review_model_override": null,
+-      "context_window": 272000,
+-      "max_context_window": 272000,
+-      "auto_compact_token_limit": null,
++      "context_window": 370000,
++      "max_context_window": 1050000,
++      "auto_compact_token_limit": 350000,
+       "comp_hash": "3000",
+       "reasoning_summary_format": "experimental",
+       "default_reasoning_summary": "none",
+@@ -249,9 +249,9 @@
+       "include_plugin_usage_instructions": true,
+       "include_apps_usage_instructions": true,
+       "auto_review_model_override": null,
+-      "context_window": 272000,
+-      "max_context_window": 272000,
+-      "auto_compact_token_limit": null,
++      "context_window": 370000,
++      "max_context_window": 1050000,
++      "auto_compact_token_limit": 350000,
+       "comp_hash": "3000",
+       "reasoning_summary_format": "experimental",
+       "default_reasoning_summary": "none",
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 0768d1e4c4..864adbefd3 100644
+index 8669a0a34f..4bdf5b2e97 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
-@@ -1481,3 +1481,77 @@ fn bundled_models_json_roundtrips() {
+@@ -1479,3 +1479,89 @@ fn bundled_models_json_roundtrips() {
          "bundled models.json should contain at least one model"
      );
  }
@@ -13285,9 +13701,10 @@ index 0768d1e4c4..864adbefd3 100644
 +    assert_eq!(model.auto_compact_token_limit(), Some(180_000));
 +}
 +
-+/// Bundled catalog leaves the limit unset so context-window policy owns it.
++/// Codex-LHC ships a 370k working window and 350k LHC trigger while retaining
++/// the full 1.05M capability ceiling for explicit operator overrides.
 +#[test]
-+fn gpt_5_6_bundled_catalog_uses_regular_context_window_default() {
++fn gpt_5_6_bundled_catalog_uses_lhc_long_context_defaults() {
 +    let bundled = crate::bundled_models_response().expect("bundled parses");
 +    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
 +        let model = bundled
@@ -13296,21 +13713,142 @@ index 0768d1e4c4..864adbefd3 100644
 +            .find(|m| m.slug == slug)
 +            .unwrap_or_else(|| panic!("bundled missing {slug}"));
 +        assert_eq!(
-+            model.auto_compact_token_limit, None,
-+            "{slug}: models.json must defer to the regular context-window default"
++            model.context_window,
++            Some(370_000),
++            "{slug}: bundled working window must be 370k"
++        );
++        assert_eq!(
++            model.auto_compact_token_limit,
++            Some(350_000),
++            "{slug}: bundled LHC compact trigger must be 350k"
 +        );
 +        assert_eq!(
 +            model.auto_compact_token_limit(),
-+            Some(244_800),
-+            "{slug}: bundled model must resolve to 90% of 272k"
++            Some(350_000),
++            "{slug}: effective bundled trigger must remain 350k"
++        );
++        assert_eq!(
++            model.max_context_window,
++            Some(1_050_000),
++            "{slug}: operator config must be able to opt into the full capability"
 +        );
 +    }
 +}
+diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs
+index 55dc633382..390939abf2 100644
+--- a/codex-rs/protocol/src/config_types.rs
++++ b/codex-rs/protocol/src/config_types.rs
+@@ -534,6 +534,49 @@ impl ServiceTier {
+     }
+ }
+ 
++pub const LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD: i64 = 272_000;
++
++fn default_lc_adaptive_service_tier_threshold() -> i64 {
++    LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD
++}
++
++fn default_lc_adaptive_service_tier_below() -> String {
++    "fast".to_string()
++}
++
++fn default_lc_adaptive_service_tier_at_or_above() -> String {
++    SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()
++}
++
++/// Cost control for long-context agents that normally use Fast service.
++///
++/// Below `threshold`, requests use `below`. At or above it, requests use
++/// `at_or_above`, avoiding simultaneous Fast and long-context multipliers.
++/// Compaction naturally restores the lower-context tier on the next request.
++#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
++#[serde(deny_unknown_fields)]
++pub struct LcAdaptiveServiceTierConfig {
++    #[serde(default)]
++    pub enabled: bool,
++    #[serde(default = "default_lc_adaptive_service_tier_threshold")]
++    pub threshold: i64,
++    #[serde(default = "default_lc_adaptive_service_tier_below")]
++    pub below: String,
++    #[serde(default = "default_lc_adaptive_service_tier_at_or_above")]
++    pub at_or_above: String,
++}
++
++impl Default for LcAdaptiveServiceTierConfig {
++    fn default() -> Self {
++        Self {
++            enabled: false,
++            threshold: LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD,
++            below: default_lc_adaptive_service_tier_below(),
++            at_or_above: default_lc_adaptive_service_tier_at_or_above(),
++        }
++    }
++}
++
+ #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
+ #[serde(rename_all = "lowercase")]
+ #[strum(serialize_all = "lowercase")]
+diff --git a/codex-rs/protocol/src/openai_models.rs b/codex-rs/protocol/src/openai_models.rs
+index 70672cde94..6b0cac4345 100644
+--- a/codex-rs/protocol/src/openai_models.rs
++++ b/codex-rs/protocol/src/openai_models.rs
+@@ -480,16 +480,13 @@ impl ModelInfo {
+     }
+ 
+     pub fn auto_compact_token_limit(&self) -> Option<i64> {
+-        let context_limit = self
+-            .resolved_context_window()
+-            .map(|context_window| (context_window * 9) / 10);
+-        let config_limit = self.auto_compact_token_limit;
+-        if let Some(context_limit) = context_limit {
++        let context_window = self.resolved_context_window();
++        if let Some(configured_limit) = self.auto_compact_token_limit {
+             return Some(
+-                config_limit.map_or(context_limit, |limit| std::cmp::min(limit, context_limit)),
++                context_window.map_or(configured_limit, |window| configured_limit.min(window)),
+             );
+         }
+-        config_limit
++        context_window.map(|window| (window * 9) / 10)
+     }
+ 
+     pub fn supports_personality(&self) -> bool {
+@@ -1715,6 +1712,30 @@ mod tests {
+         assert_eq!(model.auto_compact_token_limit(), Some(360_000));
+     }
+ 
++    #[test]
++    fn explicit_auto_compact_limit_can_use_reserved_headroom_above_ninety_percent() {
++        let model = ModelInfo {
++            context_window: Some(370_000),
++            max_context_window: Some(1_050_000),
++            auto_compact_token_limit: Some(350_000),
++            ..test_model(/*spec*/ None)
++        };
++
++        assert_eq!(model.auto_compact_token_limit(), Some(350_000));
++    }
++
++    #[test]
++    fn explicit_auto_compact_limit_never_exceeds_working_window() {
++        let model = ModelInfo {
++            context_window: Some(370_000),
++            max_context_window: Some(1_050_000),
++            auto_compact_token_limit: Some(500_000),
++            ..test_model(/*spec*/ None)
++        };
++
++        assert_eq!(model.auto_compact_token_limit(), Some(370_000));
++    }
++
+     #[test]
+     fn model_preset_preserves_availability_nux() {
+         let preset = ModelPreset::from(ModelInfo {
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
-index 11ce48b5bf..7423c9ffe9 100644
+index b6fba6b760..23ef6386de 100644
 --- a/codex-rs/rollout/src/recorder.rs
 +++ b/codex-rs/rollout/src/recorder.rs
-@@ -131,6 +131,14 @@ enum RolloutCmd {
+@@ -130,6 +130,14 @@ enum RolloutCmd {
      Flush {
          ack: oneshot::Sender<std::io::Result<()>>,
      },
@@ -13325,7 +13863,7 @@ index 11ce48b5bf..7423c9ffe9 100644
      Shutdown {
          ack: oneshot::Sender<std::io::Result<()>>,
      },
-@@ -1002,6 +1010,28 @@ impl RolloutRecorder {
+@@ -1001,6 +1009,28 @@ impl RolloutRecorder {
          })?
      }
  
@@ -13354,7 +13892,7 @@ index 11ce48b5bf..7423c9ffe9 100644
      pub async fn load_rollout_items(
          path: &Path,
      ) -> std::io::Result<(Vec<RolloutItem>, Option<ThreadId>, usize)> {
-@@ -1686,6 +1716,30 @@ impl RolloutWriterState {
+@@ -1685,6 +1715,30 @@ impl RolloutWriterState {
          self.write_pending_with_recovery("flush").await
      }
  
@@ -13385,7 +13923,7 @@ index 11ce48b5bf..7423c9ffe9 100644
      async fn shutdown(&mut self) -> std::io::Result<()> {
          if self.is_deferred() && self.pending_items.is_empty() {
              return Ok(());
-@@ -1828,6 +1882,9 @@ async fn rollout_writer(
+@@ -1827,6 +1881,9 @@ async fn rollout_writer(
              RolloutCmd::Flush { ack } => {
                  let _ = ack.send(state.flush().await);
              }
@@ -13396,10 +13934,10 @@ index 11ce48b5bf..7423c9ffe9 100644
                  Ok(()) => {
                      let _ = ack.send(Ok(()));
 diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
-index dc9afcf9e7..a28833f2b5 100644
+index 2f043800f2..600dd13f78 100644
 --- a/codex-rs/thread-store/src/live_thread.rs
 +++ b/codex-rs/thread-store/src/live_thread.rs
-@@ -368,6 +368,23 @@ impl LiveThread {
+@@ -380,6 +380,23 @@ impl LiveThread {
              .map(Some)
      }
  
@@ -13424,10 +13962,10 @@ index dc9afcf9e7..a28833f2b5 100644
          let update = self.metadata_sync.lock().await.take_pending_update();
          self.apply_pending_metadata_update(update).await
 diff --git a/codex-rs/thread-store/src/local/live_writer.rs b/codex-rs/thread-store/src/local/live_writer.rs
-index a71ec86729..182037d177 100644
+index 8472027401..e4ef9f0149 100644
 --- a/codex-rs/thread-store/src/local/live_writer.rs
 +++ b/codex-rs/thread-store/src/local/live_writer.rs
-@@ -202,6 +202,36 @@ pub(super) async fn rollout_path(
+@@ -213,6 +213,36 @@ pub(super) async fn rollout_path(
          .to_path_buf())
  }
  
@@ -13441,7 +13979,7 @@ index a71ec86729..182037d177 100644
 +    thread_id: ThreadId,
 +) -> ThreadStoreResult<()> {
 +    let _live_writer_guard = store.live_writer_locks.lock(thread_id).await;
-+    let (recorder, history_mode) = live_writer_parts(store, thread_id).await?;
++    let (recorder, _rollout_id, history_mode) = live_writer_parts(store, thread_id).await?;
 +    recorder
 +        .reopen_after_rewrite()
 +        .await
@@ -13465,10 +14003,10 @@ index a71ec86729..182037d177 100644
      store: &LocalThreadStore,
      thread_id: ThreadId,
 diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
-index f4f14fe730..e4c61ce538 100644
+index e5c12dd11f..3c81c28707 100644
 --- a/codex-rs/thread-store/src/local/mod.rs
 +++ b/codex-rs/thread-store/src/local/mod.rs
-@@ -261,6 +261,11 @@ impl LocalThreadStore {
+@@ -267,6 +267,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
  

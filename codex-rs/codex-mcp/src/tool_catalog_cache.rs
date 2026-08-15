@@ -161,8 +161,6 @@ impl McpToolCatalogCacheContext {
 
         let mut tools = tools.to_vec();
         for tool in &mut tools {
-            // Initialize instructions belong to one live connection and must not cross sessions.
-            tool.namespace_description = None;
             // Tool annotations affect approval and parallelism decisions, so only the live
             // connection may supply them.
             tool.tool.annotations = None;
@@ -235,7 +233,7 @@ impl ToolCatalogIdentity {
                 &config.transport,
                 McpServerTransportConfig::Stdio { cwd: None, .. }
             )
-            .then(|| runtime_context.local_stdio_fallback_cwd()),
+            .then(|| runtime_context.local_process_cwd()),
         })
     }
 }
@@ -258,8 +256,13 @@ impl ToolCatalogTransportIdentity {
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            http_headers_helper,
         } = &config.transport
         {
+            // Helper output is a dynamic credential identity that cannot be represented by config.
+            if http_headers_helper.is_some() {
+                return None;
+            }
             let (connection_identity, protocol_mode, agent_plugin) = connection_identity?;
             if config.oauth.is_some()
                 || config.scopes.is_some()

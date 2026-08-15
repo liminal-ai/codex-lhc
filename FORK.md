@@ -65,6 +65,37 @@ publishes without rebuilding only after Lee or CTO approval. Windows x86-64
 and Apple Silicon macOS remain source-readiness targets in
 `lhc-platform-readiness.yml`; they are not current prebuilt release assets.
 
+## LC Adaptive Service Tier
+
+`lc_adaptive_service_tier` is an opt-in cost control for long-context agents.
+It uses Fast service below a configured prepared-request threshold and Normal
+service at or above it. After LHC compact reduces the request below the
+threshold, the next request naturally returns to Fast. The resolver is pure:
+it does not mutate config or persist a separate toggle state. When disabled,
+manual `service_tier` behavior is unchanged.
+
+```toml
+# Cost control for long-context agents.
+#
+# Fast service improves latency but consumes rate-limit capacity faster.
+# OpenAI also increases token cost after the long-context threshold.
+# This feature avoids stacking both costs: it uses Fast below the threshold,
+# downshifts to Normal above it, and returns to Fast after compaction.
+#
+# Enable this if you prefer Fast and contexts above 272K,
+# but do not want to pay both multipliers at the same time.
+[lc_adaptive_service_tier]
+enabled = true
+threshold = 272000
+below = "fast"
+at_or_above = "default"
+```
+
+The distributed GPT-5.6 defaults use a 370K working window and a 350K LHC
+compact trigger. Their catalog capability ceiling remains 1.05M so operators
+using an API key can opt into a larger window. Requests above 272K use
+OpenAI's long-context pricing and consume rate limits faster.
+
 ## Touchpoint inventory (core lines owned by the fork)
 
 Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
@@ -108,6 +139,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
 | 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
 | 32 | `cli/Cargo.toml` | Codex-LHC product release version reported by `codex --version` | `0001-workspace-member` |
+| 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3

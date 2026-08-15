@@ -606,6 +606,7 @@
             "usageLimitExceeded",
             "serverOverloaded",
             "cyberPolicy",
+            "misalignmentPolicyViolation",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -4884,6 +4885,17 @@
       ],
       "type": "object"
     },
+    "ThreadQueueChangedNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ThreadRealtimeAudioChunk": {
       "description": "EXPERIMENTAL - thread realtime audio chunk.",
       "properties": {
@@ -5062,6 +5074,17 @@
       "required": [
         "role",
         "text",
+        "threadId"
+      ],
+      "type": "object"
+    },
+    "ThreadRevertedNotification": {
+      "properties": {
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
         "threadId"
       ],
       "type": "object"
@@ -6153,6 +6176,26 @@
       "properties": {
         "method": {
           "enum": [
+            "thread/reverted"
+          ],
+          "title": "Thread/revertedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadRevertedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/revertedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
             "skills/changed"
           ],
           "title": "Skills/changedNotificationMethod",
@@ -6227,6 +6270,26 @@
         "params"
       ],
       "title": "Thread/goal/clearedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "thread/queue/changed"
+          ],
+          "title": "Thread/queue/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/ThreadQueueChangedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Thread/queue/changedNotification",
       "type": "object"
     },
     {

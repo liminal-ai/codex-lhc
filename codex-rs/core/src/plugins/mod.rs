@@ -1,6 +1,7 @@
 mod discoverable;
 mod injection;
 mod mentions;
+pub(crate) mod metrics;
 mod render;
 #[cfg(test)]
 #[path = "skill_snapshot_tests.rs"]
@@ -10,6 +11,7 @@ pub(crate) mod test_support;
 
 use crate::config::Config;
 use codex_core_plugins::PluginsManager;
+use codex_protocol::auth::AuthMode;
 use codex_skills_extension::HostSkillsService;
 use std::sync::Arc;
 
@@ -27,10 +29,14 @@ pub(crate) use mentions::collect_tool_mentions_from_messages;
 /// Constructs a standalone plugin manager with extension-owned plugin skill loading.
 ///
 /// Callers that already own a host skills service should inject that existing service instead.
-pub fn plugins_manager_for_config(config: &Config) -> PluginsManager {
+pub fn plugins_manager_for_config(config: &Config, auth_mode: Option<AuthMode>) -> PluginsManager {
     let skill_root_loader = Arc::new(HostSkillsService::new(
         config.codex_home.clone(),
         /*bundled_skills_enabled*/ false,
     ));
-    PluginsManager::new(config.codex_home.to_path_buf(), skill_root_loader)
+    PluginsManager::new(
+        config.codex_home.to_path_buf(),
+        auth_mode,
+        skill_root_loader,
+    )
 }

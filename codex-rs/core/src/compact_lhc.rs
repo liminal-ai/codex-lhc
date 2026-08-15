@@ -1386,7 +1386,7 @@ async fn install_lhc_compact_rewrite(
 
     let world_state_value = world_state_baseline
         .as_ref()
-        .map(|ws| ws.snapshot().into_value());
+        .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 
     // Provisional boundary message (host ids filled after history extract).
     let provisional_message = marker.to_durable_writeback_record();

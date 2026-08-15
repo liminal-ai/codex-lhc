@@ -26,6 +26,7 @@ use crate::client::X_OPENAI_SUBAGENT_HEADER;
 pub(crate) const INSTALLATION_ID_KEY: &str = "installation_id";
 pub(crate) const SESSION_ID_KEY: &str = "session_id";
 pub(crate) const THREAD_ID_KEY: &str = "thread_id";
+pub(crate) const AGENT_NAME_KEY: &str = "agent_name";
 pub(crate) const TURN_ID_KEY: &str = "turn_id";
 pub(crate) const WINDOW_ID_KEY: &str = "window_id";
 pub(crate) const REQUEST_KIND_KEY: &str = "request_kind";
@@ -38,11 +39,14 @@ pub(crate) const TURN_STARTED_AT_UNIX_MS_KEY: &str = "turn_started_at_unix_ms";
 pub(crate) const FORKED_FROM_THREAD_ID_KEY: &str = "forked_from_thread_id";
 pub(crate) const PARENT_THREAD_ID_KEY: &str = "parent_thread_id";
 pub(crate) const PARENT_TURN_ID_KEY: &str = "parent_turn_id";
+pub(crate) const ROOT_TURN_ID_KEY: &str = "root_turn_id";
 pub(crate) const SUBAGENT_KIND_KEY: &str = "subagent_kind";
 pub(crate) const THREAD_SOURCE_KEY: &str = "thread_source";
 pub(crate) const SANDBOX_KEY: &str = "sandbox";
 pub(crate) const SANDBOX_MODE_KEY: &str = "sandbox_mode";
 pub(crate) const AUTO_REVIEW_ENABLED_KEY: &str = "auto_review_enabled";
+pub(crate) const NODE_REPL_AUTO_REVIEW_REQUIRED_KEY: &str = "node_repl_auto_review_required";
+pub(crate) const NODE_REPL_DISABLED_KEY: &str = "node_repl_disabled";
 pub(crate) const WORKSPACES_KEY: &str = "workspaces";
 
 // App-server clients can specify additional metadata in the `responsesapi_client_metadata` param
@@ -52,6 +56,7 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     X_CODEX_INSTALLATION_ID_HEADER,
     SESSION_ID_KEY,
     THREAD_ID_KEY,
+    AGENT_NAME_KEY,
     TURN_ID_KEY,
     WINDOW_ID_KEY,
     X_CODEX_WINDOW_ID_HEADER,
@@ -66,11 +71,14 @@ const RESERVED_METADATA_KEYS: &[&str] = &[
     FORKED_FROM_THREAD_ID_KEY,
     PARENT_THREAD_ID_KEY,
     PARENT_TURN_ID_KEY,
+    ROOT_TURN_ID_KEY,
     SUBAGENT_KIND_KEY,
     THREAD_SOURCE_KEY,
     SANDBOX_KEY,
     SANDBOX_MODE_KEY,
     AUTO_REVIEW_ENABLED_KEY,
+    NODE_REPL_AUTO_REVIEW_REQUIRED_KEY,
+    NODE_REPL_DISABLED_KEY,
     WORKSPACES_KEY,
 ];
 const MAX_EXTRA_METADATA_ENTRIES: usize = 16;
@@ -197,6 +205,7 @@ pub struct CodexResponsesMetadata {
     pub(crate) installation_id: String,
     pub(crate) session_id: String,
     pub(crate) thread_id: String,
+    pub(crate) agent_name: Option<String>,
     pub(crate) turn_id: Option<String>,
     pub(crate) routing_hint: Option<HeaderValue>,
     pub(crate) window_id: String,
@@ -204,12 +213,15 @@ pub struct CodexResponsesMetadata {
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) parent_turn_id: Option<String>,
+    pub(crate) root_turn_id: Option<String>,
     pub(crate) subagent_header: Option<String>,
     pub(crate) subagent_kind: Option<String>,
     pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) sandbox: Option<String>,
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) auto_review_enabled: Option<bool>,
+    pub(crate) node_repl_auto_review_required: Option<bool>,
+    pub(crate) node_repl_disabled: Option<bool>,
     pub(crate) workspaces: BTreeMap<String, TurnMetadataWorkspace>,
     pub(crate) tool_namespaces_info: Option<TurnToolNamespacesInfo>,
     pub(crate) turn_started_at_unix_ms: Option<i64>,
@@ -227,6 +239,7 @@ impl CodexResponsesMetadata {
             installation_id,
             session_id,
             thread_id,
+            agent_name: None,
             turn_id: None,
             routing_hint: None,
             window_id,
@@ -234,12 +247,15 @@ impl CodexResponsesMetadata {
             forked_from_thread_id: None,
             parent_thread_id: None,
             parent_turn_id: None,
+            root_turn_id: None,
             subagent_header: None,
             subagent_kind: None,
             thread_source: None,
             sandbox: None,
             sandbox_mode: None,
             auto_review_enabled: None,
+            node_repl_auto_review_required: None,
+            node_repl_disabled: None,
             workspaces: BTreeMap::new(),
             tool_namespaces_info: None,
             turn_started_at_unix_ms: None,
@@ -286,6 +302,9 @@ impl CodexResponsesMetadata {
         }
         if let Some(parent_turn_id) = &self.parent_turn_id {
             client_metadata.insert(PARENT_TURN_ID_KEY.to_string(), parent_turn_id.clone());
+        }
+        if let Some(root_turn_id) = &self.root_turn_id {
+            client_metadata.insert(ROOT_TURN_ID_KEY.to_string(), root_turn_id.clone());
         }
         if self.has_turn_metadata()
             && let Some(turn_metadata_json) = self.turn_metadata_json()
@@ -339,6 +358,9 @@ impl CodexResponsesMetadata {
             installation_id: has_request_identity.then_some(self.installation_id.as_str()),
             session_id: has_turn_identity.then_some(self.session_id.as_str()),
             thread_id: has_turn_identity.then_some(self.thread_id.as_str()),
+            agent_name: has_turn_identity
+                .then_some(self.agent_name.as_deref())
+                .flatten(),
             turn_id: has_turn_identity
                 .then_some(self.turn_id.as_deref())
                 .flatten(),
@@ -347,11 +369,14 @@ impl CodexResponsesMetadata {
             forked_from_thread_id: self.forked_from_thread_id,
             parent_thread_id: self.parent_thread_id,
             parent_turn_id: self.parent_turn_id.as_deref(),
+            root_turn_id: self.root_turn_id.as_deref(),
             subagent_kind: self.subagent_kind.as_deref(),
             thread_source: self.thread_source.as_ref(),
             sandbox: self.sandbox.as_deref(),
             sandbox_mode: self.sandbox_mode.as_deref(),
             auto_review_enabled: self.auto_review_enabled,
+            node_repl_auto_review_required: self.node_repl_auto_review_required,
+            node_repl_disabled: self.node_repl_disabled,
             workspaces: non_empty_workspaces(&self.workspaces),
             tool_namespaces_info: self.tool_namespaces_info.as_ref(),
             turn_started_at_unix_ms: self.turn_started_at_unix_ms,
@@ -456,6 +481,8 @@ struct CodexTurnMetadataPayload<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_name: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     window_id: Option<&'a str>,
@@ -468,6 +495,8 @@ struct CodexTurnMetadataPayload<'a> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_turn_id: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_turn_id: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_kind: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thread_source: Option<&'a ThreadSource>,
@@ -477,6 +506,10 @@ struct CodexTurnMetadataPayload<'a> {
     sandbox_mode: Option<&'a str>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auto_review_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_repl_auto_review_required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_repl_disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workspaces: Option<&'a BTreeMap<String, TurnMetadataWorkspace>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

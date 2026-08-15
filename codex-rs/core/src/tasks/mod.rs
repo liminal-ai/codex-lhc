@@ -317,12 +317,23 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let (pending_items, parent_turn_id) =
+        let (pending_items, parent_turn_id, root_turn_id) =
             self.input_queue.get_pending_input(&self.active_turn).await;
-        if let (MailboxParentProvenance::Attribute, Some(id)) =
-            (mailbox_parent_provenance, parent_turn_id)
+        if let MailboxParentProvenance::Attribute = mailbox_parent_provenance {
+            if let Some(id) = parent_turn_id {
+                turn_context.turn_metadata_state.set_parent_turn_id(id);
+            }
+            if let Some(id) = root_turn_id {
+                turn_context.turn_metadata_state.set_root_turn_id(id);
+            }
+        } else if pending_items.iter().any(|item| {
+            matches!(
+                item,
+                TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
+            )
+        }) && turn_context.turn_metadata_state.root_turn_id() != root_turn_id
         {
-            turn_context.turn_metadata_state.set_parent_turn_id(id);
+            turn_context.turn_metadata_state.mark_root_turn_ambiguous();
         }
         let turn_state = {
             let mut active = self.active_turn.lock().await;
@@ -485,7 +496,7 @@ impl Session {
         let mut active_turn_to_clear = None;
         let mut turn_context = None;
         let mut abort_timing = None;
-        if let Some(mut active_turn) = self.take_active_turn().await {
+        if let Some(mut active_turn) = self.take_active_turn(&reason).await {
             let task = active_turn.task.take();
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -531,6 +542,12 @@ impl Session {
                 .and_then(|active_turn| active_turn.task.as_ref())
                 .is_some_and(|task| task.turn_context.sub_id == turn_id)
             {
+                if matches!(
+                    reason,
+                    TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+                ) {
+                    self.mark_interrupted();
+                }
                 active.take()
             } else {
                 None
@@ -776,7 +793,10 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile,
             });
-        let idle_cause = if matches!(abort_reason.as_ref(), Some(TurnAbortReason::Interrupted)) {
+        let idle_cause = if matches!(
+            abort_reason.as_ref(),
+            Some(TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited)
+        ) {
             ThreadIdleCause::Interrupted
         } else if abort_reason.is_none() && turn_context.terminal_error.lock().await.is_some() {
             ThreadIdleCause::Failed
@@ -852,8 +872,17 @@ impl Session {
         }
     }
 
-    async fn take_active_turn(&self) -> Option<ActiveTurn> {
+    async fn take_active_turn(&self, reason: &TurnAbortReason) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
+        if matches!(
+            reason,
+            TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited
+        ) && active
+            .as_ref()
+            .is_some_and(|active_turn| active_turn.task.is_some())
+        {
+            self.mark_interrupted();
+        }
         active.take()
     }
 

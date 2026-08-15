@@ -19,6 +19,7 @@ use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
+use codex_core_plugins::PluginMetricsSidecar;
 use codex_execpolicy::Decision;
 use codex_execpolicy::Evaluation;
 use codex_execpolicy::MatchOptions;
@@ -41,6 +42,7 @@ use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::record_filesystem_sandbox_violation;
 use codex_shell_command::bash::parse_shell_lc_plain_commands;
 use codex_shell_command::bash::parse_shell_lc_single_command_prefix;
@@ -103,6 +105,7 @@ pub(super) async fn try_run_zsh_fork(
     attempt: &SandboxAttempt<'_>,
     ctx: &ToolCtx,
     command: &[String],
+    metrics_sidecar: Option<&PluginMetricsSidecar>,
 ) -> Result<Option<ExecToolCallOutput>, ToolError> {
     let Some(shell_zsh_path) = ctx.session.services.shell_zsh_path.as_ref() else {
         tracing::warn!("ZshFork backend specified, but shell_zsh_path is not configured.");
@@ -127,9 +130,16 @@ pub(super) async fn try_run_zsh_fork(
         ..req.clone()
     };
     let mut env = exec_env_for_sandbox_permissions(&req.env, req.sandbox_permissions);
+    if let Some(sidecar) = metrics_sidecar {
+        sidecar.install_output_env(&mut env);
+    }
     prepend_zsh_fork_bin_to_path(&mut env, shell_zsh_path);
-    let command =
-        build_sandbox_command(command, &req.cwd, &env, req.additional_permissions.clone())?;
+    let sidecar_permissions = metrics_sidecar.map(PluginMetricsSidecar::additional_permissions);
+    let additional_permissions = merge_permission_profiles(
+        req.additional_permissions.as_ref(),
+        sidecar_permissions.as_ref(),
+    );
+    let command = build_sandbox_command(command, &req.cwd, &env, additional_permissions)?;
     let options = ExecOptions {
         expiration: req.timeout_ms.into(),
         capture_policy: ExecCapturePolicy::ShellTool,
@@ -139,7 +149,7 @@ pub(super) async fn try_run_zsh_fork(
             command,
             options,
             managed_network_for_sandbox_permissions(req.network.as_ref(), req.sandbox_permissions),
-            Some(&req.turn_environment.environment_id),
+            Some(&req.turn_environment.selection.environment_id),
         )
         .map_err(ToolError::Codex)?;
     let crate::sandboxing::ExecRequest {
@@ -234,7 +244,7 @@ pub(super) async fn try_run_zsh_fork(
         session: Arc::clone(&ctx.session),
         review_context: GuardianReviewContext::from(&ctx.step_context),
         call_id: ctx.call_id.clone(),
-        environment_id: req.turn_environment.environment_id.clone(),
+        environment_id: req.turn_environment.selection.environment_id.clone(),
         source: GuardianCommandSource::Shell,
         tool_name: ctx.tool_name.clone(),
         approval_policy: ctx.step_context.turn.approval_policy(),
@@ -321,7 +331,7 @@ pub(crate) async fn prepare_unified_exec_zsh_fork(
         session: Arc::clone(&ctx.session),
         review_context: GuardianReviewContext::from(&ctx.step_context),
         call_id: ctx.call_id.clone(),
-        environment_id: req.turn_environment.environment_id.clone(),
+        environment_id: req.turn_environment.selection.environment_id.clone(),
         source: GuardianCommandSource::UnifiedExec,
         tool_name: ctx.tool_name.clone(),
         approval_policy: ctx.step_context.turn.approval_policy(),
@@ -971,7 +981,7 @@ impl CoreShellCommandExecutor {
             exec_request,
             options,
             self.windows_sandbox_workspace_roots.clone(),
-        );
+        )?;
         if let Some(network) = exec_request.network.as_ref() {
             network
                 .apply_to_env_for_optional_environment(

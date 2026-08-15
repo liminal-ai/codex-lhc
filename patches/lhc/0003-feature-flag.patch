@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 05528ce3f1..3292ddcf97 100644
+index d05a206097..382b2d337e 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -609,6 +609,9 @@
+@@ -615,6 +615,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,38 @@ index 05528ce3f1..3292ddcf97 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -5251,6 +5254,9 @@
+@@ -1582,6 +1585,30 @@
+       ],
+       "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
+     },
++    "LcAdaptiveServiceTierConfig": {
++      "additionalProperties": false,
++      "description": "Cost control for long-context agents that normally use Fast service.\n\nBelow `threshold`, requests use `below`. At or above it, requests use `at_or_above`, avoiding simultaneous Fast and long-context multipliers. Compaction naturally restores the lower-context tier on the next request.",
++      "properties": {
++        "at_or_above": {
++          "default": "default",
++          "type": "string"
++        },
++        "below": {
++          "default": "fast",
++          "type": "string"
++        },
++        "enabled": {
++          "default": false,
++          "type": "boolean"
++        },
++        "threshold": {
++          "default": 272000,
++          "format": "int64",
++          "type": "integer"
++        }
++      },
++      "type": "object"
++    },
+     "LegacyAppPathString": {
+       "type": "string"
+     },
+@@ -5373,6 +5400,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -22,11 +53,26 @@ index 05528ce3f1..3292ddcf97 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
+@@ -5676,6 +5706,14 @@
+       "description": "System instructions.",
+       "type": "string"
+     },
++    "lc_adaptive_service_tier": {
++      "allOf": [
++        {
++          "$ref": "#/definitions/LcAdaptiveServiceTierConfig"
++        }
++      ],
++      "description": "Optional LC Adaptive Service Tier cost control. When enabled, this owns request tier selection using the prepared long-context request size."
++    },
+     "log_dir": {
+       "allOf": [
+         {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index 31cb6afe37..a9159172c7 100644
+index ea07f80cba..e35940549f 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -279,6 +279,9 @@ pub enum Feature {
+@@ -288,6 +288,9 @@ pub enum Feature {
      PreventIdleSleep,
      /// Enable remote compaction v2 over the normal Responses API.
      RemoteCompactionV2,
@@ -36,7 +82,7 @@ index 31cb6afe37..a9159172c7 100644
      /// Retain client-authored developer messages across compacted context windows.
      RetainClientDeveloperMessages,
      /// Use Agent Identity for ChatGPT-authenticated sessions.
-@@ -1456,6 +1459,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1492,6 +1495,13 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },

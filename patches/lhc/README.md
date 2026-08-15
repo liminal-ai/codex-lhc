@@ -25,7 +25,7 @@ with the working tree, plus that every fork-owned file under `codex-rs/`
 See FORK.md's touchpoint inventory for the authoritative file list, and
 FORK.md §History-reset recovery for the drill this series exists to serve.
 
-## Series (regenerated 2026-08-12 against `BASE` = `16fbfe5574`)
+## Series (regenerated 2026-08-15 against `BASE` = `334c6ed7fd`)
 
 `BASE` advances on every upstream sync — see FORK.md "Sync drill" step 4.
 Regenerate the *whole* series against the new base in the same commit as the
@@ -39,10 +39,10 @@ One base for all seven; each fork-owned file in exactly one patch.
 | 0001-workspace-member | `codex-rs/Cargo.toml`, `code-mode-runtime/Cargo.toml` (local V8 artifact workaround), `cli/Cargo.toml` (product release identity) |
 | 0002-raw-item-contributor | `ext/extension-api/{contributors.rs, contributors/raw_item.rs, contributors/turn_lifecycle.rs, lib.rs, registry.rs}`, `ext/goal/tests/goal_extension_backend.rs` (turn timing fields on lifecycle inputs) |
 | 0003-feature-flag | `features/src/lib.rs`, `core/config.schema.json` |
-| 0004-session-raw-item-hook | `core/src/session/mod.rs`, `core/src/session/lhc_capture_e2e_tests.rs`, `core/src/stream_events_utils.rs`, `core/src/compact.rs` |
+| 0004-session-raw-item-hook | `core/src/session/{mod.rs,inject.rs,lhc_capture_e2e_tests.rs}`, `core/src/stream_events_utils.rs`, `core/src/compact.rs` |
 | 0005-app-server-dep | `app-server/Cargo.toml` |
 | 0006-app-server-install | `app-server/src/extensions.rs` |
-| 0007-lhc-compact-arm | `core/Cargo.toml`, `core/src/{compact_lhc.rs, compact_lhc_tests.rs, compact_lhc_slice_d_tests.rs, compact_lhc_mid_turn_tests.rs, lhc_inference_bridge.rs, lib.rs, thread_manager.rs}`, `core/tests/suite/{compact.rs,compact_lhc_mid_turn_loops.rs,mod.rs}`, `core/src/session/{turn.rs, session.rs, tests.rs, input_queue.rs, lhc_band_shape_eval_tests.rs}`, `core/src/state/{auto_compact_window.rs,session.rs,service.rs}`, `core/src/tasks/{compact.rs,lifecycle.rs,mod.rs}`, `models-manager/{models.json,src/manager.rs,src/manager_tests.rs}`, `rollout/src/recorder.rs`, `thread-store/src/live_thread.rs`, `thread-store/src/local/{mod.rs,live_writer.rs}`, `app-server/src/request_processors/thread_processor.rs` (slice E reconcile). LIM-63B/LIM-67 MidTurn compact-continuation lives here; host adapter code is under `codex-rs/lhc/` (not patched). |
+| 0007-lhc-compact-arm | `core/Cargo.toml`, `core/src/{compact_lhc.rs,compact_lhc_tests.rs,compact_lhc_slice_d_tests.rs,compact_lhc_mid_turn_tests.rs,lc_adaptive_service_tier.rs,lhc_inference_bridge.rs,lib.rs,thread_manager.rs}`, `core/src/config/{mod.rs,config_tests.rs}`, `core/tests/suite/{compact.rs,compact_lhc_mid_turn_loops.rs,model_switching.rs,mod.rs}`, `core/src/session/{turn.rs,session.rs,tests.rs,input_queue.rs,lhc_band_shape_eval_tests.rs}`, `core/src/state/{auto_compact_window.rs,session.rs,service.rs}`, `core/src/tasks/{compact.rs,lifecycle.rs,mod.rs}`, `config/src/config_toml.rs`, `protocol/src/{config_types.rs,openai_models.rs}`, `models-manager/{models.json,src/manager_tests.rs}`, `rollout/src/recorder.rs`, `thread-store/src/live_thread.rs`, `thread-store/src/local/{mod.rs,live_writer.rs}`, `app-server/src/request_processors/thread_processor.rs` (slice E reconcile). LIM-63B/LIM-67 MidTurn compact-continuation and LC Adaptive Service Tier live here; host adapter code is under `codex-rs/lhc/` (not patched). |
 
 `core/Cargo.toml` and `core/src/compact.rs` each carry both their Chunk 1 and
 Chunk 2b deltas, because one base means one patch per file. `core/Cargo.toml`

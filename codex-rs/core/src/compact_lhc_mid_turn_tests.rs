@@ -431,6 +431,7 @@ async fn mid_turn_input_epoch_gate_uses_queue_epoch_not_history() {
                 /*trigger_turn*/ false,
             ),
             /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
         )
         .await;
     let history_version_after = session.clone_history().await.history_version();

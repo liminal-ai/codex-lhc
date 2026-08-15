@@ -1,6 +1,6 @@
 use crate::accepted_lines::AcceptedLineFingerprintEventInput;
+use crate::accepted_lines::accepted_line_counts_from_unified_diff;
 use crate::accepted_lines::accepted_line_fingerprint_event_requests;
-use crate::accepted_lines::accepted_line_fingerprints_from_unified_diff;
 use crate::accepted_lines::accepted_line_repo_hash_for_cwd;
 use crate::events::AppServerRpcTransport;
 use crate::events::CodexAppMentionedEventRequest;
@@ -29,6 +29,8 @@ use crate::events::CodexPluginEventRequest;
 use crate::events::CodexPluginInstallFailedEventRequest;
 use crate::events::CodexPluginInstallFailedMetadata;
 use crate::events::CodexPluginInstallRequestedEventRequest;
+use crate::events::CodexPluginMeasurementEventParams;
+use crate::events::CodexPluginMeasurementEventRequest;
 use crate::events::CodexPluginUsedEventRequest;
 use crate::events::CodexReviewEventParams;
 use crate::events::CodexReviewEventRequest;
@@ -89,6 +91,8 @@ use crate::facts::ImagePreparationMetadata;
 use crate::facts::InvocationType;
 use crate::facts::PluginInstallFailedInput;
 use crate::facts::PluginInstallRequestedInput;
+use crate::facts::PluginMeasurementRow;
+use crate::facts::PluginMeasurementsInput;
 use crate::facts::PluginState;
 use crate::facts::PluginStateChangedInput;
 use crate::facts::PluginUsedInput;
@@ -160,6 +164,28 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::path::PathBuf;
 const MAX_TOOL_RESPONSE_ENTRIES: usize = 256;
+
+pub(crate) const MAX_PLUGIN_MEASUREMENTS_PER_BATCH: usize = 100;
+const MAX_PLUGIN_MEASUREMENT_DIMENSIONS: usize = 8;
+const MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES: usize = 64;
+
+pub(crate) fn valid_plugin_measurement_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('a'..='z'))
+        && value.len() <= MAX_PLUGIN_MEASUREMENT_IDENTIFIER_BYTES
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+pub(crate) fn valid_plugin_measurement_row(row: &PluginMeasurementRow) -> bool {
+    row.number_value.is_finite()
+        && valid_plugin_measurement_identifier(&row.measurement_name)
+        && row.dimensions.len() <= MAX_PLUGIN_MEASUREMENT_DIMENSIONS
+        && row.dimensions.iter().all(|(name, value)| {
+            valid_plugin_measurement_identifier(name) && valid_plugin_measurement_identifier(value)
+        })
+}
 
 #[derive(Default)]
 pub(crate) struct AnalyticsReducer {
@@ -398,6 +424,7 @@ struct TurnState {
     steer_count: usize,
     tool_counts: TurnToolCounts,
     resource_skill_invocations: HashSet<String>,
+    turn_event_emitted: bool,
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
@@ -612,6 +639,9 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::PluginInstallFailed(input) => {
                     self.ingest_plugin_install_failed(input, out);
+                }
+                CustomAnalyticsFact::PluginMeasurements(input) => {
+                    self.ingest_plugin_measurements(input, out);
                 }
                 CustomAnalyticsFact::ExternalAgentConfigImportCompleted(input) => {
                     self.ingest_external_agent_config_import_completed(input, out);
@@ -1728,6 +1758,14 @@ impl AnalyticsReducer {
                     );
                 }
                 self.item_review_summaries.remove(&key);
+                if self
+                    .turns
+                    .get(&notification.turn_id)
+                    .is_some_and(|turn_state| turn_state.turn_event_emitted)
+                    && !self.has_pending_tool_items_for_turn(&notification.turn_id)
+                {
+                    self.turns.remove(&notification.turn_id);
+                }
             }
             ServerNotification::ItemGuardianApprovalReviewStarted(notification) => {
                 let _ = notification;
@@ -1782,6 +1820,48 @@ impl AnalyticsReducer {
             }
             _ => {}
         }
+    }
+
+    fn ingest_plugin_measurements(
+        &mut self,
+        input: PluginMeasurementsInput,
+        out: &mut Vec<TrackEventRequest>,
+    ) {
+        if input.rows.is_empty()
+            || input.rows.len() > MAX_PLUGIN_MEASUREMENTS_PER_BATCH
+            || !valid_plugin_measurement_identifier(&input.operation)
+        {
+            return;
+        }
+        let PluginMeasurementsInput {
+            thread_id,
+            turn_id,
+            item_id,
+            plugin_id,
+            execution_id,
+            operation,
+            rows,
+        } = input;
+        out.extend(
+            rows.into_iter()
+                .filter(valid_plugin_measurement_row)
+                .map(|row| {
+                    TrackEventRequest::PluginMeasurement(CodexPluginMeasurementEventRequest {
+                        event_type: "codex_plugin_measurement_event",
+                        event_params: CodexPluginMeasurementEventParams {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            plugin_id: plugin_id.clone(),
+                            execution_id: execution_id.clone(),
+                            operation: operation.clone(),
+                            measurement_name: row.measurement_name,
+                            number_value: row.number_value,
+                            dimensions: (!row.dimensions.is_empty()).then_some(row.dimensions),
+                        },
+                    })
+                }),
+        );
     }
 
     fn emit_thread_initialized(
@@ -2057,6 +2137,9 @@ impl AnalyticsReducer {
         let Some(turn_state) = self.turns.get(turn_id) else {
             return;
         };
+        if turn_state.turn_event_emitted {
+            return;
+        }
         if turn_state.thread_id.is_none()
             || turn_state.num_input_images.is_none()
             || turn_state.resolved_config.is_none()
@@ -2108,7 +2191,19 @@ impl AnalyticsReducer {
             input.repo_hash = accepted_line_repo_hash_for_cwd(cwd.as_path()).await;
             out.extend(accepted_line_fingerprint_event_requests(input));
         }
-        self.turns.remove(turn_id);
+        if self.has_pending_tool_items_for_turn(turn_id) {
+            if let Some(turn_state) = self.turns.get_mut(turn_id) {
+                turn_state.turn_event_emitted = true;
+            }
+        } else {
+            self.turns.remove(turn_id);
+        }
+    }
+
+    fn has_pending_tool_items_for_turn(&self, turn_id: &str) -> bool {
+        self.tool_items_started_at_ms
+            .keys()
+            .any(|key| key.turn_id == turn_id)
     }
 
     /// Resolve the parent connection lazily when a subagent fact arrives first.
@@ -3071,7 +3166,7 @@ fn accepted_line_event_input(
     turn_state: &TurnState,
 ) -> Option<(AcceptedLineFingerprintEventInput, PathBuf)> {
     let latest_diff = turn_state.latest_diff.as_deref()?;
-    let summary = accepted_line_fingerprints_from_unified_diff(latest_diff);
+    let summary = accepted_line_counts_from_unified_diff(latest_diff);
     if summary.accepted_added_lines == 0 && summary.accepted_deleted_lines == 0 {
         return None;
     }
@@ -3090,7 +3185,6 @@ fn accepted_line_event_input(
             repo_hash: None,
             accepted_added_lines: summary.accepted_added_lines,
             accepted_deleted_lines: summary.accepted_deleted_lines,
-            line_fingerprints: summary.line_fingerprints,
         },
         resolved_config.permission_profile_cwd,
     ))

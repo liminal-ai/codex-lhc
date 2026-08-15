@@ -87,6 +87,10 @@ impl App {
                     .resolve_notification(&notification.request_id)
                 {
                     self.chat_widget.dismiss_app_server_request(&request);
+                    if self.startup_pending_protected_request {
+                        self.startup_pending_protected_request =
+                            self.chat_widget.has_pending_protected_request();
+                    }
                 }
             }
             ServerNotification::McpServerStatusUpdated(_) => {
@@ -111,6 +115,10 @@ impl App {
                 return;
             }
             ServerNotification::AccountUpdated(notification) => {
+                // Deferred terminal writes must never carry the previous account's billing into
+                // the newly authenticated identity, even when both accounts share one thread.
+                self.last_thread_usage_status_cell = None;
+                self.pending_thread_usage_history_refresh = false;
                 let has_codex_backend_auth = matches!(
                     notification.auth_mode,
                     Some(

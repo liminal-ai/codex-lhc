@@ -25,6 +25,7 @@ use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
 use crate::RenameThreadSectionParams;
 use crate::ResumeThreadParams;
+use crate::RevertThreadParams;
 use crate::SearchThreadOccurrencesParams;
 use crate::SearchThreadsParams;
 use crate::StoredModelContext;
@@ -128,6 +129,21 @@ pub trait ThreadStore: Any + Send + Sync {
         Box::pin(async {
             Err(ThreadStoreError::Unsupported {
                 operation: "prepare_fork",
+            })
+        })
+    }
+
+    /// Reverts a paginated thread's durable history so it ends immediately before
+    /// `before_turn_id`.
+    ///
+    /// Callers must close the thread's live writer first. The logical thread id and semantic
+    /// metadata stay unchanged.
+    ///
+    /// Stores without paginated revert support can retain this default implementation.
+    fn revert_thread(&self, _params: RevertThreadParams) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "revert_thread",
             })
         })
     }
@@ -246,14 +262,18 @@ pub trait ThreadStore: Any + Send + Sync {
         })
     }
 
-    /// Applies a literal metadata patch and returns the updated thread.
+    /// Applies a literal metadata patch and returns the updated thread when one was materialized.
+    ///
+    /// `None` means the update succeeded without materializing a thread, for example because the
+    /// implementation filtered the patch to a no-op. Callers that require a `StoredThread` must
+    /// perform a fallback read.
     ///
     /// Implementations should apply the supplied fields directly. Policy such as deciding whether
     /// an append-derived preview should be emitted belongs above the store.
     fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreFuture<'_, StoredThread>;
+    ) -> ThreadStoreFuture<'_, Option<StoredThread>>;
 
     /// Moves a thread to, within, or out of a server-ordered section.
     fn move_thread_to_section(

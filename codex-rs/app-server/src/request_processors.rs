@@ -80,6 +80,7 @@ use codex_app_server_protocol::FeedbackUploadResponse;
 use codex_app_server_protocol::GetAccountParams;
 use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::GetAccountResponse;
+use codex_app_server_protocol::GetAccountTokenUsageParams;
 use codex_app_server_protocol::GetAccountTokenUsageResponse;
 use codex_app_server_protocol::GetAuthStatusParams;
 use codex_app_server_protocol::GetAuthStatusResponse;
@@ -333,12 +334,17 @@ use codex_core::CodexThreadSettingsOverrides;
 use codex_core::ForkSnapshot;
 use codex_core::McpManager;
 use codex_core::NewThread;
+use codex_core::NotSubmittedReason;
 #[cfg(test)]
 use codex_core::SessionMeta;
 use codex_core::StartThreadOptions;
-use codex_core::SteerInputError;
+use codex_core::SteerSubmission;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::ThreadManager;
+use codex_core::TurnInput;
+use codex_core::TurnInputRequest;
+use codex_core::TurnInputSubmission;
+use codex_core::TurnStartOptions;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
 use codex_core::config::NetworkProxyAuditMetadata;
@@ -430,14 +436,13 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
-#[cfg(test)]
-use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::ConversationSpeechParams;
 use codex_protocol::protocol::ConversationStartParams;
 use codex_protocol::protocol::ConversationStartTransport;
 use codex_protocol::protocol::ConversationTextParams;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::EventMsg;
 #[cfg(test)]
 use codex_protocol::protocol::GitInfo as CoreGitInfo;
@@ -544,6 +549,7 @@ mod search;
 mod thread_enrichment;
 mod thread_fork_goal;
 mod thread_processor;
+mod thread_queue_processor;
 mod thread_sections;
 mod token_usage_replay;
 mod turn_processor;
@@ -568,6 +574,7 @@ pub(crate) use remote_control_processor::RemoteControlRequestProcessor;
 pub(crate) use search::SearchRequestProcessor;
 pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
+pub(crate) use thread_queue_processor::ThreadQueueRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
 
@@ -631,6 +638,7 @@ fn resolve_turn_environment_selections(
             environment_id,
             cwd,
             workspace_roots,
+            config: EnvironmentConfigState::FromThread,
         });
     }
     thread_manager

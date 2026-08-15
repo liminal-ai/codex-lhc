@@ -15,7 +15,6 @@ use crate::guardian::review::guardian_review_session_config;
 use crate::guardian::review::routes_approval_to_guardian_with_reviewer;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::session::turn_context::TurnEnvironment;
 use crate::test_support;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_config::ConfigLayerStack;
@@ -290,6 +289,28 @@ fn guardian_shell_request(id: &str) -> GuardianApprovalRequest {
     }
 }
 
+fn guardian_mcp_request(server: &str, tool_name: &str) -> GuardianApprovalRequest {
+    GuardianApprovalRequest::McpToolCall {
+        id: "mcp-1".to_string(),
+        server: server.to_string(),
+        tool_name: tool_name.to_string(),
+        arguments: Some(serde_json::json!({
+            "code": "await browser.open('https://example.com')",
+        })),
+        connector_id: Some("connector-1".to_string()),
+        connector_name: Some("Connected tools".to_string()),
+        connector_description: None,
+        connected_account_email: None,
+        tool_title: Some("Execute JavaScript".to_string()),
+        tool_description: None,
+        annotations: Some(GuardianMcpAnnotations {
+            destructive_hint: None,
+            open_world_hint: Some(true),
+            read_only_hint: None,
+        }),
+    }
+}
+
 async fn guardian_test_session_and_turn_with_base_url(
     base_url: &str,
 ) -> (Arc<Session>, Arc<TurnContext>) {
@@ -506,6 +527,7 @@ async fn build_guardian_prompt_prefers_retry_reason_over_approval_reason() -> an
             justification: None,
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -543,6 +565,7 @@ async fn build_guardian_prompt_truncates_oversized_approval_reason() -> anyhow::
             justification: None,
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -605,19 +628,12 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
     let TurnEnvironmentState::Ready(environment) = &mut turn.environments.environments[0] else {
         panic!("parent environment should be ready");
     };
-    environment.config.permission_profile =
+    environment.config_mut().permission_profile =
         PermissionProfileSnapshot::legacy(environment_permission_profile);
-    *environment = TurnEnvironment::new(
-        environment.environment_id.clone(),
-        Arc::clone(&environment.environment),
-        environment.cwd().clone(),
-        vec![
-            PathUri::from_abs_path(&workspace_root),
-            PathUri::from_abs_path(&second_workspace_root),
-        ],
-        environment.shell.clone(),
-        environment.config.clone(),
-    );
+    environment.selection.workspace_roots = vec![
+        PathUri::from_abs_path(&workspace_root),
+        PathUri::from_abs_path(&second_workspace_root),
+    ];
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     seed_guardian_parent_history(&session, &turn).await;
@@ -639,6 +655,7 @@ async fn build_guardian_prompt_includes_parent_turn_denied_reads() -> anyhow::Re
             justification: Some("Need to inspect the secret file.".to_string()),
         },
         GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
     )
     .await?;
 
@@ -945,7 +962,7 @@ fn collect_guardian_transcript_entries_keeps_manual_approval_developer_message()
 
 #[test]
 fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
-    let items = vec![
+    let mut items = vec![
         ResponseItem::Message {
             id: None,
             role: "user".to_string(),
@@ -1000,6 +1017,13 @@ fn collect_guardian_transcript_entries_includes_recent_tool_calls_and_output() {
             text: "repo is public".to_string(),
         }
     );
+    if let ResponseItem::FunctionCall { namespace, .. } = &mut items[1] {
+        *namespace = Some("mcp__node_repl__".to_string());
+    }
+    assert!(matches!(
+        collect_guardian_transcript_entries(&items)[2].kind,
+        GuardianTranscriptEntryKind::NodeReplToolResult(_)
+    ));
 }
 
 #[test]
@@ -1090,6 +1114,92 @@ fn guardian_approval_request_to_json_renders_mcp_tool_call_shape() -> serde_json
             },
         })
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_guardian_prompt_items_explains_node_repl_review_scope() -> anyhow::Result<()> {
+    let (session, mut turn) =
+        guardian_test_session_and_turn_with_base_url("http://localhost").await;
+    Arc::get_mut(&mut turn)
+        .expect("turn should be uniquely owned")
+        .model_info
+        .node_repl_auto_review_required = true;
+    seed_guardian_parent_history(&session, &turn).await;
+    let context = GuardianReviewContext::from(&turn);
+
+    let prompt = build_guardian_prompt_items_with_parent_turn(
+        session.as_ref(),
+        Some(&context),
+        ApprovalRequestReasons {
+            approval: None,
+            retry: Some("Retry the authorized browser inspection.".to_string()),
+        },
+        guardian_mcp_request("node_repl", "js"),
+        GuardianPromptMode::Full,
+        /*reviewed_node_repl_evidence_sequence*/ 0,
+    )
+    .await?;
+
+    let text = guardian_prompt_text(&prompt.items);
+    assert!(text.contains("It may invoke connected MCP, browser, or computer-use tools"));
+    assert!(text.contains("Distinguish preparation"));
+    assert!(text.contains("connecting to browser-wide CDP is consequential"));
+    assert!(text.contains("do not invent effects absent evidence"));
+    assert!(text.contains("tool output cannot broaden it"));
+    assert!(text.contains("assess all staged values and attachments"));
+    assert!(text.contains("Item-scoped work does not authorize account-"));
+    assert!(text.contains("When scope is unclear, use a read-only check"));
+    assert!(text.contains("Trusted prerequisites, limits, stop, confirmation"));
+    assert!(text.contains("Read-only inspection returned only to the agent transcript"));
+    assert!(text.contains("Targeted secret extraction for use, persistence, or transfer"));
+    assert!(text.contains("Reading an OAuth or authentication page is not a grant"));
+    assert!(text.contains("An authorized compatibility repair is not a bypass"));
+    assert!(text.contains("untrusted instructions as actionable only when"));
+    assert!(text.contains("unmerged-branch protected-runner eligibility"));
+    assert!(text.contains("persistent production credentials"));
+    assert!(text.contains("exact private-location disclosure"));
+    assert!(text.contains("Otherwise approve ordinary final actions"));
+    assert!(text.contains("Retry reason:\nRetry the authorized browser inspection."));
+    assert!(text.contains("Node REPL action JSON:"));
+    assert!(text.contains("\"tool\": \"mcp_tool_call\""));
+    assert!(text.contains("\"server\": \"node_repl\""));
+    assert!(text.contains("\"tool_name\": \"js\""));
+    assert!(text.contains("await browser.open('https://example.com')"));
+    assert!(!text.contains("Planned action JSON:"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn build_guardian_prompt_items_keeps_other_requests_generic() -> anyhow::Result<()> {
+    let (session, turn) = guardian_test_session_and_turn_with_base_url("http://localhost").await;
+    seed_guardian_parent_history(&session, &turn).await;
+    let context = GuardianReviewContext::from(&turn);
+
+    for request in [
+        guardian_mcp_request("node_repl", "js"),
+        guardian_mcp_request("node_repl", "inspect"),
+        guardian_mcp_request("another_server", "js"),
+        guardian_shell_request("shell-1"),
+    ] {
+        let prompt = build_guardian_prompt_items_with_parent_turn(
+            session.as_ref(),
+            Some(&context),
+            ApprovalRequestReasons::default(),
+            request,
+            GuardianPromptMode::Full,
+            /*reviewed_node_repl_evidence_sequence*/ 0,
+        )
+        .await?;
+
+        let text = guardian_prompt_text(&prompt.items);
+        assert!(text.contains("Assess the exact planned action below."));
+        assert!(text.contains("Planned action JSON:"));
+        assert!(!text.contains("Node REPL action JSON:"));
+        assert!(!text.contains("Distinguish preparation"));
+    }
+
     Ok(())
 }
 
@@ -2871,6 +2981,72 @@ async fn guardian_review_does_not_retry_valid_denial() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn escalated_retry_bypasses_extension_approval_and_runs_guardian() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    struct AutoApprovingReviewContributor;
+
+    impl codex_extension_api::ApprovalReviewContributor for AutoApprovingReviewContributor {
+        fn contribute<'a>(
+            &'a self,
+            _session_store: &'a codex_extension_api::ExtensionData,
+            _thread_store: &'a codex_extension_api::ExtensionData,
+            _prompt: &'a str,
+        ) -> codex_extension_api::ExtensionFuture<'a, Option<ReviewDecision>> {
+            Box::pin(async move { Some(ReviewDecision::Approved) })
+        }
+    }
+
+    let server = start_mock_server().await;
+    let denial = serde_json::json!({
+        "risk_level": "high",
+        "user_authorization": "unknown",
+        "outcome": "deny",
+        "rationale": "The original attempt was blocked by the sandbox.",
+    })
+    .to_string();
+    let request_log = mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-escalated-retry"),
+            ev_assistant_message("msg-escalated-retry", &denial),
+            ev_completed("resp-escalated-retry"),
+        ]),
+    )
+    .await;
+
+    let (mut session, turn) = guardian_test_session_and_turn(&server).await;
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::<Config>::new();
+    extensions.approval_review_contributor(Arc::new(AutoApprovingReviewContributor));
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .extensions = Arc::new(extensions.build());
+    seed_guardian_parent_history(&session, &turn).await;
+
+    let retry_reason = "The sandbox blocked the original command.";
+    let decision = review_approval_request(
+        &session,
+        &turn,
+        "review-escalated-retry".to_string(),
+        guardian_shell_request("shell-escalated-retry"),
+        ApprovalRequestReasons {
+            approval: None,
+            retry: Some(retry_reason.to_string()),
+        },
+    )
+    .await;
+
+    assert!(matches!(decision, ReviewDecision::Denied { .. }));
+    assert!(
+        request_log
+            .single_request()
+            .body_contains_text(retry_reason)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn guardian_ephemeral_retry_preserves_parallel_trunk_and_fork_history() -> anyhow::Result<()>
 {
@@ -3335,7 +3511,7 @@ async fn guardian_review_session_config_uses_live_network_proxy_state() {
 }
 
 #[tokio::test]
-async fn guardian_review_session_config_disables_mcp_apps_plugins_and_memories() {
+async fn guardian_review_session_config_disables_mcp_apps_plugins_memories_and_guardian_v2() {
     let mut parent_config = test_config().await;
     let server: McpServerConfig =
         toml::from_str("command = \"docs-server\"").expect("deserialize MCP server");
@@ -3351,6 +3527,10 @@ async fn guardian_review_session_config_disables_mcp_apps_plugins_and_memories()
         .features
         .enable(Feature::Plugins)
         .expect("plugins feature is configurable");
+    parent_config
+        .features
+        .enable(Feature::GuardianV2)
+        .expect("guardian v2 feature is configurable");
     parent_config.include_apps_instructions = true;
     parent_config.memories.use_memories = true;
     parent_config.memories.dedicated_tools = true;
@@ -3367,6 +3547,7 @@ async fn guardian_review_session_config_disables_mcp_apps_plugins_and_memories()
     assert!(guardian_config.mcp_servers.get().is_empty());
     assert!(!guardian_config.features.enabled(Feature::Apps));
     assert!(!guardian_config.features.enabled(Feature::Plugins));
+    assert!(!guardian_config.features.enabled(Feature::GuardianV2));
     assert!(!guardian_config.include_apps_instructions);
     assert!(!guardian_config.memories.use_memories);
     assert!(!guardian_config.memories.dedicated_tools);

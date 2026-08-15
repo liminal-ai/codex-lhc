@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_core::TurnInputRequest;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_lhc_host::LhcCaptureSlot;
@@ -26,7 +27,6 @@ use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathExt;
 use core_test_support::responses::ev_assistant_message;
@@ -155,16 +155,10 @@ async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
     arm_midturn_knobs(&test.codex).await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "continue this long agentic task".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "continue this long agentic task".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
@@ -340,22 +334,21 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run two parallel tools then continue".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(test.cwd_path().abs())),
-                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
-                sandbox_policy: Some(sandbox_policy),
-                permission_profile,
-                ..Default::default()
-            },
-        })
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    environments: Some(local_selections(test.cwd_path().abs())),
+                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                    sandbox_policy: Some(sandbox_policy),
+                    permission_profile,
+                    ..Default::default()
+                },
+            ),
+        )
         .await?;
     let terminal = wait_for_event(&test.codex, |ev| {
         matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
@@ -491,16 +484,10 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
     arm_midturn_knobs(&test.codex).await;
 
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "push context until exceeded".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "push context until exceeded".into(),
+            text_elements: Vec::new(),
+        }]))
         .await?;
 
     // Terminal: TurnComplete or Error — not an infinite loop.
@@ -719,22 +706,21 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
     test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run the sustained tool loop".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(test.cwd_path().abs())),
-                approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
-                sandbox_policy: Some(sandbox_policy),
-                permission_profile,
-                ..Default::default()
-            },
-        })
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    environments: Some(local_selections(test.cwd_path().abs())),
+                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                    sandbox_policy: Some(sandbox_policy),
+                    permission_profile,
+                    ..Default::default()
+                },
+            ),
+        )
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 

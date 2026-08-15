@@ -31,6 +31,7 @@ use crate::dynamic_tools::DynamicToolCallOutputContentItem;
 use crate::dynamic_tools::DynamicToolCallRequest;
 use crate::dynamic_tools::DynamicToolResponse;
 use crate::dynamic_tools::DynamicToolSpec;
+use crate::error::Result as CodexResult;
 use crate::items::TurnItem;
 use crate::mcp::CallToolResult;
 use crate::mcp::RequestId;
@@ -54,7 +55,9 @@ use crate::plan_tool::UpdatePlanArgs;
 use crate::request_permissions::RequestPermissionsEvent;
 use crate::request_permissions::RequestPermissionsResponse;
 use crate::request_user_input::RequestUserInputResponse;
-use crate::user_input::UserInput;
+use crate::turn_input::TurnInputMode;
+use crate::turn_input::TurnInputRequest;
+use crate::turn_input::TurnInputSubmission;
 use codex_extension_items::image_generation::ImageGenerationFailure;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
@@ -63,9 +66,11 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde::de::Error as _;
+use serde_json::Map;
 use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
+use tokio::sync::oneshot;
 use tracing::error;
 use ts_rs::TS;
 
@@ -85,6 +90,8 @@ pub use crate::approvals::NetworkApprovalContext;
 pub use crate::approvals::NetworkApprovalProtocol;
 pub use crate::approvals::NetworkPolicyAmendment;
 pub use crate::approvals::NetworkPolicyRuleAction;
+pub use crate::environment::EnvironmentConfig;
+pub use crate::environment::EnvironmentConfigState;
 pub use crate::legacy_events::HasLegacyEvent;
 pub use crate::permissions::FileSystemAccessMode;
 pub use crate::permissions::FileSystemPath;
@@ -140,6 +147,7 @@ pub struct TurnEnvironmentSelection {
     pub environment_id: String,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
+    pub config: EnvironmentConfigState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,12 +186,14 @@ pub struct Submission {
     pub id: String,
     /// Payload
     pub op: Op,
-    /// Client-provided id for the user message represented by `Op::UserInput`.
-    pub client_user_message_id: Option<String>,
     /// Optional W3C trace carrier propagated across async submission handoffs.
     pub trace: Option<W3cTraceContext>,
     /// Core-provided ID of the parent turn that directly initiated this submission.
+    ///
+    /// This is only used for inter-agent communication.
     pub parent_turn_id: Option<String>,
+    /// Core-provided ID of the top-level turn that causally initiated this submission.
+    pub root_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -555,19 +565,17 @@ pub enum Op {
     /// Request the list of voices supported by realtime conversation streams.
     RealtimeConversationListVoices,
 
-    /// User input, optionally with thread-settings overrides applied first.
-    UserInput {
-        /// User input items, see `InputItem`
-        items: Vec<UserInput>,
-        /// Optional JSON Schema used to constrain the final assistant message for this turn.
-        final_output_json_schema: Option<Value>,
-        /// Optional turn-scoped Responses API `client_metadata`.
-        responsesapi_client_metadata: Option<HashMap<String, String>>,
-        /// Client-supplied context fragments keyed by an opaque source identifier.
-        additional_context: BTreeMap<String, AdditionalContextEntry>,
+    /// Submit turn input using the requested routing behavior.
+    TurnInput {
+        request: Box<TurnInputRequest>,
+        mode: TurnInputMode,
+        reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
+    },
 
-        /// Persistent thread-settings overrides to apply before the input.
+    /// Resume an interrupted regular turn.
+    RecoverTurn {
         thread_settings: ThreadSettingsOverrides,
+        reply: oneshot::Sender<CodexResult<TurnInputSubmission>>,
     },
 
     /// Apply persistent thread-settings overrides without starting a turn.
@@ -724,18 +732,6 @@ impl FromStr for ThreadHistoryMode {
     }
 }
 
-impl From<Vec<UserInput>> for Op {
-    fn from(value: Vec<UserInput>) -> Self {
-        Op::UserInput {
-            items: value,
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: ThreadSettingsOverrides::default(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct InterAgentCommunication {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -874,7 +870,8 @@ impl Op {
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
             Self::RealtimeConversationClose => "realtime_conversation_close",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
-            Self::UserInput { .. } => "user_input",
+            Self::TurnInput { .. } => "turn_input",
+            Self::RecoverTurn { .. } => "recover_turn",
             Self::ThreadSettings { .. } => "thread_settings",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
             Self::ExecApproval { .. } => "exec_approval",
@@ -1773,6 +1770,7 @@ pub enum CodexErrorInfo {
     UsageLimitExceeded,
     ServerOverloaded,
     CyberPolicy,
+    MisalignmentPolicyViolation,
     HttpConnectionFailed {
         http_status_code: Option<u16>,
     },
@@ -1811,6 +1809,7 @@ impl CodexErrorInfo {
             | Self::UsageLimitExceeded
             | Self::ServerOverloaded
             | Self::CyberPolicy
+            | Self::MisalignmentPolicyViolation
             | Self::HttpConnectionFailed { .. }
             | Self::ResponseStreamConnectionFailed { .. }
             | Self::InternalServerError
@@ -2994,15 +2993,15 @@ impl<'de> Deserialize<'de> for SessionMetaLine {
 pub struct WorldStateItem {
     /// Full snapshots establish a new baseline; patches update the current baseline.
     pub full: bool,
-    pub state: Value,
+    pub state: Map<String, Value>,
 }
 
 impl WorldStateItem {
-    pub fn full(state: Value) -> Self {
+    pub fn full(state: Map<String, Value>) -> Self {
         Self { full: true, state }
     }
 
-    pub fn patch(state: Value) -> Self {
+    pub fn patch(state: Map<String, Value>) -> Self {
         Self { full: false, state }
     }
 }
@@ -3842,7 +3841,7 @@ pub struct ThreadGoalUpdatedEvent {
     pub goal: ThreadGoal,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "protocol/")]
 pub struct ThreadQueueChangedEvent {
@@ -5565,7 +5564,7 @@ mod tests {
 
     #[test]
     fn user_input_text_serializes_empty_text_elements() -> Result<()> {
-        let input = UserInput::Text {
+        let input = crate::user_input::UserInput::Text {
             text: "hello".to_string(),
             text_elements: Vec::new(),
         };

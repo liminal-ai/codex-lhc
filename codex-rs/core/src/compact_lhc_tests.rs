@@ -2346,9 +2346,9 @@ async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
 
 // ── Emergency triage: strict LHC policy evidence ───────────────────────────
 
-/// Production gpt-5.6 models use regular Codex policy: 90% of 272k.
+/// Production gpt-5.6 models use the Codex-LHC 370k window and 350k trigger.
 #[test]
-fn gpt_5_6_auto_compact_threshold_is_regular_244_800() {
+fn gpt_5_6_auto_compact_threshold_is_lhc_350_000() {
     use codex_models_manager::ModelsManagerConfig;
     use codex_models_manager::bundled_models_response;
     use codex_models_manager::test_support::construct_model_info_offline_for_tests;
@@ -2362,8 +2362,19 @@ fn gpt_5_6_auto_compact_threshold_is_regular_244_800() {
             .find(|m| m.slug == slug)
             .unwrap_or_else(|| panic!("bundled catalog missing {slug}"));
         assert_eq!(
-            catalog.auto_compact_token_limit, None,
-            "{slug}: models.json must defer to regular context-window policy"
+            catalog.context_window,
+            Some(370_000),
+            "{slug}: models.json must use the 370k working window"
+        );
+        assert_eq!(
+            catalog.max_context_window,
+            Some(1_050_000),
+            "{slug}: models.json must retain the full capability ceiling"
+        );
+        assert_eq!(
+            catalog.auto_compact_token_limit,
+            Some(350_000),
+            "{slug}: models.json must use the 350k LHC trigger"
         );
 
         let config = ModelsManagerConfig {
@@ -2376,8 +2387,8 @@ fn gpt_5_6_auto_compact_threshold_is_regular_244_800() {
         let model = construct_model_info_offline_for_tests(slug, &config);
         assert_eq!(
             model.auto_compact_token_limit(),
-            Some(244_800),
-            "{slug}: resolved auto_compact_token_limit() must be 90% of 272k"
+            Some(350_000),
+            "{slug}: resolved auto_compact_token_limit() must be 350k"
         );
     }
 }
@@ -2806,16 +2817,16 @@ async fn model_downshift_target_context_rejects_body_over_target_window() {
     );
 }
 
-/// Successful LHC compact body must clear the regular 244.8k production trigger.
+/// Successful LHC compact body must clear the 350k production trigger.
 #[tokio::test]
 async fn successful_lhc_compact_clears_regular_trigger() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, mut tc) = make_session_and_context().await;
-    // Regular Codex policy for a 272k model.
-    tc.model_info.auto_compact_token_limit = Some(244_800);
-    tc.model_info.context_window = Some(272_000);
-    tc.model_info.max_context_window = Some(272_000);
+    // Codex-LHC policy for GPT-5.6 long-context operation.
+    tc.model_info.auto_compact_token_limit = Some(350_000);
+    tc.model_info.context_window = Some(370_000);
+    tc.model_info.max_context_window = Some(1_050_000);
 
     install_lhc_and_enable(&mut session, root).await;
     let slot = session
@@ -2836,14 +2847,14 @@ async fn successful_lhc_compact_clears_regular_trigger() {
     };
     let body_tokens = codex_lhc_host::estimate_response_items_tokens(&body);
     assert!(
-        body_tokens <= 244_800,
-        "successful LHC body must clear the 244.8k trigger (body_tokens={body_tokens})"
+        body_tokens <= 350_000,
+        "successful LHC body must clear the 350k trigger (body_tokens={body_tokens})"
     );
     let installed = sess.clone_history().await.into_raw_items();
     let installed_tokens = codex_lhc_host::estimate_response_items_tokens(&installed);
     assert!(
-        installed_tokens <= 244_800,
-        "installed history must also clear 244.8k (tokens={installed_tokens})"
+        installed_tokens <= 350_000,
+        "installed history must also clear 350k (tokens={installed_tokens})"
     );
 }
 

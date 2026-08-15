@@ -534,6 +534,49 @@ impl ServiceTier {
     }
 }
 
+pub const LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD: i64 = 272_000;
+
+fn default_lc_adaptive_service_tier_threshold() -> i64 {
+    LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD
+}
+
+fn default_lc_adaptive_service_tier_below() -> String {
+    "fast".to_string()
+}
+
+fn default_lc_adaptive_service_tier_at_or_above() -> String {
+    SERVICE_TIER_DEFAULT_REQUEST_VALUE.to_string()
+}
+
+/// Cost control for long-context agents that normally use Fast service.
+///
+/// Below `threshold`, requests use `below`. At or above it, requests use
+/// `at_or_above`, avoiding simultaneous Fast and long-context multipliers.
+/// Compaction naturally restores the lower-context tier on the next request.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct LcAdaptiveServiceTierConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_lc_adaptive_service_tier_threshold")]
+    pub threshold: i64,
+    #[serde(default = "default_lc_adaptive_service_tier_below")]
+    pub below: String,
+    #[serde(default = "default_lc_adaptive_service_tier_at_or_above")]
+    pub at_or_above: String,
+}
+
+impl Default for LcAdaptiveServiceTierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: LC_ADAPTIVE_SERVICE_TIER_DEFAULT_THRESHOLD,
+            below: default_lc_adaptive_service_tier_below(),
+            at_or_above: default_lc_adaptive_service_tier_at_or_above(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Display, JsonSchema, TS)]
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]

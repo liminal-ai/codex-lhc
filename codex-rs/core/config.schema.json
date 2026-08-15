@@ -573,11 +573,17 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "guardian_enhanced_node_repl_transcripts": {
+              "type": "boolean"
+            },
+            "guardian_node_repl_transcript_images": {
+              "type": "boolean"
+            },
             "guardian_reuse_parent_compaction": {
               "type": "boolean"
             },
             "guardianv2": {
-              "type": "boolean"
+              "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
             },
             "hooks": {
               "type": "boolean"
@@ -772,6 +778,9 @@
               "type": "boolean"
             },
             "unavailable_dummy_tools": {
+              "type": "boolean"
+            },
+            "unbounded_connection_retries": {
               "type": "boolean"
             },
             "undo": {
@@ -1025,6 +1034,16 @@
         }
       ]
     },
+    "FeatureToml_for_GuardianV2ConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/GuardianV2ConfigToml"
+        }
+      ]
+    },
     "FeatureToml_for_MultiAgentV2ConfigToml": {
       "anyOf": [
         {
@@ -1212,6 +1231,94 @@
         "sandbox_approval"
       ],
       "type": "object"
+    },
+    "GuardianV2ConfigToml": {
+      "additionalProperties": false,
+      "description": "User-configurable prompt, approval, and context settings for Guardian v2.",
+      "properties": {
+        "classifier_instructions": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "max_action_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "max_classifier_instruction_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "reasoning_effort": {
+          "$ref": "#/definitions/ReasoningEffort"
+        },
+        "review_threshold": {
+          "format": "double",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "transcript": {
+          "$ref": "#/definitions/GuardianV2TranscriptConfigToml"
+        }
+      },
+      "type": "object"
+    },
+    "GuardianV2TranscriptConfigToml": {
+      "additionalProperties": false,
+      "description": "Bounds and optional sources for the Guardian v2 conversation transcript.",
+      "properties": {
+        "max_message_entry_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "max_message_transcript_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "max_recent_non_user_entries": {
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "max_tool_entry_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "max_tool_transcript_tokens": {
+          "format": "uint",
+          "maximum": 100000.0,
+          "minimum": 100.0,
+          "type": "integer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/definitions/GuardianV2TranscriptSource"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "GuardianV2TranscriptSource": {
+      "description": "Optional conversation sources available to the Guardian v2 classifier.",
+      "enum": [
+        "tool_calls",
+        "tool_outputs",
+        "reasoning"
+      ],
+      "type": "string"
     },
     "History": {
       "additionalProperties": false,
@@ -1478,6 +1585,30 @@
       ],
       "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
     },
+    "LcAdaptiveServiceTierConfig": {
+      "additionalProperties": false,
+      "description": "Cost control for long-context agents that normally use Fast service.\n\nBelow `threshold`, requests use `below`. At or above it, requests use `at_or_above`, avoiding simultaneous Fast and long-context multipliers. Compaction naturally restores the lower-context tier on the next request.",
+      "properties": {
+        "at_or_above": {
+          "default": "default",
+          "type": "string"
+        },
+        "below": {
+          "default": "fast",
+          "type": "string"
+        },
+        "enabled": {
+          "default": false,
+          "type": "boolean"
+        },
+        "threshold": {
+          "default": 272000,
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "LegacyAppPathString": {
       "type": "string"
     },
@@ -1592,6 +1723,12 @@
       "additionalProperties": false,
       "description": "OAuth client settings used when Codex launches an MCP OAuth flow.",
       "properties": {
+        "callback_port": {
+          "description": "Fixed callback port that takes precedence over Codex's global OAuth callback port.",
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
         "client_id": {
           "description": "Explicit OAuth client identifier to present during authorization and token exchange.",
           "type": "string"
@@ -2723,6 +2860,9 @@
             "type": "string"
           },
           "type": "object"
+        },
+        "http_headers_helper": {
+          "type": "string"
         },
         "name": {
           "default": null,
@@ -5218,11 +5358,17 @@
         "guardian_approval": {
           "type": "boolean"
         },
+        "guardian_enhanced_node_repl_transcripts": {
+          "type": "boolean"
+        },
+        "guardian_node_repl_transcript_images": {
+          "type": "boolean"
+        },
         "guardian_reuse_parent_compaction": {
           "type": "boolean"
         },
         "guardianv2": {
-          "type": "boolean"
+          "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
         },
         "hooks": {
           "type": "boolean"
@@ -5419,6 +5565,9 @@
         "unavailable_dummy_tools": {
           "type": "boolean"
         },
+        "unbounded_connection_retries": {
+          "type": "boolean"
+        },
         "undo": {
           "type": "boolean"
         },
@@ -5556,6 +5705,14 @@
     "instructions": {
       "description": "System instructions.",
       "type": "string"
+    },
+    "lc_adaptive_service_tier": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/LcAdaptiveServiceTierConfig"
+        }
+      ],
+      "description": "Optional LC Adaptive Service Tier cost control. When enabled, this owns request tier selection using the prepared long-context request size."
     },
     "log_dir": {
       "allOf": [

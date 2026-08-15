@@ -181,6 +181,9 @@ impl App {
                         );
                     }
                     Ok(ExternalAgentConfigMigrationFlowOutcome::Cancelled) => {}
+                    Ok(ExternalAgentConfigMigrationFlowOutcome::TerminalError(err)) => {
+                        return Err(err.into());
+                    }
                     Err(error_message) => {
                         self.chat_widget.add_error_message(error_message);
                     }
@@ -531,6 +534,61 @@ impl App {
                 }
                 return Ok(self.handle_exit_mode(app_server, mode).await);
             }
+            AppEvent::RunningTaskExit { action, thread_id } => match action {
+                RunningTaskExitAction::RunInBackground => {
+                    return Ok(self.handle_exit_mode(app_server, ExitMode::Immediate).await);
+                }
+                RunningTaskExitAction::CancelTask => {
+                    if self.chat_widget.thread_id() == Some(thread_id)
+                        && self.chat_widget.is_agent_turn_running()
+                        && self.chat_widget.submit_op(AppCommand::interrupt())
+                    {
+                        self.chat_widget.pause_active_goal_for_interrupt();
+                    } else if self.side_threads.contains_key(&thread_id)
+                        && let Err(error) = self
+                            .try_submit_active_thread_op_via_app_server(
+                                app_server,
+                                thread_id,
+                                &AppCommand::interrupt(),
+                            )
+                            .await
+                    {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to interrupt task: {error}"));
+                    }
+                }
+                RunningTaskExitAction::Exit => {
+                    if self.chat_widget.thread_id() == Some(thread_id)
+                        && self.chat_widget.is_active_goal_turn_running()
+                        && let Err(error) = app_server
+                            .thread_goal_set(
+                                thread_id,
+                                /*objective*/ None,
+                                Some(codex_app_server_protocol::ThreadGoalStatus::Paused),
+                                /*token_budget*/ None,
+                            )
+                            .await
+                    {
+                        self.chat_widget
+                            .add_error_message(format!("Failed to pause task goal: {error}"));
+                        return Ok(AppRunControl::Continue);
+                    }
+                    let turn_id = self
+                        .active_turn_id_for_thread(thread_id)
+                        .await
+                        .unwrap_or_default();
+                    match app_server.turn_interrupt(thread_id, turn_id).await {
+                        Ok(()) => {
+                            self.app_event_tx
+                                .send(AppEvent::Exit(ExitMode::ShutdownFirst));
+                        }
+                        Err(error) => {
+                            self.chat_widget
+                                .add_error_message(format!("Failed to interrupt task: {error}"));
+                        }
+                    }
+                }
+            },
             AppEvent::Logout => match app_server.logout_account().await {
                 Ok(()) => {
                     self.show_shutdown_feedback(tui)?;
@@ -983,6 +1041,12 @@ impl App {
             AppEvent::RefreshTokenActivity { request_id } => {
                 self.refresh_token_activity(app_server, request_id);
             }
+            AppEvent::RefreshThreadUsage {
+                thread_id,
+                request_id,
+            } => {
+                self.refresh_thread_usage(app_server, thread_id, request_id);
+            }
             AppEvent::RefreshStatusLineWorkspaceHeadline { request_id } => {
                 self.refresh_status_line_workspace_headline(app_server, request_id);
             }
@@ -1207,6 +1271,13 @@ impl App {
                     // provisional transcript cells have been consolidated.
                     self.insert_pending_usage_output_if_ready(tui);
                 }
+            }
+            AppEvent::ThreadUsageLoaded {
+                thread_id,
+                request_id,
+                result,
+            } => {
+                self.finish_thread_usage_refresh(tui, thread_id, request_id, result)?;
             }
             AppEvent::CommitPendingUsageOutput => {
                 self.insert_pending_usage_output_if_ready(tui);

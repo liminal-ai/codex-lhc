@@ -611,7 +611,7 @@ async fn turn_diff_display_roots(step_context: &StepContext) -> Vec<(String, Pat
         .ok()
         .flatten()
         .unwrap_or_else(|| cwd.clone());
-        display_roots.push((turn_environment.environment_id.clone(), root));
+        display_roots.push((turn_environment.selection.environment_id.clone(), root));
     }
     display_roots
 }
@@ -920,7 +920,7 @@ async fn build_extension_turn_input_items(
         .turn_environments()
         .enumerate()
         .map(|(index, environment)| TurnInputEnvironment {
-            environment_id: environment.environment_id.clone(),
+            environment_id: environment.selection.environment_id.clone(),
             cwd: environment.cwd().clone(),
             is_primary: index == 0,
         })
@@ -967,10 +967,7 @@ async fn track_turn_resolved_config_analytics(
     turn_context: &TurnContext,
     input: &[TurnInput],
 ) {
-    let thread_config = {
-        let state = sess.state.lock().await;
-        state.session_configuration.thread_config_snapshot()
-    };
+    let thread_config = sess.thread_config_snapshot().await;
     let is_first_turn = {
         let mut state = sess.state.lock().await;
         state.take_next_turn_is_first()
@@ -1291,7 +1288,7 @@ pub(crate) fn build_prompt(
     Prompt {
         input,
         tools: router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        parallel_tool_calls: true,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
         output_schema_strict: !crate::guardian::is_guardian_reviewer_source(
@@ -2180,6 +2177,18 @@ async fn try_run_sampling_request(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
+    let lc_service_tier = crate::lc_adaptive_service_tier::resolve_lc_adaptive_service_tier(
+        &turn_context.config.lc_adaptive_service_tier,
+        turn_context.config.service_tier.clone(),
+        prompt,
+    );
+    trace!(
+        enabled = turn_context.config.lc_adaptive_service_tier.enabled,
+        threshold = turn_context.config.lc_adaptive_service_tier.threshold,
+        estimated_context_tokens = ?lc_service_tier.estimated_context_tokens,
+        effective_service_tier = ?lc_service_tier.service_tier,
+        "LC Adaptive Service Tier resolved request tier"
+    );
     let mut stream = client_session
         .stream(
             prompt,
@@ -2187,7 +2196,7 @@ async fn try_run_sampling_request(
             &turn_context.session_telemetry,
             turn_context.reasoning_effort.clone(),
             turn_context.reasoning_summary,
-            turn_context.config.service_tier.clone(),
+            lc_service_tier.service_tier,
             responses_metadata,
             &inference_trace,
         )

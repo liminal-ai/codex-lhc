@@ -25,6 +25,7 @@ use codex_login::AuthManager;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::ResolvedMcpOAuthScopes;
+use codex_mcp::apply_http_headers_helper;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::discover_supported_scopes;
 use codex_mcp::oauth_login_support;
@@ -39,9 +40,8 @@ use codex_rmcp_client::perform_oauth_login;
 use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::format_env_display;
 
+use crate::cloud_config;
 use crate::plugin_cmd::load_cli_auth_mode;
-
-mod cloud_config;
 
 /// Subcommands:
 /// - `list`   — list configured servers (with `--json`)
@@ -226,13 +226,11 @@ impl McpCli {
 
         match subcommand {
             McpSubcommand::List(args) => {
-                let config =
-                    cloud_config::load_mcp_config(&config_overrides, loader_overrides).await?;
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
                 run_list(&config, args).await?;
             }
             McpSubcommand::Get(args) => {
-                let config =
-                    cloud_config::load_mcp_config(&config_overrides, loader_overrides).await?;
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
                 run_get(&config, args).await?;
             }
             McpSubcommand::Add(args) => {
@@ -242,13 +240,11 @@ impl McpCli {
                 run_remove(&config_overrides, args).await?;
             }
             McpSubcommand::Login(args) => {
-                let config =
-                    cloud_config::load_mcp_config(&config_overrides, loader_overrides).await?;
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
                 run_login(&config, args).await?;
             }
             McpSubcommand::Logout(args) => {
-                let config =
-                    cloud_config::load_mcp_config(&config_overrides, loader_overrides).await?;
+                let config = cloud_config::load_config(&config_overrides, loader_overrides).await?;
                 run_logout(&config, args).await?;
             }
         }
@@ -398,6 +394,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
                 bearer_token_env_var,
                 http_headers: None,
                 env_http_headers: None,
+                http_headers_helper: None,
             },
             oauth_client_id,
             oauth_client_registration
@@ -427,6 +424,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
             .clone()
             .map(|client_id| McpServerOAuthConfig {
                 client_id: Some(client_id),
+                callback_port: None,
             }),
         oauth_resource: oauth_resource.clone(),
         tools: HashMap::new(),
@@ -444,8 +442,9 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
 
     // `mcp add` assigns new servers to the local environment, so its immediate
     // OAuth discovery uses the local route-aware HTTP client.
-    let http_client: Arc<dyn HttpClient> =
-        Arc::new(RouteAwareHttpClient::new(config.http_client_factory()));
+    let http_client: Arc<dyn HttpClient> = Arc::new(
+        RouteAwareHttpClient::new(config.http_client_factory()).with_tls_backend_fallback(),
+    );
     let login_support = oauth_login_support(
         &transport,
         Arc::clone(&http_client),
@@ -521,14 +520,16 @@ async fn run_remove(config_overrides: &CliConfigOverrides, remove_args: RemoveAr
     Ok(())
 }
 
-async fn load_mcp_manager(config: &Config) -> McpManager {
-    let plugins_manager = Arc::new(plugins_manager_for_config(config));
-    plugins_manager.set_auth_mode(load_cli_auth_mode(config).await);
-    McpManager::new(plugins_manager)
+async fn load_mcp_manager(config: &Config) -> Result<McpManager> {
+    let plugins_manager = Arc::new(plugins_manager_for_config(
+        config,
+        load_cli_auth_mode(config).await?,
+    ));
+    Ok(McpManager::new(plugins_manager))
 }
 
 async fn run_login(config: &Config, login_args: LoginArgs) -> Result<()> {
-    let mcp_manager = load_mcp_manager(config).await;
+    let mcp_manager = load_mcp_manager(config).await?;
     let mcp_servers = mcp_manager.configured_servers(config).await;
 
     let LoginArgs {
@@ -556,8 +557,11 @@ async fn run_login(config: &Config, login_args: LoginArgs) -> Result<()> {
 
     // Standalone `mcp login` runs OAuth from the local CLI process; execution
     // environment routing belongs to app-server and session MCP flows.
-    let http_client: Arc<dyn HttpClient> =
-        Arc::new(RouteAwareHttpClient::new(config.http_client_factory()));
+    let http_client: Arc<dyn HttpClient> = Arc::new(
+        RouteAwareHttpClient::new(config.http_client_factory()).with_tls_backend_fallback(),
+    );
+    let http_client = apply_http_headers_helper(http_client, server, config.cwd.to_path_buf())
+        .map_err(anyhow::Error::msg)?;
     let explicit_scopes = (!scopes.is_empty()).then_some(scopes);
     let discovered_scopes = if explicit_scopes.is_none() && server.scopes.is_none() {
         discover_supported_scopes(
@@ -585,7 +589,7 @@ async fn run_login(config: &Config, login_args: LoginArgs) -> Result<()> {
         server.oauth_client_id(),
         client_registration,
         server.oauth_resource.as_deref(),
-        config.mcp_oauth_callback_port,
+        server.oauth_callback_port(config.mcp_oauth_callback_port),
         config.mcp_oauth_callback_url.as_deref(),
         http_client,
     )
@@ -595,7 +599,7 @@ async fn run_login(config: &Config, login_args: LoginArgs) -> Result<()> {
 }
 
 async fn run_logout(config: &Config, logout_args: LogoutArgs) -> Result<()> {
-    let mcp_manager = load_mcp_manager(config).await;
+    let mcp_manager = load_mcp_manager(config).await?;
     let mcp_servers = mcp_manager.configured_servers(config).await;
 
     let LogoutArgs { name } = logout_args;
@@ -625,9 +629,9 @@ async fn run_logout(config: &Config, logout_args: LogoutArgs) -> Result<()> {
 }
 
 async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
-    let mcp_manager = load_mcp_manager(config).await;
+    let mcp_manager = load_mcp_manager(config).await?;
     let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await;
+        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ true).await?;
     let auth = auth_manager.auth().await;
     let mcp_servers = mcp_manager.configured_servers(config).await;
     let effective_mcp_servers = mcp_manager.effective_servers(config, auth.as_ref()).await;
@@ -679,6 +683,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
                         bearer_token_env_var,
                         http_headers,
                         env_http_headers,
+                        http_headers_helper,
                     } => {
                         serde_json::json!({
                             "type": "streamable_http",
@@ -686,6 +691,9 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
                             "bearer_token_env_var": bearer_token_env_var,
                             "http_headers": http_headers,
                             "env_http_headers": env_http_headers,
+                            "http_headers_helper": http_headers_helper
+                                .as_ref()
+                                .map(|_| "<redacted>"),
                         })
                     }
                 };
@@ -886,7 +894,7 @@ async fn run_list(config: &Config, list_args: ListArgs) -> Result<()> {
 }
 
 async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
-    let mcp_manager = load_mcp_manager(config).await;
+    let mcp_manager = load_mcp_manager(config).await?;
     let mcp_servers = mcp_manager.configured_servers(config).await;
 
     let Some(server) = mcp_servers.get(&get_args.name) else {
@@ -914,12 +922,16 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
                 bearer_token_env_var,
                 http_headers,
                 env_http_headers,
+                http_headers_helper,
             } => serde_json::json!({
                 "type": "streamable_http",
                 "url": url,
                 "bearer_token_env_var": bearer_token_env_var,
                 "http_headers": http_headers,
                 "env_http_headers": env_http_headers,
+                "http_headers_helper": http_headers_helper
+                    .as_ref()
+                    .map(|_| "<redacted>"),
             }),
         };
         let output = serde_json::to_string_pretty(&serde_json::json!({
@@ -996,6 +1008,7 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
             bearer_token_env_var,
             http_headers,
             env_http_headers,
+            http_headers_helper,
         } => {
             println!("  transport: streamable_http");
             println!("  url: {url}");
@@ -1027,6 +1040,8 @@ async fn run_get(config: &Config, get_args: GetArgs) -> Result<()> {
                 _ => "-".to_string(),
             };
             println!("  env_http_headers: {env_headers_display}");
+            let helper_display = http_headers_helper.as_ref().map_or("-", |_| "<redacted>");
+            println!("  http_headers_helper: {helper_display}");
         }
     }
     if let Some(timeout) = server.startup_timeout_sec {

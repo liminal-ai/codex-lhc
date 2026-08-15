@@ -1,5 +1,5 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index 048d614a50..c5de040b7e 100644
+index ac3fcb1a2f..5dc3f71a68 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
 @@ -15,6 +15,7 @@ use crate::ExtensionMetrics;
@@ -134,10 +134,10 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index 2f21380b0f..ae39a53c45 100644
+index 69b4903af2..21f74cffcd 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
-@@ -43,6 +43,9 @@ pub use contributors::McpServerContributor;
+@@ -45,6 +45,9 @@ pub use contributors::McpServerContributor;
  pub use contributors::PreviousWorldStateSection;
  pub use contributors::PromptFragment;
  pub use contributors::PromptSlot;

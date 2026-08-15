@@ -66,7 +66,6 @@ fn remote_model_with_visibility(
             "default_verbosity": null,
             "apply_patch_tool_type": null,
             "truncation_policy": {"mode": "bytes", "limit": 10_000},
-            "supports_parallel_tool_calls": false,
             "supports_image_detail_original": false,
             "context_window": 272_000,
             "max_context_window": 272_000,
@@ -746,7 +745,6 @@ async fn get_model_info_uses_custom_catalog() {
     assert_eq!(model_info.display_name, "Overlay");
     assert_eq!(model_info.context_window, Some(272_000));
     assert!(model_info.supports_image_detail_original);
-    assert!(!model_info.supports_parallel_tool_calls);
     assert!(!model_info.used_fallback_model_metadata);
 }
 
@@ -1534,9 +1532,10 @@ async fn gpt_5_6_explicit_user_auto_compact_override_wins() {
     assert_eq!(model.auto_compact_token_limit(), Some(180_000));
 }
 
-/// Bundled catalog leaves the limit unset so context-window policy owns it.
+/// Codex-LHC ships a 370k working window and 350k LHC trigger while retaining
+/// the full 1.05M capability ceiling for explicit operator overrides.
 #[test]
-fn gpt_5_6_bundled_catalog_uses_regular_context_window_default() {
+fn gpt_5_6_bundled_catalog_uses_lhc_long_context_defaults() {
     let bundled = crate::bundled_models_response().expect("bundled parses");
     for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
         let model = bundled
@@ -1545,13 +1544,24 @@ fn gpt_5_6_bundled_catalog_uses_regular_context_window_default() {
             .find(|m| m.slug == slug)
             .unwrap_or_else(|| panic!("bundled missing {slug}"));
         assert_eq!(
-            model.auto_compact_token_limit, None,
-            "{slug}: models.json must defer to the regular context-window default"
+            model.context_window,
+            Some(370_000),
+            "{slug}: bundled working window must be 370k"
+        );
+        assert_eq!(
+            model.auto_compact_token_limit,
+            Some(350_000),
+            "{slug}: bundled LHC compact trigger must be 350k"
         );
         assert_eq!(
             model.auto_compact_token_limit(),
-            Some(244_800),
-            "{slug}: bundled model must resolve to 90% of 272k"
+            Some(350_000),
+            "{slug}: effective bundled trigger must remain 350k"
+        );
+        assert_eq!(
+            model.max_context_window,
+            Some(1_050_000),
+            "{slug}: operator config must be able to opt into the full capability"
         );
     }
 }

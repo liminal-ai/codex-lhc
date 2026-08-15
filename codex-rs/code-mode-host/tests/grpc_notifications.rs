@@ -183,10 +183,7 @@ async fn completed_waits_drain_pending_notifications_before_returning() -> Resul
         .create_session(delegate.clone())
         .await
         .map_err(anyhow::Error::msg)?;
-    let mut pending = request(
-        r#"await new Promise(resolve => setTimeout(resolve, 25)); notify("notice"); text("done");"#,
-    );
-    pending.yield_time_ms = Some(/*value*/ 1);
+    let pending = request(r#"yield_control(); notify("notice"); text("done");"#);
     let cell = session.execute(pending).await.map_err(anyhow::Error::msg)?;
     assert_eq!(
         cell.initial_response().await.map_err(anyhow::Error::msg)?,
@@ -276,7 +273,7 @@ async fn termination_cancels_pending_notifications() -> Result<()> {
 }
 
 #[tokio::test]
-async fn oversized_notification_text_is_truncated_at_a_utf8_boundary() -> Result<()> {
+async fn oversized_notification_text_is_delivered_unchanged() -> Result<()> {
     let host = HostHarness::start("grpc://127.0.0.1:0").await?;
     let provider = GrpcCodeModeSessionProvider::new(host.endpoint);
     let delegate = Arc::new(RecordingDelegate::default());
@@ -295,17 +292,13 @@ async fn oversized_notification_text_is_truncated_at_a_utf8_boundary() -> Result
     );
     timeout(TEST_TIMEOUT, delegate.notification_delivered.notified())
         .await
-        .context("truncated notification was not delivered")?;
+        .context("oversized notification was not delivered")?;
     assert_eq!(
         *delegate
             .notifications
             .lock()
             .unwrap_or_else(PoisonError::into_inner),
-        vec![(
-            "call-1".to_string(),
-            cell_id("1"),
-            format!("{}... [truncated]", "🦀".repeat(252)),
-        )]
+        vec![("call-1".to_string(), cell_id("1"), "🦀".repeat(512),)]
     );
 
     session.shutdown().await.map_err(anyhow::Error::msg)?;

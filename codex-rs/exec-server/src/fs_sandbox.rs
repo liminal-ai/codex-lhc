@@ -67,6 +67,15 @@ impl FileSystemSandboxRunner {
         sandbox: &FileSystemSandboxContext,
         request: FsHelperRequest,
     ) -> Result<FsHelperPayload, JSONRPCErrorError> {
+        let command = self.sandbox_command(sandbox)?;
+        let request_json = serde_json::to_vec(&request).map_err(json_error)?;
+        run_command(command, request_json).await
+    }
+
+    pub(crate) fn sandbox_command(
+        &self,
+        sandbox: &FileSystemSandboxContext,
+    ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let cwd = sandbox_cwd(sandbox)?;
         let native_workspace_roots = sandbox
             .workspace_roots
@@ -98,10 +107,7 @@ impl FileSystemSandboxRunner {
             &file_system_policy,
             network_policy,
         );
-        let command =
-            self.sandbox_exec_request(&permission_profile, &cwd, workspace_roots, sandbox)?;
-        let request_json = serde_json::to_vec(&request).map_err(json_error)?;
-        run_command(command, request_json).await
+        self.sandbox_exec_request(&permission_profile, &cwd, workspace_roots, sandbox)
     }
 
     fn sandbox_exec_request(
@@ -112,7 +118,7 @@ impl FileSystemSandboxRunner {
         sandbox_context: &FileSystemSandboxContext,
     ) -> Result<SandboxExecRequest, JSONRPCErrorError> {
         let helper = &self.runtime_paths.codex_self_exe;
-        let sandbox_manager = SandboxManager::new();
+        let sandbox_manager = SandboxManager::for_file_system_helpers();
         let sandbox = sandbox_manager.select_initial(
             permission_profile,
             SandboxablePreference::Require,
@@ -190,16 +196,11 @@ fn native_workspace_root(root: &PathUri) -> Result<AbsolutePathBuf, JSONRPCError
 }
 
 fn helper_read_roots(runtime_paths: &ExecServerRuntimePaths) -> Vec<AbsolutePathBuf> {
-    let mut roots = Vec::new();
-    for path in std::iter::once(runtime_paths.codex_self_exe.as_path())
-        .chain(runtime_paths.codex_linux_sandbox_exe.as_deref())
+    let mut roots = vec![runtime_paths.codex_self_exe.clone()];
+    if let Some(path) = &runtime_paths.codex_linux_sandbox_exe
+        && !roots.contains(path)
     {
-        if let Some(parent) = path.parent()
-            && let Ok(root) = AbsolutePathBuf::from_absolute_path(parent)
-            && !roots.contains(&root)
-        {
-            roots.push(root);
-        }
+        roots.push(path.clone());
     }
     roots
 }
@@ -227,9 +228,7 @@ fn add_helper_runtime_permissions(
         }
 
         file_system_policy.entries.push(FileSystemSandboxEntry::new(
-            FileSystemPath::Path {
-                path: helper_read_root.clone(),
-            },
+            helper_read_root.clone().into(),
             FileSystemAccessMode::Read,
         ));
     }
@@ -305,7 +304,7 @@ async fn run_command(
     command: SandboxExecRequest,
     request_json: Vec<u8>,
 ) -> Result<FsHelperPayload, JSONRPCErrorError> {
-    let mut child = spawn_command(command)?;
+    let mut child = spawn_command(command, std::process::Stdio::piped())?;
     let mut stdin = child
         .stdin
         .take()
@@ -314,6 +313,17 @@ async fn run_command(
     stdin.shutdown().await.map_err(io_error)?;
     drop(stdin);
 
+    let output = wait_for_helper_output(child).await?;
+    let response: FsHelperResponse = serde_json::from_slice(&output.stdout).map_err(json_error)?;
+    match response {
+        FsHelperResponse::Ok(payload) => Ok(payload),
+        FsHelperResponse::Error(error) => Err(error),
+    }
+}
+
+pub(crate) async fn wait_for_helper_output(
+    child: tokio::process::Child,
+) -> Result<std::process::Output, JSONRPCErrorError> {
     let output = child.wait_with_output().await.map_err(io_error)?;
     if !output.status.success() {
         return Err(internal_error(format!(
@@ -322,14 +332,10 @@ async fn run_command(
             stderr = String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    let response: FsHelperResponse = serde_json::from_slice(&output.stdout).map_err(json_error)?;
-    match response {
-        FsHelperResponse::Ok(payload) => Ok(payload),
-        FsHelperResponse::Error(error) => Err(error),
-    }
+    Ok(output)
 }
 
-fn spawn_command(
+pub(crate) fn spawn_command(
     SandboxExecRequest {
         command: argv,
         cwd,
@@ -337,6 +343,7 @@ fn spawn_command(
         arg0,
         ..
     }: SandboxExecRequest,
+    stdin: std::process::Stdio,
 ) -> Result<tokio::process::Child, JSONRPCErrorError> {
     let Some((program, args)) = argv.split_first() else {
         return Err(invalid_request("fs sandbox command was empty".to_string()));
@@ -355,14 +362,23 @@ fn spawn_command(
     env.retain(|name, _| !codex_protocol::shell_environment::is_non_inheritable_env_var(name));
     command.env_clear();
     command.envs(env);
-    command.stdin(std::process::Stdio::piped());
+    command.stdin(stdin);
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     command.kill_on_drop(true);
+    // macOS cannot receive passed fds with close-on-exec set atomically.
+    #[cfg(target_os = "macos")]
+    // SAFETY: Descriptor cleanup only uses fork-safe system calls.
+    unsafe {
+        command.pre_exec(|| {
+            codex_utils_pty::pty::close_inherited_fds_except(&[]);
+            Ok(())
+        });
+    }
     command.spawn().map_err(io_error)
 }
 
-fn io_error(err: std::io::Error) -> JSONRPCErrorError {
+pub(crate) fn io_error(err: std::io::Error) -> JSONRPCErrorError {
     internal_error(err.to_string())
 }
 
@@ -437,13 +453,7 @@ mod tests {
             writable.clone(),
             FileSystemAccessMode::Write,
         )]);
-        let readable = AbsolutePathBuf::from_absolute_path(
-            runtime_paths
-                .codex_self_exe
-                .parent()
-                .expect("current exe parent"),
-        )
-        .expect("absolute readable path");
+        let readable = runtime_paths.codex_self_exe.clone();
 
         add_helper_runtime_permissions(
             &mut policy,
@@ -659,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn helper_permissions_include_helper_read_root_without_additional_permissions() {
+    fn helper_permissions_include_only_the_helper_executable() {
         let codex_self_exe = std::env::current_exe().expect("current exe");
         let runtime_paths =
             ExecServerRuntimePaths::new(codex_self_exe, /*codex_linux_sandbox_exe*/ None)
@@ -667,13 +677,11 @@ mod tests {
         let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
             .expect("absolute cwd");
         let mut policy = restricted_policy(Vec::new());
-        let readable = AbsolutePathBuf::from_absolute_path(
-            runtime_paths
-                .codex_self_exe
-                .parent()
-                .expect("current exe parent"),
-        )
-        .expect("absolute readable path");
+        let parent = runtime_paths
+            .codex_self_exe
+            .parent()
+            .expect("current exe parent");
+        let sibling = parent.join("credentials.json");
 
         add_helper_runtime_permissions(
             &mut policy,
@@ -681,11 +689,15 @@ mod tests {
             cwd.as_path(),
         );
 
-        assert!(policy.can_read_path_with_cwd(readable.as_path(), cwd.as_path()));
+        assert!(
+            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+        );
+        assert!(!policy.can_read_path_with_cwd(parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_path_with_cwd(sibling.as_path(), cwd.as_path()));
     }
 
     #[test]
-    fn helper_permissions_include_linux_sandbox_alias_parent() {
+    fn helper_permissions_include_only_linux_sandbox_alias_executable() {
         let root = tempfile::tempdir().expect("temp dir");
         let codex_self_exe = root.path().join("bin").join("codex");
         let codex_linux_sandbox_exe = root.path().join("aliases").join("codex-linux-sandbox");
@@ -695,10 +707,12 @@ mod tests {
         let cwd = AbsolutePathBuf::from_absolute_path(std::env::temp_dir().as_path())
             .expect("absolute cwd");
         let mut policy = restricted_policy(Vec::new());
-        let codex_parent = AbsolutePathBuf::from_absolute_path(root.path().join("bin"))
-            .expect("absolute codex parent");
-        let alias_parent = AbsolutePathBuf::from_absolute_path(root.path().join("aliases"))
-            .expect("absolute alias parent");
+        let codex_parent = runtime_paths.codex_self_exe.parent().expect("codex parent");
+        let alias = runtime_paths
+            .codex_linux_sandbox_exe
+            .as_ref()
+            .expect("linux sandbox alias");
+        let alias_parent = alias.parent().expect("alias parent");
 
         add_helper_runtime_permissions(
             &mut policy,
@@ -706,8 +720,12 @@ mod tests {
             cwd.as_path(),
         );
 
-        assert!(policy.can_read_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
-        assert!(policy.can_read_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
+        assert!(
+            policy.can_read_path_with_cwd(runtime_paths.codex_self_exe.as_path(), cwd.as_path())
+        );
+        assert!(policy.can_read_path_with_cwd(alias.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_path_with_cwd(codex_parent.as_path(), cwd.as_path()));
+        assert!(!policy.can_read_path_with_cwd(alias_parent.as_path(), cwd.as_path()));
     }
 
     fn restricted_policy(entries: Vec<FileSystemSandboxEntry>) -> FileSystemSandboxPolicy {
@@ -735,7 +753,7 @@ mod tests {
 
     fn path_entry(path: AbsolutePathBuf, access: FileSystemAccessMode) -> FileSystemSandboxEntry {
         FileSystemSandboxEntry {
-            path: FileSystemPath::Path { path },
+            path: path.into(),
             access,
             missing_path_behavior: None,
         }

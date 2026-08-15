@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index c5bbcb5920..d563e80445 100644
+index 92c0f17487..cc4e544a56 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -71,6 +71,8 @@ members = [
+@@ -72,6 +72,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,7 +11,7 @@ index c5bbcb5920..d563e80445 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -211,6 +213,8 @@ codex-hooks = { path = "hooks" }
+@@ -213,6 +215,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }

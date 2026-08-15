@@ -210,7 +210,14 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     out.push(RolloutItem::Compacted(compacted));
 
     if let Some(state) = input.world_state.clone() {
-        out.push(RolloutItem::WorldState(WorldStateItem::full(state)));
+        match state {
+            Value::Object(state) => {
+                out.push(RolloutItem::WorldState(WorldStateItem::full(state)));
+            }
+            _ => gap_notes.push(
+                "world_state snapshot was not an object; omitted from rebuilt rollout".to_string(),
+            ),
+        }
     }
     out.push(RolloutItem::EventMsg(EventMsg::ContextCompacted(
         ContextCompactedEvent {},

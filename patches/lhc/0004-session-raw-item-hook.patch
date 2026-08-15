@@ -28,6 +28,26 @@ index b58e99d9d9..7638b438df 100644
              }
              Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                  sess.set_server_reasoning_included(included).await;
+diff --git a/codex-rs/core/src/session/inject.rs b/codex-rs/core/src/session/inject.rs
+index 6e51aa40e2..a9a3ec3dd4 100644
+--- a/codex-rs/core/src/session/inject.rs
++++ b/codex-rs/core/src/session/inject.rs
+@@ -110,8 +110,13 @@ impl Session {
+                 }
+             }));
+         }
+-        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
+-            .await;
++        self.record_prepared_conversation_items(
++            turn_context,
++            annotated_items,
++            image_preparations,
++            codex_extension_api::RawItemProvenance::HostContext,
++        )
++        .await;
+     }
+ 
+     /// Injects items into active work, or records them without starting a turn.
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
 index 0000000000..086351b058
@@ -1073,10 +1093,10 @@ index 0000000000..086351b058
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 5dd12bc91b..af5f33c8fa 100644
+index 9bb00c2d0a..db5a784c65 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1380,6 +1380,9 @@ impl Session {
+@@ -1357,6 +1357,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1086,7 +1106,7 @@ index 5dd12bc91b..af5f33c8fa 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info.slug.as_str();
-@@ -1419,6 +1422,8 @@ impl Session {
+@@ -1396,6 +1399,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1095,7 +1115,7 @@ index 5dd12bc91b..af5f33c8fa 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3027,6 +3032,25 @@ impl Session {
+@@ -3017,6 +3022,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -1121,17 +1141,40 @@ index 5dd12bc91b..af5f33c8fa 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, items);
-@@ -3048,7 +3072,8 @@ impl Session {
-                 });
-         }
-         self.persist_rollout_response_items(items).await;
--        self.send_raw_response_items(turn_context, items).await;
-+        self.send_raw_response_items(turn_context, items, provenance)
-+            .await;
+@@ -3025,8 +3049,13 @@ impl Session {
+             .into_iter()
+             .map(ResponseItemEnvelope::new)
+             .collect();
+-        self.record_prepared_conversation_items(turn_context, items, image_preparations)
+-            .await;
++        self.record_prepared_conversation_items(
++            turn_context,
++            items,
++            image_preparations,
++            provenance,
++        )
++        .await;
      }
  
-     pub(crate) async fn record_step_world_state_if_changed(
-@@ -3219,7 +3244,13 @@ impl Session {
+     async fn record_prepared_conversation_items(
+@@ -3034,6 +3063,7 @@ impl Session {
+         turn_context: &TurnContext,
+         items: Vec<ResponseItemEnvelope>,
+         image_preparations: Vec<ImagePreparationMetadata>,
++        provenance: codex_extension_api::RawItemProvenance,
+     ) {
+         let response_items = items
+             .iter()
+@@ -3059,7 +3089,7 @@ impl Session {
+         let rollout_items: Vec<RolloutItem> =
+             items.into_iter().map(RolloutItem::ResponseItem).collect();
+         self.persist_rollout_items(&rollout_items).await;
+-        self.send_raw_response_items(turn_context, &response_items)
++        self.send_raw_response_items(turn_context, &response_items, provenance)
+             .await;
+     }
+ 
+@@ -3231,7 +3261,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1146,7 +1189,7 @@ index 5dd12bc91b..af5f33c8fa 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3303,7 +3334,7 @@ impl Session {
+@@ -3315,7 +3351,7 @@ impl Session {
              Self::assign_missing_response_item_id(&mut envelope.item);
          }
          let compacted_item = CompactedItem {
@@ -1155,8 +1198,8 @@ index 5dd12bc91b..af5f33c8fa 100644
              replacement_history: Some(items.clone()),
              window_number: Some(metadata.window_number),
              first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-@@ -3323,6 +3354,10 @@ impl Session {
-                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_value()));
+@@ -3335,6 +3371,10 @@ impl Session {
+                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
 +            // I2: durable LHC derived record rides the same CompactedItem write.
@@ -1166,7 +1209,7 @@ index 5dd12bc91b..af5f33c8fa 100644
          }
  
          self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3342,6 +3377,58 @@ impl Session {
+@@ -3354,10 +3394,79 @@ impl Session {
          }
      }
  
@@ -1222,10 +1265,7 @@ index 5dd12bc91b..af5f33c8fa 100644
 +        state.last_lhc_durable_derived().map(str::to_string)
 +    }
 +
-     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
-         let rollout_items: Vec<RolloutItem> = items
-             .iter()
-@@ -3356,6 +3443,23 @@ impl Session {
+     pub fn enabled(&self, feature: Feature) -> bool {
          self.features.enabled(feature)
      }
  
@@ -1249,7 +1289,7 @@ index 5dd12bc91b..af5f33c8fa 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3391,7 +3495,42 @@ impl Session {
+@@ -3393,7 +3502,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1293,7 +1333,7 @@ index 5dd12bc91b..af5f33c8fa 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3679,6 +3818,32 @@ impl Session {
+@@ -3693,6 +3837,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1326,7 +1366,7 @@ index 5dd12bc91b..af5f33c8fa 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -3961,9 +4126,13 @@ impl Session {
+@@ -3993,9 +4163,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1343,7 +1383,7 @@ index 5dd12bc91b..af5f33c8fa 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -3983,8 +4152,13 @@ impl Session {
+@@ -4015,8 +4189,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1359,7 +1399,7 @@ index 5dd12bc91b..af5f33c8fa 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4229,3 +4403,14 @@ mod elicitation_holders_tests;
+@@ -4179,3 +4358,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

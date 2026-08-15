@@ -504,7 +504,8 @@ async fn lhc_band_shape_eval_live() {
     let auth_manager = codex_login::AuthManager::shared_from_config(
         &config, /*enable_codex_api_key_env*/ true,
     )
-    .await;
+    .await
+    .expect("initialize auth manager");
     let auth = auth_manager.auth().await.expect("ChatGPT auth required");
     eprintln!(
         "lhc band-shape live K2: auth={:?} model={LHC_DERIVATION_MODEL} source_events={source_events} body_items={}",

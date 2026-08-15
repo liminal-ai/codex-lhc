@@ -2069,6 +2069,43 @@ fn tool_catalog_cache_bypasses_remote_sourced_environment_variables() {
     );
 }
 
+#[test]
+fn tool_catalog_cache_bypasses_http_headers_helpers() {
+    let cache = McpToolCatalogCache::default();
+    let runtime_context = reusable_server_runtime_context();
+    let mut config = reusable_server_config("https://example.com/mcp");
+    let identity = reusable_server_identity(&config, &runtime_context);
+    let context = |config: &McpServerConfig, identity: &McpServerConnectionIdentity| {
+        cache.context(
+            "docs",
+            config,
+            &runtime_context,
+            /*resolved_environment*/ None,
+            (
+                &ElicitationCapability::default(),
+                &ClientMcpExtensions::default(),
+            ),
+            Some((
+                identity,
+                crate::McpProtocolMode::Legacy,
+                /*agent_plugin*/ false,
+            )),
+        )
+    };
+    assert!(context(&config, &identity).is_some());
+
+    let McpServerTransportConfig::StreamableHttp {
+        http_headers_helper,
+        ..
+    } = &mut config.transport
+    else {
+        unreachable!("expected HTTP transport");
+    };
+    *http_headers_helper = Some("auth-cli headers".to_string());
+    let identity = reusable_server_identity(&config, &runtime_context);
+    assert!(context(&config, &identity).is_none());
+}
+
 #[tokio::test]
 async fn list_available_server_infos_uses_cache_while_client_is_pending() {
     let pending_client = futures::future::pending::<Result<ManagedClient, StartupOutcomeError>>()
@@ -3532,6 +3569,7 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
                     bearer_token_env_var: None,
                     http_headers: None,
                     env_http_headers: None,
+                    http_headers_helper: None,
                 },
                 environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
                 enabled: true,
@@ -3642,6 +3680,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
             bearer_token_env_var: None,
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -3661,7 +3700,7 @@ fn mcp_init_error_display_prompts_for_github_pat() {
     };
     let err: StartupOutcomeError = anyhow::anyhow!("OAuth is unsupported").into();
 
-    let display = mcp_init_error_display(server_name, Some(&config), &err);
+    let display = mcp_init_error_display(server_name, Some(&config), &err, /*reason*/ None);
 
     let expected = format!(
         "GitHub MCP does not support OAuth. Log in by adding a personal access token (https://github.com/settings/personal-access-tokens) to your environment and config.toml:\n[mcp_servers.{server_name}]\nbearer_token_env_var = CODEX_GITHUB_PERSONAL_ACCESS_TOKEN"
@@ -3689,15 +3728,59 @@ fn mcp_init_error_display_prompts_for_login_when_auth_required() {
             is_authentication_required: true,
         },
     ] {
-        let display = mcp_init_error_display(server_name, /*config*/ None, &error);
+        let display = mcp_init_error_display(
+            server_name,
+            /*config*/ None,
+            &error,
+            /*reason*/ None,
+        );
         assert_eq!(expected, display);
 
-        let executor_display = mcp_init_error_display(server_name, Some(&executor_config), &error);
+        let executor_display = mcp_init_error_display(
+            server_name,
+            Some(&executor_config),
+            &error,
+            /*reason*/ None,
+        );
         assert_eq!(
             format!(
                 "The {server_name} MCP server is not logged in. Use your client's MCP OAuth sign-in flow."
             ),
             executor_display
+        );
+    }
+}
+
+#[test]
+fn mcp_init_error_display_identifies_oauth_reauthentication() {
+    let server_name = "example";
+    let error = StartupOutcomeError::Failed {
+        error: "authorization required: Bearer error=\"invalid_token\"".to_string(),
+        is_authentication_required: true,
+    };
+    let executor_config: McpServerConfig = serde_json::from_value(serde_json::json!({
+        "url": "https://example.com/mcp",
+        "environment_id": "executor-1",
+    }))
+    .expect("executor MCP configuration should deserialize");
+
+    for (config, recovery_hint) in [
+        (None, "Run `codex mcp login example`."),
+        (
+            Some(&executor_config),
+            "Use your client's MCP OAuth sign-in flow.",
+        ),
+    ] {
+        assert_eq!(
+            mcp_init_error_display(
+                server_name,
+                config,
+                &error,
+                Some(McpStartupFailureReason::ReauthenticationRequired),
+            ),
+            format!(
+                "The {server_name} MCP server requires OAuth reauthentication. {recovery_hint}"
+            ),
         );
     }
 }
@@ -3757,6 +3840,7 @@ fn mcp_init_error_display_reports_generic_errors() {
             bearer_token_env_var: Some("TOKEN".to_string()),
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -3776,7 +3860,7 @@ fn mcp_init_error_display_reports_generic_errors() {
     };
     let err: StartupOutcomeError = anyhow::anyhow!("boom").into();
 
-    let display = mcp_init_error_display(server_name, Some(&config), &err);
+    let display = mcp_init_error_display(server_name, Some(&config), &err, /*reason*/ None);
 
     let expected = format!("MCP client for `{server_name}` failed to start: {err:#}");
 
@@ -3792,7 +3876,12 @@ fn mcp_init_error_display_includes_startup_timeout_hint() {
     ] {
         let err: StartupOutcomeError = anyhow::anyhow!(error).into();
 
-        let display = mcp_init_error_display(server_name, /*config*/ None, &err);
+        let display = mcp_init_error_display(
+            server_name,
+            /*config*/ None,
+            &err,
+            /*reason*/ None,
+        );
 
         assert_eq!(
             "MCP client for `slow` timed out after 30 seconds. Add or adjust `startup_timeout_sec` in your config.toml:\n[mcp_servers.slow]\nstartup_timeout_sec = XX",
@@ -3809,6 +3898,7 @@ fn reusable_server_config(url: &str) -> McpServerConfig {
             bearer_token_env_var: Some("CODEX_MCP_REUSE_TEST_TOKEN".to_string()),
             http_headers: None,
             env_http_headers: None,
+            http_headers_helper: None,
         },
         environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
         enabled: true,
@@ -4079,6 +4169,101 @@ async fn reconciliation_reuses_an_unchanged_ready_server() {
 }
 
 #[tokio::test]
+async fn reconciliation_reuses_an_unchanged_pending_server_without_waiting() -> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    let tools = vec![
+        create_test_tool("docs", "search"),
+        create_test_tool("docs", "write"),
+    ];
+    let mut previous =
+        manager_with_reusable_ready_server(&config, &runtime_context, tools.clone()).await;
+    let managed_client = create_test_managed_client(tools).await;
+    let (pending_client, startup_started, release_startup) =
+        create_gated_async_managed_client(managed_client);
+    let startup = tokio::spawn({
+        let pending_client = pending_client.clone();
+        async move { pending_client.client().await }
+    });
+    startup_started.await?;
+    let connection = Arc::get_mut(
+        &mut previous
+            .servers
+            .get_mut("docs")
+            .expect("test server should exist")
+            .connection,
+    )
+    .expect("test server should have one connection owner");
+    connection.client = pending_client;
+    config.enabled_tools = Some(vec!["search".to_string()]);
+
+    let reconciled = tokio::time::timeout(
+        Duration::from_millis(100),
+        reconcile_reusable_server(&previous, config, runtime_context),
+    )
+    .await
+    .expect("reconciliation must not wait for an unchanged pending MCP server");
+
+    assert!(previous.shares_test_connection_with(&reconciled, "docs"));
+    release_startup
+        .send(())
+        .map_err(|()| anyhow!("pending startup should still be running"))?;
+    startup.await??;
+    assert_eq!(
+        model_tool_names(&reconciled.list_all_tools().await),
+        HashSet::from([ToolName::namespaced("mcp__docs", "search")])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_cancels_a_reused_pending_server_when_disabled() -> anyhow::Result<()> {
+    let runtime_context = reusable_server_runtime_context();
+    let mut config = reusable_server_config("http://127.0.0.1:1");
+    let tools = vec![create_test_tool("docs", "search")];
+    let mut previous =
+        manager_with_reusable_ready_server(&config, &runtime_context, tools.clone()).await;
+    let managed_client = create_test_managed_client(tools).await;
+    let (pending_client, startup_started, release_startup) =
+        create_gated_async_managed_client(managed_client);
+    let cancellation = pending_client.cancel_token.clone();
+    let startup = tokio::spawn({
+        let pending_client = pending_client.clone();
+        async move { pending_client.client().await }
+    });
+    startup_started.await?;
+    let connection = Arc::get_mut(
+        &mut previous
+            .servers
+            .get_mut("docs")
+            .expect("test server should exist")
+            .connection,
+    )
+    .expect("test server should have one connection owner");
+    connection.client = pending_client;
+
+    let reused =
+        reconcile_reusable_server(&previous, config.clone(), runtime_context.clone()).await;
+    assert!(previous.shares_test_connection_with(&reused, "docs"));
+
+    config.enabled = false;
+    let removed = reconcile_reusable_server(&reused, config, runtime_context).await;
+    assert!(!removed.servers.contains_key("docs"));
+    drop(previous);
+    drop(reused);
+
+    assert!(
+        cancellation.is_cancelled(),
+        "disabling a reused pending MCP server should cancel its obsolete startup"
+    );
+    release_startup
+        .send(())
+        .map_err(|()| anyhow!("pending startup should remain available for test cleanup"))?;
+    startup.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_retries_non_oauth_authentication_failures() {
     let runtime_context = reusable_server_runtime_context();
     let config = reusable_server_config("http://127.0.0.1:1");
@@ -4119,6 +4304,7 @@ fn connection_identity_uses_effective_authorization_headers() {
                 .map(|value| HashMap::from([("aUtHoRiZaTiOn".to_string(), value.to_string())])),
             env_http_headers: environment_header
                 .map(|value| HashMap::from([("aUtHoRiZaTiOn".to_string(), value.to_string())])),
+            http_headers_helper: None,
         };
         let server = EffectiveMcpServer::configured(config);
         let identity = |keyring_backend_kind| {

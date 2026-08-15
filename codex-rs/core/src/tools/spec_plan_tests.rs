@@ -21,9 +21,11 @@ use codex_protocol::openai_models::ConfigShellToolType;
 use codex_protocol::openai_models::InputModality;
 use codex_protocol::openai_models::ToolMode;
 use codex_protocol::openai_models::WebSearchToolType;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_tools::DiscoverablePluginInfo;
 use codex_tools::DiscoverableTool;
 use codex_tools::ResponsesApiNamespaceTool;
@@ -373,7 +375,7 @@ fn duplicate_primary_environment(turn: &mut TurnContext) {
         .primary()
         .expect("primary environment")
         .clone();
-    second_environment.environment_id = "secondary".to_string();
+    second_environment.selection.environment_id = "secondary".to_string();
     turn.environments
         .environments
         .push(TurnEnvironmentState::Ready(second_environment));
@@ -697,7 +699,7 @@ async fn login_shell_parameter_follows_selected_environment() {
                 else {
                     panic!("primary environment should be ready");
                 };
-                environment.config.allow_login_shell = allow_login_shell;
+                environment.config_mut().allow_login_shell = allow_login_shell;
                 if guardian {
                     turn.session_source = codex_protocol::protocol::SessionSource::SubAgent(
                         codex_protocol::protocol::SubAgentSource::Other(
@@ -729,7 +731,7 @@ async fn login_shell_parameter_is_available_when_any_environment_allows_it() {
             let TurnEnvironmentState::Ready(environment) = environment else {
                 panic!("environment should be ready");
             };
-            environment.config.allow_login_shell = index == 1;
+            environment.config_mut().allow_login_shell = index == 1;
         }
     })
     .await;
@@ -752,7 +754,7 @@ async fn shell_command_is_not_registered_without_a_single_local_environment() {
         else {
             panic!("primary environment should be ready");
         };
-        environment.environment_id = "remote".to_string();
+        environment.selection.environment_id = "remote".to_string();
         environment.environment = Arc::new(
             codex_exec_server::Environment::create_for_tests(Some(
                 "ws://127.0.0.1:1/remote-exec-server".to_string(),
@@ -902,25 +904,30 @@ async fn zsh_fork_unified_exec_keeps_shell_parameter_when_remote_environment_ava
             .environments
             .push(TurnEnvironmentState::Ready(
                 crate::session::turn_context::TurnEnvironment::new(
-                    "remote".to_string(),
+                    TurnEnvironmentSelection {
+                        environment_id: "remote".to_string(),
+                        cwd: remote_cwd,
+                        workspace_roots: Vec::new(),
+                        config: EnvironmentConfigState::Ready(
+                            codex_protocol::protocol::EnvironmentConfig {
+                                allow_login_shell: true,
+                                permission_profile: turn
+                                    .config
+                                    .permissions
+                                    .permission_profile_state()
+                                    .snapshot(),
+                                selected_capability_roots: Vec::new(),
+                            },
+                        ),
+                    },
+                    crate::environment_selection::EnvironmentConfigOrigin::Thread,
                     Arc::new(
                         codex_exec_server::Environment::create_for_tests(Some(
                             "ws://127.0.0.1:1/remote-exec-server".to_string(),
                         ))
                         .expect("remote test environment"),
                     ),
-                    remote_cwd,
-                    Vec::new(),
                     /*shell*/ None,
-                    crate::session::turn_context::TurnEnvironmentConfig {
-                        allow_login_shell: true,
-                        permission_profile: turn
-                            .config
-                            .permissions
-                            .permission_profile_state()
-                            .snapshot(),
-                        selected_capability_roots: None,
-                    },
                 ),
             ));
     })

@@ -376,6 +376,15 @@ impl McpConnectionSet {
                 reusable_previous.and_then(|previous| previous.servers.get(&server_name))
             {
                 let connection = Arc::clone(&previous_view.connection);
+                let reusable_pending_startup = connection.identity.as_ref()
+                    == Some(&connection_identity)
+                    && !connection.client.startup_complete.load(Ordering::Acquire)
+                    && !connection.startup_is_dormant()
+                    && !connection.client.cancel_token.is_cancelled()
+                    && previous_view.catalog_item_limit == catalog_item_limit
+                    && expected_protocol_mode.is_some()
+                    && reusable_previous
+                        .is_some_and(|previous| previous.protocol_mode == protocol_mode);
                 let unchanged_auth_failure = if connection.identity.as_ref()
                     == Some(&connection_identity)
                     && connection_identity.oauth_store_was_contended
@@ -391,7 +400,8 @@ impl McpConnectionSet {
                 } else {
                     None
                 };
-                if unchanged_auth_failure.is_some()
+                if reusable_pending_startup
+                    || unchanged_auth_failure.is_some()
                     || connection
                         .reusable_client(&connection_identity)
                         .await
@@ -402,6 +412,8 @@ impl McpConnectionSet {
                                 })
                         })
                 {
+                    let pending_client =
+                        reusable_pending_startup.then(|| connection.client.clone());
                     servers.insert(
                         server_name.clone(),
                         McpServerView {
@@ -413,17 +425,19 @@ impl McpConnectionSet {
                         },
                     );
                     if let Some(error) = unchanged_auth_failure {
+                        let reason = connection_identity
+                            .oauth_credentials()
+                            .ok()
+                            .flatten()
+                            .map(|_| McpStartupFailureReason::ReauthenticationRequired);
                         let status = McpStartupStatus::Failed {
                             error: mcp_init_error_display(
                                 &server_name,
                                 Some(&configured_config),
                                 &error,
+                                reason,
                             ),
-                            reason: connection_identity
-                                .oauth_credentials()
-                                .ok()
-                                .flatten()
-                                .map(|_| McpStartupFailureReason::ReauthenticationRequired),
+                            reason,
                         };
                         let tx_event = tx_event.clone();
                         let submit_id = startup_submit_id.clone();
@@ -446,6 +460,14 @@ impl McpConnectionSet {
                                 }
                             }
                             (server_name, Err(error))
+                        });
+                    } else if let Some(client) = pending_client {
+                        let publication_gate = publication_gate.clone();
+                        join_set.spawn(async move {
+                            if !publication_gate.wait().await {
+                                return (server_name, Err(StartupOutcomeError::Cancelled));
+                            }
+                            (server_name, client.client().await)
                         });
                     } else {
                         reused_ready.push(server_name);
@@ -564,6 +586,7 @@ impl McpConnectionSet {
                                     bearer_token_env_var,
                                     http_headers,
                                     env_http_headers,
+                                    ..
                                 } => {
                                     match determine_streamable_http_auth_status_from_credentials(
                                         configured_config
@@ -602,6 +625,7 @@ impl McpConnectionSet {
                                 server_name.as_str(),
                                 Some(&configured_config),
                                 error,
+                                reason,
                             );
                             McpStartupStatus::Failed {
                                 error: error_str,

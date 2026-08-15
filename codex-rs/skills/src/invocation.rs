@@ -2,6 +2,7 @@ use std::path::Path;
 
 use codex_protocol::parse_command::ParsedCommand;
 use codex_shell_command::parse_command::parse_command_impl;
+use codex_shell_command::parse_command::tokenize_powershell_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
@@ -28,7 +29,11 @@ pub fn detect_implicit_skill_invocation_for_command(
     workdir: &AbsolutePathBuf,
 ) -> Option<SkillMetadata> {
     let workdir = canonicalize_if_exists(workdir);
-    let tokens = tokenize_command(command);
+    let tokens = if PathConvention::native() == PathConvention::Windows {
+        tokenize_powershell_command(command)
+    } else {
+        tokenize_command(command)
+    };
 
     if let Some(candidate) = detect_skill_script_run(outcome, tokens.as_slice(), &workdir) {
         return Some(candidate);
@@ -42,20 +47,8 @@ pub fn implicit_skill_accesses_for_command(
     command: &str,
     workdir: &PathUri,
 ) -> Vec<ImplicitSkillAccess> {
-    // Normalize Windows paths and recognize PowerShell reads using existing cat parsing.
     let tokens = if workdir.infer_path_convention() == Some(PathConvention::Windows) {
-        let mut tokens = tokenize_command(&command.replace('\\', "/"));
-
-        if let Some(executable) = tokens.first_mut()
-            && matches!(
-                executable.to_ascii_lowercase().as_str(),
-                "get-content" | "gc" | "type"
-            )
-        {
-            *executable = "cat".to_owned();
-        }
-
-        tokens
+        tokenize_powershell_command(command)
     } else {
         tokenize_command(command)
     };

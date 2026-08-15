@@ -2,15 +2,20 @@ use anyhow::Result;
 use codex_config::types::Personality;
 use codex_core::CodexThread;
 use codex_core::ForkSnapshot;
+use codex_core::TurnInputRequest;
 use codex_features::Feature;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_protocol::config_types::CollaborationMode;
+use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::config_types::Settings;
 use codex_protocol::models::BaseInstructionsProvenance;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ConfigShellToolType;
@@ -47,30 +52,24 @@ use pretty_assertions::assert_eq;
 use test_case::test_case;
 use wiremock::MockServer;
 
-fn read_only_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> Op {
+fn read_only_user_turn(test: &TestCodex, items: Vec<UserInput>, model: String) -> TurnInputRequest {
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::read_only(), test.cwd_path());
-    Op::UserInput {
-        items,
-        final_output_json_schema: None,
-        responsesapi_client_metadata: None,
-        additional_context: Default::default(),
-        thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-            environments: Some(local_selections(test.config.cwd.clone())),
-            approval_policy: Some(AskForApproval::Never),
-            sandbox_policy: Some(sandbox_policy),
-            permission_profile,
-            collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
-                mode: codex_protocol::config_types::ModeKind::Default,
-                settings: codex_protocol::config_types::Settings {
-                    model,
-                    reasoning_effort: test.config.model_reasoning_effort.clone(),
-                    developer_instructions: None,
-                },
-            }),
-            ..Default::default()
-        },
-    }
+    TurnInputRequest::user_input(items).with_thread_settings(ThreadSettingsOverrides {
+        environments: Some(local_selections(test.config.cwd.clone())),
+        approval_policy: Some(AskForApproval::Never),
+        sandbox_policy: Some(sandbox_policy),
+        permission_profile,
+        collaboration_mode: Some(CollaborationMode {
+            mode: ModeKind::Default,
+            settings: Settings {
+                model,
+                reasoning_effort: test.config.model_reasoning_effort.clone(),
+                developer_instructions: None,
+            },
+        }),
+        ..Default::default()
+    })
 }
 
 async fn submit_model_turn(
@@ -80,16 +79,13 @@ async fn submit_model_turn(
 ) -> Result<()> {
     thread_settings.model = Some(model.to_string());
     thread
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "switch models".into(),
                 text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings,
-        })
+            }])
+            .with_thread_settings(thread_settings),
+        )
         .await?;
     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     Ok(())
@@ -117,6 +113,8 @@ fn test_model_info(
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
@@ -138,7 +136,6 @@ fn test_model_info(
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(272_000),
         max_context_window: None,
@@ -369,7 +366,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     let next_model = "gpt-5.4";
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "hello".into(),
@@ -382,7 +379,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(next_model.to_string()),
             ..Default::default()
         },
@@ -390,7 +387,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     .await?;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "switch models".into(),
@@ -464,7 +461,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     let next_model = "exp-codex-personality";
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "hello".into(),
@@ -477,7 +474,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(next_model.to_string()),
             personality: Some(Personality::Pragmatic),
             ..Default::default()
@@ -486,7 +483,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
     .await?;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "switch model and personality".into(),
@@ -544,6 +541,50 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
 
     assert_eq!(first_body["service_tier"].as_str(), Some("priority"));
     assert_eq!(second_body.get("service_tier"), None);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lc_adaptive_service_tier_reaches_http_request_seam() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_sequence(
+        &server,
+        vec![sse_completed("resp-fast"), sse_completed("resp-default")],
+    )
+    .await;
+
+    let mut fast_builder = test_codex().with_config(|config| {
+        config.lc_adaptive_service_tier = LcAdaptiveServiceTierConfig {
+            enabled: true,
+            threshold: i64::MAX,
+            below: "priority".to_string(),
+            at_or_above: "default".to_string(),
+        };
+    });
+    let fast = fast_builder.build(&server).await?;
+    fast.submit_turn("short context").await?;
+
+    let mut default_builder = test_codex().with_config(|config| {
+        config.lc_adaptive_service_tier = LcAdaptiveServiceTierConfig {
+            enabled: true,
+            threshold: 1,
+            below: "priority".to_string(),
+            at_or_above: "default".to_string(),
+        };
+    });
+    let default = default_builder.build(&server).await?;
+    default.submit_turn("long context").await?;
+
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 2, "expected one request from each session");
+    assert_eq!(
+        requests[0].body_json()["service_tier"].as_str(),
+        Some("priority")
+    );
+    assert_eq!(requests[1].body_json().get("service_tier"), None);
 
     Ok(())
 }
@@ -791,7 +832,7 @@ async fn model_change_from_multimodal_to_text_strips_prior_media_content() -> Re
         .to_string();
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![
                 UserInput::Image {
@@ -812,7 +853,7 @@ async fn model_change_from_multimodal_to_text_strips_prior_media_content() -> Re
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "second turn".to_string(),
@@ -909,7 +950,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
@@ -921,7 +962,7 @@ async fn generated_image_is_replayed_for_image_capable_models() -> Result<()> {
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
@@ -1006,7 +1047,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
@@ -1018,7 +1059,7 @@ async fn model_change_from_generated_image_to_text_preserves_prior_generated_ima
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "describe the generated image".to_string(),
@@ -1105,7 +1146,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
         .await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "generate a lobster".to_string(),
@@ -1125,7 +1166,7 @@ async fn thread_rollback_after_generated_image_drops_entire_image_turn_history()
     .await;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "after rollback".to_string(),
@@ -1187,6 +1228,8 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         used_fallback_model_metadata: false,
         supports_search_tool: false,
         use_responses_lite: false,
+        node_repl_auto_review_required: false,
+        node_repl_disabled: false,
         auto_review_model_override: None,
         model_specialty: None,
         tool_mode: None,
@@ -1208,7 +1251,6 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
         apply_patch_tool_type: None,
         web_search_tool_type: Default::default(),
         truncation_policy: TruncationPolicyConfig::bytes(/*limit*/ 10_000),
-        supports_parallel_tool_calls: false,
         supports_image_detail_original: false,
         context_window: Some(large_context_window),
         max_context_window: None,
@@ -1279,7 +1321,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     );
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "use larger model".into(),
@@ -1314,7 +1356,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
 
     core_test_support::submit_thread_settings(
         &test.codex,
-        codex_protocol::protocol::ThreadSettingsOverrides {
+        ThreadSettingsOverrides {
             model: Some(smaller_model_slug.to_string()),
             ..Default::default()
         },
@@ -1322,7 +1364,7 @@ async fn model_switch_to_smaller_model_updates_token_context_window() -> Result<
     .await?;
 
     test.codex
-        .submit(read_only_user_turn(
+        .start_or_steer_turn(read_only_user_turn(
             &test,
             vec![UserInput::Text {
                 text: "switch to smaller model".into(),
