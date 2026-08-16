@@ -23,6 +23,13 @@ def main() -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--supplemental-run-id", default=None)
     parser.add_argument(
+        "--artifact-run",
+        action="append",
+        dest="artifact_runs",
+        default=[],
+        help="Repeatable platform:run_id (e.g. --artifact-run linux-x86_64:123)",
+    )
+    parser.add_argument(
         "--expected-platform",
         action="append",
         dest="expected_platforms",
@@ -30,6 +37,15 @@ def main() -> None:
         help="Repeat for each required platform (e.g. --expected-platform linux-x86_64)",
     )
     args = parser.parse_args()
+
+    artifact_runs: dict[str, str] = {}
+    for item in args.artifact_runs:
+        if ":" not in item:
+            raise SystemExit(f"invalid --artifact-run {item!r}; expected platform:run_id")
+        platform, run_id = item.split(":", 1)
+        if not platform or not run_id:
+            raise SystemExit(f"invalid --artifact-run {item!r}; expected platform:run_id")
+        artifact_runs[platform] = run_id
 
     archives = sorted(
         path
@@ -45,14 +61,15 @@ def main() -> None:
         platform = archive.name.removeprefix(prefix)
         platform = platform.removesuffix(".tar.gz").removesuffix(".zip")
         found.add(platform)
-        artifacts.append(
-            {
-                "platform": platform,
-                "path": archive.name,
-                "sha256": sha256(archive),
-                "bytes": archive.stat().st_size,
-            }
-        )
+        entry = {
+            "platform": platform,
+            "path": archive.name,
+            "sha256": sha256(archive),
+            "bytes": archive.stat().st_size,
+        }
+        if platform in artifact_runs:
+            entry["buildRunId"] = artifact_runs[platform]
+        artifacts.append(entry)
     if found != expected:
         raise SystemExit(f"artifact platforms {sorted(found)} != {sorted(expected)}")
 

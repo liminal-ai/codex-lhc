@@ -16,6 +16,11 @@ on:
         description: "Successful Linux smoke run id for that candidate"
         required: true
         type: string
+      supplemental_run_id:
+        description: "Optional successful supplemental-platforms run id (combined bundle)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   actions: read
@@ -42,6 +47,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+          SUPPLEMENTAL_RUN_ID: ${{ inputs.supplemental_run_id }}
         run: |
           set -euo pipefail
           candidate="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
@@ -52,13 +58,27 @@ jobs:
           test "$(jq -r .path <<<"$smoke")" = .github/workflows/lhc-smoke-daytona.yml
           candidate_sha="$(jq -r .head_sha <<<"$candidate")"
           test "$candidate_sha" = "$(jq -r .head_sha <<<"$smoke")"
+          if [ -n "${SUPPLEMENTAL_RUN_ID}" ]; then
+            supplemental="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SUPPLEMENTAL_RUN_ID")"
+            test "$(jq -r .conclusion <<<"$supplemental")" = success
+            test "$(jq -r .path <<<"$supplemental")" = .github/workflows/lhc-release-supplemental.yml
+            test "$(jq -r .head_sha <<<"$supplemental")" = "$candidate_sha"
+          fi
           echo "source_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.supplemental_run_id == '' }}
         with:
           name: codex-lhc-v${{ inputs.version }}-candidate
           path: candidate
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ inputs.candidate_run_id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: ${{ inputs.supplemental_run_id != '' }}
+        with:
+          name: codex-lhc-v${{ inputs.version }}-combined
+          path: candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.supplemental_run_id }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: codex-lhc-qualification-${{ inputs.candidate_run_id }}
@@ -70,6 +90,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ inputs.version }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SUPPLEMENTAL_RUN_ID: ${{ inputs.supplemental_run_id }}
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
         run: |
           set -euo pipefail
@@ -81,7 +102,13 @@ jobs:
           assert manifest['release'] == os.environ['VERSION']
           assert manifest['buildRunId'] == os.environ['CANDIDATE_RUN_ID']
           assert manifest['sourceCommit'] == os.environ['SOURCE_SHA']
-          assert [item['platform'] for item in manifest['artifacts']] == ['linux-x86_64']
+          platforms = sorted(item['platform'] for item in manifest['artifacts'])
+          supplemental = os.environ.get('SUPPLEMENTAL_RUN_ID') or ''
+          if supplemental:
+              assert platforms == ['linux-x86_64', 'macos-aarch64', 'windows-x86_64']
+              assert manifest.get('supplementalRunId') == supplemental
+          else:
+              assert platforms == ['linux-x86_64']
           evidence = json.loads(Path('qualification/qualification.json').read_text())
           assert evidence == {
               'candidate_run_id': os.environ['CANDIDATE_RUN_ID'],
@@ -121,7 +148,23 @@ jobs:
             || { echo "::error::Release notes heading does not contain v${VERSION}"; exit 1; }
           printf '\n---\n\n- Candidate workflow: %s\n- Platform smoke workflow: %s\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
             "${CANDIDATE_RUN_ID}" "${SMOKE_RUN_ID}" >> RELEASE_NOTES.md
-      - name: Publish GitHub release without rebuilding
+      - name: Publish Linux-only GitHub release without rebuilding
+        if: ${{ inputs.supplemental_run_id == '' }}
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Codex + LHC v${{ inputs.version }}
+          target_commitish: ${{ steps.identity.outputs.source_sha }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            candidate/codex-lhc-v*-linux-x86_64.tar.gz
+            candidate/install.sh
+            candidate/release-manifest.json
+            candidate/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+      - name: Publish combined GitHub release without rebuilding
+        if: ${{ inputs.supplemental_run_id != '' }}
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: v${{ inputs.version }}
@@ -136,5 +179,5 @@ jobs:
             candidate/install.ps1
             candidate/release-manifest.json
             candidate/SHA256SUMS
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
           generate_release_notes: false
