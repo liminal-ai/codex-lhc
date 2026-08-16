@@ -2316,10 +2316,10 @@ index 0000000000..fb471e69cf
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..ddc1fde269
+index 0000000000..11a84dc8e6
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3185 @@
+@@ -0,0 +1,3189 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -2364,6 +2364,7 @@ index 0000000000..ddc1fde269
 +use crate::session::session::Session;
 +use crate::session::tests::make_session_and_context;
 +use crate::session::turn::run_auto_compact;
++use codex_protocol::error::CodexErrorDetails;
 +
 +fn text_input(text: &str) -> UserInput {
 +    UserInput::Text {
@@ -3203,9 +3204,11 @@ index 0000000000..ddc1fde269
 +        &CancellationToken::new(),
 +    )
 +    .await;
-+    // Missing slot → blocked residual. Ok continue (no native) or Err refuse.
++    // Missing slot → blocked residual. Ok continue (no native), TurnAborted
++    // (next-provider blocked), or Err refuse with MidTurn/LHC/native text.
 +    match result {
 +        Ok(()) => {}
++        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {}
 +        Err(err) => {
 +            let msg = err.to_string();
 +            assert!(
@@ -4576,6 +4579,7 @@ index 0000000000..ddc1fde269
 +    );
 +    match result {
 +        Ok(()) => {}
++        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {}
 +        Err(err) => {
 +            let msg = err.to_string();
 +            assert!(
@@ -13180,10 +13184,10 @@ index 02e555ced0..04dc517227 100644
  
 diff --git a/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
 new file mode 100644
-index 0000000000..ef7acf5166
+index 0000000000..a2aa13f4e5
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/compact_lhc_mid_turn_loops.rs
-@@ -0,0 +1,907 @@
+@@ -0,0 +1,920 @@
 +//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
 +//!
 +//! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
@@ -13537,11 +13541,17 @@ index 0000000000..ef7acf5166
 +        )
 +        .await?;
 +    let terminal = wait_for_event(&test.codex, |ev| {
-+        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
++        matches!(
++            ev,
++            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
++        )
 +    })
 +    .await;
 +    assert!(
-+        matches!(terminal, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
++        matches!(
++            terminal,
++            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
++        ),
 +        "bounded refusal must reach a clear terminal outcome"
 +    );
 +
@@ -13681,13 +13691,20 @@ index 0000000000..ef7acf5166
 +        }]))
 +        .await?;
 +
-+    // Terminal: TurnComplete or Error — not an infinite loop.
++    // Terminal: TurnComplete, Error, or TurnAborted (Slice B blocked next
++    // provider) — not an infinite loop.
 +    let terminal = wait_for_event(&test.codex, |ev| {
-+        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
++        matches!(
++            ev,
++            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
++        )
 +    })
 +    .await;
 +    assert!(
-+        matches!(terminal, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
++        matches!(
++            terminal,
++            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
++        ),
 +        "task must reach a clear terminal outcome"
 +    );
 +
