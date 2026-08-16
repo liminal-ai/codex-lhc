@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..b831fd0195
+index 0000000000..fb471e69cf
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2165 @@
+@@ -0,0 +1,2215 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -427,10 +427,11 @@ index 0000000000..b831fd0195
 +                warn!(%reason, "LHC MidTurn compact-continuation blocked mutation; continuing without native compact");
 +                Ok(())
 +            } else {
-+                error!(%reason, "LHC MidTurn compact-continuation blocked next provider request");
-+                Err(CodexErr::UnsupportedOperation(format!(
-+                    "LHC MidTurn compact-continuation blocked next provider request: {reason}"
-+                )))
++                error!(
++                    %reason,
++                    "LHC MidTurn compact-continuation blocked next provider request; aborting turn (no native compact)"
++                );
++                Err(CodexErr::TurnAborted)
 +            }
 +        }
 +    }
@@ -1584,6 +1585,55 @@ index 0000000000..b831fd0195
 +            "materialize produced empty install history (bands+tail)",
 +        ));
 +    }
++    // LIM-69: materialize reconstructs CustomToolCall(Output) from portable
++    // LHC messages and drops status / ContentItems / name. Graft the exact
++    // live pair (id + host metadata stripped) so validation, rewrite, and
++    // in-memory install share the same provider-stable bytes.
++    if let Some(spec) = host_validation.as_ref()
++        && !spec.protected_tool_call_ids.is_empty()
++    {
++        let live_items: Vec<ResponseItem> =
++            sess.clone_history().await.raw_items().cloned().collect();
++        match codex_lhc_host::graft_live_protected_pairs(
++            &mut install_history,
++            &live_items,
++            &spec.protected_tool_call_ids,
++        ) {
++            Ok(n) => {
++                info!(
++                    attempt_id = %spec.attempt_id,
++                    grafted = n,
++                    "LHC MidTurn grafted live protected pairs into materialized body"
++                );
++            }
++            Err(reason) => {
++                error!(
++                    attempt_id = %spec.attempt_id,
++                    %reason,
++                    "LHC MidTurn protected-pair graft failed; blocking without rewrite"
++                );
++                if let Err(err) = record_host_validation_on_thread(
++                    thread_id.clone(),
++                    root.clone(),
++                    spec.attempt_id.clone(),
++                    false,
++                    Some(reason.clone()),
++                )
++                .await
++                {
++                    error!(
++                        %err,
++                        attempt_id = %spec.attempt_id,
++                        "failed to persist graft-failure host validation refusal"
++                    );
++                }
++                return Ok(LhcCompactAttempt::MidTurnBlocked {
++                    reason,
++                    next_provider_request_allowed: false,
++                });
++            }
++        }
++    }
 +    for item in &mut install_history {
 +        if item_stable_id(item).is_none()
 +            && let Some(prefix) = item.id_prefix()
@@ -1996,7 +2046,7 @@ index 0000000000..b831fd0195
 +fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
 +    let target = effective_compact_target_tokens(turn_context)?;
 +    let est_tokens = estimate_response_items_tokens(body);
-+    if est_tokens > target {
++    if est_tokens >= target {
 +        Some(format!(
 +            "estimated body tokens {est_tokens} exceed compact target {target} \
 +             (min of auto-compact limit and provider window)"
@@ -2266,10 +2316,10 @@ index 0000000000..b831fd0195
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..b0f7305be8
+index 0000000000..ddc1fde269
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3006 @@
+@@ -0,0 +1,3185 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -5276,6 +5326,185 @@ index 0000000000..b0f7305be8
 +        codex_lhc_host::HostValidationStatus::Failed
 +    );
 +}
++
++/// LIM-69 Slice B: MidTurnBlocked(false) becomes TurnAborted so RegularTask
++/// cannot drain mailbox and start another provider request.
++#[tokio::test]
++async fn mid_turn_host_validation_failed_strict_compact_is_turn_aborted() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    slot.set_mid_turn_test_safe_runway(Some(5_000));
++    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
++    slot.set_mid_turn_test_force_body_validation_fail(true);
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 2).await;
++    seed_escalation_history(&session, &tc, "call-prot-abort").await;
++    inject_response_usage(&session, &tc, 4_800).await;
++    handle.flush().await;
++
++    session
++        .input_queue
++        .enqueue_mailbox_communication(
++            codex_protocol::protocol::InterAgentCommunication::new(
++                codex_protocol::AgentPath::root(),
++                codex_protocol::AgentPath::try_from("/root/worker").expect("path"),
++                Vec::new(),
++                "pending after blocked compact".into(),
++                /*trigger_turn*/ false,
++            ),
++            /*parent_turn_id*/ None,
++            /*root_turn_id*/ None,
++        )
++        .await;
++    assert!(session.input_queue.has_pending_mailbox_items().await);
++
++    let epoch = decision_epoch(&session);
++    let sess = Arc::new(session);
++    let result = crate::compact_lhc::run_strict_lhc_compact(
++        &sess,
++        &Arc::new(tc),
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "resp-esc-abort-1",
++            true,
++            epoch,
++            vec!["call-prot-abort".into()],
++            Some(sample_usage(4_800)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await;
++    assert!(
++        matches!(
++            &result,
++            Err(err)
++                if matches!(
++                    err.details(),
++                    codex_protocol::error::CodexErrorDetails::TurnAborted
++                )
++        ),
++        "MidTurnBlocked(false) must abort the turn, got {result:?}"
++    );
++    assert!(
++        sess.input_queue.has_pending_mailbox_items().await,
++        "TurnAborted must leave mailbox input pending"
++    );
++}
++
++/// LIM-69 Slice D: a later standalone compact changes the active view and
++/// supersedes the failed continuation receipt's reload block. The failed HV
++/// row stays failed.
++#[tokio::test]
++async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root).await;
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    slot.set_mid_turn_test_safe_runway(Some(5_000));
++    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
++    slot.set_mid_turn_test_force_body_validation_fail(true);
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 2).await;
++    seed_escalation_history(&session, &tc, "call-prot-view").await;
++    inject_response_usage(&session, &tc, 4_800).await;
++    handle.flush().await;
++
++    let thread_id = handle.thread_id().to_string();
++    let root_path = handle.root().map(std::path::Path::to_path_buf);
++    let sess = Arc::new(session);
++    let epoch = decision_epoch(&sess);
++    let blocked = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "resp-esc-view-1",
++            true,
++            epoch,
++            vec!["call-prot-view".into()],
++            Some(sample_usage(4_800)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    assert!(
++        matches!(
++            blocked,
++            LhcCompactAttempt::MidTurnBlocked {
++                next_provider_request_allowed: false,
++                ..
++            }
++        ),
++        "expected MidTurnBlocked(false), got {blocked:?}"
++    );
++    assert!(
++        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++            .await
++            .is_some(),
++        "failed HV must gate reload before standalone compact"
++    );
++
++    slot.set_mid_turn_test_force_body_validation_fail(false);
++    *sess
++        .services
++        .lhc_test_inference
++        .lock()
++        .expect("lhc_test_inference lock") =
++        Some(codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic callbacks"));
++    let later = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ true,
++        CompactionPhase::StandaloneTurn,
++        None,
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("standalone");
++    assert!(
++        matches!(later, LhcCompactAttempt::Installed { .. }),
++        "standalone compact must install a later view, got {later:?}"
++    );
++    assert!(
++        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++            .await
++            .is_none(),
++        "newer active view must supersede the failed continuation residual"
++    );
++    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
++        &thread_id,
++        root_path.as_deref(),
++        "resp-esc-view-1",
++    )
++    .await
++    .expect("hv inspect")
++    .expect("hv row");
++    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
++}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
 index 0000000000..e5ff9a59a3
@@ -6702,10 +6931,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..f7d68702ce
+index 0000000000..3577987c1c
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3080 @@
+@@ -0,0 +1,3162 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -6730,6 +6959,7 @@ index 0000000000..f7d68702ce
 +use tempfile::tempdir;
 +
 +use super::LhcCompactAttempt;
++use super::patch_materialized_history_ids;
 +use super::response_items_structurally_equal;
 +use super::token_limit_reached;
 +use super::try_run_lhc_compact_arm;
@@ -9784,6 +10014,87 @@ index 0000000000..f7d68702ce
 +        drain_context_compaction_counts(&rx),
 +        (0, 0),
 +        "skip/fail must not emit ContextCompaction"
++    );
++}
++
++/// LIM-69: grafted live CustomToolCall pair survives the real rewrite stamp.
++#[test]
++fn grafted_pair_survives_patch_materialized_history_ids() {
++    use codex_history::CompactedItem;
++    use codex_history::RolloutItem;
++    use codex_lhc_host::item_bytes_without_id;
++    use codex_protocol::models::FunctionCallOutputBody;
++    use codex_protocol::models::FunctionCallOutputContentItem;
++    use codex_protocol::models::FunctionCallOutputPayload;
++
++    let live_call = ResponseItem::CustomToolCall {
++        id: None,
++        status: Some("completed".into()),
++        call_id: "call-1".into(),
++        name: "exec".into(),
++        namespace: None,
++        input: r#"{"cmd":"ls"}"#.into(),
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let live_out = ResponseItem::CustomToolCallOutput {
++        id: None,
++        call_id: "call-1".into(),
++        name: None,
++        output: FunctionCallOutputPayload {
++            body: FunctionCallOutputBody::ContentItems(vec![
++                FunctionCallOutputContentItem::InputText {
++                    text: "part-a".into(),
++                },
++                FunctionCallOutputContentItem::InputText {
++                    text: "part-b".into(),
++                },
++            ]),
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let reconstructed_call = ResponseItem::CustomToolCall {
++        id: None,
++        status: None,
++        call_id: "call-1".into(),
++        name: "exec".into(),
++        namespace: None,
++        input: r#"{"cmd":"ls"}"#.into(),
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let reconstructed_out = ResponseItem::CustomToolCallOutput {
++        id: None,
++        call_id: "call-1".into(),
++        name: Some("exec".into()),
++        output: FunctionCallOutputPayload {
++            body: FunctionCallOutputBody::Text("part-a\npart-b".into()),
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    };
++    let mut rollout = vec![
++        RolloutItem::Compacted(CompactedItem {
++            message: "lhc".into(),
++            replacement_history: Some(vec![]),
++            window_number: None,
++            first_window_id: None,
++            previous_window_id: None,
++            window_id: None,
++        }),
++        RolloutItem::ResponseItem(reconstructed_call.into()),
++        RolloutItem::ResponseItem(reconstructed_out.into()),
++    ];
++    let install_history = vec![live_call.clone(), live_out.clone()];
++    patch_materialized_history_ids(&mut rollout, &install_history);
++    let resumed = codex_lhc_host::history_from_materialized_items(&rollout);
++    assert_eq!(resumed.len(), 2);
++    assert_eq!(
++        item_bytes_without_id(&resumed[0]),
++        item_bytes_without_id(&live_call)
++    );
++    assert_eq!(
++        item_bytes_without_id(&resumed[1]),
++        item_bytes_without_id(&live_out)
 +    );
 +}
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
