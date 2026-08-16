@@ -113,26 +113,22 @@ jobs:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
         run: |
-          cat > RELEASE_NOTES.md <<EOF
-          ## Codex + LHC v${VERSION}
+          NOTES_FILE="lhc-release/notes/v${VERSION}.md"
+          if [ -f "$NOTES_FILE" ]; then
+            cp "$NOTES_FILE" RELEASE_NOTES.md
+          else
+            echo "## Codex + LHC v${VERSION}" > RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+            echo "Codex-LHC v${VERSION} runs LHC capture by default." >> RELEASE_NOTES.md
+          fi
+          cat >> RELEASE_NOTES.md <<EOF
 
-          Codex-LHC v${VERSION} runs LHC capture by default with no enable flags,
-          preserving long-horizon context, stable turn/message IDs, and direct
-          retrieval. Set lhc_capture=false only as an explicit kill switch.
-
-          This release publishes a prebuilt Linux x86-64 artifact. It passed a
-          disposable Daytona install/run/uninstall lifecycle and proved default
-          LHC capture using the installed Codex binary. Windows x86-64 and
-          macOS Apple Silicon remain source-compatible readiness targets but
-          are not distributed as prebuilt artifacts in this release lane.
+          ---
 
           - Candidate workflow: ${CANDIDATE_RUN_ID}
           - Platform smoke workflow: ${SMOKE_RUN_ID}
-          - LHC thread schema: v11 (migrated from v6; downgrade to v0.2.1 unsupported)
-          - Capture: enabled by default
-
-          This is not an official OpenAI release. Verify release-manifest.json
-          and SHA256SUMS before installation.
+          - This is not an official OpenAI release. Verify release-manifest.json
+            and SHA256SUMS before installation.
           EOF
       - name: Publish GitHub release without rebuilding
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1

@@ -63,7 +63,7 @@ def main() -> None:
             "fromSchema": 6,
             "toSchema": 11,
             "rollbackSupported": False,
-            "rollbackBoundary": "Opening a thread with v0.3.0 migrates it to schema 11; downgrade to v0.2.1 is unsupported.",
+            "rollbackBoundary": f"Opening a thread with v{args.version} migrates it to schema 11; downgrade to v0.2.1 is unsupported.",
         },
     }
     manifest_path = args.dist / "release-manifest.json"
