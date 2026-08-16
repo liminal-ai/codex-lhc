@@ -291,25 +291,14 @@ pub fn content_identity_digest(item: &ResponseItem) -> String {
     item_digest(&stripped)
 }
 
-/// Cheap char/4 token estimate (same order as LHC `estimate_tokens`).
+/// Whole-body o200k estimate over the serialized item sequence.
+/// Shared approach with [`crate::body_validation::validate_next_request_body`]:
+/// tool results and other non-Message items are counted at true size, not 64 chars.
 pub fn estimate_response_items_tokens(items: &[ResponseItem]) -> i64 {
-    let chars: usize = items
-        .iter()
-        .map(|item| match item {
-            ResponseItem::Message { content, .. } => content
-                .iter()
-                .map(|c| match c {
-                    ContentItem::InputText { text } | ContentItem::OutputText { text } => {
-                        text.len()
-                    }
-                    ContentItem::InputImage { image_url, .. } => image_url.len(),
-                    ContentItem::InputAudio { audio_url } => audio_url.len(),
-                })
-                .sum::<usize>(),
-            _ => 64,
-        })
-        .sum();
-    (chars / 4) as i64
+    match serde_json::to_string(items) {
+        Ok(serialized) => lhc::shared_tech::token_counting::estimate_tokens(&serialized),
+        Err(_) => i64::MAX,
+    }
 }
 
 /// Map LHC's served LLM request context to host `ResponseItem`s (law 6: typed roles).

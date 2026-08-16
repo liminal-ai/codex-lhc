@@ -20,6 +20,10 @@ mod rollout_swap;
 mod session;
 mod tools;
 
+#[cfg(test)]
+#[path = "lim69_graft_tests.rs"]
+mod lim69_graft_tests;
+
 pub use band_shape::BandShapeItem;
 pub use band_shape::BandShapeReport;
 pub use band_shape::DEFAULT_FULL_BAND_USER_TURNS;
@@ -30,7 +34,11 @@ pub use body_validation::BodyValidationReport;
 pub use body_validation::BodyValidationSpec;
 pub use body_validation::ProtectedPairExpectation;
 pub use body_validation::capture_body_expectations;
+pub use body_validation::client_call_id;
+pub use body_validation::graft_live_protected_pairs;
 pub use body_validation::item_bytes_without_id;
+pub use body_validation::item_without_host_provenance;
+pub use body_validation::output_call_id;
 pub use body_validation::validate_next_request_body;
 pub use compact_bridge::COMPACT_MARKER_KEY_SEGMENT;
 pub use compact_bridge::CompactMarker;
