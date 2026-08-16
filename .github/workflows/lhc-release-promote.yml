@@ -112,24 +112,22 @@ jobs:
           VERSION: ${{ inputs.version }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
         run: |
+          set -euo pipefail
           NOTES_FILE="lhc-release/notes/v${VERSION}.md"
-          if [ -f "$NOTES_FILE" ]; then
-            cp "$NOTES_FILE" RELEASE_NOTES.md
-          else
-            echo "## Codex + LHC v${VERSION}" > RELEASE_NOTES.md
-            echo "" >> RELEASE_NOTES.md
-            echo "Codex-LHC v${VERSION} runs LHC capture by default." >> RELEASE_NOTES.md
-          fi
+          git show "${SOURCE_SHA}:${NOTES_FILE}" > RELEASE_NOTES.md
+          head -1 RELEASE_NOTES.md | grep -qF "v${VERSION}" \
+            || { echo "::error::Release notes heading does not contain v${VERSION}"; exit 1; }
           cat >> RELEASE_NOTES.md <<EOF
 
-          ---
+---
 
-          - Candidate workflow: ${CANDIDATE_RUN_ID}
-          - Platform smoke workflow: ${SMOKE_RUN_ID}
-          - This is not an official OpenAI release. Verify release-manifest.json
-            and SHA256SUMS before installation.
-          EOF
+- Candidate workflow: ${CANDIDATE_RUN_ID}
+- Platform smoke workflow: ${SMOKE_RUN_ID}
+- This is not an official OpenAI release. Verify release-manifest.json
+  and SHA256SUMS before installation.
+EOF
       - name: Publish GitHub release without rebuilding
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
