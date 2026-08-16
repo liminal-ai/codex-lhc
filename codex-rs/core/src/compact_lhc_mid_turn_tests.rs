@@ -42,6 +42,7 @@ use crate::compact::InitialContextInjection;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn::run_auto_compact;
+use codex_protocol::error::CodexErrorDetails;
 
 fn text_input(text: &str) -> UserInput {
     UserInput::Text {
@@ -881,9 +882,11 @@ async fn mid_turn_run_auto_compact_one_writer_no_native_arms() {
         &CancellationToken::new(),
     )
     .await;
-    // Missing slot → blocked residual. Ok continue (no native) or Err refuse.
+    // Missing slot → blocked residual. Ok continue (no native), TurnAborted
+    // (next-provider blocked), or Err refuse with MidTurn/LHC/native text.
     match result {
         Ok(()) => {}
+        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {}
         Err(err) => {
             let msg = err.to_string();
             assert!(
@@ -2254,6 +2257,7 @@ async fn mid_turn_context_pressure_residual_refuses_native_race() {
     );
     match result {
         Ok(()) => {}
+        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {}
         Err(err) => {
             let msg = err.to_string();
             assert!(

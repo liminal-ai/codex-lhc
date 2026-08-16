@@ -351,11 +351,17 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
         )
         .await?;
     let terminal = wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+        matches!(
+            ev,
+            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
+        )
     })
     .await;
     assert!(
-        matches!(terminal, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
+        matches!(
+            terminal,
+            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
+        ),
         "bounded refusal must reach a clear terminal outcome"
     );
 
@@ -495,13 +501,20 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
         }]))
         .await?;
 
-    // Terminal: TurnComplete or Error — not an infinite loop.
+    // Terminal: TurnComplete, Error, or TurnAborted (Slice B blocked next
+    // provider) — not an infinite loop.
     let terminal = wait_for_event(&test.codex, |ev| {
-        matches!(ev, EventMsg::TurnComplete(_) | EventMsg::Error(_))
+        matches!(
+            ev,
+            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
+        )
     })
     .await;
     assert!(
-        matches!(terminal, EventMsg::TurnComplete(_) | EventMsg::Error(_)),
+        matches!(
+            terminal,
+            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
+        ),
         "task must reach a clear terminal outcome"
     );
 
