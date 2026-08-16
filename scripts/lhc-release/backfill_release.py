@@ -47,8 +47,11 @@ def default_gh(repo: str, *args: str) -> str:
         raise BackfillError("GH_TOKEN is required")
     env = os.environ.copy()
     env["GH_TOKEN"] = token
+    # gh api does not accept -R; the repo is in the URL path.
+    # gh release/other subcommands use -R for repo scoping.
+    cmd = ["gh"] + (["-R", repo] if args and args[0] != "api" else []) + list(args)
     result = subprocess.run(
-        ["gh", "-R", repo, *args],
+        cmd,
         env=env,
         text=True,
         capture_output=True,

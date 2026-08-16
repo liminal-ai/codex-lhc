@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -198,6 +199,30 @@ class BackfillTests(unittest.TestCase):
                 download=gh.download,
             )
             self.assertEqual(gh.notes.count(BACKFILL_MARKER), 1)
+
+
+    def test_default_gh_does_not_pass_R_to_api(self):
+        """Regression: gh api does not accept -R repo."""
+        from backfill_release import default_gh
+        import subprocess as sp
+        calls = []
+        orig_run = sp.run
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            class R:
+                returncode = 0
+                stdout = '{"object":{"sha":"abc"}}'
+                stderr = ""
+            return R()
+        sp.run = fake_run
+        try:
+            os.environ["GH_TOKEN"] = "test"
+            default_gh("owner/repo", "api", "repos/owner/repo/git/refs/tags/v1")
+            self.assertNotIn("-R", calls[-1], "gh api must not receive -R")
+            default_gh("owner/repo", "release", "view", "v1", "--json", "tagName")
+            self.assertIn("-R", calls[-1], "gh release must receive -R")
+        finally:
+            sp.run = orig_run
 
 
 if __name__ == "__main__":
