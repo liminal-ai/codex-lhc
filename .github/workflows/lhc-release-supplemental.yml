@@ -84,6 +84,7 @@ jobs:
           import json, os, re, sys
           from pathlib import Path
           version = os.environ["VERSION"]
+          candidate_run = os.environ["CANDIDATE_RUN_ID"]
           candidate_sha = sys.argv[1]
           manifest = json.loads(Path("candidate/release-manifest.json").read_text())
           assert manifest["release"] == version, manifest.get("release")
@@ -92,6 +93,16 @@ jobs:
           assert re.fullmatch(r"[0-9a-f]{40}", source), source
           assert re.fullmatch(r"[0-9a-f]{40}", sdk), sdk
           assert source == candidate_sha, (source, candidate_sha)
+          assert manifest["buildRunId"] == candidate_run, manifest.get("buildRunId")
+          platforms = [item["platform"] for item in manifest["artifacts"]]
+          assert platforms == ["linux-x86_64"], platforms
+          evidence = json.loads(Path("qualification/qualification.json").read_text())
+          assert evidence == {
+              "candidate_run_id": candidate_run,
+              "version": version,
+              "result": "passed",
+              "platform": "linux-x86_64",
+          }, evidence
           Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8").write(f"source_sha={source}\n")
           print(f"Verified Linux candidate {source} / SDK {sdk}")
           PY
@@ -224,13 +235,25 @@ jobs:
             -InstallRoot $store `
             -Version $env:VERSION
           $env:Path = "$(Join-Path $prefix 'bin');$env:Path"
-          & codex-test-supplemental --version
+          $launcher = Join-Path $prefix "bin\codex-test-supplemental.cmd"
+          if (-not (Test-Path $launcher)) { throw "launcher missing: $launcher" }
+          $launcherText = Get-Content $launcher -Raw
+          $hostDir = Join-Path $store "versions\$env:VERSION"
+          $hostBin = Join-Path $hostDir "bin\codex-code-mode-host.exe"
+          if (-not (Test-Path $hostBin)) { throw "installed code-mode-host missing: $hostBin" }
+          if ($launcherText -notmatch [regex]::Escape((Join-Path $hostDir 'bin\codex.exe'))) {
+            throw "launcher does not resolve to installed codex.exe"
+          }
+          & $launcher --version
           if ($LASTEXITCODE) { throw "installed launcher failed: $LASTEXITCODE" }
+          & $hostBin --help | Out-Null
+          if ($LASTEXITCODE) { throw "installed code-mode-host --help failed: $LASTEXITCODE" }
           powershell -File infra\scripts\lhc-release\install.ps1 `
             -Name codex-test-supplemental `
             -Prefix $prefix `
             -InstallRoot $store `
             -Uninstall
+          if (Test-Path $launcher) { throw "launcher survived uninstall: $launcher" }
       - name: Upload Windows archive
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -302,6 +325,28 @@ jobs:
           # just-built tarball; on this macos-aarch64 runner it exercises the
           # installer script for macos-aarch64.
           python3 infra/scripts/lhc-release/test_install.py
+          archive="dist/codex-lhc-v${VERSION}-macos-aarch64.tar.gz"
+          test -f "$archive"
+          digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          printf '%s  %s\n' "$digest" "$(basename "$archive")" > dist/SHA256SUMS
+          prefix="$(mktemp -d "${TMPDIR:-/tmp}/codex-lhc-macos-prefix.XXXXXX")"
+          store="$(mktemp -d "${TMPDIR:-/tmp}/codex-lhc-macos-store.XXXXXX")"
+          sh infra/scripts/lhc-release/install.sh \
+            --asset-dir "$(pwd)/dist" \
+            --version "$VERSION" \
+            --name codex-test-supplemental \
+            --prefix "$prefix" \
+            --install-root "$store"
+          launcher="$prefix/bin/codex-test-supplemental"
+          test -L "$launcher"
+          "$launcher" --version
+          "$store/versions/${VERSION}/bin/codex-code-mode-host" --help >/dev/null
+          sh infra/scripts/lhc-release/install.sh \
+            --name codex-test-supplemental \
+            --prefix "$prefix" \
+            --install-root "$store" \
+            --uninstall
+          test ! -e "$launcher"
       - name: Upload macOS archive
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:

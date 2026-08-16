@@ -17,10 +17,9 @@ on:
         required: true
         type: string
       supplemental_run_id:
-        description: "Optional successful supplemental-platforms run id (combined bundle)"
-        required: false
+        description: "Successful supplemental-platforms run id (combined bundle; required)"
+        required: true
         type: string
-        default: ""
 
 permissions:
   actions: read
@@ -58,22 +57,14 @@ jobs:
           test "$(jq -r .path <<<"$smoke")" = .github/workflows/lhc-smoke-daytona.yml
           candidate_sha="$(jq -r .head_sha <<<"$candidate")"
           test "$candidate_sha" = "$(jq -r .head_sha <<<"$smoke")"
-          if [ -n "${SUPPLEMENTAL_RUN_ID}" ]; then
-            supplemental="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SUPPLEMENTAL_RUN_ID")"
-            test "$(jq -r .conclusion <<<"$supplemental")" = success
-            test "$(jq -r .path <<<"$supplemental")" = .github/workflows/lhc-release-supplemental.yml
-            test "$(jq -r .head_sha <<<"$supplemental")" = "$candidate_sha"
-          fi
+          test -n "${SUPPLEMENTAL_RUN_ID}"
+          supplemental="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SUPPLEMENTAL_RUN_ID")"
+          test "$(jq -r .conclusion <<<"$supplemental")" = success
+          test "$(jq -r .path <<<"$supplemental")" = .github/workflows/lhc-release-supplemental.yml
+          infra_sha="$(jq -r .head_sha <<<"$supplemental")"
           echo "source_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "infra_sha=$infra_sha" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ inputs.supplemental_run_id == '' }}
-        with:
-          name: codex-lhc-v${{ inputs.version }}-candidate
-          path: candidate
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ inputs.candidate_run_id }}
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: ${{ inputs.supplemental_run_id != '' }}
         with:
           name: codex-lhc-v${{ inputs.version }}-combined
           path: candidate
@@ -92,6 +83,7 @@ jobs:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SUPPLEMENTAL_RUN_ID: ${{ inputs.supplemental_run_id }}
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          INFRA_SHA: ${{ steps.identity.outputs.infra_sha }}
         run: |
           set -euo pipefail
           (cd candidate && sha256sum -c SHA256SUMS)
@@ -102,13 +94,13 @@ jobs:
           assert manifest['release'] == os.environ['VERSION']
           assert manifest['buildRunId'] == os.environ['CANDIDATE_RUN_ID']
           assert manifest['sourceCommit'] == os.environ['SOURCE_SHA']
+          assert manifest.get('supplementalRunId') == os.environ['SUPPLEMENTAL_RUN_ID']
           platforms = sorted(item['platform'] for item in manifest['artifacts'])
-          supplemental = os.environ.get('SUPPLEMENTAL_RUN_ID') or ''
-          if supplemental:
-              assert platforms == ['linux-x86_64', 'macos-aarch64', 'windows-x86_64']
-              assert manifest.get('supplementalRunId') == supplemental
-          else:
-              assert platforms == ['linux-x86_64']
+          assert platforms == ['linux-x86_64', 'macos-aarch64', 'windows-x86_64']
+          by_platform = {item['platform']: item for item in manifest['artifacts']}
+          assert by_platform['linux-x86_64']['buildRunId'] == os.environ['CANDIDATE_RUN_ID']
+          assert by_platform['windows-x86_64']['buildRunId'] == os.environ['SUPPLEMENTAL_RUN_ID']
+          assert by_platform['macos-aarch64']['buildRunId'] == os.environ['SUPPLEMENTAL_RUN_ID']
           evidence = json.loads(Path('qualification/qualification.json').read_text())
           assert evidence == {
               'candidate_run_id': os.environ['CANDIDATE_RUN_ID'],
@@ -116,6 +108,7 @@ jobs:
               'result': 'passed',
               'platform': 'linux-x86_64',
           }
+          print(f"product SHA {os.environ['SOURCE_SHA']}; infra SHA {os.environ['INFRA_SHA']}")
           PY
       - name: Refuse an existing tag or release
         env:
@@ -139,32 +132,18 @@ jobs:
           VERSION: ${{ inputs.version }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
           SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+          SUPPLEMENTAL_RUN_ID: ${{ inputs.supplemental_run_id }}
           SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          INFRA_SHA: ${{ steps.identity.outputs.infra_sha }}
         run: |
           set -euo pipefail
           NOTES_FILE="lhc-release/notes/v${VERSION}.md"
           git show "${SOURCE_SHA}:${NOTES_FILE}" > RELEASE_NOTES.md
           head -1 RELEASE_NOTES.md | grep -qF "v${VERSION}" \
             || { echo "::error::Release notes heading does not contain v${VERSION}"; exit 1; }
-          printf '\n---\n\n- Candidate workflow: %s\n- Platform smoke workflow: %s\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
-            "${CANDIDATE_RUN_ID}" "${SMOKE_RUN_ID}" >> RELEASE_NOTES.md
-      - name: Publish Linux-only GitHub release without rebuilding
-        if: ${{ inputs.supplemental_run_id == '' }}
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
-        with:
-          tag_name: v${{ inputs.version }}
-          name: Codex + LHC v${{ inputs.version }}
-          target_commitish: ${{ steps.identity.outputs.source_sha }}
-          body_path: RELEASE_NOTES.md
-          files: |
-            candidate/codex-lhc-v*-linux-x86_64.tar.gz
-            candidate/install.sh
-            candidate/release-manifest.json
-            candidate/SHA256SUMS
-          fail_on_unmatched_files: true
-          generate_release_notes: false
+          printf '\n---\n\n- Candidate workflow: %s\n- Platform smoke workflow: %s\n- Supplemental workflow: %s\n- Supplemental infrastructure SHA: %s\n- Platforms: linux-x86_64, windows-x86_64, macos-aarch64\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
+            "${CANDIDATE_RUN_ID}" "${SMOKE_RUN_ID}" "${SUPPLEMENTAL_RUN_ID}" "${INFRA_SHA}" >> RELEASE_NOTES.md
       - name: Publish combined GitHub release without rebuilding
-        if: ${{ inputs.supplemental_run_id != '' }}
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           tag_name: v${{ inputs.version }}
