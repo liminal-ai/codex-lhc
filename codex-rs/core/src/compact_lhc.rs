@@ -326,10 +326,11 @@ pub(crate) async fn run_strict_lhc_compact(
                 warn!(%reason, "LHC MidTurn compact-continuation blocked mutation; continuing without native compact");
                 Ok(())
             } else {
-                error!(%reason, "LHC MidTurn compact-continuation blocked next provider request");
-                Err(CodexErr::UnsupportedOperation(format!(
-                    "LHC MidTurn compact-continuation blocked next provider request: {reason}"
-                )))
+                error!(
+                    %reason,
+                    "LHC MidTurn compact-continuation blocked next provider request; aborting turn (no native compact)"
+                );
+                Err(CodexErr::TurnAborted)
             }
         }
     }
@@ -1483,6 +1484,55 @@ async fn install_lhc_compact_rewrite(
             "materialize produced empty install history (bands+tail)",
         ));
     }
+    // LIM-69: materialize reconstructs CustomToolCall(Output) from portable
+    // LHC messages and drops status / ContentItems / name. Graft the exact
+    // live pair (id + host metadata stripped) so validation, rewrite, and
+    // in-memory install share the same provider-stable bytes.
+    if let Some(spec) = host_validation.as_ref()
+        && !spec.protected_tool_call_ids.is_empty()
+    {
+        let live_items: Vec<ResponseItem> =
+            sess.clone_history().await.raw_items().cloned().collect();
+        match codex_lhc_host::graft_live_protected_pairs(
+            &mut install_history,
+            &live_items,
+            &spec.protected_tool_call_ids,
+        ) {
+            Ok(n) => {
+                info!(
+                    attempt_id = %spec.attempt_id,
+                    grafted = n,
+                    "LHC MidTurn grafted live protected pairs into materialized body"
+                );
+            }
+            Err(reason) => {
+                error!(
+                    attempt_id = %spec.attempt_id,
+                    %reason,
+                    "LHC MidTurn protected-pair graft failed; blocking without rewrite"
+                );
+                if let Err(err) = record_host_validation_on_thread(
+                    thread_id.clone(),
+                    root.clone(),
+                    spec.attempt_id.clone(),
+                    false,
+                    Some(reason.clone()),
+                )
+                .await
+                {
+                    error!(
+                        %err,
+                        attempt_id = %spec.attempt_id,
+                        "failed to persist graft-failure host validation refusal"
+                    );
+                }
+                return Ok(LhcCompactAttempt::MidTurnBlocked {
+                    reason,
+                    next_provider_request_allowed: false,
+                });
+            }
+        }
+    }
     for item in &mut install_history {
         if item_stable_id(item).is_none()
             && let Some(prefix) = item.id_prefix()
@@ -1895,7 +1945,7 @@ fn effective_compact_target_tokens(turn_context: &TurnContext) -> Option<i64> {
 fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
     let target = effective_compact_target_tokens(turn_context)?;
     let est_tokens = estimate_response_items_tokens(body);
-    if est_tokens > target {
+    if est_tokens >= target {
         Some(format!(
             "estimated body tokens {est_tokens} exceed compact target {target} \
              (min of auto-compact limit and provider window)"

@@ -260,6 +260,27 @@ pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) 
     if !installed_pending {
         return None;
     }
+    // LIM-69: the block is bound to the view this attempt installed. A later
+    // successful compact that replaced the active view supersedes the old
+    // Awaiting/Failed residual. Do not rewrite that residual as ok.
+    match host_validation_attempt_view_superseded(&ref_, &latest.attempt_id).await {
+        Ok(Some((attempt_view, active_view))) => {
+            info!(
+                attempt_id = %latest.attempt_id,
+                %attempt_view,
+                %active_view,
+                "host-validation reload gate superseded: failed/awaiting view is no longer active"
+            );
+            return None;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Some(format!(
+                "host-validation view-scope inspect failed for attempt {} ({}); refusing regeneration",
+                latest.attempt_id, err
+            ));
+        }
+    }
     // The durable host-validation row may have been resolved `ok` after the
     // receipt was recorded (validated later in the same or a prior process).
     match lhc::compact_continuation::get_compact_continuation_host_validation(
@@ -290,6 +311,58 @@ pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) 
             error.reason
         )),
     }
+}
+
+/// Returns `Some((attempt_view, active_view))` when the attempt's installed
+/// view is no longer the thread's active serving view.
+async fn host_validation_attempt_view_superseded(
+    ref_: &lhc::threads::ThreadRef,
+    attempt_id: &str,
+) -> Result<Option<(String, String)>, String> {
+    let Some(attempt_view) = installed_view_id_for_attempt(ref_, attempt_id).await? else {
+        // No install_succeeded viewId: cannot prove supersession; keep the block.
+        return Ok(None);
+    };
+    let active_view = match lhc::thread_view::describe(ref_.clone()).await {
+        lhc::shared_tech::errors::OpResult::Ok { value: Some(view) } => view.view_id,
+        lhc::shared_tech::errors::OpResult::Ok { value: None } => return Ok(None),
+        lhc::shared_tech::errors::OpResult::Err { error } => {
+            return Err(format!("{}: {}", error.code.as_str(), error.reason));
+        }
+    };
+    if active_view != attempt_view {
+        Ok(Some((attempt_view, active_view)))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn installed_view_id_for_attempt(
+    ref_: &lhc::threads::ThreadRef,
+    attempt_id: &str,
+) -> Result<Option<String>, String> {
+    let stages =
+        match lhc::compact_continuation::list_compact_continuation_stages(ref_.clone(), attempt_id)
+            .await
+        {
+            lhc::shared_tech::errors::OpResult::Ok { value } => value,
+            lhc::shared_tech::errors::OpResult::Err { error } => {
+                return Err(format!("{}: {}", error.code.as_str(), error.reason));
+            }
+        };
+    let view_id = stages.into_iter().rev().find_map(|entry| {
+        if entry.stage != "install_succeeded" {
+            return None;
+        }
+        entry
+            .detail
+            .as_ref()
+            .and_then(|d| d.get("viewId"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    });
+    Ok(view_id)
 }
 
 /// Classify + regenerate when needed. Fail-open if the thread is unavailable.

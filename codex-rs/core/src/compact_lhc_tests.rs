@@ -22,6 +22,7 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 use super::LhcCompactAttempt;
+use super::patch_materialized_history_ids;
 use super::response_items_structurally_equal;
 use super::token_limit_reached;
 use super::try_run_lhc_compact_arm;
@@ -3076,5 +3077,86 @@ async fn hard_failure_emits_no_context_compaction_items() {
         drain_context_compaction_counts(&rx),
         (0, 0),
         "skip/fail must not emit ContextCompaction"
+    );
+}
+
+/// LIM-69: grafted live CustomToolCall pair survives the real rewrite stamp.
+#[test]
+fn grafted_pair_survives_patch_materialized_history_ids() {
+    use codex_history::CompactedItem;
+    use codex_history::RolloutItem;
+    use codex_lhc_host::item_bytes_without_id;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let live_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-1".into(),
+        name: "exec".into(),
+        namespace: None,
+        input: r#"{"cmd":"ls"}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let live_out = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-1".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                FunctionCallOutputContentItem::InputText {
+                    text: "part-a".into(),
+                },
+                FunctionCallOutputContentItem::InputText {
+                    text: "part-b".into(),
+                },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let reconstructed_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: None,
+        call_id: "call-1".into(),
+        name: "exec".into(),
+        namespace: None,
+        input: r#"{"cmd":"ls"}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let reconstructed_out = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-1".into(),
+        name: Some("exec".into()),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("part-a\npart-b".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut rollout = vec![
+        RolloutItem::Compacted(CompactedItem {
+            message: "lhc".into(),
+            replacement_history: Some(vec![]),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::ResponseItem(reconstructed_call.into()),
+        RolloutItem::ResponseItem(reconstructed_out.into()),
+    ];
+    let install_history = vec![live_call.clone(), live_out.clone()];
+    patch_materialized_history_ids(&mut rollout, &install_history);
+    let resumed = codex_lhc_host::history_from_materialized_items(&rollout);
+    assert_eq!(resumed.len(), 2);
+    assert_eq!(
+        item_bytes_without_id(&resumed[0]),
+        item_bytes_without_id(&live_call)
+    );
+    assert_eq!(
+        item_bytes_without_id(&resumed[1]),
+        item_bytes_without_id(&live_out)
     );
 }

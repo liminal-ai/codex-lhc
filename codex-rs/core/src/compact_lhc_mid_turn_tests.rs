@@ -3004,3 +3004,182 @@ async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
         codex_lhc_host::HostValidationStatus::Failed
     );
 }
+
+/// LIM-69 Slice B: MidTurnBlocked(false) becomes TurnAborted so RegularTask
+/// cannot drain mailbox and start another provider request.
+#[tokio::test]
+async fn mid_turn_host_validation_failed_strict_compact_is_turn_aborted() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    slot.set_mid_turn_test_safe_runway(Some(5_000));
+    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
+    slot.set_mid_turn_test_force_body_validation_fail(true);
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 2).await;
+    seed_escalation_history(&session, &tc, "call-prot-abort").await;
+    inject_response_usage(&session, &tc, 4_800).await;
+    handle.flush().await;
+
+    session
+        .input_queue
+        .enqueue_mailbox_communication(
+            codex_protocol::protocol::InterAgentCommunication::new(
+                codex_protocol::AgentPath::root(),
+                codex_protocol::AgentPath::try_from("/root/worker").expect("path"),
+                Vec::new(),
+                "pending after blocked compact".into(),
+                /*trigger_turn*/ false,
+            ),
+            /*parent_turn_id*/ None,
+            /*root_turn_id*/ None,
+        )
+        .await;
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+
+    let epoch = decision_epoch(&session);
+    let sess = Arc::new(session);
+    let result = crate::compact_lhc::run_strict_lhc_compact(
+        &sess,
+        &Arc::new(tc),
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "resp-esc-abort-1",
+            true,
+            epoch,
+            vec!["call-prot-abort".into()],
+            Some(sample_usage(4_800)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        matches!(
+            &result,
+            Err(err)
+                if matches!(
+                    err.details(),
+                    codex_protocol::error::CodexErrorDetails::TurnAborted
+                )
+        ),
+        "MidTurnBlocked(false) must abort the turn, got {result:?}"
+    );
+    assert!(
+        sess.input_queue.has_pending_mailbox_items().await,
+        "TurnAborted must leave mailbox input pending"
+    );
+}
+
+/// LIM-69 Slice D: a later standalone compact changes the active view and
+/// supersedes the failed continuation receipt's reload block. The failed HV
+/// row stays failed.
+#[tokio::test]
+async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    slot.set_mid_turn_test_safe_runway(Some(5_000));
+    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
+    slot.set_mid_turn_test_force_body_validation_fail(true);
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 2).await;
+    seed_escalation_history(&session, &tc, "call-prot-view").await;
+    inject_response_usage(&session, &tc, 4_800).await;
+    handle.flush().await;
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let blocked = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "resp-esc-view-1",
+            true,
+            epoch,
+            vec!["call-prot-view".into()],
+            Some(sample_usage(4_800)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    assert!(
+        matches!(
+            blocked,
+            LhcCompactAttempt::MidTurnBlocked {
+                next_provider_request_allowed: false,
+                ..
+            }
+        ),
+        "expected MidTurnBlocked(false), got {blocked:?}"
+    );
+    assert!(
+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+            .await
+            .is_some(),
+        "failed HV must gate reload before standalone compact"
+    );
+
+    slot.set_mid_turn_test_force_body_validation_fail(false);
+    *sess
+        .services
+        .lhc_test_inference
+        .lock()
+        .expect("lhc_test_inference lock") =
+        Some(codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic callbacks"));
+    let later = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ true,
+        CompactionPhase::StandaloneTurn,
+        None,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("standalone");
+    assert!(
+        matches!(later, LhcCompactAttempt::Installed { .. }),
+        "standalone compact must install a later view, got {later:?}"
+    );
+    assert!(
+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+            .await
+            .is_none(),
+        "newer active view must supersede the failed continuation residual"
+    );
+    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
+        &thread_id,
+        root_path.as_deref(),
+        "resp-esc-view-1",
+    )
+    .await
+    .expect("hv inspect")
+    .expect("hv row");
+    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
+}

@@ -10,7 +10,6 @@
 //! the caller records `ok`/`failed` through the certified SDK API.
 
 use codex_protocol::models::ResponseItem;
-use lhc::shared_tech::token_counting::estimate_tokens;
 use serde_json::Value;
 
 /// Source label for the host body-size measurement (o200k estimate over the
@@ -77,7 +76,7 @@ pub fn item_bytes_without_id(item: &ResponseItem) -> String {
     value.to_string()
 }
 
-fn client_call_id(item: &ResponseItem) -> Option<String> {
+pub fn client_call_id(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::FunctionCall { call_id, .. }
         | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
@@ -94,7 +93,7 @@ fn client_call_id(item: &ResponseItem) -> Option<String> {
     }
 }
 
-fn output_call_id(item: &ResponseItem) -> Option<String> {
+pub fn output_call_id(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::FunctionCallOutput { call_id, .. }
         | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
@@ -167,6 +166,79 @@ pub fn capture_body_expectations(
         .collect();
 
     (pairs, required_encrypted_reasoning)
+}
+
+/// Clone a live item with only host provenance stripped (`id` +
+/// `internal_chat_message_metadata_passthrough`). Payload bytes — status,
+/// ContentItems, name, arguments, outputs — stay intact.
+pub fn item_without_host_provenance(item: &ResponseItem) -> Result<ResponseItem, String> {
+    serde_json::from_str(&item_bytes_without_id(item))
+        .map_err(|e| format!("normalize live protected item: {e}"))
+}
+
+/// Replace materialized call/output items with the live in-memory pair for
+/// each protected `call_id`. Missing live or materialized sides are a hard
+/// error — the pair must have been preserved after the visibility boundary.
+pub fn graft_live_protected_pairs(
+    body: &mut [ResponseItem],
+    live_items: &[ResponseItem],
+    protected_tool_call_ids: &[String],
+) -> Result<usize, String> {
+    let mut grafted = 0usize;
+    for id in protected_tool_call_ids {
+        // Require exactly one live call and one live output per protected ID.
+        let live_calls: Vec<_> = live_items
+            .iter()
+            .filter(|item| client_call_id(item).as_deref() == Some(id.as_str()))
+            .collect();
+        if live_calls.len() != 1 {
+            return Err(format!(
+                "protected call {id}: expected exactly 1 in live history, found {}",
+                live_calls.len()
+            ));
+        }
+        let live_call = live_calls[0];
+        let live_outputs: Vec<_> = live_items
+            .iter()
+            .filter(|item| output_call_id(item).as_deref() == Some(id.as_str()))
+            .collect();
+        if live_outputs.len() != 1 {
+            return Err(format!(
+                "protected output {id}: expected exactly 1 in live history, found {}",
+                live_outputs.len()
+            ));
+        }
+        let live_output = live_outputs[0];
+        // Require exactly one materialized call and one materialized output.
+        let mat_calls: Vec<_> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| client_call_id(item).as_deref() == Some(id.as_str()))
+            .collect();
+        if mat_calls.len() != 1 {
+            return Err(format!(
+                "protected call {id}: expected exactly 1 in materialized body, found {}",
+                mat_calls.len()
+            ));
+        }
+        let call_idx = mat_calls[0].0;
+        let mat_outputs: Vec<_> = body
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| output_call_id(item).as_deref() == Some(id.as_str()))
+            .collect();
+        if mat_outputs.len() != 1 {
+            return Err(format!(
+                "protected output {id}: expected exactly 1 in materialized body, found {}",
+                mat_outputs.len()
+            ));
+        }
+        let out_idx = mat_outputs[0].0;
+        body[call_idx] = item_without_host_provenance(live_call)?;
+        body[out_idx] = item_without_host_provenance(live_output)?;
+        grafted += 1;
+    }
+    Ok(grafted)
 }
 
 /// Validate the exact materialized next-request item sequence.
@@ -283,8 +355,7 @@ pub fn validate_next_request_body(
     }
 
     // 4. Complete-body size against the host safe-runway threshold.
-    let serialized = serde_json::to_string(body).map_err(|e| format!("serialize body: {e}"))?;
-    let body_token_estimate = estimate_tokens(&serialized);
+    let body_token_estimate = crate::estimate_response_items_tokens(body);
     if let Some(threshold) = spec.safe_runway_threshold_tokens
         && body_token_estimate >= threshold
     {
@@ -306,6 +377,7 @@ pub fn validate_next_request_body(
 mod tests {
     use super::*;
     use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem;
     use codex_protocol::models::FunctionCallOutputPayload;
 
     fn call(id: &str, args: &str) -> ResponseItem {
@@ -396,5 +468,113 @@ mod tests {
         rebuilt_call.set_id(Some(codex_protocol::ResponseItemId::new("assigned")));
         let body = vec![rebuilt_call, output("c1", "r")];
         validate_next_request_body(&body, &spec).expect("id-only drift is legal");
+    }
+
+    fn custom_call(id: &str, status: Option<&str>, name: &str, input: &str) -> ResponseItem {
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: status.map(str::to_string),
+            call_id: id.into(),
+            name: name.into(),
+            namespace: None,
+            input: input.into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    fn custom_output_content_items(id: &str, name: Option<&str>, texts: &[&str]) -> ResponseItem {
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: id.into(),
+            name: name.map(str::to_string),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::ContentItems(
+                    texts
+                        .iter()
+                        .map(|text| FunctionCallOutputContentItem::InputText {
+                            text: (*text).into(),
+                        })
+                        .collect(),
+                ),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    #[test]
+    fn incident_custom_tool_pair_grafts_and_validates() {
+        let live = vec![
+            custom_call("c1", Some("completed"), "exec", "{\"cmd\":\"ls\"}"),
+            custom_output_content_items("c1", None, &["part-a", "part-b"]),
+        ];
+        let mut body = vec![
+            custom_call("c1", None, "exec", "{\"cmd\":\"ls\"}"),
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "c1".into(),
+                name: Some("exec".into()),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("part-a\npart-b".into()),
+                    success: Some(true),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let grafted = graft_live_protected_pairs(&mut body, &live, &["c1".into()]).expect("graft");
+        assert_eq!(grafted, 1);
+        match &body[0] {
+            ResponseItem::CustomToolCall { status, name, .. } => {
+                assert_eq!(status.as_deref(), Some("completed"));
+                assert_eq!(name, "exec");
+            }
+            other => panic!("expected CustomToolCall, got {other:?}"),
+        }
+        match &body[1] {
+            ResponseItem::CustomToolCallOutput { name, output, .. } => {
+                assert_eq!(name.as_deref(), None);
+                assert!(matches!(
+                    output.body,
+                    FunctionCallOutputBody::ContentItems(ref items) if items.len() == 2
+                ));
+            }
+            other => panic!("expected CustomToolCallOutput, got {other:?}"),
+        }
+        let spec = spec_for(&live, &["c1"], Some(100_000));
+        validate_next_request_body(&body, &spec).expect("grafted incident shape validates");
+    }
+
+    #[test]
+    fn duplicate_live_call_cardinality_fails_graft() {
+        let live = vec![call("c1", "{}"), call("c1", "{}"), output("c1", "r")];
+        let mut body = vec![call("c1", "{}"), output("c1", "r")];
+        let err = graft_live_protected_pairs(&mut body, &live, &["c1".into()]).unwrap_err();
+        assert!(err.contains("expected exactly 1"), "{err}");
+    }
+
+    #[test]
+    fn estimator_counts_large_tool_output_and_rejects_at_threshold() {
+        let huge = "x".repeat(10_000);
+        let items = vec![output("c1", &huge)];
+        let estimate = crate::estimate_response_items_tokens(&items);
+        assert!(
+            estimate > 1000,
+            "o200k estimate of a 10k-char tool result must not look like ~16 tokens: {estimate}"
+        );
+        let live = vec![call("c1", "{}"), output("c1", &huge)];
+        let spec = spec_for(&live, &["c1"], Some(estimate));
+        let err = validate_next_request_body(&live, &spec).unwrap_err();
+        assert!(err.contains("safe-runway"), "{err}");
+        assert!(
+            err.contains(&estimate.to_string()),
+            "threshold reject should report the same estimate: {err}"
+        );
+    }
+
+    #[test]
+    fn missing_live_pair_fails_graft() {
+        let mut body = vec![call("c1", "{}"), output("c1", "r")];
+        let err = graft_live_protected_pairs(&mut body, &[], &["c1".into()]).unwrap_err();
+        assert!(err.contains("expected exactly 1"), "{err}");
     }
 }
