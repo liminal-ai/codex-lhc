@@ -114,7 +114,8 @@ jobs:
             --source-commit "$(git rev-parse HEAD)" \
             --upstream-commit "$(tr -d '[:space:]' < patches/lhc/BASE)" \
             --lhc-sdk-commit "$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)" \
-            --run-id "$GITHUB_RUN_ID"
+            --run-id "$GITHUB_RUN_ID" \
+            --expected-platform linux-x86_64
           (cd candidate && sha256sum -c SHA256SUMS)
           python3 -m json.tool candidate/release-manifest.json >/dev/null
       - name: Upload immutable candidate

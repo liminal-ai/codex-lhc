@@ -21,6 +21,14 @@ def main() -> None:
     parser.add_argument("--upstream-commit", required=True)
     parser.add_argument("--lhc-sdk-commit", required=True)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--supplemental-run-id", default=None)
+    parser.add_argument(
+        "--expected-platform",
+        action="append",
+        dest="expected_platforms",
+        required=True,
+        help="Repeat for each required platform (e.g. --expected-platform linux-x86_64)",
+    )
     args = parser.parse_args()
 
     archives = sorted(
@@ -29,7 +37,7 @@ def main() -> None:
         if path.name.startswith(f"codex-lhc-v{args.version}-")
         and path.suffix in {".gz", ".zip"}
     )
-    expected = {"linux-x86_64"}
+    expected = set(args.expected_platforms)
     artifacts = []
     found = set()
     prefix = f"codex-lhc-v{args.version}-"
@@ -56,6 +64,9 @@ def main() -> None:
         "lhcSdkCommit": args.lhc_sdk_commit,
         "lhcThreadSchema": 11,
         "buildRunId": args.run_id,
+        **({
+            "supplementalRunId": args.supplemental_run_id
+        } if args.supplemental_run_id else {}),
         "captureDefault": "on",
         "artifacts": artifacts,
         "migration": {

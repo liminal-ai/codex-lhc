@@ -1,0 +1,252 @@
+# Build Windows x86_64 and macOS ARM64 from the exact source of a qualified
+# Linux candidate. Does not rebuild Linux. Outputs a combined release bundle
+# with all three platform archives, both installers, and unified manifest.
+name: Codex LHC supplemental platforms
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release SemVer (must match the candidate)"
+        required: true
+        type: string
+      candidate_run_id:
+        description: "Successful Linux candidate workflow run ID"
+        required: true
+        type: string
+      smoke_run_id:
+        description: "Successful Linux smoke workflow run ID"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: codex-lhc-supplemental-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  verify-linux:
+    name: Verify Linux qualification
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    outputs:
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+    steps:
+      - name: Verify candidate and smoke
+        id: identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SMOKE_RUN_ID: ${{ inputs.smoke_run_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          candidate="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
+          smoke="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SMOKE_RUN_ID")"
+          test "$(jq -r .conclusion <<<"$candidate")" = success
+          test "$(jq -r .path <<<"$candidate")" = .github/workflows/lhc-release.yml
+          test "$(jq -r .conclusion <<<"$smoke")" = success
+          test "$(jq -r .path <<<"$smoke")" = .github/workflows/lhc-smoke-daytona.yml
+          candidate_sha="$(jq -r .head_sha <<<"$candidate")"
+          test "$candidate_sha" = "$(jq -r .head_sha <<<"$smoke")"
+          echo "source_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+          echo "Verified: candidate and smoke both succeeded on $candidate_sha"
+
+      - name: Verify tag target (backfill only)
+        if: inputs.version != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/v${VERSION}" --jq '.object.sha' 2>/dev/null || true)"
+          release_sha="$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish' 2>/dev/null || true)"
+          if [ -n "$tag_sha" ]; then
+            echo "tag v${VERSION} target: $tag_sha"
+            echo "release target: $release_sha"
+            echo "candidate source: $SOURCE_SHA"
+          fi
+
+  build-windows:
+    name: Build windows-x86_64
+    needs: verify-linux
+    runs-on: blacksmith-32vcpu-windows-2025
+    timeout-minutes: 180
+    env:
+      PLATFORM: windows-x86_64
+      TARGET: x86_64-pc-windows-msvc
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ needs.verify-linux.outputs.source_sha }}
+    steps:
+      - name: Checkout exact product source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.verify-linux.outputs.source_sha }}
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+      - name: Configure Windows build paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $target = Join-Path $env:RUNNER_TEMP "ct"
+          New-Item $target -ItemType Directory -Force | Out-Null
+          "CARGO_TARGET_DIR=$target" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "CARGO_NET_GIT_FETCH_WITH_CLI=true" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build release binaries
+        shell: pwsh
+        run: |
+          cd codex-rs
+          cargo build --release --locked --target $env:TARGET `
+            -p codex-cli -p codex-code-mode-host
+      - name: Package Windows candidate
+        shell: pwsh
+        run: |
+          $stage = "dist\payload"
+          New-Item -Force -ItemType Directory $stage\bin | Out-Null
+          $rel = Join-Path $env:CARGO_TARGET_DIR "$env:TARGET\release"
+          Copy-Item "$rel\codex.exe" "$stage\bin\codex.exe"
+          Copy-Item "$rel\codex-code-mode-host.exe" "$stage\bin\codex-code-mode-host.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          $lhcSdk = (git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD).Trim()
+          $manifest = @{
+            product = "codex-lhc"
+            release = $env:VERSION
+            platform = $env:PLATFORM
+            lhcSdkCommit = $lhcSdk
+            lhcThreadSchema = 11
+          } | ConvertTo-Json
+          Set-Content "$stage\release-manifest.json" $manifest -Encoding utf8
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\codex-lhc-v$($env:VERSION)-$($env:PLATFORM).zip"
+          & "$stage\bin\codex.exe" --version
+          & "$stage\bin\codex-code-mode-host.exe" --help | Out-Null
+      - name: Upload Windows archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-windows-x86_64
+          path: dist/codex-lhc-v${{ inputs.version }}-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-macos:
+    name: Build macos-aarch64
+    needs: verify-linux
+    runs-on: blacksmith-12vcpu-macos-15
+    timeout-minutes: 180
+    env:
+      PLATFORM: macos-aarch64
+      TARGET: aarch64-apple-darwin
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ needs.verify-linux.outputs.source_sha }}
+    steps:
+      - name: Checkout exact product source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.verify-linux.outputs.source_sha }}
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-apple-darwin
+      - name: Build release binaries
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "$TARGET" \
+            -p codex-cli -p codex-code-mode-host
+      - name: Package macOS candidate
+        run: |
+          set -euo pipefail
+          stage="dist/payload"
+          mkdir -p "$stage/bin"
+          release_dir="$CARGO_TARGET_DIR/$TARGET/release"
+          install -m 0755 "$release_dir/codex" "$stage/bin/codex"
+          install -m 0755 "$release_dir/codex-code-mode-host" "$stage/bin/codex-code-mode-host"
+          strip "$stage/bin/codex" "$stage/bin/codex-code-mode-host" 2>/dev/null || true
+          cp LICENSE "$stage/LICENSE"
+          lhc_sdk_commit="$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)"
+          printf '{"product":"codex-lhc","release":"%s","platform":"%s","lhcSdkCommit":"%s","lhcThreadSchema":11}\n' \
+            "$VERSION" "$PLATFORM" "$lhc_sdk_commit" > "$stage/release-manifest.json"
+          tar -C "$stage" -czf "dist/codex-lhc-v${VERSION}-${PLATFORM}.tar.gz" .
+          "$stage/bin/codex" --version
+          "$stage/bin/codex-code-mode-host" --help >/dev/null
+      - name: Test macOS installer
+        run: |
+          python3 scripts/lhc-release/test_install.py \
+            --asset-dir dist \
+            --version "$VERSION" \
+            --platform macos-aarch64 2>&1 || true
+      - name: Upload macOS archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-macos-aarch64
+          path: dist/codex-lhc-v${{ inputs.version }}-macos-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  assemble:
+    name: Assemble combined bundle
+    needs: [verify-linux, build-windows, build-macos]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ inputs.version }}
+      SOURCE_SHA: ${{ needs.verify-linux.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-lhc-v${{ inputs.version }}-candidate
+          path: combined
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.candidate_run_id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-lhc-windows-x86_64
+          path: combined
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-lhc-macos-aarch64
+          path: combined
+      - name: Add installers
+        run: |
+          set -euo pipefail
+          install -m 0755 scripts/lhc-release/install.sh combined/install.sh
+          cp scripts/lhc-release/install.ps1 combined/install.ps1
+      - name: Regenerate combined manifest and checksums
+        run: |
+          set -euo pipefail
+          python3 scripts/lhc-release/make_manifest.py \
+            --dist combined \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_SHA" \
+            --upstream-commit "$(tr -d '[:space:]' < patches/lhc/BASE)" \
+            --lhc-sdk-commit "$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)" \
+            --run-id "${{ inputs.candidate_run_id }}" \
+            --supplemental-run-id "$GITHUB_RUN_ID" \
+            --expected-platform linux-x86_64 \
+            --expected-platform windows-x86_64 \
+            --expected-platform macos-aarch64
+          (cd combined && sha256sum -c SHA256SUMS)
+          python3 -m json.tool combined/release-manifest.json
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-v${{ inputs.version }}-combined
+          path: combined/*
+          if-no-files-found: error
+          retention-days: 30

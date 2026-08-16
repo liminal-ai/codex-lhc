@@ -108,7 +108,8 @@ esac
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) PLATFORM=linux-x86_64 ;;
-  *) die "v${VERSION} publishes a prebuilt artifact for Linux x86-64 only; build from source on $(uname -s):$(uname -m)" ;;
+  Darwin:arm64|Darwin:aarch64) PLATFORM=macos-aarch64 ;;
+  *) die "v${VERSION} does not provide an artifact for $(uname -s):$(uname -m)" ;;
 esac
 
 ASSET="codex-lhc-v${VERSION}-${PLATFORM}.tar.gz"

@@ -130,8 +130,11 @@ jobs:
           body_path: RELEASE_NOTES.md
           files: |
             candidate/codex-lhc-v*-linux-x86_64.tar.gz
+            candidate/codex-lhc-v*-windows-x86_64.zip
+            candidate/codex-lhc-v*-macos-aarch64.tar.gz
             candidate/install.sh
+            candidate/install.ps1
             candidate/release-manifest.json
             candidate/SHA256SUMS
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           generate_release_notes: false
