@@ -111,6 +111,7 @@ impl LhcBandPercentages {
                 }),
             }),
             signal: None,
+            compact_point_upper_bound: None,
         }
     }
 }
