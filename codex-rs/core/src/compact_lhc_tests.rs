@@ -2748,10 +2748,10 @@ async fn rewrite_failure_leaves_auto_compact_window_unchanged() {
     );
 }
 
-/// Model-downshift installs/validates against the target (smaller) model context.
-/// A body that fits the previous larger model but exceeds the target hard-fails.
+/// Model-downshift no longer hard-fails solely because the body exceeds the
+/// auto-compact / window size heuristic. Size is diagnostic only.
 #[tokio::test]
-async fn model_downshift_target_context_rejects_body_over_target_window() {
+async fn model_downshift_does_not_refuse_on_body_size_alone() {
     use crate::session::turn::run_auto_compact;
     use codex_analytics::CompactionPhase;
     use codex_analytics::CompactionReason;
@@ -2759,7 +2759,6 @@ async fn model_downshift_target_context_rejects_body_over_target_window() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, mut target_tc) = make_session_and_context().await;
-    // Separate TurnContext for the previous larger model (TurnContext is not Clone).
     let (_, mut previous_tc) = make_session_and_context().await;
     install_lhc_and_enable(&mut session, root).await;
     let slot = session
@@ -2774,15 +2773,11 @@ async fn model_downshift_target_context_rejects_body_over_target_window() {
     handle.flush().await;
     install_deterministic_test_override(&session);
 
-    // Previous (larger) model step context — would accept a larger body.
     previous_tc.model_info.slug = "gpt-prev-large".into();
     previous_tc.model_info.context_window = Some(1_000_000);
     previous_tc.model_info.max_context_window = Some(1_000_000);
     previous_tc.model_info.auto_compact_token_limit = Some(900_000);
 
-    // Target (current) model with a tiny compact target so the LHC body is
-    // guaranteed over-target and must hard-fail (not install against the
-    // previous larger window).
     target_tc.model_info.context_window = Some(2_000);
     target_tc.model_info.max_context_window = Some(2_000);
     target_tc.model_info.auto_compact_token_limit = Some(32);
@@ -2804,18 +2799,8 @@ async fn model_downshift_target_context_rejects_body_over_target_window() {
     )
     .await;
     assert!(
-        matches!(
-            &result,
-            Err(err) if matches!(err.details(), CodexErrorDetails::UnsupportedOperation(_))
-        ),
-        "body over target model compact window must hard-fail under downshift: {result:?}"
-    );
-    let msg = result.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(
-        msg.contains("compact target")
-            || msg.contains("exceed")
-            || msg.contains("LHC compact failed"),
-        "failure should mention compact target / window, got: {msg}"
+        result.is_ok(),
+        "body-size is not a terminal downshift refuse: {result:?}"
     );
 }
 

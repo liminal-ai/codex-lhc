@@ -792,29 +792,17 @@ async fn try_run_mid_turn_compact_continuation(
     let (protected_pair_expectations, required_encrypted_reasoning) =
         codex_lhc_host::capture_body_expectations(&host_items, &protected_ids_for_validation);
 
-    // LIM-67: the host safe-runway threshold is the real bound the next
-    // materialized provider request must stay under — the Codex auto-compact
-    // scope limit when configured, else the full context window. Never a
-    // universal percentage, and never the advisory LHC lower target.
-    //
-    // Contract scope: the threshold governs pending-tool escalation
-    // classification (SDK policy field is optional elsewhere). Active
-    // non-tool seams keep their certified LIM-63 semantics and pass none.
+    // LIM-67: pending-tool safe-runway is provider capacity only (full
+    // context window). Auto-compact scope is a compaction trigger, not a
+    // body-size refuse. Active non-tool seams pass none.
     let pending_tool_seam = matches!(
         continuation,
         WorkContinuation::PendingCorrelatedToolResult { .. }
     );
     let (safe_runway_threshold_tokens, safe_runway_threshold_source) = if pending_tool_seam {
-        match (
-            token_status.auto_compact_scope_limit,
-            token_status.full_context_window_limit,
-        ) {
-            (Some(limit), _) => (
-                Some(limit),
-                Some("codex_auto_compact_scope_limit".to_string()),
-            ),
-            (None, Some(limit)) => (Some(limit), Some("codex_context_window_limit".to_string())),
-            (None, None) => (None, None),
+        match token_status.full_context_window_limit {
+            Some(limit) => (Some(limit), Some("codex_context_window_limit".to_string())),
+            None => (None, None),
         }
     } else {
         (None, None)
@@ -1319,11 +1307,15 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     let (_initial_context, world_state_baseline) =
         build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
 
-    // Token bound against the produce body (window check for served view). R8.
-    if let Some(reason) = body_exceeds_window(turn_context, &produce_body) {
-        warn!(%reason, "LHC compact body over window; hard stop");
-        return Ok(failed_attempt(reason));
-    }
+    info!(
+        body_tokens = body_token_estimate,
+        auto_compact_limit = ?turn_context
+            .config
+            .model_auto_compact_token_limit
+            .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+        provider_window = ?turn_context.model_context_window(),
+        "LHC compact produce-body size (diagnostic only; not a terminal gate)"
+    );
 
     let reference_context_item = match &initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -1565,34 +1557,18 @@ async fn install_lhc_compact_rewrite(
         }
     }
 
-    // Validate the exact history Codex will install. Materialization can add a
-    // live tail after the earlier produce-body check. For protected MidTurn
-    // escalation, persist the failed host-validation state before blocking.
-    if let Some(reason) = body_exceeds_window(turn_context, &install_history) {
-        warn!(
-            %reason,
-            manual,
-            "LHC compact final install history over target; preserving current history"
-        );
-        if let Some(spec) = host_validation.as_ref() {
-            if let Err(err) = record_host_validation_on_thread(
-                thread_id.clone(),
-                root.clone(),
-                spec.attempt_id.clone(),
-                false,
-                Some(reason.clone()),
-            )
-            .await
-            {
-                error!(%err, attempt_id = %spec.attempt_id, "failed to persist over-window host validation refusal");
-            }
-            return Ok(LhcCompactAttempt::MidTurnBlocked {
-                reason,
-                next_provider_request_allowed: false,
-            });
-        }
-        return Ok(failed_attempt(reason));
-    }
+    // Size is diagnostic only. Structural host-validation still runs below.
+    let install_tokens = estimate_response_items_tokens(&install_history);
+    info!(
+        body_tokens = install_tokens,
+        auto_compact_limit = ?turn_context
+            .config
+            .model_auto_compact_token_limit
+            .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+        provider_window = ?turn_context.model_context_window(),
+        manual,
+        "LHC compact install-history size (diagnostic only; not a terminal gate)"
+    );
 
     // LIM-67 host full-body validation gate (protected escalation only).
     // `install_history` is the exact item sequence the next provider request
@@ -1922,36 +1898,6 @@ fn patch_materialized_history_ids(items: &mut [RolloutItem], install_history: &[
             }
             _ => {}
         }
-    }
-}
-
-/// Effective compact success target: minimum of the applicable auto-compact
-/// limit and the effective provider window for the target model. A body still
-/// above the auto-compact trigger cannot report success (treadmill guard).
-fn effective_compact_target_tokens(turn_context: &TurnContext) -> Option<i64> {
-    let auto_limit = turn_context
-        .config
-        .model_auto_compact_token_limit
-        .or_else(|| turn_context.model_info.auto_compact_token_limit());
-    let provider_window = turn_context.model_context_window();
-    match (auto_limit, provider_window) {
-        (Some(a), Some(w)) => Some(a.min(w)),
-        (Some(a), None) => Some(a),
-        (None, Some(w)) => Some(w),
-        (None, None) => None,
-    }
-}
-
-fn body_exceeds_window(turn_context: &TurnContext, body: &[ResponseItem]) -> Option<String> {
-    let target = effective_compact_target_tokens(turn_context)?;
-    let est_tokens = estimate_response_items_tokens(body);
-    if est_tokens >= target {
-        Some(format!(
-            "estimated body tokens {est_tokens} exceed compact target {target} \
-             (min of auto-compact limit and provider window)"
-        ))
-    } else {
-        None
     }
 }
 
