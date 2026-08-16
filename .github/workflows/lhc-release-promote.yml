@@ -119,15 +119,8 @@ jobs:
           git show "${SOURCE_SHA}:${NOTES_FILE}" > RELEASE_NOTES.md
           head -1 RELEASE_NOTES.md | grep -qF "v${VERSION}" \
             || { echo "::error::Release notes heading does not contain v${VERSION}"; exit 1; }
-          cat >> RELEASE_NOTES.md <<EOF
-
-          ---
-
-          - Candidate workflow: ${CANDIDATE_RUN_ID}
-          - Platform smoke workflow: ${SMOKE_RUN_ID}
-          - This is not an official OpenAI release. Verify release-manifest.json
-            and SHA256SUMS before installation.
-          EOF
+          printf '\n---\n\n- Candidate workflow: %s\n- Platform smoke workflow: %s\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
+            "${CANDIDATE_RUN_ID}" "${SMOKE_RUN_ID}" >> RELEASE_NOTES.md
       - name: Publish GitHub release without rebuilding
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
