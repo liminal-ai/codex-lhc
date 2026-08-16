@@ -59,11 +59,11 @@ def main() -> None:
         "captureDefault": "on",
         "artifacts": artifacts,
         "migration": {
-            "id": "none",
+            "id": "thread-schema-6-to-11",
             "fromSchema": 6,
-            "toSchema": 6,
-            "rollbackSupported": True,
-            "rollbackBoundary": None,
+            "toSchema": 11,
+            "rollbackSupported": False,
+            "rollbackBoundary": "Opening a thread with v0.3.0 migrates it to schema 11; downgrade to v0.2.1 is unsupported.",
         },
     }
     manifest_path = args.dist / "release-manifest.json"
