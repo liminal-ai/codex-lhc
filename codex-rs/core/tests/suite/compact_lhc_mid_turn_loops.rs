@@ -654,7 +654,10 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CYCLES: usize = 22;
-    const SCOPE_LIMIT: i64 = 20_000;
+    // Slice C counts serialized JSON with o200k, not chars/4. 20k rejected
+    // compacted bodies (tool JSON + reasoning + 8k outputs). 80k still
+    // triggers at the wave seams while leaving room for the accurate estimate.
+    const SCOPE_LIMIT: i64 = 80_000;
     /// Wave seams where the emulated provider usage approaches the scope
     /// limit (post-relief responses drop back down, as a real provider would
     /// after the request shrank).
@@ -667,9 +670,9 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
     let mut responses = Vec::new();
     for i in 0..CYCLES {
         let usage: i64 = if WAVE_SEAMS.contains(&i) {
-            19_600
+            78_400
         } else {
-            10_000
+            40_000
         };
         let args = json!({
             "command": cycle_command(i),
@@ -707,7 +710,7 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
             // The REAL host safe-runway source: the auto-compact scope limit
             // doubles as the upper trigger and the safe-runway threshold.
             config.model_auto_compact_token_limit = Some(SCOPE_LIMIT);
-            config.model_context_window = Some(200_000);
+            config.model_context_window = Some(400_000);
             // Pin the model so capture identity matches turn identity and the
             // R2 gate replays encrypted reasoning (production always has this).
             config.model = Some("gpt-5.5".into());
@@ -820,10 +823,12 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
     // degraded preserve path at seam 21 is not host-validated (LIM-67 gates
     // escalations); offline derivation floors can keep it fatter.
     for follow in [8usize, 15usize] {
+        // Request JSON is denser than raw text; o200k is closer to ~chars/3
+        // than chars/4. Stay well under SCOPE_LIMIT after a validated install.
+        let json_est = (bodies[follow].len() as i64) / 3;
         assert!(
-            (bodies[follow].len() as i64) / 4 < SCOPE_LIMIT,
-            "request {follow} after a host-validated escalation (~{} est tokens) must stay below the safe-runway threshold",
-            bodies[follow].len() / 4
+            json_est < SCOPE_LIMIT,
+            "request {follow} after a host-validated escalation (~{json_est} est tokens) must stay below the safe-runway threshold"
         );
     }
 
