@@ -1093,10 +1093,10 @@ index 0000000000..086351b058
 +    assert_eq!(reconstructed.window_number, 2);
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 9bb00c2d0a..db5a784c65 100644
+index 33b77fadf4..3c1824067e 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1357,6 +1357,9 @@ impl Session {
+@@ -1359,6 +1359,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1106,7 +1106,7 @@ index 9bb00c2d0a..db5a784c65 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info.slug.as_str();
-@@ -1396,6 +1399,8 @@ impl Session {
+@@ -1398,6 +1401,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1115,7 +1115,7 @@ index 9bb00c2d0a..db5a784c65 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3017,6 +3022,25 @@ impl Session {
+@@ -3019,6 +3024,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -1141,7 +1141,7 @@ index 9bb00c2d0a..db5a784c65 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, items);
-@@ -3025,8 +3049,13 @@ impl Session {
+@@ -3027,8 +3051,13 @@ impl Session {
              .into_iter()
              .map(ResponseItemEnvelope::new)
              .collect();
@@ -1157,7 +1157,7 @@ index 9bb00c2d0a..db5a784c65 100644
      }
  
      async fn record_prepared_conversation_items(
-@@ -3034,6 +3063,7 @@ impl Session {
+@@ -3036,6 +3065,7 @@ impl Session {
          turn_context: &TurnContext,
          items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
@@ -1165,7 +1165,7 @@ index 9bb00c2d0a..db5a784c65 100644
      ) {
          let response_items = items
              .iter()
-@@ -3059,7 +3089,7 @@ impl Session {
+@@ -3061,7 +3091,7 @@ impl Session {
          let rollout_items: Vec<RolloutItem> =
              items.into_iter().map(RolloutItem::ResponseItem).collect();
          self.persist_rollout_items(&rollout_items).await;
@@ -1174,7 +1174,7 @@ index 9bb00c2d0a..db5a784c65 100644
              .await;
      }
  
-@@ -3231,7 +3261,13 @@ impl Session {
+@@ -3240,7 +3270,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1189,7 +1189,7 @@ index 9bb00c2d0a..db5a784c65 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3315,7 +3351,7 @@ impl Session {
+@@ -3324,7 +3360,7 @@ impl Session {
              Self::assign_missing_response_item_id(&mut envelope.item);
          }
          let compacted_item = CompactedItem {
@@ -1198,7 +1198,7 @@ index 9bb00c2d0a..db5a784c65 100644
              replacement_history: Some(items.clone()),
              window_number: Some(metadata.window_number),
              first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
-@@ -3335,6 +3371,10 @@ impl Session {
+@@ -3344,6 +3380,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1209,7 +1209,7 @@ index 9bb00c2d0a..db5a784c65 100644
          }
  
          self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3354,10 +3394,79 @@ impl Session {
+@@ -3363,10 +3403,79 @@ impl Session {
          }
      }
  
@@ -1289,7 +1289,7 @@ index 9bb00c2d0a..db5a784c65 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3393,7 +3502,42 @@ impl Session {
+@@ -3402,7 +3511,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1333,7 +1333,7 @@ index 9bb00c2d0a..db5a784c65 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3693,6 +3837,32 @@ impl Session {
+@@ -3702,6 +3846,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1366,7 +1366,7 @@ index 9bb00c2d0a..db5a784c65 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -3993,9 +4163,13 @@ impl Session {
+@@ -4002,9 +4172,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1383,7 +1383,7 @@ index 9bb00c2d0a..db5a784c65 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -4015,8 +4189,13 @@ impl Session {
+@@ -4024,8 +4198,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1399,7 +1399,7 @@ index 9bb00c2d0a..db5a784c65 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4179,3 +4358,14 @@ mod elicitation_holders_tests;
+@@ -4189,3 +4368,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

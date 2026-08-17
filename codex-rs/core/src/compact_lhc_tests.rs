@@ -2773,14 +2773,14 @@ async fn model_downshift_does_not_refuse_on_body_size_alone() {
     handle.flush().await;
     install_deterministic_test_override(&session);
 
-    previous_tc.model_info.slug = "gpt-prev-large".into();
-    previous_tc.model_info.context_window = Some(1_000_000);
-    previous_tc.model_info.max_context_window = Some(1_000_000);
-    previous_tc.model_info.auto_compact_token_limit = Some(900_000);
+    Arc::make_mut(&mut previous_tc.model_info).slug = "gpt-prev-large".into();
+    Arc::make_mut(&mut previous_tc.model_info).context_window = Some(1_000_000);
+    Arc::make_mut(&mut previous_tc.model_info).max_context_window = Some(1_000_000);
+    Arc::make_mut(&mut previous_tc.model_info).auto_compact_token_limit = Some(900_000);
 
-    target_tc.model_info.context_window = Some(2_000);
-    target_tc.model_info.max_context_window = Some(2_000);
-    target_tc.model_info.auto_compact_token_limit = Some(32);
+    Arc::make_mut(&mut target_tc.model_info).context_window = Some(2_000);
+    Arc::make_mut(&mut target_tc.model_info).max_context_window = Some(2_000);
+    Arc::make_mut(&mut target_tc.model_info).auto_compact_token_limit = Some(32);
 
     let sess = Arc::new(session);
     let previous_step = crate::session::step_context::StepContext::for_test(Arc::new(previous_tc));
@@ -2811,9 +2811,9 @@ async fn successful_lhc_compact_clears_regular_trigger() {
     let root = dir.path().to_path_buf();
     let (mut session, mut tc) = make_session_and_context().await;
     // Codex-LHC policy for GPT-5.6 long-context operation.
-    tc.model_info.auto_compact_token_limit = Some(350_000);
-    tc.model_info.context_window = Some(370_000);
-    tc.model_info.max_context_window = Some(1_050_000);
+    Arc::make_mut(&mut tc.model_info).auto_compact_token_limit = Some(350_000);
+    Arc::make_mut(&mut tc.model_info).context_window = Some(370_000);
+    Arc::make_mut(&mut tc.model_info).max_context_window = Some(1_050_000);
 
     install_lhc_and_enable(&mut session, root).await;
     let slot = session

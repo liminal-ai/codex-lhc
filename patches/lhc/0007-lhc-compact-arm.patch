@@ -6881,7 +6881,7 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..f5b8cb0338
+index 0000000000..093af9cf6d
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
 @@ -0,0 +1,3147 @@
@@ -9660,14 +9660,14 @@ index 0000000000..f5b8cb0338
 +    handle.flush().await;
 +    install_deterministic_test_override(&session);
 +
-+    previous_tc.model_info.slug = "gpt-prev-large".into();
-+    previous_tc.model_info.context_window = Some(1_000_000);
-+    previous_tc.model_info.max_context_window = Some(1_000_000);
-+    previous_tc.model_info.auto_compact_token_limit = Some(900_000);
++    Arc::make_mut(&mut previous_tc.model_info).slug = "gpt-prev-large".into();
++    Arc::make_mut(&mut previous_tc.model_info).context_window = Some(1_000_000);
++    Arc::make_mut(&mut previous_tc.model_info).max_context_window = Some(1_000_000);
++    Arc::make_mut(&mut previous_tc.model_info).auto_compact_token_limit = Some(900_000);
 +
-+    target_tc.model_info.context_window = Some(2_000);
-+    target_tc.model_info.max_context_window = Some(2_000);
-+    target_tc.model_info.auto_compact_token_limit = Some(32);
++    Arc::make_mut(&mut target_tc.model_info).context_window = Some(2_000);
++    Arc::make_mut(&mut target_tc.model_info).max_context_window = Some(2_000);
++    Arc::make_mut(&mut target_tc.model_info).auto_compact_token_limit = Some(32);
 +
 +    let sess = Arc::new(session);
 +    let previous_step = crate::session::step_context::StepContext::for_test(Arc::new(previous_tc));
@@ -9698,9 +9698,9 @@ index 0000000000..f5b8cb0338
 +    let root = dir.path().to_path_buf();
 +    let (mut session, mut tc) = make_session_and_context().await;
 +    // Codex-LHC policy for GPT-5.6 long-context operation.
-+    tc.model_info.auto_compact_token_limit = Some(350_000);
-+    tc.model_info.context_window = Some(370_000);
-+    tc.model_info.max_context_window = Some(1_050_000);
++    Arc::make_mut(&mut tc.model_info).auto_compact_token_limit = Some(350_000);
++    Arc::make_mut(&mut tc.model_info).context_window = Some(370_000);
++    Arc::make_mut(&mut tc.model_info).max_context_window = Some(1_050_000);
 +
 +    install_lhc_and_enable(&mut session, root).await;
 +    let slot = session
@@ -11956,10 +11956,10 @@ index dfd6ca1bb9..0bb66f5aa9 100644
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index beb48f4a38..bb2f4035c9 100644
+index 9a90659060..bd905ba790 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -5920,6 +5920,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -5927,6 +5927,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -11968,7 +11968,7 @@ index beb48f4a38..bb2f4035c9 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
-@@ -8117,6 +8119,8 @@ where
+@@ -8124,6 +8126,8 @@ where
              config.http_client_factory(),
          ),
          executed_tool_calls,
@@ -11978,7 +11978,7 @@ index beb48f4a38..bb2f4035c9 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 6c2dc1496a..2acbe79048 100644
+index 7ff56e4da3..3049057f43 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -7,9 +7,6 @@ use crate::client::ModelClientSession;
@@ -12208,7 +12208,7 @@ index 6c2dc1496a..2acbe79048 100644
  }
  
  pub(super) fn collect_explicit_app_ids_from_skill_items(
-@@ -1559,6 +1547,17 @@ pub(crate) async fn built_tools(
+@@ -1556,6 +1544,17 @@ pub(crate) async fn built_tools(
  struct SamplingRequestResult {
      needs_follow_up: bool,
      last_agent_message: Option<String>,
@@ -12226,7 +12226,7 @@ index 6c2dc1496a..2acbe79048 100644
  }
  
  /// Ephemeral per-response state for streaming a single proposed plan.
-@@ -2178,6 +2177,18 @@ async fn try_run_sampling_request(
+@@ -2176,14 +2175,26 @@ async fn try_run_sampling_request(
          .features
          .enabled(Feature::ConcurrentReasoningSummaries)
          && turn_context.provider.info().is_openai();
@@ -12245,25 +12245,36 @@ index 6c2dc1496a..2acbe79048 100644
      let mut stream = client_session
          .stream(
              prompt,
-@@ -2185,7 +2196,7 @@ async fn try_run_sampling_request(
-             &turn_context.session_telemetry,
-             turn_context.reasoning_effort.clone(),
-             turn_context.reasoning_summary,
--            turn_context.config.service_tier.clone(),
+-            &step_context.model_info,
+-            &step_context.session_telemetry,
+-            step_context.reasoning_effort.clone(),
+-            step_context.reasoning_summary,
+-            step_context.service_tier.clone(),
++            &turn_context.model_info,
++            &turn_context.session_telemetry,
++            turn_context.reasoning_effort.clone(),
++            turn_context.reasoning_summary,
 +            lc_service_tier.service_tier,
              responses_metadata,
              &inference_trace,
          )
-@@ -2205,6 +2216,8 @@ async fn try_run_sampling_request(
+@@ -2203,12 +2214,9 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
      const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
      let mut analytics_tool_call_ids = Vec::new();
+-    let reasoning_effort = step_context
+-        .reasoning_effort
+-        .clone()
+-        .or_else(|| step_context.model_info.default_reasoning_level.clone())
+-        .map(|effort| effort.to_string())
+-        .unwrap_or_else(|| "default".to_string());
 +    // Response-scoped tool call IDs for MidTurn continuation classification.
 +    let mut response_tool_call_ids: Vec<String> = Vec::new();
-     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
++    let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
      let plan_mode = turn_context.mode == ModeKind::Plan;
      let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
-@@ -2261,7 +2274,8 @@ async fn try_run_sampling_request(
+     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
+@@ -2264,7 +2272,8 @@ async fn try_run_sampling_request(
              ResponseEvent::OutputItemDone(mut item) => {
                  assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                  if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -12273,7 +12284,7 @@ index 6c2dc1496a..2acbe79048 100644
                          ResponseItem::FunctionCall { call_id, .. }
                          | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                          ResponseItem::ToolSearchCall { call_id, .. }
-@@ -2272,10 +2286,35 @@ async fn try_run_sampling_request(
+@@ -2275,10 +2284,35 @@ async fn try_run_sampling_request(
                          }
                          _ => None,
                      };
@@ -12310,7 +12321,7 @@ index 6c2dc1496a..2acbe79048 100644
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                      && let Ok(Some(event)) = consumer.finish()
                  {
-@@ -2366,6 +2405,10 @@ async fn try_run_sampling_request(
+@@ -2369,6 +2403,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
@@ -12321,7 +12332,7 @@ index 6c2dc1496a..2acbe79048 100644
                      });
                  }
              }
-@@ -2527,7 +2570,7 @@ async fn try_run_sampling_request(
+@@ -2530,7 +2568,7 @@ async fn try_run_sampling_request(
                  sess.send_event(
                      &turn_context,
                      EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
@@ -12330,7 +12341,7 @@ index 6c2dc1496a..2acbe79048 100644
                          token_usage: token_usage.clone(),
                      }),
                  )
-@@ -2546,6 +2589,10 @@ async fn try_run_sampling_request(
+@@ -2549,6 +2587,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
@@ -12739,10 +12750,10 @@ index cc71acb3b5..be8f1d150e 100644
  }
  
 diff --git a/codex-rs/core/src/thread_manager.rs b/codex-rs/core/src/thread_manager.rs
-index 42b14e3400..4bdb9f2e22 100644
+index 3c373f9fe0..2aaeb7a1ba 100644
 --- a/codex-rs/core/src/thread_manager.rs
 +++ b/codex-rs/core/src/thread_manager.rs
-@@ -943,7 +943,9 @@ impl ThreadManager {
+@@ -959,7 +959,9 @@ impl ThreadManager {
          parent_trace: Option<W3cTraceContext>,
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
@@ -12753,7 +12764,7 @@ index 42b14e3400..4bdb9f2e22 100644
          Box::pin(self.resume_thread_with_history(
              config,
              initial_history,
-@@ -1017,7 +1019,9 @@ impl ThreadManager {
+@@ -1033,7 +1035,9 @@ impl ThreadManager {
          client_mcp_extensions: ClientMcpExtensions,
      ) -> CodexResult<NewThread> {
          let agent_control = self.agent_control_for_config(&config);
@@ -12764,7 +12775,7 @@ index 42b14e3400..4bdb9f2e22 100644
          let (session_source, thread_source) = initial_history
              .get_resumed_session_sources()
              .unwrap_or_else(|| (self.state.session_source.clone(), None));
-@@ -1127,7 +1131,9 @@ impl ThreadManager {
+@@ -1143,7 +1147,9 @@ impl ThreadManager {
          S: Into<ForkSnapshot>,
      {
          let snapshot = snapshot.into();
@@ -12775,7 +12786,7 @@ index 42b14e3400..4bdb9f2e22 100644
          self.fork_thread_from_history(
              snapshot,
              config,
-@@ -1142,7 +1148,29 @@ impl ThreadManager {
+@@ -1158,7 +1164,29 @@ impl ThreadManager {
      async fn initial_history_from_rollout_path(
          &self,
          rollout_path: PathBuf,
@@ -12805,7 +12816,7 @@ index 42b14e3400..4bdb9f2e22 100644
          let requested_rollout_path = rollout_path.clone();
          let stored_thread = self
              .state
-@@ -1948,6 +1976,19 @@ impl ThreadManagerState {
+@@ -1964,6 +1992,19 @@ impl ThreadManagerState {
      }
  }
  
@@ -14000,18 +14011,18 @@ index 4aa10fdc7b..e5ea98cbb7 100644
  mod compact_remote_parity;
  mod compact_resume_fork;
 diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
-index dfbb6d6859..50c8aae2eb 100644
+index 699696289d..c96acbf0e8 100644
 --- a/codex-rs/core/tests/suite/model_switching.rs
 +++ b/codex-rs/core/tests/suite/model_switching.rs
-@@ -10,6 +10,7 @@ use codex_login::CodexAuth;
- use codex_models_manager::bundled_models_response;
+@@ -12,6 +12,7 @@ use codex_models_manager::bundled_models_response;
  use codex_models_manager::manager::RefreshStrategy;
+ use codex_protocol::config_types::ApprovalsReviewer;
  use codex_protocol::config_types::CollaborationMode;
 +use codex_protocol::config_types::LcAdaptiveServiceTierConfig;
  use codex_protocol::config_types::ModeKind;
  use codex_protocol::config_types::ReasoningSummary;
  use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
-@@ -544,6 +545,50 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
+@@ -698,6 +699,50 @@ async fn service_tier_change_is_applied_on_next_http_turn() -> Result<()> {
      Ok(())
  }
  
