@@ -15,6 +15,32 @@ empty (48 columns):
 
   ? for shortcuts
 ---
+resuming (48 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Resuming session…
+
+› Ask Codex to do anything
+
+  ? for shortcuts
+---
+forking (48 columns):
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v<VERSION>)              │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+  Forking session…
+
+› draft while loading
+
+
+---
 multiline (48 columns):
 ╭───────────────────────────────────────╮
 │ >_ OpenAI Codex (v<VERSION>)              │

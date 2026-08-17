@@ -4,6 +4,8 @@
 mod advanced_reasoning_tests;
 #[path = "tests/background_exit_tests.rs"]
 mod background_exit_tests;
+#[path = "tests/connector_policy.rs"]
+mod connector_policy;
 #[path = "tests/key_chords.rs"]
 mod key_chords;
 #[path = "tests/mcp_startup.rs"]
@@ -151,6 +153,29 @@ macro_rules! assert_app_snapshot {
 
 fn test_absolute_path(path: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::try_from(PathBuf::from(path)).expect("absolute test path")
+}
+
+#[tokio::test]
+async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<()> {
+    let mut app = make_test_app().await;
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+    let mut tui = crate::tui::test_support::make_test_tui()?;
+
+    app.handle_tui_event(
+        &mut tui,
+        &mut app_server,
+        TuiEvent::Paste("line1\r\nline2\rline3\nline4".to_string()),
+    )
+    .await?;
+
+    assert_snapshot!(app.chat_widget.composer_text_with_pending(), @r"
+    line1
+    line2
+    line3
+    line4
+    ");
+
+    Ok(())
 }
 
 #[tokio::test]
