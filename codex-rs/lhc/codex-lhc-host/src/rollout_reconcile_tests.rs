@@ -503,3 +503,811 @@ async fn encrypted_reasoning_round_trip_identity_gate() {
         "absent live identity must suppress encrypted_content"
     );
 }
+
+/// nc4: When the LHC SDK has installed a view (compact_point advanced in
+/// thread_view) but the Codex host marker note was NOT committed to archive
+/// events (crash window), the reconciliation must still detect the rollout as
+/// STALE and regenerate. This proves `read_thread_compact_point` uses the
+/// installed view's compact_point (via describe), not just event markers.
+#[tokio::test]
+async fn reconcile_detects_stale_when_view_ahead_of_event_markers() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-view-ahead";
+
+    // Seed a bandable thread. Large padding ensures tokens exceed the 120K
+    // lower bound so compact actually advances the compact_point.
+    // Include an exact CustomToolCall/CustomToolCallOutput pair in the
+    // final turn so it lands in the active tail after compact.
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..79 {
+        items.push(user(&format!("nc4 user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4 asst {i} {pad}"), &format!("a{i}")));
+    }
+    // Final turn with a protected CustomToolCall/Output pair
+    items.push(user("nc4 user 79 final turn", "u79"));
+    items.push(ResponseItem::CustomToolCall {
+        id: Some(ResponseItemId::from_server("ctc_nc4".into())),
+        status: Some("completed".into()),
+        call_id: "call_nc4_custom".into(),
+        name: "my_custom_tool".into(),
+        namespace: Some("test_ns".into()),
+        input: r#"{"key":"structured_value","count":42}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    items.push(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call_nc4_custom".into(),
+        name: Some("my_custom_tool".into()),
+        output: codex_protocol::models::FunctionCallOutputPayload {
+            body: codex_protocol::models::FunctionCallOutputBody::Text(
+                "custom tool result payload".into(),
+            ),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    });
+    items.push(assistant(&format!("nc4 asst 79 final {pad}"), "a79"));
+    seed_thread(&root, tid, &items).await;
+
+    // Compact via the SDK (this installs a view with compact_point > 0).
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact must succeed");
+    let view_point = result.marker.compact_point;
+    assert!(
+        view_point > 0,
+        "compact must advance compact_point; got {view_point}"
+    );
+
+    // Write a rollout file with compact_point=0 (stale relative to the view).
+    // This simulates the crash window: SDK compact installed the view but the
+    // Codex marker note was never committed to events.
+    let path = dir.path().join("sessions").join("nc4-stale.jsonl");
+    write_items(&path, &single_boundary_items(0));
+
+    // read_thread_compact_point must return the VIEW's compact_point, not 0.
+    let read_point = read_thread_compact_point(tid, Some(root.as_path())).await;
+    assert_eq!(
+        read_point,
+        Some(view_point),
+        "read_thread_compact_point must return the installed view's compact_point"
+    );
+
+    // classify must detect STALE.
+    let class = classify_rollout_vs_thread(&path, read_point).unwrap();
+    assert_eq!(
+        class,
+        RolloutFileClass::NeedsRewrite(RolloutReconcileTrigger::Stale),
+        "rollout at point=0 must be STALE vs view at point={view_point}"
+    );
+
+    // Full reconcile must regenerate.
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    match &outcome {
+        ReconcileOutcome::Regenerated { trigger, items } => {
+            assert_eq!(*trigger, RolloutReconcileTrigger::Stale);
+            assert!(*items >= 1, "regenerated rollout must have items");
+        }
+        other => panic!("expected Regenerated(Stale), got {other:?}"),
+    }
+
+    // Item 2: the regenerated rollout's file_boundary_compact_point must
+    // equal the installed view's compact_point.
+    let regenerated = parse_rollout_items(&path).expect("parse regenerated");
+    let file_point = file_boundary_compact_point(&regenerated).unwrap_or(0);
+    assert_eq!(
+        file_point, view_point,
+        "regenerated rollout boundary must match installed view compact_point"
+    );
+
+    // Item 3: a second reconcile must find the rollout OK (convergence).
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge to Unchanged(ok); got {second:?}"
+    );
+
+    // Item 4: active CustomToolCall/Output pair in the tail survives the
+    // stale-view regeneration with byte-stable fields.
+    let tail_items: Vec<&ResponseItem> = regenerated
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !tail_items.is_empty(),
+        "regenerated rollout must preserve ResponseItem entries from the live tail"
+    );
+
+    // Find the CustomToolCall and assert exact fields
+    let ctc = tail_items.iter().find(|item| {
+        matches!(item, ResponseItem::CustomToolCall { call_id, .. } if call_id == "call_nc4_custom")
+    });
+    match ctc {
+        Some(ResponseItem::CustomToolCall {
+            call_id,
+            name,
+            input,
+            ..
+        }) => {
+            // Assert byte-stable correlation fields that survive LHC
+            // capture → materialization round-trip. Status and namespace
+            // are stripped by forward mapping (known LHC contract).
+            assert_eq!(call_id, "call_nc4_custom");
+            assert_eq!(name, "my_custom_tool");
+            assert_eq!(input, r#"{"key":"structured_value","count":42}"#);
+        }
+        _ => panic!("CustomToolCall call_nc4_custom not found in regenerated tail"),
+    }
+
+    // Find the CustomToolCallOutput and assert correlation + output
+    let cto = tail_items.iter().find(|item| {
+        matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "call_nc4_custom")
+    });
+    match cto {
+        Some(ResponseItem::CustomToolCallOutput {
+            call_id,
+            name,
+            output,
+            ..
+        }) => {
+            assert_eq!(call_id, "call_nc4_custom");
+            assert_eq!(name.as_deref(), Some("my_custom_tool"));
+            match &output.body {
+                codex_protocol::models::FunctionCallOutputBody::Text(text) => {
+                    assert_eq!(text, "custom tool result payload");
+                }
+                other => panic!("expected Text output, got {other:?}"),
+            }
+            // success may be stripped in LHC round-trip; correlation
+            // and output text are the byte-stable contract.
+        }
+        _ => panic!("CustomToolCallOutput call_nc4_custom not found in regenerated tail"),
+    }
+
+    // Assert ordering: call before output in the tail
+    let call_pos = tail_items.iter().position(|item| {
+        matches!(item, ResponseItem::CustomToolCall { call_id, .. } if call_id == "call_nc4_custom")
+    });
+    let output_pos = tail_items.iter().position(|item| {
+        matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "call_nc4_custom")
+    });
+    assert!(
+        call_pos < output_pos,
+        "CustomToolCall must precede CustomToolCallOutput in regenerated tail"
+    );
+}
+
+/// nc4: pair followed by assistant response is completed history — no graft;
+/// normal LHC-materialized shape.
+#[tokio::test]
+async fn nc4_completed_pair_is_not_grafted() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-completed";
+
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4c user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4c asst {i} {pad}"), &format!("a{i}")));
+    }
+    // Pair followed by assistant = completed, not active.
+    items.push(user("completed turn", "u80"));
+    items.push(ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-completed".into(),
+        name: "tool".into(),
+        namespace: Some("ns".into()),
+        input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    items.push(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-completed".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("result".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    });
+    items.push(assistant("done after tool", "a80")); // Makes the pair historical.
+    seed_thread(&root, tid, &items).await;
+
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact");
+    assert!(result.marker.compact_point > 0);
+
+    // Prior rollout with the completed pair (followed by assistant).
+    let path = dir.path().join("sessions").join("nc4c-stale.jsonl");
+    let mut stale = single_boundary_items(0);
+    stale.push(RolloutItem::ResponseItem(
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".into()),
+            call_id: "call-completed".into(),
+            name: "tool".into(),
+            namespace: Some("ns".into()),
+            input: "{}".into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    ));
+    stale.push(RolloutItem::ResponseItem(
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "call-completed".into(),
+            name: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("result".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    ));
+    stale.push(RolloutItem::ResponseItem(
+        assistant("done after tool", "a80").into(),
+    ));
+    write_items(&path, &stale);
+
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(&outcome, ReconcileOutcome::Regenerated { .. }),
+        "expected Regenerated"
+    );
+
+    // The completed pair must NOT be grafted — LHC-materialized shape.
+    let regen = parse_rollout_items(&path).expect("parse");
+    let tail: Vec<&ResponseItem> = regen
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+    if let Some(ResponseItem::CustomToolCall {
+        status, namespace, ..
+    }) = tail.iter().find(|item| {
+        matches!(
+            item,
+            ResponseItem::CustomToolCall { call_id, .. } if call_id == "call-completed"
+        )
+    }) {
+        assert!(
+            status.is_none() && namespace.is_none(),
+            "completed pair must use LHC shape, not graft: status={status:?}, namespace={namespace:?}"
+        );
+    }
+}
+
+/// nc4 + LIM-69: an exact provider-native CustomToolCall/Output pair in the
+/// prior rollout's terminal active suffix must survive stale-view startup
+/// reconciliation byte-for-byte. The active suffix ends with the output
+/// (no trailing assistant) — it is the unsent provider suffix.
+#[tokio::test]
+async fn nc4_protected_pair_survives_stale_view_reconciliation_byte_stably() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem as Item;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-pair-stable";
+
+    // The exact provider-native pair (LIM-69 incident shape).
+    let exact_call = ResponseItem::CustomToolCall {
+        id: Some(ResponseItemId::from_server("ctc_pair".into())),
+        status: Some("completed".into()),
+        call_id: "call-nc4-pair".into(),
+        name: "exec".into(),
+        namespace: Some("test_ns".into()),
+        input: r#"{"cmd":"ls -la","cwd":"/tmp"}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let exact_output = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-nc4-pair".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![
+                Item::InputText {
+                    text: "total 42\ndrwxr-xr-x 2 user user 4096 Aug 17 00:00 .".into(),
+                },
+                Item::InputText {
+                    text: "-rw-r--r-- 1 user user 1234 Aug 17 00:00 file.txt".into(),
+                },
+            ]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    // Seed a bandable thread with the pair as the final active suffix
+    // (no trailing assistant — this is the unsent provider suffix).
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4p user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4p asst {i} {pad}"), &format!("a{i}")));
+    }
+    items.push(user("final turn with custom tool", "u80"));
+    items.push(exact_call.clone());
+    items.push(exact_output.clone());
+    // No trailing assistant — the pair IS the active suffix.
+    seed_thread(&root, tid, &items).await;
+
+    // Compact to advance the view.
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact must succeed");
+    let view_point = result.marker.compact_point;
+    assert!(view_point > 0, "compact must advance");
+
+    // Write a stale rollout with boundary + exact original pair in the
+    // active tail. This simulates the crash window: SDK compact installed
+    // the view but the Codex marker was not written. The prior rollout
+    // still has the exact provider-native pair.
+    let path = dir.path().join("sessions").join("nc4p-stale.jsonl");
+    let mut stale_items = single_boundary_items(0);
+    stale_items.push(RolloutItem::ResponseItem(exact_call.clone().into()));
+    stale_items.push(RolloutItem::ResponseItem(exact_output.clone().into()));
+    write_items(&path, &stale_items);
+
+    // Reconcile: must detect stale and regenerate.
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(&outcome, ReconcileOutcome::Regenerated { .. }),
+        "expected Regenerated, got {outcome:?}"
+    );
+
+    // Parse the regenerated rollout and extract the tail.
+    let regenerated = parse_rollout_items(&path).expect("parse regenerated");
+    let tail_items: Vec<&ResponseItem> = regenerated
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+
+    // Find exactly one CustomToolCall and one CustomToolCallOutput.
+    let calls: Vec<&&ResponseItem> = tail_items
+        .iter()
+        .filter(|item| {
+            matches!(item, ResponseItem::CustomToolCall { call_id, .. }
+                     if call_id == "call-nc4-pair")
+        })
+        .collect();
+    let outputs: Vec<&&ResponseItem> = tail_items
+        .iter()
+        .filter(|item| {
+            matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. }
+                     if call_id == "call-nc4-pair")
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "exactly one CustomToolCall must survive");
+    assert_eq!(
+        outputs.len(),
+        1,
+        "exactly one CustomToolCallOutput must survive"
+    );
+
+    // Byte-for-byte: the grafted pair must match the original provider-native
+    // objects (sans id assignment). Status, namespace, structured ContentItems,
+    // success — all must be preserved through the graft.
+    let call_bytes = crate::item_bytes_without_id(calls[0]);
+    let output_bytes = crate::item_bytes_without_id(outputs[0]);
+    let orig_call_bytes = crate::item_bytes_without_id(&exact_call);
+    let orig_output_bytes = crate::item_bytes_without_id(&exact_output);
+    assert_eq!(
+        call_bytes, orig_call_bytes,
+        "CustomToolCall must be byte-stable (status, namespace, input preserved)"
+    );
+    assert_eq!(
+        output_bytes, orig_output_bytes,
+        "CustomToolCallOutput must be byte-stable (ContentItems, success preserved)"
+    );
+
+    // Ordering: call before output.
+    let call_pos = tail_items.iter().position(|item| {
+        matches!(item, ResponseItem::CustomToolCall { call_id, .. }
+                 if call_id == "call-nc4-pair")
+    });
+    let output_pos = tail_items.iter().position(|item| {
+        matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. }
+                 if call_id == "call-nc4-pair")
+    });
+    assert!(
+        call_pos < output_pos,
+        "CustomToolCall must precede CustomToolCallOutput"
+    );
+
+    // Convergence: second reconcile is Unchanged.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge"
+    );
+}
+
+/// nc4 negative: ambiguous cardinality (duplicate call_id) in prior rollout
+/// must NOT graft — the materialized LHC shape is left as-is.
+#[tokio::test]
+async fn nc4_ambiguous_pair_does_not_graft() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-ambig";
+
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4a user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4a asst {i} {pad}"), &format!("a{i}")));
+    }
+    items.push(user("ambig turn", "u80"));
+    items.push(ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-ambig".into(),
+        name: "tool".into(),
+        namespace: Some("ns".into()),
+        input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    seed_thread(&root, tid, &items).await;
+
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact");
+    assert!(result.marker.compact_point > 0);
+
+    // Prior rollout with DUPLICATE call_ids (ambiguous cardinality).
+    let path = dir.path().join("sessions").join("nc4a-stale.jsonl");
+    let dup_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-ambig".into(),
+        name: "tool".into(),
+        namespace: Some("ns".into()),
+        input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let dup_output = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-ambig".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("out1".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut stale = single_boundary_items(0);
+    // Two calls with same call_id = ambiguous.
+    stale.push(RolloutItem::ResponseItem(dup_call.clone().into()));
+    stale.push(RolloutItem::ResponseItem(dup_call.clone().into()));
+    stale.push(RolloutItem::ResponseItem(dup_output.clone().into()));
+    write_items(&path, &stale);
+
+    // Record pre-reconcile file bytes.
+    let pre_bytes = std::fs::read(&path).expect("read pre");
+
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+
+    // Ambiguous terminal suffix => fail-open, file bytes unchanged.
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::Unchanged {
+            reason: "regenerate_failed"
+        },
+        "ambiguous terminal suffix must leave prior unchanged; got {outcome:?}"
+    );
+    let post_bytes = std::fs::read(&path).expect("read post");
+    assert_eq!(
+        pre_bytes, post_bytes,
+        "file bytes must be exactly unchanged after ambiguous graft failure"
+    );
+}
+
+/// nc4: two parallel terminal pairs — both grafted byte-stably and ordered.
+#[tokio::test]
+async fn nc4_two_parallel_terminal_pairs_both_grafted() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputContentItem as Item;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-parallel";
+
+    let call_a = ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-par-a".into(),
+        name: "tool_a".into(),
+        namespace: Some("ns_a".into()),
+        input: r#"{"a":1}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let call_b = ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-par-b".into(),
+        name: "tool_b".into(),
+        namespace: Some("ns_b".into()),
+        input: r#"{"b":2}"#.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output_a = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-par-a".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::ContentItems(vec![Item::InputText {
+                text: "result_a".into(),
+            }]),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output_b = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-par-b".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("result_b".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4par user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(
+            &format!("nc4par asst {i} {pad}"),
+            &format!("a{i}"),
+        ));
+    }
+    items.push(user("parallel turn", "u80"));
+    items.push(call_a.clone());
+    items.push(call_b.clone());
+    items.push(output_a.clone());
+    items.push(output_b.clone());
+    // No trailing assistant.
+    seed_thread(&root, tid, &items).await;
+
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact");
+    assert!(result.marker.compact_point > 0);
+
+    let path = dir.path().join("sessions").join("nc4par-stale.jsonl");
+    let mut stale = single_boundary_items(0);
+    stale.push(RolloutItem::ResponseItem(call_a.clone().into()));
+    stale.push(RolloutItem::ResponseItem(call_b.clone().into()));
+    stale.push(RolloutItem::ResponseItem(output_a.clone().into()));
+    stale.push(RolloutItem::ResponseItem(output_b.clone().into()));
+    write_items(&path, &stale);
+
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(&outcome, ReconcileOutcome::Regenerated { .. }),
+        "expected Regenerated"
+    );
+
+    let regen = parse_rollout_items(&path).expect("parse");
+    let tail: Vec<&ResponseItem> = regen
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+
+    // Both pairs must be byte-stable.
+    for (cid, orig_call, orig_output) in [
+        ("call-par-a", &call_a, &output_a),
+        ("call-par-b", &call_b, &output_b),
+    ] {
+        let found_call = tail
+            .iter()
+            .find(|item| {
+                matches!(item, ResponseItem::CustomToolCall { call_id, .. } if call_id == cid)
+            })
+            .unwrap_or_else(|| panic!("CustomToolCall {cid} not found"));
+        let found_output = tail
+            .iter()
+            .find(|item| {
+                matches!(item, ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == cid)
+            })
+            .unwrap_or_else(|| panic!("CustomToolCallOutput {cid} not found"));
+        assert_eq!(
+            crate::item_bytes_without_id(found_call),
+            crate::item_bytes_without_id(orig_call),
+            "call {cid} must be byte-stable"
+        );
+        assert_eq!(
+            crate::item_bytes_without_id(found_output),
+            crate::item_bytes_without_id(orig_output),
+            "output {cid} must be byte-stable"
+        );
+    }
+}
+
+/// nc4 negative: orphan output (output_call_id with no matching call) in the
+/// terminal suffix must leave the prior rollout byte-unchanged.
+#[tokio::test]
+async fn nc4_orphan_output_leaves_prior_unchanged() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-orphan-out";
+
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4o user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4o asst {i} {pad}"), &format!("a{i}")));
+    }
+    items.push(user("orphan turn", "u80"));
+    items.push(ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-orphan".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("orphan result".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    });
+    seed_thread(&root, tid, &items).await;
+
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact");
+    assert!(result.marker.compact_point > 0);
+
+    let path = dir.path().join("sessions").join("nc4o-stale.jsonl");
+    let mut stale = single_boundary_items(0);
+    stale.push(RolloutItem::ResponseItem(
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "call-orphan".into(),
+            name: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("orphan result".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    ));
+    write_items(&path, &stale);
+
+    let pre_bytes = std::fs::read(&path).expect("read pre");
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::Unchanged {
+            reason: "regenerate_failed"
+        },
+        "orphan output must leave prior unchanged; got {outcome:?}"
+    );
+    let post_bytes = std::fs::read(&path).expect("read post");
+    assert_eq!(pre_bytes, post_bytes, "file bytes must be unchanged");
+}
+
+/// nc4 negative: missing output (call with no matching output) in the
+/// terminal suffix must leave the prior rollout byte-unchanged.
+#[tokio::test]
+async fn nc4_missing_output_leaves_prior_unchanged() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "nc4-miss-out";
+
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("nc4m user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(&format!("nc4m asst {i} {pad}"), &format!("a{i}")));
+    }
+    items.push(user("missing output turn", "u80"));
+    items.push(ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-missing".into(),
+        name: "tool".into(),
+        namespace: Some("ns".into()),
+        input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    seed_thread(&root, tid, &items).await;
+
+    let result = crate::produce_lhc_compact_deterministic(
+        tid,
+        Some(root.as_path()),
+        &items,
+        /*import*/ false,
+    )
+    .await
+    .expect("compact");
+    assert!(result.marker.compact_point > 0);
+
+    let path = dir.path().join("sessions").join("nc4m-stale.jsonl");
+    let mut stale = single_boundary_items(0);
+    stale.push(RolloutItem::ResponseItem(
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: Some("completed".into()),
+            call_id: "call-missing".into(),
+            name: "tool".into(),
+            namespace: Some("ns".into()),
+            input: "{}".into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+        .into(),
+    ));
+    write_items(&path, &stale);
+
+    let pre_bytes = std::fs::read(&path).expect("read pre");
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        outcome,
+        ReconcileOutcome::Unchanged {
+            reason: "regenerate_failed"
+        },
+        "missing output must leave prior unchanged; got {outcome:?}"
+    );
+    let post_bytes = std::fs::read(&path).expect("read post");
+    assert_eq!(pre_bytes, post_bytes, "file bytes must be unchanged");
+}

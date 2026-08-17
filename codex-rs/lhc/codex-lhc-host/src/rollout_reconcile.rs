@@ -17,6 +17,8 @@ use codex_protocol::protocol::SessionMetaLine;
 use tracing::info;
 use tracing::warn;
 
+use codex_protocol::models::ResponseItem;
+
 use crate::compact_bridge::CompactMarker;
 use crate::compact_bridge::read_materialize_surfaces;
 use crate::inference::lhc_inference_callbacks;
@@ -182,21 +184,47 @@ pub async fn read_thread_compact_point(thread_id: &str, root: Option<&Path>) -> 
     if !file_path.exists() {
         return None;
     }
-    let callbacks = lhc_inference_callbacks(false).ok()?;
-    let (session, _) =
-        LhcSession::open_with_inference(thread_id, None, Some(root_buf.as_path()), callbacks)
-            .await?;
-    let events = match session.list_events().await {
-        Ok(e) => e,
-        Err(err) => {
-            warn!(%err, thread_id, "LHC reconcile: list_events failed; fail-open");
-            session.close().await;
-            return None;
+
+    // nc4: read the installed view's compact_point directly from the
+    // thread_view table via SDK describe(). This is the authoritative
+    // source — it advances atomically when LHC compact installs a view,
+    // even if the Codex marker note was not yet committed to events
+    // (crash window between SDK compact and host marker write-back).
+    let ref_ = lhc::threads::ThreadRef::file_path(file_path.to_string_lossy().into_owned());
+    match lhc::thread_view::describe(ref_).await {
+        lhc::shared_tech::errors::OpResult::Ok { value: Some(view) } => Some(view.compact_point),
+        lhc::shared_tech::errors::OpResult::Ok { value: None } => {
+            // Thread exists but has no view yet — pre-compact.
+            Some(0)
         }
-    };
-    let point = latest_compact_point_from_events(&events);
-    session.close().await;
-    point
+        lhc::shared_tech::errors::OpResult::Err { error } => {
+            warn!(
+                thread_id,
+                reason = %error.reason,
+                "LHC reconcile: describe failed; falling back to event scan"
+            );
+            // Fall back to the event-scan path for robustness.
+            let callbacks = lhc_inference_callbacks(false).ok()?;
+            let (session, _) = LhcSession::open_with_inference(
+                thread_id,
+                None,
+                Some(root_buf.as_path()),
+                callbacks,
+            )
+            .await?;
+            let events = match session.list_events().await {
+                Ok(e) => e,
+                Err(err) => {
+                    warn!(%err, thread_id, "LHC reconcile: list_events failed; fail-open");
+                    session.close().await;
+                    return None;
+                }
+            };
+            let point = latest_compact_point_from_events(&events);
+            session.close().await;
+            point
+        }
+    }
 }
 
 /// Best-effort max compact point from archive event notes.
@@ -454,6 +482,22 @@ pub async fn regenerate_rollout_from_thread(
         .await
         .map_err(|e| format!("materialize surfaces: {e}"))?;
 
+    // nc4: read the installed view metadata for boundary synthesis when no
+    // Codex event marker exists (crash window between SDK compact and host
+    // marker write-back).
+    let ref_ = lhc::threads::ThreadRef::file_path(file_path.to_string_lossy().into_owned());
+    let installed_view = match lhc::thread_view::describe(ref_).await {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => {
+            warn!(
+                thread_id,
+                reason = %error.reason,
+                "nc4: describe failed during regeneration; boundary may be stale"
+            );
+            None
+        }
+    };
+
     let prior_generation = if path.exists() {
         parse_rollout_items(path).unwrap_or_else(|err| {
             warn!(
@@ -481,22 +525,33 @@ pub async fn regenerate_rollout_from_thread(
     let durable_message = latest_durable_marker_message(thread_id, Some(root_buf.as_path()))
         .await
         .unwrap_or_else(|| {
-            // Minimal durable-shaped note so resume can reseed; compact_point 0
-            // when no marker is in the archive yet.
+            // nc4: when no Codex event marker exists (crash between SDK
+            // compact and host marker write-back), synthesize boundary
+            // metadata from the installed view. Never stamp compactPoint=0
+            // when the view is ahead.
+            let (cp, cf, vid, prof) = match installed_view.as_ref() {
+                Some(v) => (
+                    v.compact_point,
+                    v.covered_from,
+                    v.view_id.as_str(),
+                    v.profile_name.as_deref(),
+                ),
+                None => (0, 0, "reconcile", None),
+            };
             format!(
                 "lhc_compact_durable {}",
                 serde_json::json!({
-                    "viewId": "reconcile",
-                    "coveredFrom": 0,
-                    "compactPoint": 0,
+                    "viewId": vid,
+                    "coveredFrom": cf,
+                    "compactPoint": cp,
                     "totalTokens": 0,
                     "tailTokens": 0,
                     "firstKeptMessageId": null,
-                    "profile": null,
+                    "profile": prof,
                     "bands": null,
                     "viewMapSeam": crate::compact_bridge::VIEW_MAP_SEAM_ID,
                     "bodyItemCount": 0,
-                    "markerKey": format!("codex:{thread_id}:compact_marker:reconcile"),
+                    "markerKey": format!("codex:{thread_id}:compact_marker:reconcile:{cp}"),
                     "derivedContentDigests": [],
                     "derivedHostIds": [],
                     "archiveTip": "reconcile",
@@ -509,7 +564,7 @@ pub async fn regenerate_rollout_from_thread(
             .map_err(|e| format!("create rollout parent {}: {e}", parent.display()))?;
     }
 
-    let result = materialize_rollout(&MaterializeInput {
+    let mut result = materialize_rollout(&MaterializeInput {
         session_meta,
         thread_view: &surfaces.thread_view,
         messages: &surfaces.messages,
@@ -531,10 +586,170 @@ pub async fn regenerate_rollout_from_thread(
         warn!(%note, ?trigger, "LHC reconcile materialize gap_note");
     }
 
+    // nc4: graft the exact provider-native active suffix from the prior
+    // rollout into the regenerated materialization. The LHC round-trip
+    // flattens CustomToolCall status/namespace and ContentItems; the prior
+    // rollout holds the exact provider-native bytes. Graft only when a
+    // prior active pair can be unambiguously correlated by call_id.
+    // If ambiguous, leave the prior rollout unchanged (fail-open).
+    if let Err(reason) = graft_prior_active_suffix(&mut result.items, &prior_generation) {
+        warn!(
+            %reason,
+            path = %path.display(),
+            "nc4 graft failed: leaving prior rollout unchanged"
+        );
+        return Err(reason);
+    }
+
     atomic_rewrite_rollout(path, &result.items)
         .map_err(|e| format!("atomic rewrite {}: {e}", path.display()))?;
 
     Ok(result.items.len())
+}
+
+/// Graft exact provider-native active tool call/output pairs from the prior
+/// rollout's **terminal active suffix** into the regenerated materialization.
+///
+/// The terminal active suffix is the trailing sequence of tool calls/outputs
+/// NOT followed by any assistant/Message response — i.e., the unsent provider
+/// suffix that the next request still depends on.
+///
+/// Returns `Err` if the prior active suffix requires preservation but
+/// correlation/cardinality is ambiguous or missing — the caller must leave
+/// the prior rollout unchanged (fail-open).
+fn graft_prior_active_suffix(
+    regenerated: &mut [RolloutItem],
+    prior_generation: &[RolloutItem],
+) -> Result<(), String> {
+    use crate::body_validation::{client_call_id, output_call_id};
+
+    // Extract items after the last Compacted boundary.
+    let last_boundary = prior_generation
+        .iter()
+        .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
+    let prior_tail: Vec<&ResponseItem> = prior_generation
+        .iter()
+        .skip(last_boundary.map_or(0, |i| i + 1))
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+    if prior_tail.is_empty() {
+        return Ok(());
+    }
+
+    // Derive the terminal active suffix: scan backwards from the end;
+    // stop at the first assistant/Message response (that marks completion).
+    fn is_assistant_or_message(item: &ResponseItem) -> bool {
+        matches!(
+            item,
+            ResponseItem::Message { role, .. } if role == "assistant"
+        ) || matches!(item, ResponseItem::Compaction { .. })
+    }
+    let terminal_start = prior_tail
+        .iter()
+        .rposition(|item| is_assistant_or_message(item))
+        .map_or(0, |i| i + 1);
+    let terminal_suffix = &prior_tail[terminal_start..];
+    if terminal_suffix.is_empty() {
+        return Ok(());
+    }
+
+    // Build the correlation-id set from BOTH client_call_id and output_call_id.
+    // Every id present on either side must have exactly one call + one output.
+    let mut seen_ids: Vec<String> = Vec::new();
+    for item in terminal_suffix {
+        if let Some(id) = client_call_id(item) {
+            if !seen_ids.contains(&id) {
+                seen_ids.push(id);
+            }
+        }
+        if let Some(id) = output_call_id(item) {
+            if !seen_ids.contains(&id) {
+                seen_ids.push(id);
+            }
+        }
+    }
+    if seen_ids.is_empty() {
+        return Ok(());
+    }
+    // Validate every id has exactly 1 call + 1 output.
+    let mut active_call_ids: Vec<String> = Vec::new();
+    for id in &seen_ids {
+        let call_count = terminal_suffix
+            .iter()
+            .filter(|i| client_call_id(i).as_deref() == Some(id.as_str()))
+            .count();
+        let output_count = terminal_suffix
+            .iter()
+            .filter(|i| output_call_id(i).as_deref() == Some(id.as_str()))
+            .count();
+        if call_count == 1 && output_count == 1 {
+            active_call_ids.push(id.clone());
+        } else {
+            // Missing or ambiguous pairing (1/0, 0/1, duplicate) — fail.
+            return Err(format!(
+                "nc4 graft: missing or ambiguous correlation for call_id {id} \
+                 in terminal suffix (calls={call_count}, outputs={output_count})"
+            ));
+        }
+    }
+
+    // Verify each active call_id has exactly 1 call + 1 output in the
+    // regenerated items. If not, the correlation is ambiguous — fail.
+    for call_id in &active_call_ids {
+        let regen_calls: Vec<usize> = regenerated
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                RolloutItem::ResponseItem(ri)
+                    if client_call_id(&ri.item).as_deref() == Some(call_id.as_str()) =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        let regen_outputs: Vec<usize> = regenerated
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                RolloutItem::ResponseItem(ri)
+                    if output_call_id(&ri.item).as_deref() == Some(call_id.as_str()) =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            })
+            .collect();
+        if regen_calls.len() != 1 || regen_outputs.len() != 1 {
+            return Err(format!(
+                "nc4 graft: ambiguous cardinality for call_id {call_id} in \
+                 regenerated rollout (calls={}, outputs={})",
+                regen_calls.len(),
+                regen_outputs.len()
+            ));
+        }
+
+        // Graft the exact prior items.
+        let Some(prior_call) = terminal_suffix
+            .iter()
+            .find(|item| client_call_id(item).as_deref() == Some(call_id.as_str()))
+        else {
+            return Err(format!("nc4 graft: prior call {call_id} vanished"));
+        };
+        let Some(prior_output) = terminal_suffix
+            .iter()
+            .find(|item| output_call_id(item).as_deref() == Some(call_id.as_str()))
+        else {
+            return Err(format!("nc4 graft: prior output {call_id} vanished"));
+        };
+
+        regenerated[regen_calls[0]] = RolloutItem::ResponseItem((*prior_call).clone().into());
+        regenerated[regen_outputs[0]] = RolloutItem::ResponseItem((*prior_output).clone().into());
+    }
+    Ok(())
 }
 
 fn synthesize_session_meta(thread_id: &str, path: &Path) -> SessionMetaLine {
