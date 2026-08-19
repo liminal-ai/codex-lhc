@@ -1039,7 +1039,6 @@ async fn mid_turn_cancel_joins_worker_no_detached_mutator() {
     inject_response_usage(&session, &tc, 2_000).await;
     handle.flush().await;
 
-    let threads_before = thread_count_named("lhc-midturn");
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
     let cancel = CancellationToken::new();
@@ -1070,11 +1069,13 @@ async fn mid_turn_cancel_joins_worker_no_detached_mutator() {
         }
         other => panic!("expected blocked on cancel, got {other:?}"),
     }
-    // No lhc-midturn worker remains after return.
-    let threads_after = thread_count_named("lhc-midturn");
-    assert!(
-        threads_after <= threads_before,
-        "detached midturn worker remains: before={threads_before} after={threads_after}"
+    // No worker for this attempt remains after return. Scoped to `cancel-1`:
+    // the other MidTurn tests run in parallel and one of them keeps a worker
+    // deliberately alive, so a process-wide count proves nothing here.
+    let threads_after = midturn_workers_for_attempt("cancel-1");
+    assert_eq!(
+        threads_after, 0,
+        "detached midturn worker remains for attempt cancel-1: {threads_after}"
     );
 }
 
@@ -1235,15 +1236,28 @@ fn mid_turn_attempt_variants_are_exhaustive_one_writer() {
     assert_eq!(kinds.len(), 5);
 }
 
-fn thread_count_named(prefix: &str) -> usize {
+/// Live MidTurn compact-continuation workers **for one attempt**.
+///
+/// The worker thread is named `lhc-mt-{attempt_id}` and Linux truncates a
+/// thread's `comm` to 15 bytes, so that is what lands in `/proc`. Matching the
+/// truncation exactly is what keeps the count scoped to the caller's own
+/// attempt: this test binary runs the MidTurn tests in parallel, and a
+/// process-wide `starts_with("lhc-midturn")` count also sees the workers other
+/// tests deliberately keep alive — that is a count of the binary's activity,
+/// not of whether *this* turn left a detached mutator behind.
+///
+/// Attempt ids passed here must therefore stay distinct within their first
+/// 8 bytes (15 minus the 7-byte `lhc-mt-` prefix).
+fn midturn_workers_for_attempt(attempt_id: &str) -> usize {
+    let full = format!("{}{attempt_id}", super::MIDTURN_WORKER_THREAD_PREFIX);
+    let comm: String = full.chars().take(15).collect();
     let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
         return 0;
     };
     let mut n = 0;
     for entry in dir.flatten() {
-        let comm = entry.path().join("comm");
-        if let Ok(name) = std::fs::read_to_string(comm)
-            && name.trim().starts_with(prefix)
+        if let Ok(name) = std::fs::read_to_string(entry.path().join("comm"))
+            && name.trim() == comm
         {
             n += 1;
         }
@@ -1326,11 +1340,22 @@ async fn mid_turn_cancel_during_critical_section_applies_installed_view() {
     let epoch = decision_epoch(&sess);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
-    // Late enough that the worker is spawned and stalled inside the critical
-    // section (pre-worker setup takes ~100ms), well before the stall ends.
+    // Cancel once the worker is observably inside the critical section. A
+    // wall-clock guess raced the pre-worker setup: under load the cancel landed
+    // before the spawn, the arm refused without one, and the test proved
+    // nothing about post-mutation cancellation.
     let cancel_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut saw_worker = false;
+        while std::time::Instant::now() < deadline {
+            if midturn_workers_for_attempt("cancel-critical-1") > 0 {
+                saw_worker = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         cancel_clone.cancel();
+        saw_worker
     });
 
     let started = std::time::Instant::now();
@@ -1352,11 +1377,17 @@ async fn mid_turn_cancel_during_critical_section_applies_installed_view() {
     .await
     .expect("arm");
     let elapsed = started.elapsed();
-    let _ = cancel_task.await;
+    let saw_worker = cancel_task.await.expect("cancel task");
     drop(override_guard);
 
-    // Must have waited for the stalled worker: the cancel landed at 600ms and
-    // the worker only finishes after its 1.5s stall.
+    // The premise of the proof: the cancel landed while the mutator was live.
+    assert!(
+        saw_worker,
+        "cancel never observed a live midturn worker; the test proves nothing about \
+         post-mutation cancellation"
+    );
+    // Must have waited for the stalled worker: the worker only finishes after
+    // its 1.5s stall, and the arm returns after joining it.
     assert!(
         elapsed >= Duration::from_millis(1_000),
         "cancel during critical section must await worker exit; elapsed={elapsed:?}"
@@ -1378,13 +1409,13 @@ async fn mid_turn_cancel_during_critical_section_applies_installed_view() {
     // Named worker for this attempt must be gone (poll briefly for OS reaping).
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        if thread_count_named("lhc-midturn-cancel-critical") == 0 {
+        if midturn_workers_for_attempt("cancel-critical-1") == 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(
-        thread_count_named("lhc-midturn-cancel-critical"),
+        midturn_workers_for_attempt("cancel-critical-1"),
         0,
         "detached midturn worker remains after cancel join"
     );
@@ -1438,7 +1469,6 @@ async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
     let override_guard = super::midturn_worker_override_guard();
     override_guard.set_timeout(Some(Duration::from_millis(80)));
     override_guard.set_stall(Some(Duration::from_secs(30)));
-    let threads_before = thread_count_named("lhc-midturn");
     let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
@@ -1483,10 +1513,10 @@ async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
         }
         other => panic!("expected MidTurnBlocked on stall timeout, got {other:?}"),
     }
-    let threads_after = thread_count_named("lhc-midturn");
-    assert!(
-        threads_after <= threads_before,
-        "detached midturn worker remains after timeout: before={threads_before} after={threads_after}"
+    let threads_after = midturn_workers_for_attempt("stall-timeout-1");
+    assert_eq!(
+        threads_after, 0,
+        "detached midturn worker remains after timeout for attempt stall-timeout-1: {threads_after}"
     );
     let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
     assert_eq!(

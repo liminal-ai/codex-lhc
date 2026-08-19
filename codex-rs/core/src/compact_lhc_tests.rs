@@ -193,24 +193,44 @@ async fn seed_conversation_bandable(
     }
 }
 
+/// Whether the LHC archive holds the compact marker note.
+///
+/// "No marker" and "could not look" are different answers. Returning `false`
+/// for a failed open blames the compact for a read that never happened, so a
+/// transient archive failure is retried briefly and then panics with its own
+/// reason.
 async fn archive_has_compact_marker(thread_id: &str, root: Option<&std::path::Path>) -> bool {
-    let Ok(callbacks) = codex_lhc_host::lhc_inference_callbacks(false) else {
-        return false;
-    };
+    const ATTEMPTS: usize = 5;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match read_archive_marker(thread_id, root).await {
+            Ok(found) => return found,
+            Err(err) => last = err,
+        }
+        if attempt < ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+        }
+    }
+    panic!("LHC archive unreadable while checking for a compact marker: {last}");
+}
+
+async fn read_archive_marker(
+    thread_id: &str,
+    root: Option<&std::path::Path>,
+) -> Result<bool, String> {
+    let callbacks =
+        codex_lhc_host::lhc_inference_callbacks(false).map_err(|err| err.to_string())?;
     let Some((session, _)) =
         codex_lhc_host::LhcSession::open_with_inference(thread_id, None, root, callbacks).await
     else {
-        return false;
+        return Err("archive open failed".to_string());
     };
-    let Ok(events) = session.list_events().await else {
-        session.close().await;
-        return false;
-    };
+    let events = session.list_events().await;
     session.close().await;
-    events.iter().any(|e| {
+    Ok(events?.iter().any(|e| {
         e.text_payload()
             .is_some_and(|p| p.text.contains("lhc_compact_marker"))
-    })
+    }))
 }
 
 #[tokio::test]

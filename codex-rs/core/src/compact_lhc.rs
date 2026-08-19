@@ -1281,6 +1281,10 @@ async fn inspect_mid_turn_recovery_on_thread(
     }
 }
 
+/// Thread-name prefix for the MidTurn compact-continuation worker — the one
+/// thread that mutates LHC SQLite for an attempt.
+pub(crate) const MIDTURN_WORKER_THREAD_PREFIX: &str = "lhc-mt-";
+
 async fn run_mid_turn_on_thread(
     req: MidTurnCompactContinuationRequest,
     turn_cancel: &CancellationToken,
@@ -1293,8 +1297,14 @@ async fn run_mid_turn_on_thread(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let attempt = req.attempt_id.clone();
     let worker_timeout = midturn_worker_timeout();
+    // Short prefix on purpose: Linux truncates a thread's `comm` to 15 bytes,
+    // so `lhc-midturn-{attempt}` reached /proc as `lhc-midturn-can` and every
+    // MidTurn worker in the process looked alike. `lhc-mt-` leaves 8 bytes of
+    // attempt id, which is what makes "is *this* attempt's mutator still
+    // running?" answerable — from a debugger or from the no-detached-mutator
+    // tests. Do not lengthen it.
     let join = std::thread::Builder::new()
-        .name(format!("lhc-midturn-{attempt}"))
+        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt}"))
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -1994,12 +2004,22 @@ async fn install_lhc_compact_rewrite(
     }
 
     // LHC archive: small constant-size note only (I1). Digests stay off the model path.
-    if let Err(err) = commit_marker_on_thread(thread_id, root, marker.clone()).await {
-        warn!(
+    //
+    // The marker is not a diagnostic receipt — R11 covers validation ACKs, not
+    // this. It is the durable compact record the next open reads, so an
+    // `Installed` outcome has to carry it wherever the thread is writable. A
+    // single archive open under contention is not evidence the thread is
+    // unwritable, so the commit is retried inside one wall-clock budget (the
+    // marker's idempotency key makes a retry after a partial write a no-op).
+    if let Err(err) = commit_marker_with_retry(thread_id, root, &marker).await {
+        error!(
             %err,
             manual,
-            "LHC compact archive note commit failed after write-back; recording \
-             degradation (history remains installed; no second compact)"
+            marker_key = %marker.marker_key,
+            "LHC compact archive marker commit failed after write-back and retries; \
+             the compacted body stands (history is installed and the durable \
+             write-back record is in the rollout) but this thread's archive has \
+             no marker for it"
         );
     }
 
@@ -2335,10 +2355,62 @@ async fn produce_lhc_compact_on_thread(
     }
 }
 
+/// Total wall-clock budget for committing the compact marker, retries included.
+const MARKER_COMMIT_BUDGET: Duration = Duration::from_secs(30);
+
+/// Commit the compact marker, retrying transient archive failures inside
+/// [`MARKER_COMMIT_BUDGET`].
+///
+/// The archive open/submit can fail for reasons that say nothing about whether
+/// the thread is writable — a busy registry, a concurrent opener. Accepting the
+/// first such failure loses the durable compact record permanently while the
+/// attempt still reports `Installed`, and nothing later re-commits it. Retrying
+/// is safe: the marker carries an idempotency key, so a retry after a submit
+/// that actually landed is a no-op.
+///
+/// The budget is a ceiling, not a target — it is spent only when the archive is
+/// genuinely wedged, and it never lengthens the successful path.
+async fn commit_marker_with_retry(
+    thread_id: String,
+    root: Option<PathBuf>,
+    marker: &CompactMarker,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + MARKER_COMMIT_BUDGET;
+    let mut backoff = Duration::from_millis(50);
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let err = match commit_marker_on_thread(
+            thread_id.clone(),
+            root.clone(),
+            marker.clone(),
+            remaining,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => err,
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining <= backoff {
+            return Err(format!("{err} (after {attempt} attempt(s))"));
+        }
+        warn!(
+            %err,
+            attempt,
+            "LHC compact archive marker commit failed; retrying within the commit budget"
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 4).min(Duration::from_secs(2));
+    }
+}
+
 async fn commit_marker_on_thread(
     thread_id: String,
     root: Option<PathBuf>,
     marker: CompactMarker,
+    timeout: Duration,
 ) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -2358,7 +2430,7 @@ async fn commit_marker_on_thread(
             let _ = tx.send(r);
         })
         .map_err(|e| format!("spawn marker thread: {e}"))?;
-    match tokio::time::timeout(Duration::from_secs(30), rx).await {
+    match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(r)) => r,
         Ok(Err(_)) => Err("marker thread dropped".into()),
         Err(_) => Err("marker commit timed out".into()),
