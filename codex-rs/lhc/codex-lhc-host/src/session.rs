@@ -58,7 +58,9 @@ pub struct CompactWriterOwnership {
 
 impl CompactWriterOwnership {
     pub fn claim(thread_id: &str, attempt_id: &str) -> Option<Self> {
-        let mut owners = compact_writer_owners().lock().expect("owners lock");
+        let mut owners = compact_writer_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match owners.get(thread_id) {
             Some(owner) if owner != attempt_id => None,
             _ => {
@@ -74,7 +76,9 @@ impl CompactWriterOwnership {
 
 impl Drop for CompactWriterOwnership {
     fn drop(&mut self) {
-        let mut owners = compact_writer_owners().lock().expect("owners lock");
+        let mut owners = compact_writer_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if owners.get(&self.thread_id) == Some(&self.attempt_id) {
             owners.remove(&self.thread_id);
         }
@@ -84,7 +88,9 @@ impl Drop for CompactWriterOwnership {
 /// Host authority answer for the SDK's stale-row reclaim: is a live attempt
 /// other than `attempt_id` holding `thread_id` in this process right now?
 pub fn live_compact_writer_owner(thread_id: &str, attempt_id: &str) -> bool {
-    let owners = compact_writer_owners().lock().expect("owners lock");
+    let owners = compact_writer_owners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     matches!(owners.get(thread_id), Some(owner) if owner != attempt_id)
 }
 
