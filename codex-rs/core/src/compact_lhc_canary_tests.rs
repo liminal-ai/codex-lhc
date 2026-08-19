@@ -686,13 +686,14 @@ async fn seed_oversized_protected_pair(
 }
 
 /// (g) R11 arm-level: the validation-ACK write fails and the arm warns and
-/// continues. The protected-escalation compact/install stands — no rollback,
-/// no refusal — the session serves the compacted body, and the durable state
-/// stays truthful and consistent: the receipt residual remains `awaiting`, no
-/// fabricated `ok` row exists, and the LIM-67 reload gate conservatively keeps
-/// the rollout on its prior generation until the attempt is resolved or a
-/// later compact supersedes it. Bookkeeping observes; it never governs the
-/// session's next request.
+/// continues — in-process AND at the next open. The protected-escalation
+/// compact/install stands (no rollback, no refusal), the session serves the
+/// compacted body, and the durable state stays truthful: the receipt keeps
+/// its awaiting posture and no fabricated `ok` row ever appears. The missing
+/// ack is a loud warning, never a veto: next-open reconciliation regenerates
+/// the rollout from the installed LHC view (the prior oversized generation
+/// does not stay authoritative) and converges. The ordinary repair op remains
+/// available as optional bookkeeping recovery.
 #[tokio::test]
 #[serial]
 async fn canary_validation_ack_write_failure_warns_and_continues() {
@@ -794,19 +795,85 @@ async fn canary_validation_ack_write_failure_warns_and_continues() {
         "a failed ACK write must never leave a fabricated ok row: {hv:?}"
     );
 
-    // The LIM-67 reload gate holds the rollout on its prior generation —
-    // conservative bookkeeping about the missing ack. The durable receipt
-    // truthfully records the awaiting posture taken at install time; the
-    // in-process session above already proved compact continued regardless.
+    // R11: the unresolved ack is a WARNING descriptor, never a veto.
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
             .await
             .is_some(),
-        "missing ack must keep rollout regeneration conservative until superseded"
+        "the unresolved ack must be loudly describable for the warning"
     );
 
-    // The state is recoverable, not wedged: once the write path works again,
-    // the ordinary host repair op records the ack and the gate clears.
+    // NEXT OPEN (G25 under R11): a stale prior-generation rollout must NOT
+    // stay authoritative because the ack is missing. Reconciliation proceeds
+    // from the installed LHC view, produces a provider-sendable compacted
+    // generation, and converges.
+    let rollout_dir = tempdir().unwrap();
+    let rollout_path = rollout_dir.path().join("canary-ack-fail.jsonl");
+    codex_lhc_host::atomic_rewrite_rollout(
+        &rollout_path,
+        &[codex_history::RolloutItem::ResponseItem(
+            ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: "stale prior-generation rollout".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }
+            .into(),
+        )],
+    )
+    .expect("seed stale rollout");
+    let reconciled = codex_lhc_host::reconcile_rollout_at_path(
+        &rollout_path,
+        &thread_id,
+        root_path.as_deref(),
+        None,
+    )
+    .await;
+    let codex_lhc_host::ReconcileOutcome::Regenerated { items, .. } = reconciled else {
+        panic!(
+            "next open must regenerate from the installed view, not preserve the \
+             prior generation: {reconciled:?}"
+        );
+    };
+    assert!(
+        items > 0,
+        "regenerated rollout must carry the compacted body"
+    );
+    // Convergence: a second open finds the regenerated file authoritative.
+    let second = codex_lhc_host::reconcile_rollout_at_path(
+        &rollout_path,
+        &thread_id,
+        root_path.as_deref(),
+        None,
+    )
+    .await;
+    assert_eq!(
+        second,
+        codex_lhc_host::ReconcileOutcome::Unchanged { reason: "ok" },
+        "second open must converge with no repeated rewrite"
+    );
+    // Still no fabricated ok row after the whole next-open path.
+    let hv_after = codex_lhc_host::inspect_mid_turn_host_validation(
+        &thread_id,
+        root_path.as_deref(),
+        "canary-ack-write-fail",
+    )
+    .await
+    .expect("hv inspect");
+    assert!(
+        !matches!(
+            hv_after.as_ref().map(|row| row.status),
+            Some(codex_lhc_host::HostValidationStatus::Ok)
+        ),
+        "next-open regeneration must not fabricate an ok row: {hv_after:?}"
+    );
+
+    // Optional bookkeeping recovery (not required for service): once the
+    // write path works again, the ordinary repair op records the ack and the
+    // warning clears.
     slot.set_mid_turn_test_force_validation_ack_write_fail(false);
     codex_lhc_host::record_mid_turn_host_validation(
         &thread_id,
@@ -818,9 +885,9 @@ async fn canary_validation_ack_write_failure_warns_and_continues() {
     .await
     .expect("ack retry");
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
             .await
             .is_none(),
-        "a recorded ack resolves the reload gate"
+        "a recorded ack clears the warning"
     );
 }

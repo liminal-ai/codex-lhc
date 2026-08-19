@@ -13,7 +13,7 @@ use tempfile::tempdir;
 
 use crate::HostValidationStatus;
 use crate::LhcSession;
-use crate::host_validation_reload_block;
+use crate::host_validation_reload_warning;
 use crate::inspect_mid_turn_host_validation;
 use crate::lhc_inference_callbacks;
 use crate::record_mid_turn_host_validation;
@@ -91,7 +91,7 @@ async fn canary_validation_ack_write_failure_records_nothing_and_gates_nothing()
     // block the next request or rollout regeneration because a receipt is
     // missing.
     assert_eq!(
-        host_validation_reload_block(thread_id, Some(&root)).await,
+        host_validation_reload_warning(thread_id, Some(&root)).await,
         None,
         "a receipt that could not be written must not become a gate"
     );

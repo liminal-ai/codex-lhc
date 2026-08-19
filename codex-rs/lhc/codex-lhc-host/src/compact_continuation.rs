@@ -764,8 +764,10 @@ pub async fn inspect_compact_continuation_receipts(
 /// Record the host's full-body validation result for one attempt (LIM-67).
 ///
 /// Core installation and host validation are intentionally separate states:
-/// recording `failed` never rolls the installed LHC view back; it durably
-/// blocks the next provider request until repaired or superseded.
+/// recording `failed` never rolls the installed LHC view back. The row is
+/// bookkeeping (R11): unresolved state is surfaced as a loud warning at the
+/// next open, but it never governs regeneration or the next provider request
+/// — a rerun validation failure degrades per R10 instead.
 pub async fn record_mid_turn_host_validation(
     thread_id: &str,
     root: Option<&Path>,

@@ -201,7 +201,7 @@ pub use rollout_reconcile::compacted_record_count;
 pub use rollout_reconcile::compacted_rollout_identity;
 pub use rollout_reconcile::consume_reopen_failure_receipt;
 pub use rollout_reconcile::file_boundary_compact_point;
-pub use rollout_reconcile::host_validation_reload_block;
+pub use rollout_reconcile::host_validation_reload_warning;
 pub use rollout_reconcile::is_native_append_polluted;
 pub use rollout_reconcile::materialize_thread_rollout_items;
 pub use rollout_reconcile::read_capture_frontier;

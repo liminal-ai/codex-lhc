@@ -825,15 +825,21 @@ pub fn latest_compact_point_from_events(events: &[lhc::intake_stream::EventRecor
     best.or(Some(0))
 }
 
-/// LIM-67: durable host-validation reload gate.
+/// R11 (CX-S6): unresolved host-validation warning descriptor.
 ///
 /// When the newest compact-continuation receipt records an installed view
 /// whose full-body host validation is `awaiting` or `failed` (and the durable
-/// host-validation row has not since been recorded `ok`), the rollout must
-/// **stay on its prior generation**: regenerating it from the installed LHC
-/// surface would auto-install the unvalidated (or known-unsafe) body on
-/// reload. Returns the blocking description, or `None` when reload is clear.
-pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) -> Option<String> {
+/// host-validation row has not since been recorded `ok`), this returns a
+/// description of that unresolved state — for a loud warning, never for a
+/// veto. The validation ACK is bookkeeping: its absence must not keep the
+/// prior (typically oversized) rollout generation authoritative on the next
+/// open. Regeneration proceeds from the installed LHC view through the
+/// ordinary degrade path; a rerun validation failure degrades per R10 with no
+/// backward fallback. Returns `None` when the state is resolved or superseded.
+pub async fn host_validation_reload_warning(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Option<String> {
     let root_buf = root
         .map(Path::to_path_buf)
         .unwrap_or_else(crate::gating::lhc_root);
@@ -848,9 +854,10 @@ pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) 
         {
             lhc::shared_tech::errors::OpResult::Ok { value } => value,
             lhc::shared_tech::errors::OpResult::Err { error } => {
-                // Inspection failure must not silently unblock: refuse regeneration.
+                // Inspection failure is itself only worth a warning; it never
+                // decides whether regeneration proceeds.
                 return Some(format!(
-                    "host-validation inspect failed ({}: {}); refusing rollout regeneration",
+                    "host-validation inspect failed ({}: {})",
                     error.code.as_str(),
                     error.reason
                 ));
@@ -885,7 +892,7 @@ pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) 
         Ok(None) => {}
         Err(err) => {
             return Some(format!(
-                "host-validation view-scope inspect failed for attempt {} ({}); refusing regeneration",
+                "host-validation view-scope inspect failed for attempt {} ({})",
                 latest.attempt_id, err
             ));
         }
@@ -904,7 +911,7 @@ pub async fn host_validation_reload_block(thread_id: &str, root: Option<&Path>) 
             None
         }
         lhc::shared_tech::errors::OpResult::Ok { value: row } => Some(format!(
-            "attempt {} installed a view whose host validation is {} (durable row: {:?});              rollout stays on prior generation until resolved or superseded",
+            "attempt {} installed a view whose host validation is {} (durable row: {:?})",
             latest.attempt_id,
             match status {
                 lhc::shared_tech::compact_continuation::HostValidationStatusFact::Failed =>
@@ -1004,34 +1011,36 @@ pub async fn reconcile_rollout_at_path(
         if !rollout_reopen_receipt_path(path).exists() {
             return ReconcileOutcome::Unchanged { reason: "ok" };
         }
-        if let Some(block) = host_validation_reload_block(thread_id, root).await {
+        // R11 (CX-S6): unresolved host validation is a warning, never a veto.
+        // Receipt consumption proceeds; diagnostics record, they do not govern.
+        if let Some(warning) = host_validation_reload_warning(thread_id, root).await {
             warn!(
                 path = %path.display(),
                 thread_id,
-                %block,
-                "LHC startup reconciliation: host-validation gate defers receipt consumption"
+                %warning,
+                "LHC startup reconciliation: consuming reopen receipt with unresolved \
+                 host validation (warn-and-continue; the ACK is bookkeeping)"
             );
-            return ReconcileOutcome::Unchanged {
-                reason: "host_validation_blocked",
-            };
         }
         return apply_reopen_failure_receipt(path, thread_id, root, live_identity).await;
     };
 
-    // LIM-67: an installed-but-unvalidated (or validation-failed) protected
-    // escalation must not be auto-installed on reload. Deterministic refusal:
-    // the prior rollout generation remains authoritative.
-    if let Some(block) = host_validation_reload_block(thread_id, root).await {
+    // R11 (CX-S6): an installed view with unresolved host validation still
+    // regenerates. Keeping the prior (typically oversized) generation
+    // authoritative because an ACK receipt is missing is the backward-fallback
+    // gate this campaign removes — the missed next-open occurrence of G25. The
+    // installed LHC view is what the session was serving; regeneration goes
+    // through the ordinary degrade path and a rerun validation failure
+    // degrades per R10. Warn loudly; never govern.
+    if let Some(warning) = host_validation_reload_warning(thread_id, root).await {
         warn!(
             path = %path.display(),
             thread_id,
             ?trigger,
-            %block,
-            "LHC startup reconciliation: host-validation reload gate blocks regeneration"
+            %warning,
+            "LHC startup reconciliation: regenerating from the installed view with \
+             unresolved host validation (warn-and-continue; the ACK is bookkeeping)"
         );
-        return ReconcileOutcome::Unchanged {
-            reason: "host_validation_blocked",
-        };
     }
 
     match regenerate_rollout_from_thread(path, thread_id, root, trigger, live_identity).await {

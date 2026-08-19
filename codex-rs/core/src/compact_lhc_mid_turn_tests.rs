@@ -3202,7 +3202,7 @@ async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate
     .expect("hv row");
     assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root.as_deref())
             .await
             .is_none(),
         "ok validation must clear the reload gate"
@@ -3290,7 +3290,7 @@ async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_cl
         "the ok row must record how the body degraded: {reason}"
     );
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
             .await
             .is_none(),
         "a session that compacted must not be gated out of rollout regeneration"
@@ -3473,7 +3473,7 @@ async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() 
         "expected a degraded install, got {blocked:?}"
     );
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
             .await
             .is_none(),
         "a degraded install must not gate rollout regeneration"
@@ -3502,7 +3502,7 @@ async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() 
         "standalone compact must install a later view, got {later:?}"
     );
     assert!(
-        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
             .await
             .is_none(),
         "newer active view must supersede the failed continuation residual"
