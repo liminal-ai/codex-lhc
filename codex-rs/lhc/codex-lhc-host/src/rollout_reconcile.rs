@@ -483,6 +483,25 @@ pub async fn consume_reopen_failure_receipt(
         }
     }
 
+    // The recorder frontier the receipt recorded must agree with the
+    // compacted generation it names. Where it does not, the receipt's
+    // accounting is internally inconsistent — replaying on top of it would
+    // be a guess, and guesses are exactly what this protocol exists to
+    // prevent. (A zero frontier is the identity-unreadable fallback at write
+    // time and carries no independent claim, so it is not checked.)
+    if receipt.recorder_frontier_items != 0
+        && receipt.recorder_frontier_items != receipt.compacted_rollout.items
+    {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::AccountingUnavailable {
+            detail: format!(
+                "reopen receipt's recorder frontier ({} items) disagrees with its own \
+                 compacted generation ({} items); accounting is inconsistent, not replaying",
+                receipt.recorder_frontier_items, receipt.compacted_rollout.items
+            ),
+        };
+    }
+
     // (a) The receipt's canonical capture frontier at failure.
     let Some(receipt_capture) = receipt.capture_frontier else {
         clear_reopen_failure_receipt(path);
@@ -575,35 +594,41 @@ pub async fn consume_reopen_failure_receipt(
 
     let rollout_tail = tail_after_last_boundary(&rollout_items);
     let canonical_tail = tail_after_last_boundary(&canonical);
-    let rollout_ids: Vec<String> = rollout_tail
-        .iter()
-        .map(|item| crate::body_validation::item_bytes_without_id(item))
-        .collect();
 
-    // The replay boundary is the newest canonical item the rollout already
-    // has. Everything after it is provably beyond the rollout frontier.
-    let anchor = canonical_tail.iter().rposition(|item| {
-        rollout_ids.contains(&crate::body_validation::item_bytes_without_id(item))
-    });
-    let start = match anchor {
-        Some(idx) => idx + 1,
-        None if rollout_tail.is_empty() => 0,
-        None => {
-            clear_reopen_failure_receipt(path);
-            return ReopenReceiptOutcome::AccountingUnavailable {
-                detail: format!(
-                    "canonical materialization ({} tail items) does not overlap the compacted \
-                     rollout tail ({} items); no provable suffix boundary",
-                    canonical_tail.len(),
-                    rollout_tail.len()
-                ),
-            };
-        }
-    };
+    // Occurrence-aware ordered alignment. In this G26 geometry the compacted
+    // rollout tail must be an exact ordered prefix of the current canonical
+    // tail (both cut at the same newest Compacted boundary), compared
+    // position-by-position on id-insensitive bytes. Repeated identical
+    // content is legal — distinct events may serialize identically — so no
+    // content-set membership is consulted anywhere: an any-position anchor
+    // can seize a later duplicate and skip real suffix, and a global
+    // contains-filter drops legitimately repeated suffix events. If the
+    // rollout tail is not an exact ordered prefix, there is no provable
+    // boundary and the answer is AccountingUnavailable, not a guess.
+    let is_ordered_prefix = rollout_tail.len() <= canonical_tail.len()
+        && rollout_tail
+            .iter()
+            .zip(canonical_tail.iter())
+            .all(|(r, c)| {
+                crate::body_validation::item_bytes_without_id(r)
+                    == crate::body_validation::item_bytes_without_id(c)
+            });
+    if !is_ordered_prefix {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::AccountingUnavailable {
+            detail: format!(
+                "compacted rollout tail ({} items) is not an ordered prefix of the canonical \
+                 materialized tail ({} items); no provable suffix boundary, not replaying",
+                rollout_tail.len(),
+                canonical_tail.len()
+            ),
+        };
+    }
 
-    let suffix: Vec<RolloutItem> = canonical_tail[start..]
+    // Everything past the aligned prefix is provably beyond the rollout
+    // frontier — replayed exactly, duplicates included.
+    let suffix: Vec<RolloutItem> = canonical_tail[rollout_tail.len()..]
         .iter()
-        .filter(|item| !rollout_ids.contains(&crate::body_validation::item_bytes_without_id(item)))
         .map(|item| RolloutItem::ResponseItem((*item).clone().into()))
         .collect();
     if suffix.is_empty() {

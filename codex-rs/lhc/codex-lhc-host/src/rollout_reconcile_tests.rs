@@ -2058,3 +2058,265 @@ async fn g20_in_memory_only_install_rebuilds_rollout_at_next_open() {
         "second reconcile must converge; got {second:?}"
     );
 }
+
+// ── G26 replay boundary: occurrence-aware ordered-prefix alignment ─────────
+
+/// Repeated identical content is distinct events. The rollout tail already
+/// holds one item with text X; the canonical suffix holds another item with
+/// the same text. The second X must replay — a global contains-filter would
+/// drop it.
+#[tokio::test]
+async fn g26_repeated_identical_suffix_item_replays_exactly_once() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-dup-suffix";
+    seed_and_compact(&root, tid, "g26d").await;
+
+    // First X lands in the compacted rollout tail.
+    seed_thread(&root, tid, &[user("g26 duplicate text", "u-dup-1")]).await;
+    let path = dir.path().join("sessions").join("g26-dup.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+    let compacted_items = parse_rollout_items(&path).expect("parse compacted");
+    assert_eq!(
+        tail_occurrences(&compacted_items, "g26 duplicate text"),
+        1,
+        "rollout tail must hold the first X"
+    );
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // Second X: same content, distinct event, captured canonically only.
+    seed_thread(&root, tid, &[user("g26 duplicate text", "u-dup-2")]).await;
+
+    let recovered = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(
+            recovered,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+                ..
+            }
+        ),
+        "expected suffix replay, got {recovered:?}"
+    );
+    let replayed = parse_rollout_items(&path).expect("parse replayed");
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 duplicate text"),
+        2,
+        "both distinct events with identical content must be present"
+    );
+    assert_eq!(
+        item_json(&replayed)[..compacted_items.len()],
+        item_json(&compacted_items)[..],
+        "replay appends; it never rewrites the compacted base"
+    );
+}
+
+/// A later canonical duplicate of an earlier rollout item must not become the
+/// replay anchor. Rollout tail ends with A; canonical continues [B, A']. An
+/// any-position rposition anchor would seize A' and skip B entirely. The
+/// ordered prefix replays both.
+#[tokio::test]
+async fn g26_later_duplicate_cannot_anchor_past_real_suffix() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-dup-anchor";
+    seed_and_compact(&root, tid, "g26a").await;
+
+    seed_thread(&root, tid, &[user("g26 alpha text", "u-alpha-1")]).await;
+    let path = dir.path().join("sessions").join("g26-anchor.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // Suffix beyond the frontier: B, then a duplicate of A.
+    seed_thread(
+        &root,
+        tid,
+        &[
+            user("g26 beta text", "u-beta-1"),
+            user("g26 alpha text", "u-alpha-2"),
+        ],
+    )
+    .await;
+
+    let recovered = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(
+            recovered,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+                ..
+            }
+        ),
+        "expected suffix replay, got {recovered:?}"
+    );
+    let replayed = parse_rollout_items(&path).expect("parse replayed");
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 beta text"),
+        1,
+        "the real suffix event before the duplicate must replay"
+    );
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 alpha text"),
+        2,
+        "the duplicate suffix event must replay as its own event"
+    );
+}
+
+/// Same-content overlap that is not an ordered prefix has no provable
+/// boundary: AccountingUnavailable, no guessed replay, rollout untouched.
+#[tokio::test]
+async fn g26_non_prefix_overlap_is_accounting_unavailable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-non-prefix";
+    seed_and_compact(&root, tid, "g26n").await;
+
+    seed_thread(
+        &root,
+        tid,
+        &[user("g26 gamma one", "u-g1"), user("g26 gamma two", "u-g2")],
+    )
+    .await;
+    let path = dir.path().join("sessions").join("g26-nonprefix.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    // Swap the two tail items so the rollout tail is no longer an ordered
+    // prefix of the canonical tail, while every byte of content still occurs
+    // somewhere in both.
+    let mut items = parse_rollout_items(&path).expect("parse");
+    let tail_positions: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            RolloutItem::ResponseItem(ri) => serde_json::to_string(&ri.item)
+                .ok()
+                .filter(|json| json.contains("g26 gamma"))
+                .map(|_| i),
+            _ => None,
+        })
+        .collect();
+    assert!(tail_positions.len() >= 2, "need both gamma items in tail");
+    items.swap(tail_positions[0], tail_positions[1]);
+    atomic_rewrite_rollout(&path, &items).expect("write swapped rollout");
+
+    let identity = compacted_rollout_identity(&path).expect("identity after swap");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+    let swapped_bytes = std::fs::read(&path).expect("read swapped");
+
+    // Advance the canonical frontier so the no-advance shortcut cannot hide
+    // the alignment question.
+    seed_thread(&root, tid, &[user("g26 gamma three", "u-g3")]).await;
+
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    match outcome {
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            assert!(
+                detail.contains("ordered prefix"),
+                "detail must name the alignment failure: {detail}"
+            );
+        }
+        other => panic!("expected AccountingUnavailable, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("read after"),
+        swapped_bytes,
+        "no guessed replay may touch the rollout"
+    );
+}
+
+/// A receipt whose recorder frontier disagrees with its own compacted
+/// generation is internally inconsistent: AccountingUnavailable, no replay.
+#[tokio::test]
+async fn g26_recorder_frontier_mismatch_is_accounting_unavailable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-frontier-mismatch";
+    seed_and_compact(&root, tid, "g26f").await;
+
+    let path = dir.path().join("sessions").join("g26-mismatch.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items + 3,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+    let bytes_before = std::fs::read(&path).expect("read before");
+
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    match outcome {
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            assert!(
+                detail.contains("recorder frontier"),
+                "detail must name the disagreement: {detail}"
+            );
+        }
+        other => panic!("expected AccountingUnavailable, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("read after"),
+        bytes_before,
+        "inconsistent accounting must not replay"
+    );
+}
