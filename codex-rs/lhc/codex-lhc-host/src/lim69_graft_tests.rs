@@ -44,7 +44,12 @@ fn grafted_custom_tool_pair_survives_rollout_resume() {
         *name = Some("exec".into());
         output.body = FunctionCallOutputBody::Text("part-a\npart-b".into());
     }
-    graft_live_protected_pairs(&mut body, &live, &["call-1".into()]).unwrap();
+    let report = graft_live_protected_pairs(&mut body, &live, &["call-1".into()]);
+    assert!(
+        report.is_fully_grafted(),
+        "provable pair must graft exactly: {}",
+        report.degraded_summary()
+    );
     for (got, want) in body.iter().zip(&live) {
         assert_eq!(item_bytes_without_id(got), item_bytes_without_id(want));
     }

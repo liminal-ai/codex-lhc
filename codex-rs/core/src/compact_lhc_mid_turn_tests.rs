@@ -3021,6 +3021,36 @@ async fn mid_turn_epoch_change_during_critical_section_still_applies() {
 
 /// Seed one open agentic turn shape for escalation: older big unprotected
 /// pairs, then the response-scoped protected pair.
+
+/// Every installed body must remain a legal provider request: tool calls and
+/// outputs correlated and ordered, no orphans, no duplicates. This is the bar
+/// a degraded body still has to clear (R10) — the provider decides the rest.
+fn assert_provider_sendable(body: &[ResponseItem]) {
+    let spec = codex_lhc_host::BodyValidationSpec {
+        attempt_id: "structural".into(),
+        protected_tool_call_ids: Vec::new(),
+        protected_pairs: Vec::new(),
+        required_encrypted_reasoning: Vec::new(),
+        safe_runway_threshold_tokens: None,
+    };
+    codex_lhc_host::validate_next_request_body(body, &spec)
+        .expect("installed body must be a legal provider request");
+    let mut tracker = codex_lhc_host::OccurrenceTracker::new();
+    for item in body {
+        assert!(
+            !codex_lhc_host::map_item(
+                "assert-sendable",
+                item,
+                codex_extension_api::RawItemProvenance::ModelOutput,
+                &mut tracker,
+                None,
+            )
+            .is_empty(),
+            "installed item must still round-trip through the capture mapping: {item:?}"
+        );
+    }
+}
+
 async fn seed_escalation_history(
     session: &Session,
     tc: &crate::session::turn_context::TurnContext,
@@ -3175,12 +3205,13 @@ async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate
     );
 }
 
-/// Negative path: forced host body-validation failure after a successful core
-/// install records `failed`, blocks the next provider request without rolling
-/// core state back, deterministically gates reload regeneration, and replays
-/// idempotently (no second boundary or marker).
+/// R10/R11 (CX-S3): a host body-validation failure degrades the body and
+/// installs it. The core install stands, the durable row records that this
+/// attempt's view is the one being served (carrying the degradation reason),
+/// the reload gate stays clear because the session did compact, and the same
+/// attempt still replays idempotently (no second boundary or marker).
 #[tokio::test]
-async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
+async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_clear() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -3223,27 +3254,23 @@ async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
     )
     .await
     .expect("arm");
-    match &attempt {
-        LhcCompactAttempt::MidTurnBlocked {
-            reason,
-            next_provider_request_allowed,
-        } => {
-            assert!(
-                reason.contains("host full-body validation failed"),
-                "{reason}"
-            );
-            assert!(
-                !next_provider_request_allowed,
-                "failed host validation must block the next provider request"
-            );
-        }
-        other => panic!("expected MidTurnBlocked on forced validation failure, got {other:?}"),
-    }
+    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
+        panic!("validation failure must degrade and install, got {attempt:?}");
+    };
+    assert!(!body.is_empty(), "degraded body must not be empty");
+    assert_provider_sendable(body);
+    // The session is serving the degraded body, not the pre-compact one.
+    let installed: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        crate::compact_lhc::response_items_structurally_equal(&installed, body),
+        "the degraded body is what the session holds"
+    );
 
     let thread_id = handle.thread_id().to_string();
     let root_path = handle.root().map(std::path::Path::to_path_buf);
 
-    // Durable failed row + reload gate engaged; core install retained.
+    // Durable row: this attempt's view is the one being served, and the reason
+    // carries the degradation for forensics. Receipts observe, never govern.
     let hv = codex_lhc_host::inspect_mid_turn_host_validation(
         &thread_id,
         root_path.as_deref(),
@@ -3252,11 +3279,18 @@ async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
     .await
     .expect("hv inspect")
     .expect("hv row");
-    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
-    let block = codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
-        .await
-        .expect("failed validation must gate reload");
-    assert!(block.contains("resp-esc-fail-1"), "{block}");
+    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
+    let reason = hv.reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("proceeded degraded") && reason.contains("test-injected"),
+        "the ok row must record how the body degraded: {reason}"
+    );
+    assert!(
+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+            .await
+            .is_none(),
+        "a session that compacted must not be gated out of rollout regeneration"
+    );
 
     let receipts =
         codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root_path.as_deref())
@@ -3276,12 +3310,11 @@ async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
         )
         .await
         .expect("marker"),
-        "core install (boundary + marker) is retained after failed host validation"
+        "core install (boundary + marker) is retained through the degrade"
     );
     let receipts_before = receipts.len();
 
-    // Replay the same attempt: terminal replay, no second boundary/marker, and
-    // the durable failed row is not overwritten.
+    // Replay the same attempt: terminal replay, no second boundary/marker.
     let replay = try_run_lhc_compact_arm(
         &sess,
         &tc,
@@ -3306,24 +3339,13 @@ async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
         receipts_before,
         "same-attempt replay must not append a second receipt"
     );
-    let hv_after = codex_lhc_host::inspect_mid_turn_host_validation(
-        &thread_id,
-        root_path.as_deref(),
-        "resp-esc-fail-1",
-    )
-    .await
-    .expect("hv inspect")
-    .expect("hv row");
-    assert_eq!(
-        hv_after.status,
-        codex_lhc_host::HostValidationStatus::Failed
-    );
 }
 
-/// LIM-69 Slice B: MidTurnBlocked(false) becomes TurnAborted so RegularTask
-/// cannot drain mailbox and start another provider request.
+/// R10 (CX-S3): the strict compact path completes through a host body
+/// validation failure. Nothing aborts the turn; the session runs on the
+/// degraded body and its queued mailbox work is still there to drain.
 #[tokio::test]
-async fn mid_turn_host_validation_failed_strict_compact_is_turn_aborted() {
+async fn mid_turn_host_validation_failure_strict_compact_completes_turn() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -3380,27 +3402,26 @@ async fn mid_turn_host_validation_failed_strict_compact_is_turn_aborted() {
     )
     .await;
     assert!(
-        matches!(
-            &result,
-            Err(err)
-                if matches!(
-                    err.details(),
-                    codex_protocol::error::CodexErrorDetails::TurnAborted
-                )
-        ),
-        "MidTurnBlocked(false) must abort the turn, got {result:?}"
+        result.is_ok(),
+        "a degraded body must not abort the turn, got {result:?}"
     );
     assert!(
         sess.input_queue.has_pending_mailbox_items().await,
-        "TurnAborted must leave mailbox input pending"
+        "queued mailbox input survives the compact and is still drainable"
     );
+    let installed: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        !installed.is_empty(),
+        "the session keeps serving a body after a degraded compact"
+    );
+    assert_provider_sendable(&installed);
 }
 
-/// LIM-69 Slice D: a later standalone compact changes the active view and
-/// supersedes the failed continuation receipt's reload block. The failed HV
-/// row stays failed.
+/// LIM-69 Slice D, under R10/R11: a degraded install never raises a reload
+/// block in the first place, and a later standalone compact still installs a
+/// newer view over it.
 #[tokio::test]
-async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
+async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -3444,20 +3465,14 @@ async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
     .await
     .expect("arm");
     assert!(
-        matches!(
-            blocked,
-            LhcCompactAttempt::MidTurnBlocked {
-                next_provider_request_allowed: false,
-                ..
-            }
-        ),
-        "expected MidTurnBlocked(false), got {blocked:?}"
+        matches!(blocked, LhcCompactAttempt::Installed { .. }),
+        "expected a degraded install, got {blocked:?}"
     );
     assert!(
         codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
             .await
-            .is_some(),
-        "failed HV must gate reload before standalone compact"
+            .is_none(),
+        "a degraded install must not gate rollout regeneration"
     );
 
     slot.set_mid_turn_test_force_body_validation_fail(false);
@@ -3496,5 +3511,9 @@ async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
     .await
     .expect("hv inspect")
     .expect("hv row");
-    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
+    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
+    assert!(
+        hv.reason.unwrap_or_default().contains("proceeded degraded"),
+        "the degraded attempt is still recorded as degraded"
+    );
 }

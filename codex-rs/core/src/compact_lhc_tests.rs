@@ -3392,3 +3392,125 @@ fn grafted_pair_survives_patch_materialized_history_ids() {
         item_bytes_without_id(&live_out)
     );
 }
+
+/// R19 (CX-S3): an empty install history keeps the prior body instead of
+/// hard-failing. `ContinuedWithoutCompact` is the outcome the strict path maps
+/// to `Ok(())` — the session keeps serving what it already holds and compact
+/// retries at the next seam.
+///
+/// The condition is built from the real `history_from_materialized_items`:
+/// a boundary with no bands and no post-boundary items rebuilds to nothing.
+/// (The end-to-end route is currently unreachable — the SDK refuses a thread
+/// with no events long before body assembly runs — so the branch's decision is
+/// asserted directly.)
+#[test]
+fn empty_install_history_keeps_prior_body() {
+    use codex_history::CompactedItem;
+    use codex_history::RolloutItem;
+
+    let items = vec![RolloutItem::Compacted(CompactedItem {
+        message: "lhc".into(),
+        replacement_history: Some(vec![]),
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    })];
+    assert!(
+        codex_lhc_host::history_from_materialized_items(&items).is_empty(),
+        "a boundary with no bands and no tail rebuilds to nothing"
+    );
+
+    let attempt = super::kept_prior_body_attempt("materialize produced empty install history");
+    match attempt {
+        LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
+            assert!(reason.contains("empty install history"), "{reason}");
+        }
+        other => panic!("empty body must keep the prior body, got {other:?}"),
+    }
+}
+
+/// R10 (CX-S3): when the degrade ladder drops items, the same items leave the
+/// materialized rollout, so a resume rebuilds exactly the body the session
+/// installed (law 1). Covers a drop in the bands and a drop in the tail.
+#[test]
+fn degraded_drops_keep_rollout_and_installed_body_identical() {
+    use codex_history::CompactedItem;
+    use codex_history::RolloutItem;
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    fn call(id: &str) -> ResponseItem {
+        ResponseItem::FunctionCall {
+            id: None,
+            name: "shell".into(),
+            namespace: None,
+            arguments: "{}".into(),
+            encrypted_function_args: None,
+            call_id: id.into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn output(id: &str) -> ResponseItem {
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: id.into(),
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("out".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn message(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText { text: text.into() }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    // Bands carry an orphan output; the tail carries a call with no output.
+    let bands = vec![message("band-a"), output("orphan-band"), message("band-b")];
+    let tail = vec![call("live-1"), output("live-1"), call("no-output")];
+    let mut rollout = vec![RolloutItem::Compacted(CompactedItem {
+        message: "lhc".into(),
+        replacement_history: Some(bands.iter().cloned().map(Into::into).collect()),
+        window_number: None,
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    })];
+    rollout.extend(
+        tail.iter()
+            .cloned()
+            .map(|item| RolloutItem::ResponseItem(item.into())),
+    );
+
+    let assembled = codex_lhc_host::history_from_materialized_items(&rollout);
+    assert_eq!(assembled.len(), 6);
+    let spec = codex_lhc_host::BodyValidationSpec {
+        attempt_id: "degrade".into(),
+        protected_tool_call_ids: Vec::new(),
+        protected_pairs: Vec::new(),
+        required_encrypted_reasoning: Vec::new(),
+        safe_runway_threshold_tokens: None,
+    };
+    codex_lhc_host::validate_next_request_body(&assembled, &spec)
+        .expect_err("the assembled body is not sendable as-is");
+    let degraded = codex_lhc_host::degrade_body_to_best_available(&assembled, &spec);
+    assert_eq!(degraded.dropped_count(), 2, "{}", degraded.summary());
+    codex_lhc_host::validate_next_request_body(&degraded.body, &spec)
+        .expect("the degraded body is a legal provider request");
+
+    super::drop_materialized_items(&mut rollout, &degraded.kept);
+    patch_materialized_history_ids(&mut rollout, &degraded.body);
+    let resumed = codex_lhc_host::history_from_materialized_items(&rollout);
+    assert!(
+        response_items_structurally_equal(&resumed, &degraded.body),
+        "resume must rebuild exactly the installed body: {resumed:?} vs {:?}",
+        degraded.body
+    );
+}
