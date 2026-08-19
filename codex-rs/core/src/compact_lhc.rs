@@ -1340,9 +1340,12 @@ async fn run_mid_turn_on_thread(
         .map_err(|e| format!("spawn lhc-midturn thread: {e}"))?;
 
     // Always join the worker. Never drop `join` while the mutator may still
-    // run — cancellation only marks that host apply must be suppressed later.
-    // The operation is already bounded inside the worker, so join cannot hang
-    // forever on a stalled compact-continuation future.
+    // run — R6 (CX-S2): cancellation no longer suppresses the host apply; the
+    // joined worker's result is applied and the smaller body stands. Joining
+    // here is what keeps the one-writer invariant: no detached thread may keep
+    // mutating LHC SQLite after this function returns. The operation is
+    // already bounded inside the worker, so join cannot hang forever on a
+    // stalled compact-continuation future.
     let worker_out = rx.await;
     let join_result = tokio::task::spawn_blocking(move || join.join()).await;
     match join_result {
@@ -2005,21 +2008,21 @@ async fn install_lhc_compact_rewrite(
 
     // LHC archive: small constant-size note only (I1). Digests stay off the model path.
     //
-    // The marker is not a diagnostic receipt — R11 covers validation ACKs, not
-    // this. It is the durable compact record the next open reads, so an
-    // `Installed` outcome has to carry it wherever the thread is writable. A
-    // single archive open under contention is not evidence the thread is
-    // unwritable, so the commit is retried inside one wall-clock budget (the
-    // marker's idempotency key makes a retry after a partial write a no-op).
+    // Write-behind duplication, not the durable record. The durable compact
+    // record is the rollout `Compacted` item (fsynced by the rewrite above);
+    // next open reseeds derived provenance from it, so a missing archive note
+    // never causes re-ingest. The commit still retries briefly — a single
+    // archive open under contention is not evidence the archive is wedged —
+    // but a wedged archive must not hold the turn.
     if let Err(err) = commit_marker_with_retry(thread_id, root, &marker).await {
-        error!(
+        warn!(
             %err,
             manual,
             marker_key = %marker.marker_key,
-            "LHC compact archive marker commit failed after write-back and retries; \
-             the compacted body stands (history is installed and the durable \
-             write-back record is in the rollout) but this thread's archive has \
-             no marker for it"
+            "LHC compact archive marker note commit failed after write-back; \
+             the compacted body stands and the durable record is in the \
+             rollout — next open reseeds provenance from it; only this \
+             thread's archive lacks the duplicate note"
         );
     }
 
@@ -2355,18 +2358,27 @@ async fn produce_lhc_compact_on_thread(
     }
 }
 
-/// Total wall-clock budget for committing the compact marker, retries included.
-const MARKER_COMMIT_BUDGET: Duration = Duration::from_secs(30);
+/// Total wall-clock budget for committing the archive marker note, retries
+/// included. Brief on purpose: the durable compact record is the rollout
+/// `Compacted` item (already fsynced by the rewrite before this runs); the
+/// archive note duplicates the same serialized marker as an observation, so
+/// a wedged archive must not hold the turn.
+const MARKER_COMMIT_BUDGET: Duration = Duration::from_secs(2);
 
-/// Commit the compact marker, retrying transient archive failures inside
+/// Commit the archive marker note, retrying transient failures inside
 /// [`MARKER_COMMIT_BUDGET`].
 ///
 /// The archive open/submit can fail for reasons that say nothing about whether
-/// the thread is writable — a busy registry, a concurrent opener. Accepting the
-/// first such failure loses the durable compact record permanently while the
-/// attempt still reports `Installed`, and nothing later re-commits it. Retrying
-/// is safe: the marker carries an idempotency key, so a retry after a submit
-/// that actually landed is a no-op.
+/// the thread is writable — a busy registry, a concurrent opener. A brief
+/// retry absorbs that contention. Retrying is safe: the marker carries an
+/// idempotency key, so a retry after a submit that actually landed is a no-op.
+///
+/// Losing the note is recoverable, not silent data loss: the same marker
+/// payload lives in the rollout `Compacted` record, which
+/// `seed_last_lhc_durable_from_rollout` reads at next open and
+/// `reseed_slot_from_durable_session` merges into the slot's derived
+/// provenance — the same sets `DerivedProvenance::from_session_and_archive`
+/// consults, so re-ingest prevention holds without the archive copy.
 ///
 /// The budget is a ceiling, not a target — it is spent only when the archive is
 /// genuinely wedged, and it never lengthens the successful path.

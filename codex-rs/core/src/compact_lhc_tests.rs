@@ -3168,14 +3168,17 @@ async fn blocked_capture_flush_does_not_hang_lhc_compact() {
                 marker.body_item_count > 0,
                 "installed LHC marker must describe a served body: {marker:?}"
             );
-            assert!(
-                archive_has_compact_marker(&thread_id, Some(root.as_path())).await,
-                "reducing LHC body must install an LHC marker"
-            );
+            // The durable compact record is the rollout `Compacted` item
+            // (asserted below). The archive note is write-behind duplication
+            // committed inside a brief budget; with this test's capture
+            // writer deliberately wedged, its absence is a legal degraded
+            // outcome, so it is observed, not asserted.
+            let archive_note = archive_has_compact_marker(&thread_id, Some(root.as_path())).await;
+            eprintln!("archive marker note present under blocked flush: {archive_note}");
             assert_eq!(
                 compacted.len(),
                 1,
-                "LHC rewrite writes exactly one LHC Compacted boundary"
+                "LHC rewrite writes exactly one durable LHC Compacted record"
             );
         }
         LhcCompactAttempt::Failed { reason }
