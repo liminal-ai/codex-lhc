@@ -24,6 +24,10 @@ mod tools;
 #[path = "lim69_graft_tests.rs"]
 mod lim69_graft_tests;
 
+#[cfg(test)]
+#[path = "cxs6_canary_tests.rs"]
+mod cxs6_canary_tests;
+
 pub use band_shape::BandShapeItem;
 pub use band_shape::BandShapeReport;
 pub use band_shape::DEFAULT_FULL_BAND_USER_TURNS;

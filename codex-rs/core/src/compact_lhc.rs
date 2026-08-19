@@ -2541,3 +2541,7 @@ mod slice_d_tests;
 #[cfg(test)]
 #[path = "compact_lhc_mid_turn_tests.rs"]
 mod mid_turn_tests;
+
+#[cfg(test)]
+#[path = "compact_lhc_canary_tests.rs"]
+mod canary_tests;

@@ -50,7 +50,7 @@ fn text_input(text: &str) -> UserInput {
     }
 }
 
-fn sample_usage(input_tokens: i64) -> TokenUsage {
+pub(super) fn sample_usage(input_tokens: i64) -> TokenUsage {
     TokenUsage {
         input_tokens,
         cached_input_tokens: 0,
@@ -62,7 +62,7 @@ fn sample_usage(input_tokens: i64) -> TokenUsage {
     }
 }
 
-async fn install_lhc_midturn(session: &mut Session, root: std::path::PathBuf) {
+pub(super) async fn install_lhc_midturn(session: &mut Session, root: std::path::PathBuf) {
     session
         .set_feature_for_test(Feature::LhcCapture, true)
         .expect("enable LhcCapture");
@@ -111,7 +111,11 @@ async fn install_lhc_midturn(session: &mut Session, root: std::path::PathBuf) {
     }
 }
 
-async fn seed_turns(session: &Session, tc: &crate::session::turn_context::TurnContext, n: usize) {
+pub(super) async fn seed_turns(
+    session: &Session,
+    tc: &crate::session::turn_context::TurnContext,
+    n: usize,
+) {
     let pad = "x".repeat(800);
     for i in 0..n {
         session
@@ -140,7 +144,7 @@ async fn seed_turns(session: &Session, tc: &crate::session::turn_context::TurnCo
     }
 }
 
-async fn inject_response_usage(
+pub(super) async fn inject_response_usage(
     session: &Session,
     tc: &crate::session::turn_context::TurnContext,
     input_tokens: i64,
@@ -152,7 +156,7 @@ async fn inject_response_usage(
         .expect("record token usage");
 }
 
-fn mid_facts(
+pub(super) fn mid_facts(
     attempt: &str,
     total_needs_follow_up: bool,
     epoch: i64,
@@ -170,7 +174,7 @@ fn mid_facts(
     }
 }
 
-fn decision_epoch(session: &Session) -> i64 {
+pub(super) fn decision_epoch(session: &Session) -> i64 {
     i64::try_from(session.input_queue.input_epoch()).unwrap_or(0)
 }
 
@@ -3025,7 +3029,7 @@ async fn mid_turn_epoch_change_during_critical_section_still_applies() {
 /// Every installed body must remain a legal provider request: tool calls and
 /// outputs correlated and ordered, no orphans, no duplicates. This is the bar
 /// a degraded body still has to clear (R10) — the provider decides the rest.
-fn assert_provider_sendable(body: &[ResponseItem]) {
+pub(super) fn assert_provider_sendable(body: &[ResponseItem]) {
     let spec = codex_lhc_host::BodyValidationSpec {
         attempt_id: "structural".into(),
         protected_tool_call_ids: Vec::new(),
