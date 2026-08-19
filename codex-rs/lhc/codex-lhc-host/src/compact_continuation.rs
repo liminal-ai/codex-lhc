@@ -910,57 +910,27 @@ pub async fn run_mid_turn_compact_continuation(
     }
 }
 
-/// Default growth margin (tokens) required after a truthful no-reduction before
-/// MidTurn may re-attempt compact-continuation. Named / configured for tests.
-pub const DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS: i64 = 10_000;
-
-/// Hysteresis after a **truthful** no-reduction (or exact frozen dry-relief
-/// outcome). Skip/refusal/capture-lag/transport-retry/input-epoch/invalid-
-/// install must **not** suppress later recovery.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Record of the last MidTurn compact-continuation attempt.
+///
+/// R3 (CX-S1): this is a **diagnostic** only. It used to carry a growth-margin
+/// treadmill guard (`should_attempt_after_no_reduction`, default 10k tokens)
+/// that suppressed the next attempt after a truthful no-reduction — exactly
+/// when a session under pressure needed the retry most. The guard is gone; a
+/// session retries at the next seam at zero cost. `armed` now only reports
+/// whether the last recorded outcome was a truthful no-reduction.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CompactContinuationHysteresis {
     pub last_attempt_id: String,
     pub last_pressure_tokens: i64,
     pub last_reduced: bool,
     pub last_outcome: String,
-    /// Required measured growth above `last_pressure_tokens` to clear.
-    pub growth_margin_tokens: i64,
-    /// True only while a truthful no-reduction treadmill guard is armed.
+    /// True only when the last recorded outcome was a truthful no-reduction.
+    /// Skip/refusal/capture-lag/transport-retry/input-epoch/invalid-install
+    /// outcomes never set it.
     pub armed: bool,
 }
 
-impl Default for CompactContinuationHysteresis {
-    fn default() -> Self {
-        Self {
-            last_attempt_id: String::new(),
-            last_pressure_tokens: 0,
-            last_reduced: true,
-            last_outcome: String::new(),
-            growth_margin_tokens: DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS,
-            armed: false,
-        }
-    }
-}
-
 impl CompactContinuationHysteresis {
-    pub fn with_growth_margin(mut self, margin: i64) -> Self {
-        self.growth_margin_tokens = margin.max(0);
-        self
-    }
-
-    /// Whether another attempt is warranted given new measured pressure.
-    /// When armed after truthful no-reduction, requires pressure growth of at
-    /// least `growth_margin_tokens` (default 10k).
-    pub fn should_attempt_after_no_reduction(&self, next_pressure_tokens: i64) -> bool {
-        if !self.armed {
-            return true;
-        }
-        next_pressure_tokens
-            >= self
-                .last_pressure_tokens
-                .saturating_add(self.growth_margin_tokens)
-    }
-
     /// Record an attempt. Only truthful no-reduction (or frozen dry-relief
     /// alias) arms the treadmill guard. Successful reduction clears it.
     /// Skip/refuse/capture/transport outcomes leave prior state alone.
@@ -980,6 +950,7 @@ impl CompactContinuationHysteresis {
         // after capture lag / transport retry / epoch change still works.
     }
 
+    /// Clear the no-reduction record after a reducing attempt.
     pub fn clear(&mut self, attempt_id: &str, pressure: i64, outcome: &str) {
         self.last_attempt_id = attempt_id.to_string();
         self.last_pressure_tokens = pressure;
@@ -1199,39 +1170,38 @@ mod tests {
         }
     }
 
+    /// R3 (CX-S1): the record is a diagnostic. A truthful no-reduction is
+    /// recorded, and it suppresses nothing — there is no growth margin left to
+    /// clear before the next attempt.
     #[test]
-    fn hysteresis_blocks_until_growth_margin_after_no_reduction() {
+    fn hysteresis_record_is_diagnostic_and_suppresses_nothing() {
         let mut h = CompactContinuationHysteresis::default();
         h.record("a1", 100_000, false, "no_reduction");
         assert!(h.armed);
-        assert!(!h.should_attempt_after_no_reduction(100_000));
-        assert!(!h.should_attempt_after_no_reduction(109_999));
-        assert!(h.should_attempt_after_no_reduction(110_000));
+        assert_eq!(h.last_pressure_tokens, 100_000);
+        assert_eq!(h.last_outcome, "no_reduction");
+        assert!(!h.last_reduced);
+        // No growth-margin API remains, so nothing here can gate a retry.
     }
 
     #[test]
     fn hysteresis_table_truthful_only() {
         let cases = [
-            ("no_reduction", false, true, false),
-            ("terminal_no_reduction", false, true, false),
-            ("dry_relief_no_reduction", false, true, false),
-            ("skip_seam", false, false, true),
-            ("refuse", false, false, true),
-            ("continue_normal", false, false, true),
-            ("compact_continue_turn", true, false, true),
-            ("degraded_compact", true, false, true),
+            ("no_reduction", false, true),
+            ("terminal_no_reduction", false, true),
+            ("dry_relief_no_reduction", false, true),
+            ("skip_seam", false, false),
+            ("refuse", false, false),
+            ("continue_normal", false, false),
+            ("compact_continue_turn", true, false),
+            ("degraded_compact", true, false),
         ];
-        for (outcome, reduced, expect_armed, expect_attempt_same) in cases {
+        for (outcome, reduced, expect_armed) in cases {
             let mut h = CompactContinuationHysteresis::default();
             h.record("t", 50_000, reduced, outcome);
             assert_eq!(
                 h.armed, expect_armed,
                 "outcome={outcome} reduced={reduced} armed"
-            );
-            assert_eq!(
-                h.should_attempt_after_no_reduction(50_000),
-                expect_attempt_same,
-                "outcome={outcome} same-pressure attempt"
             );
         }
     }
@@ -1240,19 +1210,18 @@ mod tests {
     fn hysteresis_clears_on_successful_reduction() {
         let mut h = CompactContinuationHysteresis::default();
         h.record("a1", 100_000, false, "no_reduction");
-        assert!(!h.should_attempt_after_no_reduction(100_000));
+        assert!(h.armed);
         h.record("a2", 100_000, true, "compact_continue_turn");
         assert!(!h.armed);
-        assert!(h.should_attempt_after_no_reduction(100_000));
+        assert!(h.last_reduced);
     }
 
     #[test]
-    fn hysteresis_skip_does_not_suppress_recovery() {
+    fn hysteresis_skip_does_not_arm() {
         let mut h = CompactContinuationHysteresis::default();
         // Prior skip must not arm.
         h.record("skip1", 90_000, false, "skip_seam");
         assert!(!h.armed);
-        assert!(h.should_attempt_after_no_reduction(90_000));
         // Capture lag / transport / epoch refuse aliases.
         for outcome in [
             "skip_capture_incomplete",
@@ -1263,7 +1232,6 @@ mod tests {
             let mut h = CompactContinuationHysteresis::default();
             h.record("x", 80_000, false, outcome);
             assert!(!h.armed, "{outcome} must not arm hysteresis");
-            assert!(h.should_attempt_after_no_reduction(80_000));
         }
     }
 

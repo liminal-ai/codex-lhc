@@ -73,7 +73,6 @@ pub use compact_bridge::read_materialize_surfaces;
 pub use compact_bridge::unrepresentable_host_items_gap;
 pub use compact_continuation::COMPACT_CONTINUATION_ACTOR;
 pub use compact_continuation::CompactContinuationHysteresis;
-pub use compact_continuation::DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS;
 pub use compact_continuation::DEFAULT_LOWER_TARGET_TOKENS;
 pub use compact_continuation::MidTurnCompactContinuationOutcome;
 pub use compact_continuation::MidTurnCompactContinuationRequest;

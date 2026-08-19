@@ -406,7 +406,8 @@ async fn sub_threshold_does_not_grow_model_context() {
     match attempt {
         LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Unavailable { reason }
-        | LhcCompactAttempt::Cancelled { reason } => {
+        | LhcCompactAttempt::Cancelled { reason }
+        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             // NoReduction is fine; other hard stops also fine for tiny seed.
             let _ = reason;
             assert!(response_items_structurally_equal(
@@ -473,7 +474,8 @@ async fn production_three_compacts_do_not_reingest_body() {
             | LhcCompactAttempt::Unavailable { reason }
             | LhcCompactAttempt::Cancelled { reason }
             | LhcCompactAttempt::MidTurnSkipped { reason }
-            | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            | LhcCompactAttempt::MidTurnBlocked { reason, .. }
+            | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
                 // After first Install, further rounds may NoReduction — still
                 // must not re-ingest during produce's import path.
                 assert!(
@@ -1092,7 +1094,8 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
         }
         LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Unavailable { reason }
-        | LhcCompactAttempt::Cancelled { reason } => {
+        | LhcCompactAttempt::Cancelled { reason }
+        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             assert!(!reason.is_empty(), "hard-stop reason should be non-empty");
             // History unchanged — no native compact.
             assert!(response_items_structurally_equal(
@@ -1456,6 +1459,8 @@ async fn background_derivation_leaves_compact_with_no_inference_to_do() {
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
+                format!("ContinuedWithoutCompact({reason})"),
             LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
         }
     );
@@ -1628,6 +1633,8 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
+                format!("ContinuedWithoutCompact({reason})"),
             LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
         }
     );
@@ -1741,6 +1748,8 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
+            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
+                format!("ContinuedWithoutCompact({reason})"),
             LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
         }
     );
@@ -1758,7 +1767,8 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
         }
         LhcCompactAttempt::Failed { .. }
         | LhcCompactAttempt::Unavailable { .. }
-        | LhcCompactAttempt::Cancelled { .. } => {}
+        | LhcCompactAttempt::Cancelled { .. }
+        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
         LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
             panic!("StandaloneTurn must not return MidTurn residual");
         }
@@ -2936,7 +2946,9 @@ async fn blocked_capture_flush_does_not_hang_lhc_compact() {
                 "LHC rewrite writes exactly one LHC Compacted boundary"
             );
         }
-        LhcCompactAttempt::Failed { reason } | LhcCompactAttempt::Unavailable { reason } => {
+        LhcCompactAttempt::Failed { reason }
+        | LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             let history_after = sess.clone_history().await.into_raw_items();
             assert!(
                 response_items_structurally_equal(&history_before, &history_after),
