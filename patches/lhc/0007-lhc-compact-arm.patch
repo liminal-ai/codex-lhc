@@ -2662,7 +2662,7 @@ index 0000000000..6fa69219d4
 +mod canary_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..3bf1acd05c
+index 0000000000..059bf3577d
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 @@ -0,0 +1,3523 @@
@@ -5870,7 +5870,7 @@ index 0000000000..3bf1acd05c
 +    .expect("hv row");
 +    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
 +    assert!(
-+        codex_lhc_host::host_validation_reload_block(&thread_id, root.as_deref())
++        codex_lhc_host::host_validation_reload_warning(&thread_id, root.as_deref())
 +            .await
 +            .is_none(),
 +        "ok validation must clear the reload gate"
@@ -5958,7 +5958,7 @@ index 0000000000..3bf1acd05c
 +        "the ok row must record how the body degraded: {reason}"
 +    );
 +    assert!(
-+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
 +            .await
 +            .is_none(),
 +        "a session that compacted must not be gated out of rollout regeneration"
@@ -6141,7 +6141,7 @@ index 0000000000..3bf1acd05c
 +        "expected a degraded install, got {blocked:?}"
 +    );
 +    assert!(
-+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
 +            .await
 +            .is_none(),
 +        "a degraded install must not gate rollout regeneration"
@@ -6170,7 +6170,7 @@ index 0000000000..3bf1acd05c
 +        "standalone compact must install a later view, got {later:?}"
 +    );
 +    assert!(
-+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++        codex_lhc_host::host_validation_reload_warning(&thread_id, root_path.as_deref())
 +            .await
 +            .is_none(),
 +        "newer active view must supersede the failed continuation residual"
