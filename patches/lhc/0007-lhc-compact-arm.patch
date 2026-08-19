@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..d57cdf58f3
+index 0000000000..2043e3ddf3
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2470 @@
+@@ -0,0 +1,2543 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -458,6 +458,19 @@ index 0000000000..d57cdf58f3
 +
 +fn failed_attempt(reason: impl Into<String>) -> LhcCompactAttempt {
 +    LhcCompactAttempt::Failed {
++        reason: reason.into(),
++    }
++}
++
++/// R19 (CX-S3): body assembly produced nothing installable.
++///
++/// This is never a hard failure. The session keeps the body it already holds,
++/// the turn continues on it, and compact retries at the next seam — the same
++/// disposition as any other "no body this time" outcome. Failing here would
++/// strand a session over an empty derivation, which is the one cost no
++/// bookkeeping is worth.
++fn kept_prior_body_attempt(reason: impl Into<String>) -> LhcCompactAttempt {
++    LhcCompactAttempt::ContinuedWithoutCompact {
 +        reason: reason.into(),
 +    }
 +}
@@ -1808,88 +1821,56 @@ index 0000000000..d57cdf58f3
 +    // resume-from-rewritten-file rebuilds.
 +    let mut install_history = history_from_materialized_items(&materialize_result.items);
 +    if install_history.is_empty() {
-+        return Ok(failed_attempt(
-+            "materialize produced empty install history (bands+tail)",
++        // R19 (CX-S3): an empty materialization is not a reason to strand. The
++        // session keeps the body it already holds, the turn continues, and
++        // compact retries at the next seam.
++        warn!(
++            manual,
++            materialized_items = materialize_result.items.len(),
++            messages = surfaces.messages.len(),
++            turns = surfaces.turns.len(),
++            "LHC compact materialized an empty install history (bands+tail); \
++             keeping the prior body and continuing without compact"
++        );
++        return Ok(kept_prior_body_attempt(
++            "materialize produced empty install history (bands+tail); prior body kept",
 +        ));
 +    }
 +    // LIM-69: materialize reconstructs CustomToolCall(Output) from portable
 +    // LHC messages and drops status / ContentItems / name. Graft the exact
 +    // live pair (id + host metadata stripped) so validation, rewrite, and
 +    // in-memory install share the same provider-stable bytes.
++    //
++    // R8 (CX-S3): a pair that cannot be proven keeps the LHC-reconstructed
++    // call/output instead of blocking — same call_id, same correlation, only
++    // provider-specific fields (status, namespace) missing. Degraded body,
++    // valid request, loud warning.
 +    if let Some(spec) = host_validation.as_ref()
 +        && !spec.protected_tool_call_ids.is_empty()
 +    {
 +        let live_items: Vec<ResponseItem> =
 +            sess.clone_history().await.raw_items().cloned().collect();
-+        match codex_lhc_host::graft_live_protected_pairs(
++        let graft = codex_lhc_host::graft_live_protected_pairs(
 +            &mut install_history,
 +            &live_items,
 +            &spec.protected_tool_call_ids,
-+        ) {
-+            Ok(n) => {
-+                info!(
-+                    attempt_id = %spec.attempt_id,
-+                    grafted = n,
-+                    "LHC MidTurn grafted live protected pairs into materialized body"
-+                );
-+            }
-+            Err(reason) => {
-+                error!(
-+                    attempt_id = %spec.attempt_id,
-+                    %reason,
-+                    "LHC MidTurn protected-pair graft failed; blocking without rewrite"
-+                );
-+                if let Err(err) = record_host_validation_on_thread(
-+                    thread_id.clone(),
-+                    root.clone(),
-+                    spec.attempt_id.clone(),
-+                    false,
-+                    Some(reason.clone()),
-+                )
-+                .await
-+                {
-+                    error!(
-+                        %err,
-+                        attempt_id = %spec.attempt_id,
-+                        "failed to persist graft-failure host validation refusal"
-+                    );
-+                }
-+                return Ok(LhcCompactAttempt::MidTurnBlocked {
-+                    reason,
-+                    next_provider_request_allowed: false,
-+                });
-+            }
-+        }
-+    }
-+    for item in &mut install_history {
-+        if item_stable_id(item).is_none()
-+            && let Some(prefix) = item.id_prefix()
-+        {
-+            item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
-+        }
-+    }
-+    let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
-+    if assigned_ids.is_empty() {
-+        return Ok(failed_attempt(
-+            "derived provenance: no stable ids for install history",
-+        ));
-+    }
-+    let digests: Vec<String> = install_history
-+        .iter()
-+        .map(content_identity_digest)
-+        .collect();
-+    marker.derived_host_ids = assigned_ids.clone();
-+    marker.derived_content_digests = digests.clone();
-+    marker.body_item_count = install_history.len();
-+    // Final durable record (with host ids) must ride the Compacted.message in
-+    // the rewritten file — patch the provisional boundary before the swap.
-+    // Also stamp assigned ids into the file's replacement_history + tail so
-+    // resume rebuilds the same items the live session holds.
-+    let durable_message = marker.to_durable_writeback_record();
-+    patch_materialized_history_ids(&mut materialize_result.items, &install_history);
-+    for item in &mut materialize_result.items {
-+        if let RolloutItem::Compacted(compacted) = item {
-+            compacted.message = durable_message.clone();
++        );
++        if graft.is_fully_grafted() {
++            info!(
++                attempt_id = %spec.attempt_id,
++                grafted = graft.grafted.len(),
++                "LHC MidTurn grafted live protected pairs into materialized body"
++            );
++        } else {
++            warn!(
++                attempt_id = %spec.attempt_id,
++                grafted = graft.grafted.len(),
++                degraded = graft.degraded.len(),
++                detail = %graft.degraded_summary(),
++                "LHC MidTurn protected-pair graft could not prove every pair; continuing \
++                 with the LHC-reconstructed pair (same call_id and correlation, \
++                 provider-specific fields may be absent)"
++            );
 +        }
 +    }
 +
@@ -1906,14 +1887,21 @@ index 0000000000..d57cdf58f3
 +        "LHC compact install-history size (diagnostic only; not a terminal gate)"
 +    );
 +
-+    // LIM-67 host full-body validation gate (protected escalation only).
++    // LIM-67 host full-body validation (protected escalation only).
 +    // `install_history` is the exact item sequence the next provider request
-+    // serves (identical to what the rewrite and in-memory install would use).
-+    // Validate BEFORE the rollout rewrite / in-memory replacement; record the
-+    // durable ok/failed acknowledgment through the certified SDK API. A failed
-+    // (or unrecordable) validation leaves rollout and in-memory history on
-+    // their prior generation and blocks the next provider request. It does NOT
-+    // roll the installed LHC core view back.
++    // serves (identical to what the rewrite and in-memory install use).
++    //
++    // R10 (CX-S3): validation detects, it does not veto. A body that fails is
++    // degraded to the best version still legal to send — unpaired/orphan items
++    // dropped, oversized content truncated, missing encrypted reasoning
++    // omitted — and the same drops are applied to the materialized rollout
++    // items so the rewritten file rebuilds exactly the installed body (law 1).
++    // The provider is the final authority on what it accepts; a rejected
++    // request is recoverable, a stranded session is not.
++    //
++    // R11 (CX-S3): the durable acknowledgment is a receipt. It records that
++    // this attempt's view is the one being served — including *how* it
++    // degraded — and a write failure never decides whether compact proceeds.
 +    if let Some(spec) = host_validation.as_ref() {
 +        #[cfg(any(test, feature = "test-util"))]
 +        let validation = if slot.mid_turn_test_force_body_validation_fail() {
@@ -1923,70 +1911,113 @@ index 0000000000..d57cdf58f3
 +        };
 +        #[cfg(not(any(test, feature = "test-util")))]
 +        let validation = codex_lhc_host::validate_next_request_body(&install_history, spec);
-+        match validation {
++        let ack_reason = match validation {
 +            Ok(report) => {
-+                match record_host_validation_on_thread(
-+                    thread_id.clone(),
-+                    root.clone(),
-+                    spec.attempt_id.clone(),
-+                    true,
-+                    None,
-+                )
-+                .await
-+                {
-+                    Ok(()) => {
-+                        info!(
-+                            attempt_id = %spec.attempt_id,
-+                            body_items = report.body_item_count,
-+                            body_tokens = report.body_token_estimate,
-+                            threshold = ?report.safe_runway_threshold_tokens,
-+                            protected_pairs = report.protected_pair_count,
-+                            reasoning_preserved = report.reasoning_preserved_count,
-+                            "LHC MidTurn host full-body validation ok; proceeding to rewrite"
-+                        );
-+                    }
-+                    Err(err) => {
-+                        error!(
-+                            %err,
-+                            attempt_id = %spec.attempt_id,
-+                            "LHC MidTurn host validation passed but durable ack write failed;                              blocking without rewrite (residual stays awaiting)"
-+                        );
-+                        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+                            reason: format!(
-+                                "host validation ack write failed for attempt {}: {err}",
-+                                spec.attempt_id
-+                            ),
-+                            next_provider_request_allowed: false,
-+                        });
-+                    }
-+                }
++                info!(
++                    attempt_id = %spec.attempt_id,
++                    body_items = report.body_item_count,
++                    body_tokens = report.body_token_estimate,
++                    threshold = ?report.safe_runway_threshold_tokens,
++                    protected_pairs = report.protected_pair_count,
++                    reasoning_preserved = report.reasoning_preserved_count,
++                    "LHC MidTurn host full-body validation ok; proceeding to rewrite"
++                );
++                None
 +            }
 +            Err(reason) => {
-+                if let Err(err) = record_host_validation_on_thread(
-+                    thread_id.clone(),
-+                    root.clone(),
-+                    spec.attempt_id.clone(),
-+                    false,
-+                    Some(reason.clone()),
-+                )
-+                .await
-+                {
-+                    error!(
-+                        %err,
-+                        attempt_id = %spec.attempt_id,
-+                        "LHC MidTurn host-validation-failed record write failed; blocking anyway"
-+                    );
-+                }
-+                error!(
++                let degraded =
++                    codex_lhc_host::degrade_body_to_best_available(&install_history, spec);
++                let detail = degraded.summary();
++                warn!(
 +                    attempt_id = %spec.attempt_id,
 +                    %reason,
-+                    "LHC MidTurn host full-body validation FAILED; rollout and in-memory                      history stay on prior generation; next provider request blocked"
++                    body_items_before = install_history.len(),
++                    body_items_after = degraded.body.len(),
++                    dropped_items = degraded.dropped_count(),
++                    degradations = degraded.degradations.len(),
++                    %detail,
++                    "LHC MidTurn host full-body validation failed; degrading to the best \
++                     available body and continuing (never stranding; the provider is the \
++                     final authority on the request)"
 +                );
-+                return Ok(LhcCompactAttempt::MidTurnBlocked {
-+                    reason: format!("host full-body validation failed: {reason}"),
-+                    next_provider_request_allowed: false,
-+                });
++                if degraded.dropped_count() > 0 {
++                    drop_materialized_items(&mut materialize_result.items, &degraded.kept);
++                }
++                install_history = degraded.body;
++                if install_history.is_empty() {
++                    // Nothing survived the ladder: same disposition as R19 —
++                    // keep the body the session already holds.
++                    warn!(
++                        attempt_id = %spec.attempt_id,
++                        %detail,
++                        "LHC MidTurn degrade ladder emptied the body; keeping the prior body \
++                         and continuing without compact"
++                    );
++                    return Ok(kept_prior_body_attempt(format!(
++                        "degraded body empty after validation failure ({reason}); prior body kept"
++                    )));
++                }
++                Some(format!("proceeded degraded: {reason} | {detail}"))
 +            }
++        };
++        // `ok` records what is true after the ladder: this attempt's view is
++        // the body being served, degradations and all. Recording `failed`
++        // would gate rollout regeneration for a session that did compact —
++        // exactly the bookkeeping-as-authority pattern R10/R11 remove.
++        if let Err(err) = record_host_validation_on_thread(
++            thread_id.clone(),
++            root.clone(),
++            spec.attempt_id.clone(),
++            /*ok*/ true,
++            ack_reason,
++        )
++        .await
++        {
++            warn!(
++                %err,
++                attempt_id = %spec.attempt_id,
++                "LHC MidTurn host validation ack write failed; the body is installed anyway \
++                 (receipts observe, never govern)"
++            );
++        }
++    }
++
++    for item in &mut install_history {
++        if item_stable_id(item).is_none()
++            && let Some(prefix) = item.id_prefix()
++        {
++            item.set_id(Some(codex_protocol::ResponseItemId::new(prefix)));
++        }
++    }
++    let assigned_ids: Vec<String> = install_history.iter().filter_map(item_stable_id).collect();
++    let digests: Vec<String> = install_history
++        .iter()
++        .map(content_identity_digest)
++        .collect();
++    if assigned_ids.is_empty() {
++        // R9 (CX-S3): stable ids are the preferred identity, not the only one.
++        // Content digests are computed unconditionally for every item, so
++        // resume equivalence and coverage accounting survive on digests alone.
++        warn!(
++            manual,
++            body_items = install_history.len(),
++            digests = digests.len(),
++            "LHC compact derived provenance has no assignable stable ids; \
++             falling through to content-digest identity"
++        );
++    }
++    marker.derived_host_ids = assigned_ids.clone();
++    marker.derived_content_digests = digests.clone();
++    marker.body_item_count = install_history.len();
++    // Final durable record (with host ids) must ride the Compacted.message in
++    // the rewritten file — patch the provisional boundary before the swap.
++    // Also stamp assigned ids into the file's replacement_history + tail so
++    // resume rebuilds the same items the live session holds.
++    let durable_message = marker.to_durable_writeback_record();
++    patch_materialized_history_ids(&mut materialize_result.items, &install_history);
++    for item in &mut materialize_result.items {
++        if let RolloutItem::Compacted(compacted) = item {
++            compacted.message = durable_message.clone();
 +        }
 +    }
 +
@@ -2216,6 +2247,48 @@ index 0000000000..d57cdf58f3
 +        marker.derived_host_ids.iter().cloned(),
 +        marker.derived_content_digests.iter().cloned(),
 +    );
++}
++
++/// Apply the degrade ladder's keep mask to the materialized rollout items so
++/// the rewritten file rebuilds exactly the body the session installs (law 1).
++///
++/// Walks `items` in the order [`history_from_materialized_items`] reads them:
++/// the newest `Compacted.replacement_history` (the bands) first, then the
++/// post-boundary `ResponseItem` / `InterAgentCommunication` entries (the tail).
++/// Positions the mask does not cover are kept — a shorter mask must never
++/// silently truncate durable state.
++fn drop_materialized_items(items: &mut Vec<RolloutItem>, kept: &[bool]) {
++    let boundary = items
++        .iter()
++        .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
++    let mut cursor = 0usize;
++    if let Some(idx) = boundary
++        && let RolloutItem::Compacted(compacted) = &mut items[idx]
++        && let Some(history) = compacted.replacement_history.as_mut()
++    {
++        history.retain(|_| {
++            let verdict = kept.get(cursor).copied().unwrap_or(true);
++            cursor += 1;
++            verdict
++        });
++    }
++    let tail_start = boundary.map(|idx| idx + 1).unwrap_or(0);
++    let mut position = 0usize;
++    items.retain(|item| {
++        let idx = position;
++        position += 1;
++        if idx < tail_start {
++            return true;
++        }
++        match item {
++            RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
++                let verdict = kept.get(cursor).copied().unwrap_or(true);
++                cursor += 1;
++                verdict
++            }
++            _ => true,
++        }
++    });
 +}
 +
 +/// Stamp host-assigned ids from `install_history` (bands + tail) onto the
@@ -2571,10 +2644,10 @@ index 0000000000..d57cdf58f3
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..8dce0bda08
+index 0000000000..c0c51a15d1
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3500 @@
+@@ -0,0 +1,3519 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -5598,6 +5671,36 @@ index 0000000000..8dce0bda08
 +
 +/// Seed one open agentic turn shape for escalation: older big unprotected
 +/// pairs, then the response-scoped protected pair.
++
++/// Every installed body must remain a legal provider request: tool calls and
++/// outputs correlated and ordered, no orphans, no duplicates. This is the bar
++/// a degraded body still has to clear (R10) — the provider decides the rest.
++fn assert_provider_sendable(body: &[ResponseItem]) {
++    let spec = codex_lhc_host::BodyValidationSpec {
++        attempt_id: "structural".into(),
++        protected_tool_call_ids: Vec::new(),
++        protected_pairs: Vec::new(),
++        required_encrypted_reasoning: Vec::new(),
++        safe_runway_threshold_tokens: None,
++    };
++    codex_lhc_host::validate_next_request_body(body, &spec)
++        .expect("installed body must be a legal provider request");
++    let mut tracker = codex_lhc_host::OccurrenceTracker::new();
++    for item in body {
++        assert!(
++            !codex_lhc_host::map_item(
++                "assert-sendable",
++                item,
++                codex_extension_api::RawItemProvenance::ModelOutput,
++                &mut tracker,
++                None,
++            )
++            .is_empty(),
++            "installed item must still round-trip through the capture mapping: {item:?}"
++        );
++    }
++}
++
 +async fn seed_escalation_history(
 +    session: &Session,
 +    tc: &crate::session::turn_context::TurnContext,
@@ -5752,12 +5855,13 @@ index 0000000000..8dce0bda08
 +    );
 +}
 +
-+/// Negative path: forced host body-validation failure after a successful core
-+/// install records `failed`, blocks the next provider request without rolling
-+/// core state back, deterministically gates reload regeneration, and replays
-+/// idempotently (no second boundary or marker).
++/// R10/R11 (CX-S3): a host body-validation failure degrades the body and
++/// installs it. The core install stands, the durable row records that this
++/// attempt's view is the one being served (carrying the degradation reason),
++/// the reload gate stays clear because the session did compact, and the same
++/// attempt still replays idempotently (no second boundary or marker).
 +#[tokio::test]
-+async fn mid_turn_host_validation_failed_blocks_send_and_gates_reload() {
++async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_clear() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -5800,27 +5904,23 @@ index 0000000000..8dce0bda08
 +    )
 +    .await
 +    .expect("arm");
-+    match &attempt {
-+        LhcCompactAttempt::MidTurnBlocked {
-+            reason,
-+            next_provider_request_allowed,
-+        } => {
-+            assert!(
-+                reason.contains("host full-body validation failed"),
-+                "{reason}"
-+            );
-+            assert!(
-+                !next_provider_request_allowed,
-+                "failed host validation must block the next provider request"
-+            );
-+        }
-+        other => panic!("expected MidTurnBlocked on forced validation failure, got {other:?}"),
-+    }
++    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
++        panic!("validation failure must degrade and install, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "degraded body must not be empty");
++    assert_provider_sendable(body);
++    // The session is serving the degraded body, not the pre-compact one.
++    let installed: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert!(
++        crate::compact_lhc::response_items_structurally_equal(&installed, body),
++        "the degraded body is what the session holds"
++    );
 +
 +    let thread_id = handle.thread_id().to_string();
 +    let root_path = handle.root().map(std::path::Path::to_path_buf);
 +
-+    // Durable failed row + reload gate engaged; core install retained.
++    // Durable row: this attempt's view is the one being served, and the reason
++    // carries the degradation for forensics. Receipts observe, never govern.
 +    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
 +        &thread_id,
 +        root_path.as_deref(),
@@ -5829,11 +5929,18 @@ index 0000000000..8dce0bda08
 +    .await
 +    .expect("hv inspect")
 +    .expect("hv row");
-+    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
-+    let block = codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
-+        .await
-+        .expect("failed validation must gate reload");
-+    assert!(block.contains("resp-esc-fail-1"), "{block}");
++    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
++    let reason = hv.reason.clone().unwrap_or_default();
++    assert!(
++        reason.contains("proceeded degraded") && reason.contains("test-injected"),
++        "the ok row must record how the body degraded: {reason}"
++    );
++    assert!(
++        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
++            .await
++            .is_none(),
++        "a session that compacted must not be gated out of rollout regeneration"
++    );
 +
 +    let receipts =
 +        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root_path.as_deref())
@@ -5853,12 +5960,11 @@ index 0000000000..8dce0bda08
 +        )
 +        .await
 +        .expect("marker"),
-+        "core install (boundary + marker) is retained after failed host validation"
++        "core install (boundary + marker) is retained through the degrade"
 +    );
 +    let receipts_before = receipts.len();
 +
-+    // Replay the same attempt: terminal replay, no second boundary/marker, and
-+    // the durable failed row is not overwritten.
++    // Replay the same attempt: terminal replay, no second boundary/marker.
 +    let replay = try_run_lhc_compact_arm(
 +        &sess,
 +        &tc,
@@ -5883,24 +5989,13 @@ index 0000000000..8dce0bda08
 +        receipts_before,
 +        "same-attempt replay must not append a second receipt"
 +    );
-+    let hv_after = codex_lhc_host::inspect_mid_turn_host_validation(
-+        &thread_id,
-+        root_path.as_deref(),
-+        "resp-esc-fail-1",
-+    )
-+    .await
-+    .expect("hv inspect")
-+    .expect("hv row");
-+    assert_eq!(
-+        hv_after.status,
-+        codex_lhc_host::HostValidationStatus::Failed
-+    );
 +}
 +
-+/// LIM-69 Slice B: MidTurnBlocked(false) becomes TurnAborted so RegularTask
-+/// cannot drain mailbox and start another provider request.
++/// R10 (CX-S3): the strict compact path completes through a host body
++/// validation failure. Nothing aborts the turn; the session runs on the
++/// degraded body and its queued mailbox work is still there to drain.
 +#[tokio::test]
-+async fn mid_turn_host_validation_failed_strict_compact_is_turn_aborted() {
++async fn mid_turn_host_validation_failure_strict_compact_completes_turn() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -5957,27 +6052,26 @@ index 0000000000..8dce0bda08
 +    )
 +    .await;
 +    assert!(
-+        matches!(
-+            &result,
-+            Err(err)
-+                if matches!(
-+                    err.details(),
-+                    codex_protocol::error::CodexErrorDetails::TurnAborted
-+                )
-+        ),
-+        "MidTurnBlocked(false) must abort the turn, got {result:?}"
++        result.is_ok(),
++        "a degraded body must not abort the turn, got {result:?}"
 +    );
 +    assert!(
 +        sess.input_queue.has_pending_mailbox_items().await,
-+        "TurnAborted must leave mailbox input pending"
++        "queued mailbox input survives the compact and is still drainable"
 +    );
++    let installed: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert!(
++        !installed.is_empty(),
++        "the session keeps serving a body after a degraded compact"
++    );
++    assert_provider_sendable(&installed);
 +}
 +
-+/// LIM-69 Slice D: a later standalone compact changes the active view and
-+/// supersedes the failed continuation receipt's reload block. The failed HV
-+/// row stays failed.
++/// LIM-69 Slice D, under R10/R11: a degraded install never raises a reload
++/// block in the first place, and a later standalone compact still installs a
++/// newer view over it.
 +#[tokio::test]
-+async fn standalone_compact_supersedes_failed_host_validation_reload_block() {
++async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -6021,20 +6115,14 @@ index 0000000000..8dce0bda08
 +    .await
 +    .expect("arm");
 +    assert!(
-+        matches!(
-+            blocked,
-+            LhcCompactAttempt::MidTurnBlocked {
-+                next_provider_request_allowed: false,
-+                ..
-+            }
-+        ),
-+        "expected MidTurnBlocked(false), got {blocked:?}"
++        matches!(blocked, LhcCompactAttempt::Installed { .. }),
++        "expected a degraded install, got {blocked:?}"
 +    );
 +    assert!(
 +        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
 +            .await
-+            .is_some(),
-+        "failed HV must gate reload before standalone compact"
++            .is_none(),
++        "a degraded install must not gate rollout regeneration"
 +    );
 +
 +    slot.set_mid_turn_test_force_body_validation_fail(false);
@@ -6073,7 +6161,11 @@ index 0000000000..8dce0bda08
 +    .await
 +    .expect("hv inspect")
 +    .expect("hv row");
-+    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Failed);
++    assert_eq!(hv.status, codex_lhc_host::HostValidationStatus::Ok);
++    assert!(
++        hv.reason.unwrap_or_default().contains("proceeded degraded"),
++        "the degraded attempt is still recorded as degraded"
++    );
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
@@ -7501,10 +7593,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..1094bf8edb
+index 0000000000..5eaa120ee3
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3394 @@
+@@ -0,0 +1,3516 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -10897,6 +10989,128 @@ index 0000000000..1094bf8edb
 +    assert_eq!(
 +        item_bytes_without_id(&resumed[1]),
 +        item_bytes_without_id(&live_out)
++    );
++}
++
++/// R19 (CX-S3): an empty install history keeps the prior body instead of
++/// hard-failing. `ContinuedWithoutCompact` is the outcome the strict path maps
++/// to `Ok(())` — the session keeps serving what it already holds and compact
++/// retries at the next seam.
++///
++/// The condition is built from the real `history_from_materialized_items`:
++/// a boundary with no bands and no post-boundary items rebuilds to nothing.
++/// (The end-to-end route is currently unreachable — the SDK refuses a thread
++/// with no events long before body assembly runs — so the branch's decision is
++/// asserted directly.)
++#[test]
++fn empty_install_history_keeps_prior_body() {
++    use codex_history::CompactedItem;
++    use codex_history::RolloutItem;
++
++    let items = vec![RolloutItem::Compacted(CompactedItem {
++        message: "lhc".into(),
++        replacement_history: Some(vec![]),
++        window_number: None,
++        first_window_id: None,
++        previous_window_id: None,
++        window_id: None,
++    })];
++    assert!(
++        codex_lhc_host::history_from_materialized_items(&items).is_empty(),
++        "a boundary with no bands and no tail rebuilds to nothing"
++    );
++
++    let attempt = super::kept_prior_body_attempt("materialize produced empty install history");
++    match attempt {
++        LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
++            assert!(reason.contains("empty install history"), "{reason}");
++        }
++        other => panic!("empty body must keep the prior body, got {other:?}"),
++    }
++}
++
++/// R10 (CX-S3): when the degrade ladder drops items, the same items leave the
++/// materialized rollout, so a resume rebuilds exactly the body the session
++/// installed (law 1). Covers a drop in the bands and a drop in the tail.
++#[test]
++fn degraded_drops_keep_rollout_and_installed_body_identical() {
++    use codex_history::CompactedItem;
++    use codex_history::RolloutItem;
++    use codex_protocol::models::FunctionCallOutputBody;
++    use codex_protocol::models::FunctionCallOutputPayload;
++
++    fn call(id: &str) -> ResponseItem {
++        ResponseItem::FunctionCall {
++            id: None,
++            name: "shell".into(),
++            namespace: None,
++            arguments: "{}".into(),
++            encrypted_function_args: None,
++            call_id: id.into(),
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++    fn output(id: &str) -> ResponseItem {
++        ResponseItem::FunctionCallOutput {
++            id: None,
++            call_id: id.into(),
++            output: FunctionCallOutputPayload {
++                body: FunctionCallOutputBody::Text("out".into()),
++                success: Some(true),
++            },
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++    fn message(text: &str) -> ResponseItem {
++        ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText { text: text.into() }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }
++    }
++
++    // Bands carry an orphan output; the tail carries a call with no output.
++    let bands = vec![message("band-a"), output("orphan-band"), message("band-b")];
++    let tail = vec![call("live-1"), output("live-1"), call("no-output")];
++    let mut rollout = vec![RolloutItem::Compacted(CompactedItem {
++        message: "lhc".into(),
++        replacement_history: Some(bands.iter().cloned().map(Into::into).collect()),
++        window_number: None,
++        first_window_id: None,
++        previous_window_id: None,
++        window_id: None,
++    })];
++    rollout.extend(
++        tail.iter()
++            .cloned()
++            .map(|item| RolloutItem::ResponseItem(item.into())),
++    );
++
++    let assembled = codex_lhc_host::history_from_materialized_items(&rollout);
++    assert_eq!(assembled.len(), 6);
++    let spec = codex_lhc_host::BodyValidationSpec {
++        attempt_id: "degrade".into(),
++        protected_tool_call_ids: Vec::new(),
++        protected_pairs: Vec::new(),
++        required_encrypted_reasoning: Vec::new(),
++        safe_runway_threshold_tokens: None,
++    };
++    codex_lhc_host::validate_next_request_body(&assembled, &spec)
++        .expect_err("the assembled body is not sendable as-is");
++    let degraded = codex_lhc_host::degrade_body_to_best_available(&assembled, &spec);
++    assert_eq!(degraded.dropped_count(), 2, "{}", degraded.summary());
++    codex_lhc_host::validate_next_request_body(&degraded.body, &spec)
++        .expect("the degraded body is a legal provider request");
++
++    super::drop_materialized_items(&mut rollout, &degraded.kept);
++    patch_materialized_history_ids(&mut rollout, &degraded.body);
++    let resumed = codex_lhc_host::history_from_materialized_items(&rollout);
++    assert!(
++        response_items_structurally_equal(&resumed, &degraded.body),
++        "resume must rebuild exactly the installed body: {resumed:?} vs {:?}",
++        degraded.body
 +    );
 +}
 diff --git a/codex-rs/core/src/config/config_tests.rs b/codex-rs/core/src/config/config_tests.rs
