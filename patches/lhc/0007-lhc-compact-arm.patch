@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..2043e3ddf3
+index 0000000000..6fa69219d4
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2543 @@
+@@ -0,0 +1,2561 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -1964,15 +1964,29 @@ index 0000000000..2043e3ddf3
 +        // the body being served, degradations and all. Recording `failed`
 +        // would gate rollout regeneration for a session that did compact —
 +        // exactly the bookkeeping-as-authority pattern R10/R11 remove.
-+        if let Err(err) = record_host_validation_on_thread(
++        #[cfg(any(test, feature = "test-util"))]
++        let ack_write = if slot.mid_turn_test_force_validation_ack_write_fail() {
++            Err("validation ack write failed (test injection)".to_string())
++        } else {
++            record_host_validation_on_thread(
++                thread_id.clone(),
++                root.clone(),
++                spec.attempt_id.clone(),
++                /*ok*/ true,
++                ack_reason,
++            )
++            .await
++        };
++        #[cfg(not(any(test, feature = "test-util")))]
++        let ack_write = record_host_validation_on_thread(
 +            thread_id.clone(),
 +            root.clone(),
 +            spec.attempt_id.clone(),
 +            /*ok*/ true,
 +            ack_reason,
 +        )
-+        .await
-+        {
++        .await;
++        if let Err(err) = ack_write {
 +            warn!(
 +                %err,
 +                attempt_id = %spec.attempt_id,
@@ -2642,12 +2656,16 @@ index 0000000000..2043e3ddf3
 +#[cfg(test)]
 +#[path = "compact_lhc_mid_turn_tests.rs"]
 +mod mid_turn_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_canary_tests.rs"]
++mod canary_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..c0c51a15d1
+index 0000000000..3bf1acd05c
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3519 @@
+@@ -0,0 +1,3523 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -2700,7 +2718,7 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+fn sample_usage(input_tokens: i64) -> TokenUsage {
++pub(super) fn sample_usage(input_tokens: i64) -> TokenUsage {
 +    TokenUsage {
 +        input_tokens,
 +        cached_input_tokens: 0,
@@ -2712,7 +2730,7 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+async fn install_lhc_midturn(session: &mut Session, root: std::path::PathBuf) {
++pub(super) async fn install_lhc_midturn(session: &mut Session, root: std::path::PathBuf) {
 +    session
 +        .set_feature_for_test(Feature::LhcCapture, true)
 +        .expect("enable LhcCapture");
@@ -2761,7 +2779,11 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+async fn seed_turns(session: &Session, tc: &crate::session::turn_context::TurnContext, n: usize) {
++pub(super) async fn seed_turns(
++    session: &Session,
++    tc: &crate::session::turn_context::TurnContext,
++    n: usize,
++) {
 +    let pad = "x".repeat(800);
 +    for i in 0..n {
 +        session
@@ -2790,7 +2812,7 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+async fn inject_response_usage(
++pub(super) async fn inject_response_usage(
 +    session: &Session,
 +    tc: &crate::session::turn_context::TurnContext,
 +    input_tokens: i64,
@@ -2802,7 +2824,7 @@ index 0000000000..c0c51a15d1
 +        .expect("record token usage");
 +}
 +
-+fn mid_facts(
++pub(super) fn mid_facts(
 +    attempt: &str,
 +    total_needs_follow_up: bool,
 +    epoch: i64,
@@ -2820,7 +2842,7 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+fn decision_epoch(session: &Session) -> i64 {
++pub(super) fn decision_epoch(session: &Session) -> i64 {
 +    i64::try_from(session.input_queue.input_epoch()).unwrap_or(0)
 +}
 +
@@ -5675,7 +5697,7 @@ index 0000000000..c0c51a15d1
 +/// Every installed body must remain a legal provider request: tool calls and
 +/// outputs correlated and ordered, no orphans, no duplicates. This is the bar
 +/// a degraded body still has to clear (R10) — the provider decides the rest.
-+fn assert_provider_sendable(body: &[ResponseItem]) {
++pub(super) fn assert_provider_sendable(body: &[ResponseItem]) {
 +    let spec = codex_lhc_host::BodyValidationSpec {
 +        attempt_id: "structural".into(),
 +        protected_tool_call_ids: Vec::new(),
@@ -5701,7 +5723,7 @@ index 0000000000..c0c51a15d1
 +    }
 +}
 +
-+async fn seed_escalation_history(
++pub(super) async fn seed_escalation_history(
 +    session: &Session,
 +    tc: &crate::session::turn_context::TurnContext,
 +    protected_id: &str,
