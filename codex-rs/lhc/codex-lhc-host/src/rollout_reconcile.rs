@@ -44,6 +44,14 @@ pub enum RolloutReconcileTrigger {
     /// LHC compact point advanced past the file's newest Compacted boundary
     /// (crash window between LHC commit and rename).
     Stale,
+    /// R12/G26 (CX-S4): a reopen-failure receipt proved canonical suffix
+    /// events beyond the compacted rollout's frontier, and they were replayed
+    /// onto it. Never produced by [`classify_rollout_vs_thread`].
+    ReopenSuffixReplay,
+    /// R12/G26 (CX-S4): a reopen failure is known to have happened but its
+    /// accounting is unusable, so the rollout is rebuilt from the best
+    /// available LHC view. Never produced by [`classify_rollout_vs_thread`].
+    ReopenAccountingUnavailable,
 }
 
 /// Classification of a rollout file relative to an LHC thread compact point.
@@ -315,6 +323,412 @@ pub fn read_rollout_reopen_failure_receipt(
     serde_json::from_slice(&bytes).ok()
 }
 
+/// R12/G26 (CX-S4): what the next open did with a reopen-failure receipt.
+///
+/// The compacted rollout is authoritative in every arm. Nothing here can put
+/// the oversized prior generation back — the receipt exists to name what was
+/// lost or to replay what canonical LHC can still prove, never to roll back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReopenReceiptOutcome {
+    /// No receipt beside this rollout — ordinary open.
+    Absent,
+    /// The receipt describes a rollout generation that is no longer on disk:
+    /// a later rewrite already superseded it.
+    Superseded { detail: String },
+    /// Frontiers compared: canonical LHC holds nothing beyond the compacted
+    /// rollout's frontier.
+    NoSuffix,
+    /// Suffix events provably present in canonical LHC beyond the rollout
+    /// frontier were replayed onto the compacted rollout, in canonical order,
+    /// exactly once.
+    Replayed { appended: usize, total_items: usize },
+    /// The receipt proves canonical events the archive can no longer produce.
+    /// The compacted rollout stands and the loss is named explicitly.
+    KnownGap { warning: String, events: u64 },
+    /// A reopen failure is known to have happened, but its accounting is
+    /// unusable (unreadable receipt, no recorded capture frontier, or a
+    /// canonical materialization that does not overlap the rollout). The next
+    /// open rebuilds from the best available LHC view.
+    AccountingUnavailable { detail: String },
+    /// The suffix was computed but could not be written. The receipt stays on
+    /// disk so a later open can retry; the compacted rollout is untouched.
+    ReplayFailed { detail: String },
+}
+
+/// Consume the receipt: it is diagnostics, and a consumed one must not make
+/// the next open warn or replay a second time.
+fn clear_reopen_failure_receipt(rollout_path: &Path) {
+    let path = rollout_reopen_receipt_path(rollout_path);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => warn!(
+            %err,
+            path = %path.display(),
+            "reopen-failure receipt could not be consumed; the next open re-reads it \
+             (replay stays idempotent by item identity)"
+        ),
+    }
+}
+
+/// ResponseItems after the newest `Compacted` boundary — the rollout's active
+/// tail, which is the only region a suffix replay may touch.
+fn tail_after_last_boundary(items: &[RolloutItem]) -> Vec<&ResponseItem> {
+    let last_boundary = items
+        .iter()
+        .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
+    items
+        .iter()
+        .skip(last_boundary.map_or(0, |i| i + 1))
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect()
+}
+
+/// R12/G26 (CX-S4): next-open consumer for the reopen-failure receipt CX-S2
+/// persists after a compacted rollout's append recorder failed to reopen.
+///
+/// Compares three frontiers:
+/// (a) the receipt's recorder frontier + canonical capture frontier at
+///     failure, (b) the canonical LHC capture frontier/tail right now, and
+/// (c) the frontier reconstructed from the compacted rollout on disk.
+///
+/// Replays **only** the suffix events provably present in canonical LHC
+/// beyond the reconstructed rollout frontier, in canonical order, skipping
+/// any item already present (idempotent: a second open appends nothing).
+///
+/// When the receipt proves a frontier the archive can no longer produce, the
+/// session continues on the compacted rollout and the loss is named with an
+/// exact bounded range and count. Recovery is never inferred from the fact
+/// that the open succeeded, and the oversized prior rollout is never restored.
+pub async fn consume_reopen_failure_receipt(
+    path: &Path,
+    thread_id: &str,
+    root: Option<&Path>,
+    live_identity: Option<crate::mapping::ModelIdentity>,
+) -> ReopenReceiptOutcome {
+    let receipt_path = rollout_reopen_receipt_path(path);
+    if !receipt_path.exists() {
+        return ReopenReceiptOutcome::Absent;
+    }
+
+    let Some(receipt) = read_rollout_reopen_failure_receipt(path) else {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::AccountingUnavailable {
+            detail: format!(
+                "reopen-failure receipt at {} is unreadable or unparseable",
+                receipt_path.display()
+            ),
+        };
+    };
+    if receipt.schema != ROLLOUT_REOPEN_RECEIPT_SCHEMA {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::AccountingUnavailable {
+            detail: format!(
+                "reopen-failure receipt schema {:?} is not {ROLLOUT_REOPEN_RECEIPT_SCHEMA:?}; \
+                 refusing to interpret unknown accounting",
+                receipt.schema
+            ),
+        };
+    }
+    if receipt.thread_id != thread_id {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::Superseded {
+            detail: format!(
+                "reopen-failure receipt names thread {} but this open is thread {thread_id}",
+                receipt.thread_id
+            ),
+        };
+    }
+
+    // (c) Reconstruct the compacted-rollout frontier from the file on disk,
+    // and prove it is the generation the receipt describes.
+    let rollout_items = match parse_rollout_items(path) {
+        Ok(items) => items,
+        Err(err) => {
+            clear_reopen_failure_receipt(path);
+            return ReopenReceiptOutcome::AccountingUnavailable {
+                detail: format!(
+                    "compacted rollout {} is unreadable ({err}); no frontier to reconcile against",
+                    path.display()
+                ),
+            };
+        }
+    };
+    match compacted_rollout_identity(path) {
+        Ok(identity) if identity == receipt.compacted_rollout => {}
+        Ok(identity) => {
+            clear_reopen_failure_receipt(path);
+            return ReopenReceiptOutcome::Superseded {
+                detail: format!(
+                    "rollout on disk (sha256 {}, {} items) is not the receipt's compacted \
+                     generation (sha256 {}, {} items)",
+                    identity.sha256,
+                    identity.items,
+                    receipt.compacted_rollout.sha256,
+                    receipt.compacted_rollout.items
+                ),
+            };
+        }
+        Err(err) => {
+            clear_reopen_failure_receipt(path);
+            return ReopenReceiptOutcome::AccountingUnavailable {
+                detail: format!(
+                    "compacted rollout identity for {} unreadable ({err})",
+                    path.display()
+                ),
+            };
+        }
+    }
+
+    // (a) The receipt's canonical capture frontier at failure.
+    let Some(receipt_capture) = receipt.capture_frontier else {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::AccountingUnavailable {
+            detail: format!(
+                "reopen-failure receipt for {} records no canonical capture frontier \
+                 (recorder frontier {} items); nothing to bound a replay with",
+                path.display(),
+                receipt.recorder_frontier_items
+            ),
+        };
+    };
+
+    // (b) The canonical capture frontier now.
+    let Some(now) = read_capture_frontier(thread_id, root).await else {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::KnownGap {
+            warning: format!(
+                "canonical LHC archive unavailable at next open: the reopen receipt proves \
+                 {events} captured events through event_order {order}, and none of them can be \
+                 replayed onto the compacted rollout ({path}); continuing on the compacted \
+                 rollout (the oversized prior generation is never restored)",
+                events = receipt_capture.event_count,
+                order = receipt_capture.last_event_order,
+                path = path.display()
+            ),
+            events: receipt_capture.event_count,
+        };
+    };
+
+    if now.last_event_order < receipt_capture.last_event_order
+        || now.event_count < receipt_capture.event_count
+    {
+        // Count what the receipt proved and the archive can no longer produce.
+        // When the counts agree but the ordering regressed, fall back to the
+        // width of the missing event_order range.
+        let missing_events = receipt_capture.event_count.saturating_sub(now.event_count);
+        let missing = if missing_events > 0 {
+            missing_events
+        } else {
+            receipt_capture
+                .last_event_order
+                .saturating_sub(now.last_event_order)
+                .max(0) as u64
+        };
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::KnownGap {
+            warning: format!(
+                "reopen receipt proves canonical capture through event_order {r_order} \
+                 ({r_count} events); the archive now ends at event_order {n_order} \
+                 ({n_count} events): event_order range ({n_order}, {r_order}] is unavailable \
+                 ({missing} events lost); continuing on the compacted rollout (the oversized \
+                 prior generation is never restored)",
+                r_order = receipt_capture.last_event_order,
+                r_count = receipt_capture.event_count,
+                n_order = now.last_event_order,
+                n_count = now.event_count,
+            ),
+            events: missing,
+        };
+    }
+
+    if now.last_event_order == receipt_capture.last_event_order
+        && now.event_count == receipt_capture.event_count
+    {
+        // Open succeeding is not evidence of recovery — the frontiers are.
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::NoSuffix;
+    }
+
+    // Canonical capture advanced past the receipt frontier while appends were
+    // going to the orphaned inode. Replay exactly that suffix.
+    let canonical = match materialize_thread_rollout_items(
+        path,
+        thread_id,
+        root,
+        RolloutReconcileTrigger::ReopenSuffixReplay,
+        live_identity,
+    )
+    .await
+    {
+        Ok(items) => items,
+        Err(err) => {
+            clear_reopen_failure_receipt(path);
+            return ReopenReceiptOutcome::AccountingUnavailable {
+                detail: format!("canonical materialization unavailable for replay: {err}"),
+            };
+        }
+    };
+
+    let rollout_tail = tail_after_last_boundary(&rollout_items);
+    let canonical_tail = tail_after_last_boundary(&canonical);
+    let rollout_ids: Vec<String> = rollout_tail
+        .iter()
+        .map(|item| crate::body_validation::item_bytes_without_id(item))
+        .collect();
+
+    // The replay boundary is the newest canonical item the rollout already
+    // has. Everything after it is provably beyond the rollout frontier.
+    let anchor = canonical_tail.iter().rposition(|item| {
+        rollout_ids.contains(&crate::body_validation::item_bytes_without_id(item))
+    });
+    let start = match anchor {
+        Some(idx) => idx + 1,
+        None if rollout_tail.is_empty() => 0,
+        None => {
+            clear_reopen_failure_receipt(path);
+            return ReopenReceiptOutcome::AccountingUnavailable {
+                detail: format!(
+                    "canonical materialization ({} tail items) does not overlap the compacted \
+                     rollout tail ({} items); no provable suffix boundary",
+                    canonical_tail.len(),
+                    rollout_tail.len()
+                ),
+            };
+        }
+    };
+
+    let suffix: Vec<RolloutItem> = canonical_tail[start..]
+        .iter()
+        .filter(|item| !rollout_ids.contains(&crate::body_validation::item_bytes_without_id(item)))
+        .map(|item| RolloutItem::ResponseItem((*item).clone().into()))
+        .collect();
+    if suffix.is_empty() {
+        clear_reopen_failure_receipt(path);
+        return ReopenReceiptOutcome::NoSuffix;
+    }
+
+    let appended = suffix.len();
+    let mut merged = rollout_items;
+    merged.extend(suffix);
+    if let Err(err) = atomic_rewrite_rollout(path, &merged) {
+        // Keep the receipt: the replay is retryable and still idempotent.
+        return ReopenReceiptOutcome::ReplayFailed {
+            detail: format!("suffix replay rewrite {} failed: {err}", path.display()),
+        };
+    }
+    clear_reopen_failure_receipt(path);
+    ReopenReceiptOutcome::Replayed {
+        appended,
+        total_items: merged.len(),
+    }
+}
+
+/// Map a consumed receipt onto the reconcile outcome, warning at the volume
+/// each arm deserves.
+async fn apply_reopen_failure_receipt(
+    path: &Path,
+    thread_id: &str,
+    root: Option<&Path>,
+    live_identity: Option<crate::mapping::ModelIdentity>,
+) -> ReconcileOutcome {
+    match consume_reopen_failure_receipt(path, thread_id, root, live_identity.clone()).await {
+        ReopenReceiptOutcome::Absent | ReopenReceiptOutcome::NoSuffix => {
+            ReconcileOutcome::Unchanged { reason: "ok" }
+        }
+        ReopenReceiptOutcome::Superseded { detail } => {
+            info!(
+                %detail,
+                path = %path.display(),
+                thread_id,
+                "LHC startup reconciliation: reopen-failure receipt superseded; discarded"
+            );
+            ReconcileOutcome::Unchanged { reason: "ok" }
+        }
+        ReopenReceiptOutcome::Replayed {
+            appended,
+            total_items,
+        } => {
+            warn!(
+                path = %path.display(),
+                thread_id,
+                appended,
+                total_items,
+                "LHC startup reconciliation: replayed the canonical suffix a dead recorder \
+                 handle never appended onto the compacted rollout"
+            );
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+                items: total_items,
+            }
+        }
+        ReopenReceiptOutcome::KnownGap { warning, events } => {
+            warn!(
+                %warning,
+                path = %path.display(),
+                thread_id,
+                events,
+                "LHC startup reconciliation: EXPLICIT LOSS — canonical payload unavailable for a \
+                 range the reopen receipt proved; the compacted rollout stands"
+            );
+            ReconcileOutcome::Unchanged {
+                reason: "reopen_gap_unrecoverable",
+            }
+        }
+        ReopenReceiptOutcome::ReplayFailed { detail } => {
+            warn!(
+                %detail,
+                path = %path.display(),
+                thread_id,
+                "LHC startup reconciliation: suffix replay could not be written; receipt kept \
+                 for a later open; compacted rollout untouched"
+            );
+            ReconcileOutcome::Unchanged {
+                reason: "reopen_replay_failed",
+            }
+        }
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            warn!(
+                %detail,
+                path = %path.display(),
+                thread_id,
+                "LHC startup reconciliation: reopen accounting unavailable; rebuilding the \
+                 rollout from the best available LHC view"
+            );
+            let trigger = RolloutReconcileTrigger::ReopenAccountingUnavailable;
+            match regenerate_rollout_from_thread(path, thread_id, root, trigger, live_identity)
+                .await
+            {
+                Ok(items) => {
+                    info!(
+                        path = %path.display(),
+                        thread_id,
+                        items,
+                        "LHC startup reconciliation: rollout rebuilt from LHC view without \
+                         reopen accounting"
+                    );
+                    ReconcileOutcome::Regenerated { trigger, items }
+                }
+                Err(err) => {
+                    warn!(
+                        %err,
+                        path = %path.display(),
+                        thread_id,
+                        "LHC startup reconciliation: rebuild without accounting failed; \
+                         compacted rollout stands"
+                    );
+                    ReconcileOutcome::Unchanged {
+                        reason: "regenerate_failed",
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Read the thread's latest compact point from the archive (fail-open → `None`).
 ///
 /// Does **not** create a new thread: missing thread file means unavailable.
@@ -557,7 +971,26 @@ pub async fn reconcile_rollout_at_path(
     };
 
     let RolloutFileClass::NeedsRewrite(trigger) = class else {
-        return ReconcileOutcome::Unchanged { reason: "ok" };
+        // R12/G26 (CX-S4): the file matches the thread's compact point, but a
+        // reopen-failure receipt beside it means appends stopped landing in
+        // this inode while canonical capture kept advancing. A clean
+        // classification is not evidence of recovery — compare the frontiers.
+        // The probe costs one `exists()` on every ordinary open.
+        if !rollout_reopen_receipt_path(path).exists() {
+            return ReconcileOutcome::Unchanged { reason: "ok" };
+        }
+        if let Some(block) = host_validation_reload_block(thread_id, root).await {
+            warn!(
+                path = %path.display(),
+                thread_id,
+                %block,
+                "LHC startup reconciliation: host-validation gate defers receipt consumption"
+            );
+            return ReconcileOutcome::Unchanged {
+                reason: "host_validation_blocked",
+            };
+        }
+        return apply_reopen_failure_receipt(path, thread_id, root, live_identity).await;
     };
 
     // LIM-67: an installed-but-unvalidated (or validation-failed) protected
@@ -578,6 +1011,17 @@ pub async fn reconcile_rollout_at_path(
 
     match regenerate_rollout_from_thread(path, thread_id, root, trigger, live_identity).await {
         Ok(items) => {
+            // A full rebuild from canonical LHC covers everything a reopen
+            // receipt could have named, so the receipt is spent.
+            if rollout_reopen_receipt_path(path).exists() {
+                info!(
+                    path = %path.display(),
+                    thread_id,
+                    "LHC startup reconciliation: reopen-failure receipt superseded by full \
+                     regeneration from canonical LHC"
+                );
+                clear_reopen_failure_receipt(path);
+            }
             info!(
                 path = %path.display(),
                 thread_id,
@@ -610,6 +1054,30 @@ pub async fn regenerate_rollout_from_thread(
     trigger: RolloutReconcileTrigger,
     live_identity: Option<crate::mapping::ModelIdentity>,
 ) -> Result<usize, String> {
+    let items =
+        materialize_thread_rollout_items(path, thread_id, root, trigger, live_identity).await?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create rollout parent {}: {e}", parent.display()))?;
+    }
+    atomic_rewrite_rollout(path, &items)
+        .map_err(|e| format!("atomic rewrite {}: {e}", path.display()))?;
+    Ok(items.len())
+}
+
+/// Materialize the LHC thread into the rollout item sequence `path` should
+/// hold, **without writing anything**.
+///
+/// Shared by full regeneration and by the R12/G26 suffix replay, which needs
+/// the canonical sequence in order to diff it against the compacted rollout
+/// already on disk.
+pub async fn materialize_thread_rollout_items(
+    path: &Path,
+    thread_id: &str,
+    root: Option<&Path>,
+    trigger: RolloutReconcileTrigger,
+    live_identity: Option<crate::mapping::ModelIdentity>,
+) -> Result<Vec<RolloutItem>, String> {
     let root_buf = root
         .map(Path::to_path_buf)
         .unwrap_or_else(crate::gating::lhc_root);
@@ -701,11 +1169,6 @@ pub async fn regenerate_rollout_from_thread(
             )
         });
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create rollout parent {}: {e}", parent.display()))?;
-    }
-
     let mut result = materialize_rollout(&MaterializeInput {
         session_meta,
         thread_view: &surfaces.thread_view,
@@ -731,22 +1194,48 @@ pub async fn regenerate_rollout_from_thread(
     // nc4: graft the exact provider-native active suffix from the prior
     // rollout into the regenerated materialization. The LHC round-trip
     // flattens CustomToolCall status/namespace and ContentItems; the prior
-    // rollout holds the exact provider-native bytes. Graft only when a
-    // prior active pair can be unambiguously correlated by call_id.
-    // If ambiguous, leave the prior rollout unchanged (fail-open).
-    if let Err(reason) = graft_prior_active_suffix(&mut result.items, &prior_generation) {
+    // rollout holds the exact provider-native bytes. Graft per call_id, and
+    // only when that call_id correlates unambiguously on both sides.
+    //
+    // R20 (CX-S4): **this intentionally supersedes the nc4-negotiated
+    // preserve-prior-bytes behavior.** nc4 returned `Err` from the graft on
+    // ambiguous / orphaned / missing correlation and left the prior rollout
+    // byte-for-byte intact. That preserved a rollout which is both stale AND
+    // oversized — the exact hazard startup reconciliation exists to clear —
+    // in order to protect provider-specific decoration (status, namespace,
+    // structured ContentItems) that the LHC-reconstructed pair does not need
+    // in order to correlate: it carries the same call_id. R20 rules the other
+    // way. Regeneration proceeds with the LHC-reconstructed pair, warns
+    // loudly, and leaves the provider as the final authority on the degraded
+    // body. A degraded-but-correlated body is recoverable; a session stranded
+    // on a stale oversized rollout is not. Un-grafted call_ids keep their LHC
+    // shape; unambiguous ones stay byte-exact.
+    let graft = graft_prior_active_suffix(&mut result.items, &prior_generation);
+    for reason in &graft.degraded {
         warn!(
             %reason,
             path = %path.display(),
-            "nc4 graft failed: leaving prior rollout unchanged"
+            thread_id,
+            ?trigger,
+            "R20 (CX-S4): provider-native graft unavailable; regenerating with the \
+             LHC-reconstructed pair (degraded body; the stale rollout is NOT preserved)"
         );
-        return Err(reason);
     }
 
-    atomic_rewrite_rollout(path, &result.items)
-        .map_err(|e| format!("atomic rewrite {}: {e}", path.display()))?;
+    Ok(result.items)
+}
 
-    Ok(result.items.len())
+/// Per-call_id result of the terminal-suffix graft.
+///
+/// R20 (CX-S4): the graft reports; it never vetoes. `degraded` names every
+/// call_id whose provider-native pair could not be lifted across, and the
+/// caller regenerates with the LHC-reconstructed pair for exactly those ids.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GraftReport {
+    /// call_ids whose exact provider-native pair was grafted byte-for-byte.
+    pub grafted: Vec<String>,
+    /// One reason per call_id left on its LHC-reconstructed shape.
+    pub degraded: Vec<String>,
 }
 
 /// Graft exact provider-native active tool call/output pairs from the prior
@@ -756,13 +1245,15 @@ pub async fn regenerate_rollout_from_thread(
 /// NOT followed by any assistant/Message response — i.e., the unsent provider
 /// suffix that the next request still depends on.
 ///
-/// Returns `Err` if the prior active suffix requires preservation but
-/// correlation/cardinality is ambiguous or missing — the caller must leave
-/// the prior rollout unchanged (fail-open).
-fn graft_prior_active_suffix(
+/// R20 (CX-S4): ambiguous cardinality, an orphan output, or a call with no
+/// output no longer aborts the regeneration. That call_id is reported in
+/// [`GraftReport::degraded`] and keeps the LHC-reconstructed pair, which
+/// carries the same call_id and correlation and differs only in provider
+/// decoration. Every other call_id in the suffix is still grafted exactly.
+pub(crate) fn graft_prior_active_suffix(
     regenerated: &mut [RolloutItem],
     prior_generation: &[RolloutItem],
-) -> Result<(), String> {
+) -> GraftReport {
     use crate::body_validation::{client_call_id, output_call_id};
 
     // Extract items after the last Compacted boundary.
@@ -777,8 +1268,9 @@ fn graft_prior_active_suffix(
             _ => None,
         })
         .collect();
+    let mut report = GraftReport::default();
     if prior_tail.is_empty() {
-        return Ok(());
+        return report;
     }
 
     // Derive the terminal active suffix: scan backwards from the end;
@@ -795,7 +1287,7 @@ fn graft_prior_active_suffix(
         .map_or(0, |i| i + 1);
     let terminal_suffix = &prior_tail[terminal_start..];
     if terminal_suffix.is_empty() {
-        return Ok(());
+        return report;
     }
 
     // Build the correlation-id set from BOTH client_call_id and output_call_id.
@@ -814,9 +1306,11 @@ fn graft_prior_active_suffix(
         }
     }
     if seen_ids.is_empty() {
-        return Ok(());
+        return report;
     }
-    // Validate every id has exactly 1 call + 1 output.
+    // Every id needs exactly 1 call + 1 output on the prior side to be lifted
+    // across byte-exactly. Anything else (1/0 missing output, 0/1 orphan
+    // output, duplicates) is reported and left on the LHC pair — R20.
     let mut active_call_ids: Vec<String> = Vec::new();
     for id in &seen_ids {
         let call_count = terminal_suffix
@@ -830,10 +1324,9 @@ fn graft_prior_active_suffix(
         if call_count == 1 && output_count == 1 {
             active_call_ids.push(id.clone());
         } else {
-            // Missing or ambiguous pairing (1/0, 0/1, duplicate) — fail.
-            return Err(format!(
-                "nc4 graft: missing or ambiguous correlation for call_id {id} \
-                 in terminal suffix (calls={call_count}, outputs={output_count})"
+            report.degraded.push(format!(
+                "graft: missing or ambiguous correlation for call_id {id} \
+                 in prior terminal suffix (calls={call_count}, outputs={output_count})"
             ));
         }
     }
@@ -866,12 +1359,13 @@ fn graft_prior_active_suffix(
             })
             .collect();
         if regen_calls.len() != 1 || regen_outputs.len() != 1 {
-            return Err(format!(
-                "nc4 graft: ambiguous cardinality for call_id {call_id} in \
+            report.degraded.push(format!(
+                "graft: ambiguous cardinality for call_id {call_id} in \
                  regenerated rollout (calls={}, outputs={})",
                 regen_calls.len(),
                 regen_outputs.len()
             ));
+            continue;
         }
 
         // Graft the exact prior items.
@@ -879,19 +1373,26 @@ fn graft_prior_active_suffix(
             .iter()
             .find(|item| client_call_id(item).as_deref() == Some(call_id.as_str()))
         else {
-            return Err(format!("nc4 graft: prior call {call_id} vanished"));
+            report
+                .degraded
+                .push(format!("graft: prior call {call_id} vanished"));
+            continue;
         };
         let Some(prior_output) = terminal_suffix
             .iter()
             .find(|item| output_call_id(item).as_deref() == Some(call_id.as_str()))
         else {
-            return Err(format!("nc4 graft: prior output {call_id} vanished"));
+            report
+                .degraded
+                .push(format!("graft: prior output {call_id} vanished"));
+            continue;
         };
 
         regenerated[regen_calls[0]] = RolloutItem::ResponseItem((*prior_call).clone().into());
         regenerated[regen_outputs[0]] = RolloutItem::ResponseItem((*prior_output).clone().into());
+        report.grafted.push(call_id.clone());
     }
-    Ok(())
+    report
 }
 
 fn synthesize_session_meta(thread_id: &str, path: &Path) -> SessionMetaLine {
