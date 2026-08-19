@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..2d6914c963
+index 0000000000..d9513b41fe
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2161 @@
+@@ -0,0 +1,2191 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -339,8 +339,13 @@ index 0000000000..2d6914c963
 +    /// Turn cancellation. Not permission for native compact.
 +    Cancelled { reason: String },
 +    /// MidTurn compact-continuation explicitly skipped (transport retry, below
-+    /// trigger, hysteresis). No host mutation; next provider request allowed.
++    /// trigger, unsettled stream). No host mutation; next provider request
++    /// allowed.
 +    MidTurnSkipped { reason: String },
++    /// No compact was produced, but the session is not stranded: the turn
++    /// continues on its current body and compact retries at the next eligible
++    /// seam. Never permission for native compact.
++    ContinuedWithoutCompact { reason: String },
 +    /// MidTurn compact-continuation refused or failed. Native compact remains
 +    /// unreachable; the flag controls only whether sampling may continue.
 +    MidTurnBlocked {
@@ -365,15 +370,16 @@ index 0000000000..2d6914c963
 +    } else {
 +        CompactionTrigger::Auto
 +    };
-+    match run_pre_compact_hooks(sess, turn_context, trigger).await {
-+        PreCompactHookOutcome::Continue => {}
-+        PreCompactHookOutcome::Stopped => {
-+            info!(
-+                manual,
-+                "PreCompact hook stopped LHC compact; skipping compact (no native fallback)"
-+            );
-+            return Err(CodexErr::TurnAborted);
-+        }
++    // R15 (CX-S1): PreCompact hooks are notification only. Compact is the
++    // recovery mechanism, so an external hook does not get to veto one the fork
++    // has already decided to run; a stop request is recorded and ignored.
++    // PostCompact keeps its notification role for hooks that need to observe.
++    if let PreCompactHookOutcome::Stopped = run_pre_compact_hooks(sess, turn_context, trigger).await
++    {
++        warn!(
++            manual,
++            "PreCompact hook requested stop; LHC compact continues (hook veto removed)"
++        );
 +    }
 +
 +    match try_run_lhc_compact_arm(
@@ -417,6 +423,14 @@ index 0000000000..2d6914c963
 +        }
 +        LhcCompactAttempt::MidTurnSkipped { reason } => {
 +            info!(%reason, "LHC MidTurn compact-continuation skipped; continuing without native compact");
++            Ok(())
++        }
++        LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
++            warn!(
++                %reason,
++                manual,
++                "LHC compact did not produce a body; turn continues on its current body (no native compact)"
++            );
 +            Ok(())
 +        }
 +        LhcCompactAttempt::MidTurnBlocked {
@@ -562,13 +576,21 @@ index 0000000000..2d6914c963
 +    mid_turn: Option<MidTurnSeamFacts>,
 +    cancellation_token: &CancellationToken,
 +) -> CodexResult<LhcCompactAttempt> {
-+    if matches!(phase, CompactionPhase::MidTurn) {
++    // R17 (CX-S1): `MidTurnSeamFacts` are constructed unconditionally by the
++    // MidTurn caller (`session/turn.rs`), so absent facts are not a runtime
++    // condition the system can produce. The old missing-facts guard blocked the
++    // next provider request for that impossible state; it is gone. A MidTurn
++    // dispatch without facts declines into the ordinary settled-seam compact
++    // rather than stopping anything.
++    if matches!(phase, CompactionPhase::MidTurn)
++        && let Some(mid) = mid_turn
++    {
 +        // Box to keep rustc query depth under the limit when nested under run_turn.
 +        return Box::pin(try_run_mid_turn_compact_continuation(
 +            sess,
 +            turn_context,
 +            initial_context_injection,
-+            mid_turn,
++            mid,
 +            cancellation_token,
 +        ))
 +        .await;
@@ -628,7 +650,7 @@ index 0000000000..2d6914c963
 +    sess: &Arc<Session>,
 +    turn_context: &TurnContext,
 +    initial_context_injection: InitialContextInjection,
-+    mid_turn: Option<MidTurnSeamFacts>,
++    mid: MidTurnSeamFacts,
 +    cancellation_token: &CancellationToken,
 +) -> CodexResult<LhcCompactAttempt> {
 +    if cancellation_token.is_cancelled() {
@@ -644,9 +666,14 @@ index 0000000000..2d6914c963
 +    }
 +
 +    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
++        // R16 (CX-S1): the slot is structural and its absence is a transient
++        // startup condition, never a reason to strand the turn. Sampling
++        // continues on the existing body; compact retries at the next seam.
 +        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+            reason: "LHC enabled but no LhcCaptureSlot at MidTurn; refusing native fallback".into(),
-+            next_provider_request_allowed: false,
++            reason:
++                "no LhcCaptureSlot at MidTurn; next provider request continues on the existing body"
++                    .into(),
++            next_provider_request_allowed: true,
 +        });
 +    };
 +    let Some(handle) = slot.get() else {
@@ -655,19 +682,15 @@ index 0000000000..2d6914c963
 +            next_provider_request_allowed: true,
 +        });
 +    };
++    // R2 (CX-S1): capture feeds derivation quality, not compact capability —
++    // the SDK compacts the LHC thread, not the capture buffer. A degraded
++    // capture is a reason to compact (the session is big), never a reason to
++    // strand it. Detect, warn, continue — the ordinary path (G33) already does.
 +    if handle.is_degraded() {
-+        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+            reason: "LHC capture degraded at MidTurn; refusing native fallback".into(),
-+            next_provider_request_allowed: false,
-+        });
++        warn!(
++            "LHC capture degraded at MidTurn; compact-continuation continues (thread is the source)"
++        );
 +    }
-+
-+    let Some(mid) = mid_turn else {
-+        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+            reason: "MidTurn seam facts missing; refusing compact and native fallback".into(),
-+            next_provider_request_allowed: false,
-+        });
-+    };
 +
 +    if mid.inside_transport_retry {
 +        return Ok(LhcCompactAttempt::MidTurnSkipped {
@@ -675,36 +698,31 @@ index 0000000000..2d6914c963
 +        });
 +    }
 +
-+    // Capture flush before decision (settled seam). A wedged worker must not
-+    // hide the compact deadline. MidTurn cannot proceed with an unconfirmed
-+    // protected suffix, so timeout blocks sampling without native fallback.
++    // R2 (CX-S1): bounded flush before the decision so the seam sees as much
++    // captured content as the worker can produce. A wedged or slow capture
++    // worker is warned about and compact continues — the ordinary path (G34)
++    // behaves the same way.
 +    if !handle.flush_within(MIDTURN_COMPACT_FLUSH_BOUND).await {
-+        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+            reason: format!(
-+                "capture flush did not complete within {}ms; protected suffix unconfirmed",
-+                MIDTURN_COMPACT_FLUSH_BOUND.as_millis()
-+            ),
-+            next_provider_request_allowed: false,
-+        });
++        warn!(
++            timeout_ms = MIDTURN_COMPACT_FLUSH_BOUND.as_millis() as u64,
++            "LHC capture flush did not complete in time at MidTurn; compact-continuation continues"
++        );
 +    }
 +    if handle.is_degraded() {
-+        return Ok(LhcCompactAttempt::MidTurnBlocked {
-+            reason: "capture degraded after flush; protected suffix unconfirmed".into(),
-+            next_provider_request_allowed: false,
-+        });
++        warn!("LHC capture degraded after MidTurn flush; compact-continuation continues");
 +    }
 +
-+    // Re-read input-queue epoch immediately before the LHC operation. Pending
-+    // steer/mailbox can arrive without touching history; history_version is
-+    // not a proxy for queued input.
++    // R1 (CX-S1): the input-queue epoch is a diagnostic, not an authority.
++    // Settled history is not invalidated by input that arrives after the
++    // rollover decision — that input belongs to the next turn. The
++    // decision-to-apply veto is gone; drift is logged and compact proceeds.
 +    let input_epoch_at_apply = i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
 +    if mid.input_epoch_at_decision != input_epoch_at_apply {
-+        return Ok(LhcCompactAttempt::MidTurnSkipped {
-+            reason: format!(
-+                "input epoch changed decision={} apply={}; no mutation",
-+                mid.input_epoch_at_decision, input_epoch_at_apply
-+            ),
-+        });
++        info!(
++            decision = mid.input_epoch_at_decision,
++            apply = input_epoch_at_apply,
++            "LHC MidTurn input epoch changed since the rollover decision; compact continues"
++        );
 +    }
 +
 +    // Unsettled stream (mailbox preempt / abandoned): certified runtime skips
@@ -755,24 +773,10 @@ index 0000000000..2d6914c963
 +    let post_measurement = post_measurement_tail.saturating_add(response_output_estimate);
 +    let pressure = next_request_pressure(&provider_usage, post_measurement);
 +
-+    // Hysteresis: only after truthful no-reduction, require configured growth.
-+    if let Some(p) = pressure {
-+        let hyst = slot.mid_turn_hysteresis();
-+        if !hyst.should_attempt_after_no_reduction(p) {
-+            info!(
-+                pressure = p,
-+                last = hyst.last_pressure_tokens,
-+                margin = hyst.growth_margin_tokens,
-+                "LHC MidTurn hysteresis: no growth since no-reduction; skip"
-+            );
-+            return Ok(LhcCompactAttempt::MidTurnSkipped {
-+                reason: format!(
-+                    "hysteresis: no measured growth since no_reduction (pressure={p}, last={}, margin={})",
-+                    hyst.last_pressure_tokens, hyst.growth_margin_tokens
-+                ),
-+            });
-+        }
-+    }
++    // R3 (CX-S1): the growth-margin hysteresis guard is gone. A prior
++    // no-reduction outcome no longer taxes the next attempt — a session under
++    // pressure retries at the next seam at zero cost. The attempt record is
++    // still kept below, as a diagnostic.
 +
 +    let host_items = sess
 +        .clone_history()
@@ -929,7 +933,11 @@ index 0000000000..2d6914c963
 +        writer_claim,
 +        capture_complete: true,
 +        provider_identity_valid,
-+        input_epoch_at_decision: mid.input_epoch_at_decision,
++        // R1 (CX-S1): the host no longer treats decision-to-apply drift as a
++        // stop, so it does not report a delta the engine would re-litigate.
++        // Both sides carry the apply-time epoch; the drift itself is logged
++        // above.
++        input_epoch_at_decision: input_epoch_at_apply,
 +        input_epoch_at_apply,
 +        inside_transport_retry: false,
 +        model_response_complete: mid.model_response_complete,
@@ -964,10 +972,21 @@ index 0000000000..2d6914c963
 +    let outcome = match run_mid_turn_on_thread(req, cancellation_token).await {
 +        Ok(o) => o,
 +        Err(err) => {
-+            error!(%err, "LHC MidTurn compact-continuation operation failed");
++            // R14 (CX-S1): a worker that outruns its bound is detected and
++            // warned about, never stranded on. The session proceeds with its
++            // current body and compact retries at the next seam.
++            let timed_out = is_worker_timeout_reason(&err);
++            if timed_out {
++                warn!(
++                    %err,
++                    "LHC MidTurn compact-continuation worker timed out; next provider request continues on the existing body"
++                );
++            } else {
++                error!(%err, "LHC MidTurn compact-continuation operation failed");
++            }
 +            return Ok(LhcCompactAttempt::MidTurnBlocked {
 +                reason: err,
-+                next_provider_request_allowed: false,
++                next_provider_request_allowed: timed_out,
 +            });
 +        }
 +    };
@@ -980,19 +999,10 @@ index 0000000000..2d6914c963
 +        });
 +    }
 +
-+    // N2: re-read input epoch after the worker returns and before host rewrite.
-+    // Steering during the critical section must not be silently applied over;
-+    // leave a truthful residual that B1 can repair on the next settled seam.
-+    let input_epoch_after_worker =
-+        i64::try_from(sess.input_queue.input_epoch()).unwrap_or(i64::MAX);
-+    if mid.input_epoch_at_decision != input_epoch_after_worker {
-+        return Ok(LhcCompactAttempt::MidTurnSkipped {
-+            reason: format!(
-+                "input epoch changed during MidTurn critical section decision={} after={}; host apply suppressed",
-+                mid.input_epoch_at_decision, input_epoch_after_worker
-+            ),
-+        });
-+    }
++    // R1/R7 (CX-S1): the post-worker input-epoch recheck is gone. Input that
++    // arrived during the critical section does not invalidate the view the SDK
++    // installed; suppressing the host apply here only left a split state for
++    // the next seam to repair. The steer belongs to the next turn.
 +
 +    if let Some(p) = pressure {
 +        slot.record_mid_turn_hysteresis(&attempt_id, p, outcome.reduced, &outcome.outcome_kind);
@@ -1383,6 +1393,18 @@ index 0000000000..2d6914c963
 +            if is_cancel_reason(&err) {
 +                return Ok(cancelled_attempt(err));
 +            }
++            if is_worker_timeout_reason(&err) {
++                // R14 (CX-S1): the produce worker outran its bound. Warn and
++                // continue on the current usable body; the next eligible seam
++                // retries. The ordinary path has no MidTurn result, so this is
++                // a non-stranding outcome that lets the turn complete.
++                warn!(
++                    %err,
++                    manual,
++                    "LHC compact worker timed out; turn continues on its current body (retry at next seam)"
++                );
++                return Ok(LhcCompactAttempt::ContinuedWithoutCompact { reason: err });
++            }
 +            warn!(%err, manual, "LHC compact hard failure; preserving history");
 +            return Ok(failed_attempt(err));
 +        }
@@ -1447,6 +1469,14 @@ index 0000000000..2d6914c963
 +fn is_cancel_reason(reason: &str) -> bool {
 +    let lower = reason.to_ascii_lowercase();
 +    lower.contains("cancel") || lower.contains("aborted")
++}
++
++/// R14 (CX-S1): worker-timeout reasons degrade instead of stranding. The bound
++/// still exists — a hung worker is detached at the deadline — but the session
++/// keeps its current body and compact retries at the next eligible seam.
++fn is_worker_timeout_reason(reason: &str) -> bool {
++    let lower = reason.to_ascii_lowercase();
++    lower.contains("timed out") || lower.contains("timeout")
 +}
 +
 +/// Materialize → atomic rewrite → in-memory bands+tail install.
@@ -2201,7 +2231,7 @@ index 0000000000..2d6914c963
 +            drop(join);
 +            warn!(
 +                timeout_ms = thread_timeout.as_millis() as u64,
-+                "lhc-compact timed out; detaching worker thread (hard stop, no native)"
++                "lhc-compact timed out; detaching worker thread (turn continues on its current body)"
 +            );
 +            Err(format!(
 +                "lhc-compact timed out after {}ms",
@@ -2262,10 +2292,10 @@ index 0000000000..2d6914c963
 +mod mid_turn_tests;
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..11a84dc8e6
+index 0000000000..0542ea0836
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,3189 @@
+@@ -0,0 +1,3273 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -2280,7 +2310,6 @@ index 0000000000..11a84dc8e6
 +use codex_extension_api::ExtensionRegistryBuilder;
 +use codex_extension_api::ThreadStartInput;
 +use codex_features::Feature;
-+use codex_lhc_host::DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS;
 +use codex_lhc_host::LhcCaptureSlot;
 +use codex_lhc_host::ProviderUsageAuthority;
 +use codex_lhc_host::WorkContinuation;
@@ -2594,18 +2623,14 @@ index 0000000000..11a84dc8e6
 +    );
 +}
 +
++/// R3 (CX-S1): the growth-margin guard is gone. The attempt record survives as
++/// a diagnostic only — `DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS` and
++/// `should_attempt_after_no_reduction` no longer exist, so no recorded outcome
++/// can suppress the next attempt. (The old
++/// `hysteresis_default_margin_is_10k` test asserted the 10k tax as intended
++/// behavior and is deleted with it.)
 +#[test]
-+fn hysteresis_default_margin_is_10k() {
-+    assert_eq!(DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS, 10_000);
-+    let mut h = codex_lhc_host::CompactContinuationHysteresis::default();
-+    h.record("a1", 100_000, false, "no_reduction");
-+    assert!(!h.should_attempt_after_no_reduction(100_001));
-+    assert!(!h.should_attempt_after_no_reduction(109_999));
-+    assert!(h.should_attempt_after_no_reduction(110_000));
-+}
-+
-+#[test]
-+fn hysteresis_table_skips_and_refuses_do_not_arm() {
++fn hysteresis_record_is_diagnostic_only() {
 +    for outcome in [
 +        "skip_seam",
 +        "refuse",
@@ -2618,8 +2643,11 @@ index 0000000000..11a84dc8e6
 +        let mut h = codex_lhc_host::CompactContinuationHysteresis::default();
 +        h.record("x", 50_000, false, outcome);
 +        assert!(!h.armed, "{outcome} must not arm hysteresis");
-+        assert!(h.should_attempt_after_no_reduction(50_000));
 +    }
++    let mut armed = codex_lhc_host::CompactContinuationHysteresis::default();
++    armed.record("a1", 100_000, false, "no_reduction");
++    assert!(armed.armed, "truthful no-reduction is still recorded");
++    assert_eq!(armed.last_pressure_tokens, 100_000);
 +}
 +
 +#[tokio::test]
@@ -2668,8 +2696,15 @@ index 0000000000..11a84dc8e6
 +    }
 +}
 +
++/// R1 (CX-S1): input arriving between the rollover decision and the compact
++/// entry does not invalidate settled history — that input belongs to the next
++/// turn. The decision-to-apply epoch veto (G11) is gone: compact installs, and
++/// the queued input is still pending afterwards.
++///
++/// Supersedes `mid_turn_input_epoch_gate_uses_queue_epoch_not_history`, which
++/// asserted the skip as intended behavior.
 +#[tokio::test]
-+async fn mid_turn_input_epoch_gate_uses_queue_epoch_not_history() {
++async fn mid_turn_input_epoch_change_does_not_suppress_compact() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -2679,11 +2714,13 @@ index 0000000000..11a84dc8e6
 +        .thread_extension_data
 +        .get::<LhcCaptureSlot>()
 +        .expect("slot");
++    // Force above-trigger so a real install is the expected outcome.
++    slot.set_mid_turn_test_upper_trigger(Some(100));
 +    let handle = wait_for_handle(&slot, Duration::from_secs(30))
 +        .await
 +        .expect("handle");
-+    seed_turns(&session, &tc, 6).await;
-+    inject_response_usage(&session, &tc, 2_000).await;
++    seed_turns(&session, &tc, 16).await;
++    inject_response_usage(&session, &tc, 5_000).await;
 +    handle.flush().await;
 +
 +    let decision_epoch = decision_epoch(&session);
@@ -2722,7 +2759,7 @@ index 0000000000..11a84dc8e6
 +        true,
 +        decision_epoch,
 +        Vec::new(),
-+        Some(sample_usage(2_000)),
++        Some(sample_usage(5_000)),
 +    );
 +    let attempt = try_run_lhc_compact_arm(
 +        &sess,
@@ -2735,26 +2772,23 @@ index 0000000000..11a84dc8e6
 +    )
 +    .await
 +    .expect("arm");
-+    match attempt {
-+        LhcCompactAttempt::MidTurnSkipped { reason } => {
-+            assert!(
-+                reason.contains("epoch"),
-+                "expected epoch skip, got {reason}"
-+            );
-+        }
-+        other => panic!("expected MidTurnSkipped for epoch change, got {other:?}"),
-+    }
-+    // Input order preserved for next seam.
++    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
++        panic!("stale decision epoch must not suppress compact, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "installed body must be non-empty");
++    // The queued input still belongs to the next turn.
 +    assert!(
 +        sess.input_queue.has_pending_mailbox_items().await,
-+        "pending mailbox must be preserved after epoch skip"
++        "pending mailbox must be preserved across the compact"
 +    );
 +}
 +
++/// R16 (CX-S1): feature on but no capture slot is a transient startup
++/// condition. The next provider request continues on the existing body
++/// (`MidTurnBlocked(true)`), and `run_auto_compact` still must not fall open to
++/// native compact.
 +#[tokio::test]
-+async fn mid_turn_lhc_unavailable_does_not_native_fallback_via_auto_ladder() {
-+    // Feature on but no capture slot → MidTurnBlocked; run_auto_compact must
-+    // not fall open to native.
++async fn mid_turn_missing_slot_allows_next_request_without_native_fallback() {
 +    let (mut session, tc) = make_session_and_context().await;
 +    session
 +        .set_feature_for_test(Feature::LhcCapture, true)
@@ -2772,10 +2806,14 @@ index 0000000000..11a84dc8e6
 +    .await
 +    .expect("arm");
 +    match attempt {
-+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
++        LhcCompactAttempt::MidTurnBlocked {
++            reason,
++            next_provider_request_allowed,
++        } => {
++            assert!(reason.contains("LhcCaptureSlot"), "{reason}");
 +            assert!(
-+                reason.contains("LhcCaptureSlot") || reason.contains("no LhcCaptureSlot"),
-+                "{reason}"
++                next_provider_request_allowed,
++                "a missing slot must not strand the turn: {reason}"
 +            );
 +        }
 +        other => panic!("expected MidTurnBlocked without slot, got {other:?}"),
@@ -2808,8 +2846,15 @@ index 0000000000..11a84dc8e6
 +    }
 +}
 +
++/// R2 (CX-S1): a wedged capture worker is warned about, not stranded on. The
++/// SDK compacts the LHC thread, not the capture buffer, so the flush timeout
++/// (G9) and the degraded recheck (G10) no longer stop anything — the MidTurn
++/// path now behaves like the ordinary path (G33/G34).
++///
++/// Supersedes `mid_turn_blocked_capture_flush_stops_without_hanging_or_native`,
++/// which asserted `MidTurnBlocked(false)` as intended behavior.
 +#[tokio::test]
-+async fn mid_turn_blocked_capture_flush_stops_without_hanging_or_native() {
++async fn mid_turn_blocked_capture_flush_warns_and_compact_continues() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -2819,15 +2864,35 @@ index 0000000000..11a84dc8e6
 +        .thread_extension_data
 +        .get::<LhcCaptureSlot>()
 +        .expect("slot");
++    slot.set_mid_turn_test_upper_trigger(Some(100));
 +    let handle = wait_for_handle(&slot, Duration::from_secs(30))
 +        .await
 +        .expect("handle");
++    seed_turns(&session, &tc, 16).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++
++    // Park the worker so the arm's flush can never be acknowledged, and queue
++    // capture work behind the park.
 +    let release = handle.block_worker().await;
++    handle.persist(
++        &ResponseItem::Message {
++            id: None,
++            role: "user".into(),
++            content: vec![ContentItem::InputText {
++                text: "pending-behind-blocked-worker".into(),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        },
++        codex_extension_api::RawItemProvenance::UserPrompt,
++    );
++
 +    let sess = Arc::new(session);
 +    let epoch = decision_epoch(&sess);
 +    let started = std::time::Instant::now();
 +    let attempt = tokio::time::timeout(
-+        Duration::from_secs(5),
++        Duration::from_secs(30),
 +        try_run_lhc_compact_arm(
 +            &sess,
 +            &tc,
@@ -2847,18 +2912,16 @@ index 0000000000..11a84dc8e6
 +    .await
 +    .expect("blocked capture worker must not hang MidTurn compact")
 +    .expect("arm");
++    let elapsed = started.elapsed();
 +    drop(release);
-+    assert!(started.elapsed() < Duration::from_secs(5));
-+    match attempt {
-+        LhcCompactAttempt::MidTurnBlocked {
-+            reason,
-+            next_provider_request_allowed,
-+        } => {
-+            assert!(reason.contains("capture flush"), "{reason}");
-+            assert!(!next_provider_request_allowed);
-+        }
-+        other => panic!("blocked capture flush must block without native fallback: {other:?}"),
-+    }
++    assert!(
++        elapsed < Duration::from_secs(30),
++        "flush bound must keep the seam bounded; took {elapsed:?}"
++    );
++    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
++        panic!("wedged capture worker must not stop compact, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "installed body must be non-empty");
 +}
 +
 +#[tokio::test]
@@ -2905,6 +2968,9 @@ index 0000000000..11a84dc8e6
 +        }
 +        LhcCompactAttempt::MidTurnSkipped { reason } => {
 +            assert!(!reason.is_empty(), "skip must carry a diagnostic");
++        }
++        LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
++            assert!(!reason.is_empty(), "continue must carry a diagnostic");
 +        }
 +        LhcCompactAttempt::MidTurnBlocked {
 +            reason,
@@ -3032,8 +3098,14 @@ index 0000000000..11a84dc8e6
 +    assert!(call_ids.contains(&"call-tool-z"));
 +}
 +
++/// R3 (CX-S1): a prior truthful no-reduction records a diagnostic and taxes
++/// nothing. With the 10k growth margin gone, the very next seam re-attempts and
++/// installs even though measured pressure has not grown.
++///
++/// Supersedes `mid_turn_hysteresis_blocks_repeat_no_reduction_with_margin`,
++/// which asserted the growth tax as intended behavior.
 +#[tokio::test]
-+async fn mid_turn_hysteresis_blocks_repeat_no_reduction_with_margin() {
++async fn mid_turn_prior_no_reduction_does_not_suppress_next_attempt() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -3043,29 +3115,51 @@ index 0000000000..11a84dc8e6
 +        .thread_extension_data
 +        .get::<LhcCaptureSlot>()
 +        .expect("slot");
-+    // Simulate prior truthful no-reduction at pressure 100k.
++    slot.set_mid_turn_test_upper_trigger(Some(100));
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 16).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++
++    // Prior truthful no-reduction recorded far above the pressure we are about
++    // to present: under the old growth margin this seam could not attempt.
 +    slot.record_mid_turn_hysteresis("prior", 100_000, false, "no_reduction");
-+    let hyst = slot.mid_turn_hysteresis();
-+    assert!(!hyst.should_attempt_after_no_reduction(100_000));
-+    assert!(!hyst.should_attempt_after_no_reduction(100_001));
-+    assert!(
-+        !hyst.should_attempt_after_no_reduction(
-+            100_000 + DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS - 1
-+        )
-+    );
-+    assert!(
-+        hyst.should_attempt_after_no_reduction(100_000 + DEFAULT_HYSTERESIS_GROWTH_MARGIN_TOKENS)
-+    );
-+    // Skip/refuse must not re-arm if we only record non-no_reduction.
-+    slot.record_mid_turn_hysteresis("skip", 100_000, false, "skip_seam");
-+    let hyst2 = slot.mid_turn_hysteresis();
-+    // Still armed from prior no_reduction (skip does not clear or re-arm).
-+    assert!(hyst2.armed);
-+    let _ = tc;
++    assert!(slot.mid_turn_hysteresis().armed);
++
++    let sess = Arc::new(session);
++    let attempt = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            "after-no-reduction",
++            true,
++            decision_epoch(&sess),
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
++        panic!("prior no-reduction must not suppress the next attempt, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "installed body must be non-empty");
 +}
 +
++/// R17 (CX-S1): the seam-facts guard is gone. `session/turn.rs` constructs
++/// `MidTurnSeamFacts` unconditionally, so this state is unreachable in
++/// production; if it were ever reached, the dispatch declines into the ordinary
++/// settled-seam compact instead of blocking the next provider request.
++///
++/// Supersedes `mid_turn_missing_seam_facts_blocks`.
 +#[tokio::test]
-+async fn mid_turn_missing_seam_facts_blocks() {
++async fn mid_turn_missing_seam_facts_declines_into_ordinary_path() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -3090,12 +3184,16 @@ index 0000000000..11a84dc8e6
 +    )
 +    .await
 +    .expect("arm");
-+    match attempt {
-+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
-+            assert!(reason.contains("seam facts"), "{reason}");
-+        }
-+        other => panic!("expected MidTurnBlocked, got {other:?}"),
-+    }
++    assert!(
++        !matches!(
++            attempt,
++            LhcCompactAttempt::MidTurnBlocked {
++                next_provider_request_allowed: false,
++                ..
++            }
++        ),
++        "missing seam facts must never strand the turn, got {attempt:?}"
++    );
 +}
 +
 +#[test]
@@ -3188,10 +3286,6 @@ index 0000000000..11a84dc8e6
 +    // recording a non-arming skip outcome, then prove recovery.
 +    slot.record_mid_turn_hysteresis("lag", 90_000, false, "skip_capture_incomplete");
 +    assert!(!slot.mid_turn_hysteresis().armed);
-+    assert!(
-+        slot.mid_turn_hysteresis()
-+            .should_attempt_after_no_reduction(90_000)
-+    );
 +
 +    let handle = wait_for_handle(&slot, Duration::from_secs(30))
 +        .await
@@ -3432,8 +3526,11 @@ index 0000000000..11a84dc8e6
 +        "Unavailable",
 +        "MidTurnSkipped",
 +        "MidTurnBlocked",
++        // R14 (CX-S1): ordinary-path degrade — turn continues on its current
++        // body, compact retries at the next seam. Never native permission.
++        "ContinuedWithoutCompact",
 +    ];
-+    assert_eq!(kinds.len(), 4);
++    assert_eq!(kinds.len(), 5);
 +}
 +
 +fn thread_count_named(prefix: &str) -> usize {
@@ -3590,6 +3687,10 @@ index 0000000000..11a84dc8e6
 +
 +/// Deliberately stalled worker hits the bounded in-worker timeout, joins, and
 +/// leaves no worker thread or later mutation.
++///
++/// R14 (CX-S1): the bound still exists, but its consequence is no longer
++/// strand-class — the next provider request continues on the existing body and
++/// compact retries at the next seam.
 +#[tokio::test]
 +#[serial]
 +async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
@@ -3646,10 +3747,17 @@ index 0000000000..11a84dc8e6
 +        "worker timeout must bound the caller; elapsed={elapsed:?}"
 +    );
 +    match attempt {
-+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
++        LhcCompactAttempt::MidTurnBlocked {
++            reason,
++            next_provider_request_allowed,
++        } => {
 +            assert!(
 +                reason.contains("timed out") || reason.contains("timeout"),
 +                "expected worker timeout residual, got {reason}"
++            );
++            assert!(
++                next_provider_request_allowed,
++                "a worker timeout must not strand the turn: {reason}"
 +            );
 +        }
 +        other => panic!("expected MidTurnBlocked on stall timeout, got {other:?}"),
@@ -4334,7 +4442,8 @@ index 0000000000..11a84dc8e6
 +                );
 +            }
 +            LhcCompactAttempt::MidTurnSkipped { reason }
-+            | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
++            | LhcCompactAttempt::MidTurnBlocked { reason, .. }
++            | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +                assert!(!reason.is_empty(), "degradation residual must be truthful");
 +            }
 +            LhcCompactAttempt::Unavailable { reason }
@@ -4633,8 +4742,9 @@ index 0000000000..11a84dc8e6
 +        LhcCompactAttempt::Installed { .. } => {
 +            assert!(pending_after.is_none(), "install clears pending boundary");
 +        }
-+        LhcCompactAttempt::MidTurnSkipped { reason } => {
-+            // Quiet skip still allowed if pressure/hysteresis; must not hard-error.
++        LhcCompactAttempt::MidTurnSkipped { reason }
++        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
++            // Quiet skip still allowed if pressure; must not hard-error.
 +            assert!(!reason.contains("conflict"), "{reason}");
 +        }
 +        LhcCompactAttempt::MidTurnBlocked {
@@ -4818,7 +4928,9 @@ index 0000000000..11a84dc8e6
 +                "must not permanent-wedge on identity conflict: {reason}"
 +            );
 +        }
-+        LhcCompactAttempt::Installed { .. } | LhcCompactAttempt::MidTurnSkipped { .. } => {}
++        LhcCompactAttempt::Installed { .. }
++        | LhcCompactAttempt::MidTurnSkipped { .. }
++        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
 +    }
 +
 +    let claim_after =
@@ -4917,13 +5029,14 @@ index 0000000000..11a84dc8e6
 +    );
 +}
 +
-+/// N2: input epoch change at the apply re-check suppresses host mutation.
++/// R1/R7 (CX-S1): the post-worker epoch recheck (G17) is gone. Feeding a stale
++/// decision-epoch snapshot against the live queue used to suppress the host
++/// apply after the SDK had already installed a view — a split state the next
++/// seam had to repair. The install now completes.
 +///
-+/// Production re-reads the epoch both before the worker and after it returns
-+/// (same residual). Feeding a stale decision-epoch snapshot against the live
-+/// queue proves the gate without private input-queue mutators.
++/// Supersedes `mid_turn_epoch_change_during_critical_section_suppresses_apply`.
 +#[tokio::test]
-+async fn mid_turn_epoch_change_during_critical_section_suppresses_apply() {
++async fn mid_turn_epoch_change_during_critical_section_still_applies() {
 +    let dir = tempdir().unwrap();
 +    let root = dir.path().to_path_buf();
 +    let (mut session, tc) = make_session_and_context().await;
@@ -4961,17 +5074,18 @@ index 0000000000..11a84dc8e6
 +    )
 +    .await
 +    .expect("arm");
-+    match attempt {
-+        LhcCompactAttempt::MidTurnSkipped { reason } => {
-+            assert!(
-+                reason.contains("epoch"),
-+                "expected epoch skip residual, got {reason}"
-+            );
-+        }
-+        other => panic!("epoch change must skip apply, got {other:?}"),
-+    }
++    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
++        panic!("epoch drift during the critical section must not suppress apply, got {attempt:?}");
++    };
++    assert!(!body.is_empty(), "installed body must be non-empty");
 +    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
-+    assert_eq!(history_before.len(), history_after.len());
++    assert!(
++        history_after.len() <= history_before.len(),
++        "host apply must install the compacted body, not grow history: \
++         before={} after={}",
++        history_before.len(),
++        history_after.len()
++    );
 +}
 +
 +// ── LIM-67: protected escalation + host full-body validation ────────────────
@@ -6881,10 +6995,10 @@ index 0000000000..e5ff9a59a3
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..093af9cf6d
+index 0000000000..d6d33eb0a0
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3147 @@
+@@ -0,0 +1,3159 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -7293,7 +7407,8 @@ index 0000000000..093af9cf6d
 +    match attempt {
 +        LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Unavailable { reason }
-+        | LhcCompactAttempt::Cancelled { reason } => {
++        | LhcCompactAttempt::Cancelled { reason }
++        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            // NoReduction is fine; other hard stops also fine for tiny seed.
 +            let _ = reason;
 +            assert!(response_items_structurally_equal(
@@ -7360,7 +7475,8 @@ index 0000000000..093af9cf6d
 +            | LhcCompactAttempt::Unavailable { reason }
 +            | LhcCompactAttempt::Cancelled { reason }
 +            | LhcCompactAttempt::MidTurnSkipped { reason }
-+            | LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
++            | LhcCompactAttempt::MidTurnBlocked { reason, .. }
++            | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +                // After first Install, further rounds may NoReduction — still
 +                // must not re-ingest during produce's import path.
 +                assert!(
@@ -7979,7 +8095,8 @@ index 0000000000..093af9cf6d
 +        }
 +        LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Unavailable { reason }
-+        | LhcCompactAttempt::Cancelled { reason } => {
++        | LhcCompactAttempt::Cancelled { reason }
++        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            assert!(!reason.is_empty(), "hard-stop reason should be non-empty");
 +            // History unchanged — no native compact.
 +            assert!(response_items_structurally_equal(
@@ -8343,6 +8460,8 @@ index 0000000000..093af9cf6d
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
++            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
++                format!("ContinuedWithoutCompact({reason})"),
 +            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
 +        }
 +    );
@@ -8515,6 +8634,8 @@ index 0000000000..093af9cf6d
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
++            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
++                format!("ContinuedWithoutCompact({reason})"),
 +            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
 +        }
 +    );
@@ -8628,6 +8749,8 @@ index 0000000000..093af9cf6d
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
++            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
++                format!("ContinuedWithoutCompact({reason})"),
 +            LhcCompactAttempt::MidTurnBlocked { reason, .. } => format!("MidTurnBlocked({reason})"),
 +        }
 +    );
@@ -8645,7 +8768,8 @@ index 0000000000..093af9cf6d
 +        }
 +        LhcCompactAttempt::Failed { .. }
 +        | LhcCompactAttempt::Unavailable { .. }
-+        | LhcCompactAttempt::Cancelled { .. } => {}
++        | LhcCompactAttempt::Cancelled { .. }
++        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
 +        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
 +            panic!("StandaloneTurn must not return MidTurn residual");
 +        }
@@ -9823,7 +9947,9 @@ index 0000000000..093af9cf6d
 +                "LHC rewrite writes exactly one LHC Compacted boundary"
 +            );
 +        }
-+        LhcCompactAttempt::Failed { reason } | LhcCompactAttempt::Unavailable { reason } => {
++        LhcCompactAttempt::Failed { reason }
++        | LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            let history_after = sess.clone_history().await.into_raw_items();
 +            assert!(
 +                response_items_structurally_equal(&history_before, &history_after),
