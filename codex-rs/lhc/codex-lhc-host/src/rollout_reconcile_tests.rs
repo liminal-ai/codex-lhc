@@ -958,10 +958,16 @@ async fn nc4_protected_pair_survives_stale_view_reconciliation_byte_stably() {
     );
 }
 
-/// nc4 negative: ambiguous cardinality (duplicate call_id) in prior rollout
-/// must NOT graft — the materialized LHC shape is left as-is.
+/// R20 (CX-S4): ambiguous cardinality (duplicate call_id) in the prior
+/// rollout's terminal suffix no longer preserves the stale rollout.
+///
+/// **Intentional supersession of nc4.** nc4 asserted the prior bytes stayed
+/// exactly as they were on ambiguous correlation. R20 rules the other way:
+/// the prior rollout is stale AND oversized, so regeneration proceeds with
+/// the LHC-reconstructed pair (same call_id, no provider decoration) and
+/// warns. The provider is the final authority on the degraded body.
 #[tokio::test]
-async fn nc4_ambiguous_pair_does_not_graft() {
+async fn r20_ambiguous_pair_regenerates_with_lhc_reconstructed_pair() {
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
 
@@ -995,7 +1001,8 @@ async fn nc4_ambiguous_pair_does_not_graft() {
     )
     .await
     .expect("compact");
-    assert!(result.marker.compact_point > 0);
+    let view_point = result.marker.compact_point;
+    assert!(view_point > 0);
 
     // Prior rollout with DUPLICATE call_ids (ambiguous cardinality).
     let path = dir.path().join("sessions").join("nc4a-stale.jsonl");
@@ -1025,23 +1032,69 @@ async fn nc4_ambiguous_pair_does_not_graft() {
     stale.push(RolloutItem::ResponseItem(dup_output.clone().into()));
     write_items(&path, &stale);
 
-    // Record pre-reconcile file bytes.
     let pre_bytes = std::fs::read(&path).expect("read pre");
 
     let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
-
-    // Ambiguous terminal suffix => fail-open, file bytes unchanged.
-    assert_eq!(
-        outcome,
-        ReconcileOutcome::Unchanged {
-            reason: "regenerate_failed"
-        },
-        "ambiguous terminal suffix must leave prior unchanged; got {outcome:?}"
+    assert!(
+        matches!(
+            outcome,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::Stale,
+                ..
+            }
+        ),
+        "R20: ambiguous correlation must NOT preserve the stale rollout; got {outcome:?}"
     );
+
     let post_bytes = std::fs::read(&path).expect("read post");
-    assert_eq!(
+    assert_ne!(
         pre_bytes, post_bytes,
-        "file bytes must be exactly unchanged after ambiguous graft failure"
+        "R20 supersedes nc4: the stale oversized rollout must be replaced, not preserved"
+    );
+
+    // The hazard is actually cleared: the boundary now names the installed view.
+    let regen = parse_rollout_items(&path).expect("parse");
+    assert_eq!(
+        file_boundary_compact_point(&regen).unwrap_or(0),
+        view_point,
+        "regenerated boundary must match the installed view compact_point"
+    );
+    assert!(compacted_record_count(&regen) <= 1, "single boundary");
+
+    // Degraded, not grafted: the exact provider-native bytes are absent.
+    let grafted_exact = regen.iter().any(|item| match item {
+        RolloutItem::ResponseItem(ri) => {
+            crate::item_bytes_without_id(&ri.item) == crate::item_bytes_without_id(&dup_call)
+        }
+        _ => false,
+    });
+    assert!(
+        !grafted_exact,
+        "ambiguous call_id must keep the LHC-reconstructed shape, not the provider-native bytes"
+    );
+    for item in &regen {
+        if let RolloutItem::ResponseItem(ri) = item
+            && let ResponseItem::CustomToolCall {
+                call_id,
+                status,
+                namespace,
+                ..
+            } = &ri.item
+            && call_id == "call-ambig"
+        {
+            assert!(
+                status.is_none() && namespace.is_none(),
+                "degraded pair must carry LHC shape: status={status:?}, namespace={namespace:?}"
+            );
+        }
+    }
+
+    // Convergence: no repeated rewrite.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
     );
 }
 
@@ -1177,10 +1230,11 @@ async fn nc4_two_parallel_terminal_pairs_both_grafted() {
     }
 }
 
-/// nc4 negative: orphan output (output_call_id with no matching call) in the
-/// terminal suffix must leave the prior rollout byte-unchanged.
+/// R20 (CX-S4): an orphan output (output with no matching call) in the
+/// terminal suffix no longer preserves the stale rollout. Intentional
+/// supersession of the nc4 `leaves_prior_unchanged` assertion.
 #[tokio::test]
-async fn nc4_orphan_output_leaves_prior_unchanged() {
+async fn r20_orphan_output_regenerates_degraded() {
     use codex_protocol::models::FunctionCallOutputBody;
     use codex_protocol::models::FunctionCallOutputPayload;
 
@@ -1215,42 +1269,62 @@ async fn nc4_orphan_output_leaves_prior_unchanged() {
     )
     .await
     .expect("compact");
-    assert!(result.marker.compact_point > 0);
+    let view_point = result.marker.compact_point;
+    assert!(view_point > 0);
 
     let path = dir.path().join("sessions").join("nc4o-stale.jsonl");
+    let orphan = ResponseItem::CustomToolCallOutput {
+        id: None,
+        call_id: "call-orphan".into(),
+        name: None,
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("orphan result".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
     let mut stale = single_boundary_items(0);
-    stale.push(RolloutItem::ResponseItem(
-        ResponseItem::CustomToolCallOutput {
-            id: None,
-            call_id: "call-orphan".into(),
-            name: None,
-            output: FunctionCallOutputPayload {
-                body: FunctionCallOutputBody::Text("orphan result".into()),
-                success: Some(true),
-            },
-            internal_chat_message_metadata_passthrough: None,
-        }
-        .into(),
-    ));
+    stale.push(RolloutItem::ResponseItem(orphan.clone().into()));
     write_items(&path, &stale);
 
     let pre_bytes = std::fs::read(&path).expect("read pre");
     let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
-    assert_eq!(
-        outcome,
-        ReconcileOutcome::Unchanged {
-            reason: "regenerate_failed"
-        },
-        "orphan output must leave prior unchanged; got {outcome:?}"
+    assert!(
+        matches!(
+            outcome,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::Stale,
+                ..
+            }
+        ),
+        "R20: an orphan output must not preserve the stale rollout; got {outcome:?}"
     );
     let post_bytes = std::fs::read(&path).expect("read post");
-    assert_eq!(pre_bytes, post_bytes, "file bytes must be unchanged");
+    assert_ne!(
+        pre_bytes, post_bytes,
+        "R20 supersedes nc4: stale oversized bytes must not survive an orphan output"
+    );
+
+    let regen = parse_rollout_items(&path).expect("parse");
+    assert_eq!(
+        file_boundary_compact_point(&regen).unwrap_or(0),
+        view_point,
+        "regenerated boundary must match the installed view compact_point"
+    );
+
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
 }
 
-/// nc4 negative: missing output (call with no matching output) in the
-/// terminal suffix must leave the prior rollout byte-unchanged.
+/// R20 (CX-S4): a call with no matching output in the terminal suffix no
+/// longer preserves the stale rollout. Intentional supersession of the nc4
+/// `leaves_prior_unchanged` assertion.
 #[tokio::test]
-async fn nc4_missing_output_leaves_prior_unchanged() {
+async fn r20_missing_output_regenerates_degraded() {
     let dir = tempdir().unwrap();
     let root = dir.path().join("lhc");
     let tid = "nc4-miss-out";
@@ -1281,35 +1355,176 @@ async fn nc4_missing_output_leaves_prior_unchanged() {
     )
     .await
     .expect("compact");
-    assert!(result.marker.compact_point > 0);
+    let view_point = result.marker.compact_point;
+    assert!(view_point > 0);
 
     let path = dir.path().join("sessions").join("nc4m-stale.jsonl");
+    let lone_call = ResponseItem::CustomToolCall {
+        id: None,
+        status: Some("completed".into()),
+        call_id: "call-missing".into(),
+        name: "tool".into(),
+        namespace: Some("ns".into()),
+        input: "{}".into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
     let mut stale = single_boundary_items(0);
-    stale.push(RolloutItem::ResponseItem(
-        ResponseItem::CustomToolCall {
-            id: None,
-            status: Some("completed".into()),
-            call_id: "call-missing".into(),
-            name: "tool".into(),
-            namespace: Some("ns".into()),
-            input: "{}".into(),
-            internal_chat_message_metadata_passthrough: None,
-        }
-        .into(),
-    ));
+    stale.push(RolloutItem::ResponseItem(lone_call.clone().into()));
     write_items(&path, &stale);
 
     let pre_bytes = std::fs::read(&path).expect("read pre");
     let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
-    assert_eq!(
-        outcome,
-        ReconcileOutcome::Unchanged {
-            reason: "regenerate_failed"
-        },
-        "missing output must leave prior unchanged; got {outcome:?}"
+    assert!(
+        matches!(
+            outcome,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::Stale,
+                ..
+            }
+        ),
+        "R20: a call with no output must not preserve the stale rollout; got {outcome:?}"
     );
     let post_bytes = std::fs::read(&path).expect("read post");
-    assert_eq!(pre_bytes, post_bytes, "file bytes must be unchanged");
+    assert_ne!(
+        pre_bytes, post_bytes,
+        "R20 supersedes nc4: stale oversized bytes must not survive a missing output"
+    );
+
+    let regen = parse_rollout_items(&path).expect("parse");
+    assert_eq!(
+        file_boundary_compact_point(&regen).unwrap_or(0),
+        view_point,
+        "regenerated boundary must match the installed view compact_point"
+    );
+    let grafted_exact = regen.iter().any(|item| match item {
+        RolloutItem::ResponseItem(ri) => {
+            crate::item_bytes_without_id(&ri.item) == crate::item_bytes_without_id(&lone_call)
+        }
+        _ => false,
+    });
+    assert!(
+        !grafted_exact,
+        "an unpaired call must keep the LHC-reconstructed shape, not provider-native bytes"
+    );
+
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
+}
+
+/// R20 (CX-S4) unit bar: the graft reports per call_id and never vetoes.
+/// One unambiguous pair is still lifted byte-exactly while an ambiguous
+/// neighbour degrades — the degradation is scoped, not global.
+#[test]
+fn r20_graft_reports_per_call_id_and_never_vetoes() {
+    use codex_protocol::models::FunctionCallOutputBody;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    fn call(call_id: &str, native: bool) -> ResponseItem {
+        ResponseItem::CustomToolCall {
+            id: None,
+            status: native.then(|| "completed".to_string()),
+            call_id: call_id.into(),
+            name: "tool".into(),
+            namespace: native.then(|| "ns".to_string()),
+            input: "{}".into(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+    fn output(call_id: &str) -> ResponseItem {
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: call_id.into(),
+            name: None,
+            output: FunctionCallOutputPayload {
+                body: FunctionCallOutputBody::Text("out".into()),
+                success: Some(true),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    // Prior terminal suffix: "clean" pairs 1:1; "ambig" has two calls;
+    // "lonely" has a call with no output; "orphan" has an output with no call.
+    let mut prior = single_boundary_items(1);
+    prior.truncate(2); // SessionMeta + Compacted boundary only.
+    for item in [
+        call("clean", true),
+        output("clean"),
+        call("ambig", true),
+        call("ambig", true),
+        output("ambig"),
+        call("lonely", true),
+        output("orphan"),
+    ] {
+        prior.push(RolloutItem::ResponseItem(item.into()));
+    }
+
+    // Regenerated (LHC-reconstructed) shapes: no status/namespace.
+    let mut regenerated: Vec<RolloutItem> = vec![
+        call("clean", false),
+        output("clean"),
+        call("ambig", false),
+        output("ambig"),
+        call("lonely", false),
+        output("orphan"),
+    ]
+    .into_iter()
+    .map(|item| RolloutItem::ResponseItem(item.into()))
+    .collect();
+
+    let report = graft_prior_active_suffix(&mut regenerated, &prior);
+
+    assert_eq!(
+        report.grafted,
+        vec!["clean".to_string()],
+        "the unambiguous pair is still lifted byte-exactly"
+    );
+    assert_eq!(
+        report.degraded.len(),
+        3,
+        "ambig / lonely / orphan each report once: {:?}",
+        report.degraded
+    );
+    for id in ["ambig", "lonely", "orphan"] {
+        assert!(
+            report
+                .degraded
+                .iter()
+                .any(|reason| reason.contains(id) && reason.contains("correlation")),
+            "degraded must name call_id {id}: {:?}",
+            report.degraded
+        );
+    }
+
+    // The clean pair carries provider-native decoration; the degraded ones
+    // keep the LHC shape. Nothing was left un-regenerated.
+    let native: Vec<&ResponseItem> = regenerated
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(ri) => Some(&ri.item),
+            _ => None,
+        })
+        .collect();
+    for item in &native {
+        if let ResponseItem::CustomToolCall {
+            call_id,
+            status,
+            namespace,
+            ..
+        } = item
+        {
+            let expect_native = call_id == "clean";
+            assert_eq!(
+                status.is_some() && namespace.is_some(),
+                expect_native,
+                "call_id {call_id}: status/namespace presence must follow graft success"
+            );
+        }
+    }
 }
 
 // ── R12 (CX-S2): reopen-failure receipt ───────────────────────────────────
@@ -1414,5 +1629,694 @@ fn unwritable_or_corrupt_receipt_reads_as_absent() {
     assert!(
         read_rollout_reopen_failure_receipt(&live).is_none(),
         "corrupt receipt reads as absent, never as authority"
+    );
+}
+
+// ── R12 / G26 (CX-S4): next-open receipt consumer ─────────────────────────
+
+/// Rollout records as JSON, so sequences compare without the per-line
+/// `timestamp` the writer stamps fresh on every rewrite.
+fn item_json(items: &[RolloutItem]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| serde_json::to_string(item).expect("serialize rollout item"))
+        .collect()
+}
+
+/// Count tail ResponseItems whose serialized form carries `needle`.
+fn tail_occurrences(items: &[RolloutItem], needle: &str) -> usize {
+    items
+        .iter()
+        .filter(|item| match item {
+            RolloutItem::ResponseItem(ri) => {
+                serde_json::to_string(&ri.item).is_ok_and(|json| json.contains(needle))
+            }
+            _ => false,
+        })
+        .count()
+}
+
+/// Seed a bandable thread and drive a real compact so the installed view
+/// advances the compact point. Returns the view's compact point.
+async fn seed_and_compact(root: &Path, tid: &str, tag: &str) -> i64 {
+    let pad = "x".repeat(2500);
+    let mut items = Vec::new();
+    for i in 0..80 {
+        items.push(user(&format!("{tag} user {i} {pad}"), &format!("u{i}")));
+        items.push(assistant(
+            &format!("{tag} asst {i} {pad}"),
+            &format!("a{i}"),
+        ));
+    }
+    seed_thread(root, tid, &items).await;
+    let result =
+        crate::produce_lhc_compact_deterministic(tid, Some(root), &items, /*import*/ false)
+            .await
+            .expect("compact must succeed");
+    assert!(
+        result.marker.compact_point > 0,
+        "compact must advance the view"
+    );
+    result.marker.compact_point
+}
+
+/// G26 two-open recovered suffix (R12).
+///
+/// Open 1: atomic compact rewrite installs the compacted rollout, the append
+/// recorder fails to reopen onto the new inode, CX-S2 persists the receipt,
+/// and a later item is captured canonically while its append goes to the dead
+/// handle. Open 2 reads the receipt, compares the three frontiers, and
+/// replays exactly that suffix onto the compacted rollout — once.
+#[tokio::test]
+async fn g26_two_open_recovered_suffix_replays_exactly_once() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-recovered";
+    let view_point = seed_and_compact(&root, tid, "g26r").await;
+
+    // Atomic compact rewrite: the compacted rollout lands on disk.
+    let path = dir.path().join("sessions").join("g26-recovered.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(installed, ReconcileOutcome::Regenerated { .. }),
+        "compacted rollout must be installed; got {installed:?}"
+    );
+    let compacted_items = parse_rollout_items(&path).expect("parse compacted");
+    let compacted_bytes = std::fs::read(&path).expect("read compacted");
+    assert_eq!(
+        file_boundary_compact_point(&compacted_items).unwrap_or(0),
+        view_point
+    );
+
+    // Forced recorder-reopen failure: CX-S2's write-behind receipt.
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("capture frontier at failure");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity,
+        recorder_frontier_items: compacted_items.len() as u64,
+        capture_frontier: Some(frontier),
+        reopen_error: "append handle points at the orphaned inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // A later item is captured canonically; its append goes to the dead
+    // recorder, so the rollout file does not move.
+    seed_thread(&root, tid, &[user("g26 late item after reopen", "u-late")]).await;
+    assert_eq!(
+        std::fs::read(&path).expect("read after late item"),
+        compacted_bytes,
+        "the dead recorder handle appends nothing to the compacted rollout"
+    );
+    let advanced = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("advanced frontier");
+    assert!(
+        advanced.last_event_order > frontier.last_event_order,
+        "canonical capture must have advanced past the receipt frontier: \
+         {advanced:?} vs {frontier:?}"
+    );
+    assert_eq!(
+        tail_occurrences(&compacted_items, "g26 late item after reopen"),
+        0,
+        "the late item is not in the compacted rollout"
+    );
+
+    // ── Open 2: read the receipt and replay the provable suffix. ──────────
+    let recovered = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    let replayed_total = match recovered {
+        ReconcileOutcome::Regenerated {
+            trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+            items,
+        } => items,
+        other => panic!("expected ReopenSuffixReplay regeneration, got {other:?}"),
+    };
+
+    let replayed = parse_rollout_items(&path).expect("parse replayed");
+    let replayed_bytes = std::fs::read(&path).expect("read replayed");
+    assert_eq!(replayed.len(), replayed_total);
+    assert!(
+        replayed.len() > compacted_items.len(),
+        "the recovered suffix must be appended"
+    );
+    // The compacted rollout is the base: every record it held is preserved in
+    // order, and the suffix follows them.
+    assert_eq!(
+        item_json(&replayed)[..compacted_items.len()],
+        item_json(&compacted_items)[..],
+        "replay appends a suffix; it never rewrites the compacted rollout"
+    );
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 late item after reopen"),
+        1,
+        "the recovered item must appear exactly once"
+    );
+    assert!(
+        !rollout_reopen_receipt_path(&path).exists(),
+        "a consumed receipt must not survive to replay twice"
+    );
+
+    // Convergence: no repeated rewrite, no duplicate suffix.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
+    let after_second = parse_rollout_items(&path).expect("parse after second");
+    assert_eq!(
+        std::fs::read(&path).expect("read after second"),
+        replayed_bytes,
+        "convergent reconcile must not touch the rollout"
+    );
+    assert_eq!(
+        tail_occurrences(&after_second, "g26 late item after reopen"),
+        1,
+        "idempotent: the suffix is replayed once, ever"
+    );
+}
+
+/// G26 two-open known gap (R12).
+///
+/// The receipt proves a canonical range the archive can no longer produce.
+/// Next open names the missing range and count exactly, continues on the
+/// compacted rollout, and never restores the oversized prior generation.
+#[tokio::test]
+async fn g26_two_open_known_gap_names_range_and_count() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-known-gap";
+    let view_point = seed_and_compact(&root, tid, "g26g").await;
+
+    let path = dir.path().join("sessions").join("g26-known-gap.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+    let compacted_items = parse_rollout_items(&path).expect("parse compacted");
+    let compacted_bytes = std::fs::read(&path).expect("read compacted");
+    assert_eq!(
+        file_boundary_compact_point(&compacted_items).unwrap_or(0),
+        view_point
+    );
+
+    let live = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("live frontier");
+    // The receipt proves capture ran ahead of anything the archive can now
+    // produce: four events at orders the archive no longer holds.
+    let proven = CaptureFrontier {
+        last_event_order: live.last_event_order + 9,
+        event_count: live.event_count + 4,
+    };
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: compacted_rollout_identity(&path).expect("identity"),
+        recorder_frontier_items: compacted_items.len() as u64,
+        capture_frontier: Some(proven),
+        reopen_error: "orphaned inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // The consumer names the exact bounded range and count.
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    let (warning, events) = match outcome {
+        ReopenReceiptOutcome::KnownGap { warning, events } => (warning, events),
+        other => panic!("expected KnownGap, got {other:?}"),
+    };
+    assert_eq!(events, 4, "exact count of unavailable events");
+    assert!(
+        warning.contains(&format!(
+            "event_order range ({}, {}] is unavailable (4 events lost)",
+            live.last_event_order, proven.last_event_order
+        )),
+        "loss warning must name the exact missing range and count: {warning}"
+    );
+    assert!(
+        warning.contains("continuing on the compacted rollout"),
+        "loss warning must state the session continues: {warning}"
+    );
+    assert!(
+        warning.contains("never restored"),
+        "loss warning must state the oversized prior generation is not restored: {warning}"
+    );
+    assert!(
+        warning.len() < 600,
+        "loss warning must stay bounded, not dump payload: {} chars",
+        warning.len()
+    );
+
+    // End to end: the reconcile reports the gap and touches nothing.
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("rewrite receipt");
+    let reconciled = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        reconciled,
+        ReconcileOutcome::Unchanged {
+            reason: "reopen_gap_unrecoverable"
+        },
+        "a proven gap continues on the compacted rollout; got {reconciled:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read post"),
+        compacted_bytes,
+        "no rollback: the compacted rollout is byte-identical after the gap warning"
+    );
+
+    // Convergence.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read final"),
+        compacted_bytes,
+        "still no rewrite on the convergent open"
+    );
+}
+
+/// G26 receipt write failure (R12).
+///
+/// The receipt is write-behind: a failed write cannot veto the compact, and
+/// the compacted rollout stays authoritative. A torn receipt left on disk
+/// gives the next open no accounting, so it rebuilds from the best available
+/// LHC view and says so.
+#[tokio::test]
+async fn g26_receipt_write_failure_rebuilds_with_accounting_unavailable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-no-accounting";
+    let view_point = seed_and_compact(&root, tid, "g26n").await;
+
+    let path = dir.path().join("sessions").join("g26-no-accounting.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+    let compacted_items = parse_rollout_items(&path).expect("parse compacted");
+    let compacted_bytes = std::fs::read(&path).expect("read compacted");
+
+    // The receipt write fails outright: the compact still stands.
+    let unwritable = rollout_reopen_receipt_path(&path).join("not-a-dir");
+    assert!(
+        std::fs::write(&unwritable, b"{}").is_err(),
+        "receipt sidecar is unwritable in this shape"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read after failed receipt"),
+        compacted_bytes,
+        "a receipt that cannot be written costs accounting, never the compact"
+    );
+
+    // A torn write leaves an unparseable receipt behind.
+    std::fs::write(rollout_reopen_receipt_path(&path), b"{\"schema\":\"lhc.rol")
+        .expect("torn receipt");
+
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    match &outcome {
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            assert!(
+                detail.contains("unreadable or unparseable"),
+                "detail must name the missing accounting: {detail}"
+            );
+        }
+        other => panic!("expected AccountingUnavailable, got {other:?}"),
+    }
+
+    // End to end: next open rebuilds from the best available LHC view.
+    std::fs::write(rollout_reopen_receipt_path(&path), b"{\"schema\":\"lhc.rol")
+        .expect("torn receipt again");
+    let rebuilt = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    match rebuilt {
+        ReconcileOutcome::Regenerated {
+            trigger: RolloutReconcileTrigger::ReopenAccountingUnavailable,
+            items,
+        } => assert!(items >= 1, "rebuilt rollout must have items"),
+        other => panic!("expected ReopenAccountingUnavailable rebuild, got {other:?}"),
+    }
+    let rebuilt_items = parse_rollout_items(&path).expect("parse rebuilt");
+    assert_eq!(
+        file_boundary_compact_point(&rebuilt_items).unwrap_or(0),
+        view_point,
+        "the rebuild must come from the installed LHC view"
+    );
+    assert!(
+        rebuilt_items
+            .iter()
+            .any(|item| matches!(item, RolloutItem::SessionMeta(_))),
+        "rebuilt rollout must carry SessionMeta"
+    );
+    assert!(
+        compacted_record_count(&rebuilt_items) <= 1,
+        "rebuilt rollout must not be multi-Compacted polluted"
+    );
+    assert!(
+        !rollout_reopen_receipt_path(&path).exists(),
+        "the unusable receipt is consumed, not re-warned forever"
+    );
+    assert!(
+        !compacted_items.is_empty(),
+        "sanity: the compacted rollout had content to rebuild from"
+    );
+
+    // Convergence.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
+}
+
+/// G20 (R18) in-memory-only install: CX-S2 installs with no rollout path
+/// available, so nothing is on disk. The next open rebuilds the rollout from
+/// the installed LHC thread view plus the captured canonical tail.
+#[tokio::test]
+async fn g20_in_memory_only_install_rebuilds_rollout_at_next_open() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g20-in-memory";
+    let view_point = seed_and_compact(&root, tid, "g20m").await;
+
+    // The compact installed in memory only: no rollout file was ever written.
+    let path = dir.path().join("sessions").join("g20-in-memory.jsonl");
+    assert!(!path.exists(), "in-memory-only install writes no rollout");
+
+    // Canonical capture keeps advancing on the live session.
+    seed_thread(
+        &root,
+        tid,
+        &[user("g20 tail after in-memory install", "u-tail")],
+    )
+    .await;
+
+    let outcome = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    match outcome {
+        ReconcileOutcome::Regenerated {
+            trigger: RolloutReconcileTrigger::Missing,
+            items,
+        } => assert!(items >= 1, "rebuilt rollout must have items"),
+        other => panic!("expected Missing regeneration, got {other:?}"),
+    }
+
+    let rebuilt = parse_rollout_items(&path).expect("parse rebuilt");
+    assert!(
+        rebuilt
+            .iter()
+            .any(|item| matches!(item, RolloutItem::SessionMeta(_))),
+        "rebuilt rollout must carry SessionMeta"
+    );
+    assert_eq!(
+        file_boundary_compact_point(&rebuilt).unwrap_or(0),
+        view_point,
+        "the boundary must come from the installed LHC thread view"
+    );
+    assert_eq!(
+        compacted_record_count(&rebuilt),
+        1,
+        "exactly one boundary: the installed view's"
+    );
+    assert_eq!(
+        tail_occurrences(&rebuilt, "g20 tail after in-memory install"),
+        1,
+        "the captured canonical tail must be present exactly once"
+    );
+
+    // Convergence.
+    let second = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert_eq!(
+        second,
+        ReconcileOutcome::Unchanged { reason: "ok" },
+        "second reconcile must converge; got {second:?}"
+    );
+}
+
+// ── G26 replay boundary: occurrence-aware ordered-prefix alignment ─────────
+
+/// Repeated identical content is distinct events. The rollout tail already
+/// holds one item with text X; the canonical suffix holds another item with
+/// the same text. The second X must replay — a global contains-filter would
+/// drop it.
+#[tokio::test]
+async fn g26_repeated_identical_suffix_item_replays_exactly_once() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-dup-suffix";
+    seed_and_compact(&root, tid, "g26d").await;
+
+    // First X lands in the compacted rollout tail.
+    seed_thread(&root, tid, &[user("g26 duplicate text", "u-dup-1")]).await;
+    let path = dir.path().join("sessions").join("g26-dup.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+    let compacted_items = parse_rollout_items(&path).expect("parse compacted");
+    assert_eq!(
+        tail_occurrences(&compacted_items, "g26 duplicate text"),
+        1,
+        "rollout tail must hold the first X"
+    );
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // Second X: same content, distinct event, captured canonically only.
+    seed_thread(&root, tid, &[user("g26 duplicate text", "u-dup-2")]).await;
+
+    let recovered = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(
+            recovered,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+                ..
+            }
+        ),
+        "expected suffix replay, got {recovered:?}"
+    );
+    let replayed = parse_rollout_items(&path).expect("parse replayed");
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 duplicate text"),
+        2,
+        "both distinct events with identical content must be present"
+    );
+    assert_eq!(
+        item_json(&replayed)[..compacted_items.len()],
+        item_json(&compacted_items)[..],
+        "replay appends; it never rewrites the compacted base"
+    );
+}
+
+/// A later canonical duplicate of an earlier rollout item must not become the
+/// replay anchor. Rollout tail ends with A; canonical continues [B, A']. An
+/// any-position rposition anchor would seize A' and skip B entirely. The
+/// ordered prefix replays both.
+#[tokio::test]
+async fn g26_later_duplicate_cannot_anchor_past_real_suffix() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-dup-anchor";
+    seed_and_compact(&root, tid, "g26a").await;
+
+    seed_thread(&root, tid, &[user("g26 alpha text", "u-alpha-1")]).await;
+    let path = dir.path().join("sessions").join("g26-anchor.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    // Suffix beyond the frontier: B, then a duplicate of A.
+    seed_thread(
+        &root,
+        tid,
+        &[
+            user("g26 beta text", "u-beta-1"),
+            user("g26 alpha text", "u-alpha-2"),
+        ],
+    )
+    .await;
+
+    let recovered = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(
+        matches!(
+            recovered,
+            ReconcileOutcome::Regenerated {
+                trigger: RolloutReconcileTrigger::ReopenSuffixReplay,
+                ..
+            }
+        ),
+        "expected suffix replay, got {recovered:?}"
+    );
+    let replayed = parse_rollout_items(&path).expect("parse replayed");
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 beta text"),
+        1,
+        "the real suffix event before the duplicate must replay"
+    );
+    assert_eq!(
+        tail_occurrences(&replayed, "g26 alpha text"),
+        2,
+        "the duplicate suffix event must replay as its own event"
+    );
+}
+
+/// Same-content overlap that is not an ordered prefix has no provable
+/// boundary: AccountingUnavailable, no guessed replay, rollout untouched.
+#[tokio::test]
+async fn g26_non_prefix_overlap_is_accounting_unavailable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-non-prefix";
+    seed_and_compact(&root, tid, "g26n").await;
+
+    seed_thread(
+        &root,
+        tid,
+        &[user("g26 gamma one", "u-g1"), user("g26 gamma two", "u-g2")],
+    )
+    .await;
+    let path = dir.path().join("sessions").join("g26-nonprefix.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    // Swap the two tail items so the rollout tail is no longer an ordered
+    // prefix of the canonical tail, while every byte of content still occurs
+    // somewhere in both.
+    let mut items = parse_rollout_items(&path).expect("parse");
+    let tail_positions: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            RolloutItem::ResponseItem(ri) => serde_json::to_string(&ri.item)
+                .ok()
+                .filter(|json| json.contains("g26 gamma"))
+                .map(|_| i),
+            _ => None,
+        })
+        .collect();
+    assert!(tail_positions.len() >= 2, "need both gamma items in tail");
+    items.swap(tail_positions[0], tail_positions[1]);
+    atomic_rewrite_rollout(&path, &items).expect("write swapped rollout");
+
+    let identity = compacted_rollout_identity(&path).expect("identity after swap");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+    let swapped_bytes = std::fs::read(&path).expect("read swapped");
+
+    // Advance the canonical frontier so the no-advance shortcut cannot hide
+    // the alignment question.
+    seed_thread(&root, tid, &[user("g26 gamma three", "u-g3")]).await;
+
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    match outcome {
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            assert!(
+                detail.contains("ordered prefix"),
+                "detail must name the alignment failure: {detail}"
+            );
+        }
+        other => panic!("expected AccountingUnavailable, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("read after"),
+        swapped_bytes,
+        "no guessed replay may touch the rollout"
+    );
+}
+
+/// A receipt whose recorder frontier disagrees with its own compacted
+/// generation is internally inconsistent: AccountingUnavailable, no replay.
+#[tokio::test]
+async fn g26_recorder_frontier_mismatch_is_accounting_unavailable() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "g26-frontier-mismatch";
+    seed_and_compact(&root, tid, "g26f").await;
+
+    let path = dir.path().join("sessions").join("g26-mismatch.jsonl");
+    write_items(&path, &single_boundary_items(0));
+    let installed = reconcile_rollout_at_path(&path, tid, Some(root.as_path()), None).await;
+    assert!(matches!(installed, ReconcileOutcome::Regenerated { .. }));
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    let frontier = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("frontier");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: identity.items + 3,
+        capture_frontier: Some(frontier),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+    let bytes_before = std::fs::read(&path).expect("read before");
+
+    let outcome = consume_reopen_failure_receipt(&path, tid, Some(root.as_path()), None).await;
+    match outcome {
+        ReopenReceiptOutcome::AccountingUnavailable { detail } => {
+            assert!(
+                detail.contains("recorder frontier"),
+                "detail must name the disagreement: {detail}"
+            );
+        }
+        other => panic!("expected AccountingUnavailable, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&path).expect("read after"),
+        bytes_before,
+        "inconsistent accounting must not replay"
     );
 }
