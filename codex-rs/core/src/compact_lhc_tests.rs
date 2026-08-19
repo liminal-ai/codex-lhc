@@ -2165,6 +2165,218 @@ async fn slice_c_reopen_pin_append_lands_in_new_file() {
     }
 }
 
+/// R12 (CX-S2): when the append recorder cannot reopen onto the rewritten
+/// rollout, the compacted rollout stands and a write-behind receipt records
+/// what the next open needs — compacted-rollout identity/hash, the recorder
+/// frontier at failure, and the canonical LHC capture frontier/event order.
+#[tokio::test]
+async fn slice_c_reopen_failure_receipt_records_identity_and_frontiers() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let thread_root = handle.root().map(std::path::Path::to_path_buf);
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body, .. } = attempt else {
+        panic!("expected Installed: {attempt:?}");
+    };
+
+    let compacted_bytes = std::fs::read(&rollout_path).expect("read compacted rollout");
+    let compacted_items =
+        codex_lhc_host::parse_rollout_items(&rollout_path).expect("parse compacted rollout");
+
+    // Simulate the failure the rollback used to answer: the swap succeeded, the
+    // append handle did not come back.
+    super::persist_reopen_failure_receipt(
+        &rollout_path,
+        &thread_id,
+        thread_root.clone(),
+        compacted_items.len() as u64,
+        "injected: recorder reopen failed after retry",
+    )
+    .await;
+
+    let receipt = codex_lhc_host::read_rollout_reopen_failure_receipt(&rollout_path)
+        .expect("reopen-failure receipt must be persisted");
+    assert_eq!(receipt.thread_id, thread_id);
+    assert_eq!(
+        receipt.compacted_rollout,
+        codex_lhc_host::compacted_rollout_identity(&rollout_path).expect("identity"),
+        "receipt must name the compacted rollout by hash + size"
+    );
+    assert_eq!(
+        receipt.recorder_frontier_items,
+        compacted_items.len() as u64,
+        "recorder frontier at failure = records durably in the compacted rollout"
+    );
+    let capture = receipt
+        .capture_frontier
+        .expect("canonical LHC capture frontier");
+    assert!(
+        capture.last_event_order > 0 && capture.event_count > 0,
+        "capture frontier must carry canonical event order: {capture:?}"
+    );
+    assert!(
+        receipt.reopen_error.contains("recorder reopen failed"),
+        "receipt keeps the reopen error for diagnosis: {}",
+        receipt.reopen_error
+    );
+
+    // Forward-only: no rollback. The compacted generation is still live and the
+    // installed body is still the session's history.
+    assert_eq!(
+        std::fs::read(&rollout_path).expect("read after receipt"),
+        compacted_bytes,
+        "the fsynced compacted rollout stays authoritative — the oversized prior \
+         generation is never restored"
+    );
+    let host = sess.clone_history().await.into_raw_items();
+    assert!(
+        response_items_structurally_equal(&host, &body),
+        "reopen failure must not undo the install"
+    );
+}
+
+/// R12 (CX-S2): the receipt is diagnostics. A receipt that cannot be written
+/// costs the next open its accounting and nothing else — never the compact.
+#[tokio::test]
+async fn slice_c_reopen_receipt_write_failure_does_not_veto_compact() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let thread_root = handle.root().map(std::path::Path::to_path_buf);
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body, .. } = attempt else {
+        panic!("expected Installed: {attempt:?}");
+    };
+    let compacted_bytes = std::fs::read(&rollout_path).expect("read compacted rollout");
+
+    // Occupy the receipt path with a directory so the sidecar write fails.
+    let receipt_path = codex_lhc_host::rollout_reopen_receipt_path(&rollout_path);
+    std::fs::create_dir(&receipt_path).expect("block receipt path");
+
+    super::persist_reopen_failure_receipt(
+        &rollout_path,
+        &thread_id,
+        thread_root,
+        7,
+        "injected: recorder reopen failed after retry",
+    )
+    .await;
+
+    assert!(
+        codex_lhc_host::read_rollout_reopen_failure_receipt(&rollout_path).is_none(),
+        "receipt could not be written"
+    );
+    assert_eq!(
+        std::fs::read(&rollout_path).expect("read after failed receipt"),
+        compacted_bytes,
+        "a failed receipt write must not touch the compacted rollout"
+    );
+    let host = sess.clone_history().await.into_raw_items();
+    assert!(
+        response_items_structurally_equal(&host, &body),
+        "a failed receipt write must not undo the install"
+    );
+}
+
+/// R18 (CX-S2): a rollout path lookup failure degrades to an in-memory-only
+/// install. Shutting the live recorder down makes `current_rollout_path()`
+/// return Err — the compact must still install its body instead of failing and
+/// leaving the session against the context wall.
+#[tokio::test]
+async fn slice_c_rollout_path_lookup_failure_installs_in_memory() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout_for_slice_c(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+
+    // Drop the live recorder: the path lookup now errors (ThreadNotFound).
+    session
+        .services
+        .live_thread
+        .as_ref()
+        .expect("live thread")
+        .shutdown()
+        .await
+        .expect("shutdown live recorder");
+    let history_before = session.clone_history().await.into_raw_items();
+    let rollout_before = std::fs::read(&rollout_path).expect("read rollout before");
+
+    let sess = Arc::new(session);
+    assert!(
+        sess.current_rollout_path().await.is_err(),
+        "test precondition: rollout path lookup must fail"
+    );
+
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    let LhcCompactAttempt::Installed { body, .. } = attempt else {
+        panic!("path lookup failure must still install in memory: {attempt:?}");
+    };
+    assert!(!body.is_empty(), "in-memory install must carry a body");
+
+    let host = sess.clone_history().await.into_raw_items();
+    assert!(
+        response_items_structurally_equal(&host, &body),
+        "installed body must equal live host history"
+    );
+    assert!(
+        host.len() < history_before.len(),
+        "in-memory install must replace history: before={} after={}",
+        history_before.len(),
+        host.len()
+    );
+    assert_eq!(
+        std::fs::read(&rollout_path).expect("read rollout after"),
+        rollout_before,
+        "with no usable path the rollout file is left alone (reconciliation \
+         rewrites it at next open)"
+    );
+}
+
 /// In-memory history installed at compact must equal what resume rebuilds
 /// from the rewritten file (item-for-item structural equality).
 #[tokio::test]

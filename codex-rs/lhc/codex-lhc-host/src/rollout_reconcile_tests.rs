@@ -1311,3 +1311,108 @@ async fn nc4_missing_output_leaves_prior_unchanged() {
     let post_bytes = std::fs::read(&path).expect("read post");
     assert_eq!(pre_bytes, post_bytes, "file bytes must be unchanged");
 }
+
+// ── R12 (CX-S2): reopen-failure receipt ───────────────────────────────────
+
+/// The receipt carries what the next open needs: which compacted rollout is
+/// live (hash + size + item count), how far the recorder got, and where
+/// canonical LHC capture was when the recorder handle died.
+#[tokio::test]
+async fn reopen_failure_receipt_carries_rollout_identity_and_frontiers() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "reopen-receipt-tid";
+    seed_thread(
+        &root,
+        tid,
+        &[user("hello receipt", "u1"), assistant("hi", "a1")],
+    )
+    .await;
+
+    let path = dir.path().join("sessions").join("rollout-reopen.jsonl");
+    let items = single_boundary_items(7);
+    write_items(&path, &items);
+
+    let identity = compacted_rollout_identity(&path).expect("identity");
+    assert_eq!(
+        identity.items,
+        items.len() as u64,
+        "identity item count must match the compacted rollout"
+    );
+    assert_eq!(identity.sha256.len(), 64, "sha256 hex over rollout bytes");
+    assert_eq!(
+        identity.bytes,
+        std::fs::metadata(&path).expect("meta").len(),
+        "identity size must match the file on disk"
+    );
+
+    let capture = read_capture_frontier(tid, Some(root.as_path()))
+        .await
+        .expect("capture frontier");
+    assert!(
+        capture.event_count > 0 && capture.last_event_order > 0,
+        "canonical capture frontier must be non-empty: {capture:?}"
+    );
+
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: tid.into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: identity.clone(),
+        recorder_frontier_items: items.len() as u64,
+        capture_frontier: Some(capture),
+        reopen_error: "orphan inode".into(),
+    };
+    write_rollout_reopen_failure_receipt(&path, &receipt).expect("write receipt");
+
+    let read_back = read_rollout_reopen_failure_receipt(&path).expect("receipt present");
+    assert_eq!(read_back, receipt, "receipt must round-trip verbatim");
+    assert_eq!(read_back.compacted_rollout, identity);
+    assert_eq!(read_back.capture_frontier, Some(capture));
+    // The compacted rollout itself is untouched by receipt bookkeeping.
+    assert_eq!(
+        parse_rollout_items(&path).expect("parse").len(),
+        items.len(),
+        "receipt write must not disturb the compacted rollout"
+    );
+}
+
+/// The receipt is write-behind: an unwritable sidecar (missing parent dir)
+/// surfaces as an error to the caller, which warns and keeps the compact. An
+/// absent or corrupt receipt reads as "no accounting", never as a block.
+#[test]
+fn unwritable_or_corrupt_receipt_reads_as_absent() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nope").join("rollout.jsonl");
+    let receipt = RolloutReopenFailureReceipt {
+        schema: ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: "2026-08-19T00:00:00Z".into(),
+        thread_id: "tid".into(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout: CompactedRolloutIdentity {
+            sha256: "deadbeef".into(),
+            bytes: 1,
+            items: 1,
+        },
+        recorder_frontier_items: 1,
+        capture_frontier: None,
+        reopen_error: "boom".into(),
+    };
+    assert!(
+        write_rollout_reopen_failure_receipt(&path, &receipt).is_err(),
+        "missing parent directory cannot be written"
+    );
+    assert!(
+        read_rollout_reopen_failure_receipt(&path).is_none(),
+        "no receipt reads as absent"
+    );
+
+    let live = dir.path().join("rollout.jsonl");
+    write_items(&live, &single_boundary_items(1));
+    std::fs::write(rollout_reopen_receipt_path(&live), b"{not json").expect("write junk");
+    assert!(
+        read_rollout_reopen_failure_receipt(&live).is_none(),
+        "corrupt receipt reads as absent, never as authority"
+    );
+}

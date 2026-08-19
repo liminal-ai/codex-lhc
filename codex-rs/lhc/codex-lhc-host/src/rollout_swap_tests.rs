@@ -149,27 +149,6 @@ fn failpoint_post_new_rename_pre_reopen_leaves_new_active_parseable() {
 }
 
 #[test]
-fn rollback_after_failed_reopen_restores_prior_generation() {
-    let _guard = SwapFailpointGuard::arm(SwapFailpoint::None);
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("rollout.jsonl");
-    write_seed(&path, "old");
-    atomic_rewrite_rollout(&path, &sample_items("new")).expect("install new generation");
-
-    rollback_rollout_after_failed_reopen(&path).expect("restore prior generation");
-
-    assert_parseable_active(&path, "old");
-    let paths = SwapPaths::for_rollout(&path);
-    assert!(!paths.prev.exists(), "restored prior moved back to active");
-    let mut rejected = path.as_os_str().to_os_string();
-    rejected.push(".rejected-tmp");
-    assert!(
-        !PathBuf::from(rejected).exists(),
-        "rejected new generation cleaned up"
-    );
-}
-
-#[test]
 #[cfg(unix)]
 fn read_only_dir_leaves_old_authoritative() {
     let _guard = SwapFailpointGuard::arm(SwapFailpoint::None);

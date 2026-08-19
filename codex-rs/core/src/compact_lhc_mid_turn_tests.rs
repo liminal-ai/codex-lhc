@@ -1286,11 +1286,15 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
 
 // ── Timeout / cancel critical-section proofs (production hop) ─────────────
 
-/// Cancel during the critical section: return only after worker exit; no
-/// detached mutator; host apply suppressed.
+/// Cancel during the critical section: return only after worker exit and no
+/// detached mutator.
+///
+/// R6 (CX-S2): cancellation no longer suppresses the host apply. The SDK may
+/// already have installed a view, and skipping the host rewrite is what leaves
+/// the split state a later seam has to repair.
 #[tokio::test]
 #[serial]
-async fn mid_turn_cancel_during_critical_section_joins_before_return() {
+async fn mid_turn_cancel_during_critical_section_applies_installed_view() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -1312,15 +1316,20 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
     // Hold the process-wide override lock for the whole test so plain-parallel
     // runs cannot race sibling timeout/stall injections.
     let override_guard = super::midturn_worker_override_guard();
-    override_guard.set_timeout(Some(Duration::from_millis(400)));
-    override_guard.set_stall(Some(Duration::from_millis(200)));
+    // Generous bound + a stall the cancel lands inside: the worker runs to
+    // completion (SDK view installed) with the turn already cancelled, which is
+    // exactly the post-mutation cancellation R6 is about.
+    override_guard.set_timeout(Some(Duration::from_secs(30)));
+    override_guard.set_stall(Some(Duration::from_millis(1_500)));
     let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
+    // Late enough that the worker is spawned and stalled inside the critical
+    // section (pre-worker setup takes ~100ms), well before the stall ends.
     let cancel_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         cancel_clone.cancel();
     });
 
@@ -1346,25 +1355,25 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
     let _ = cancel_task.await;
     drop(override_guard);
 
-    // Must have waited for the stalled worker (not returned immediately on cancel).
-    // Stall is 200ms; allow some scheduling slack while still proving we did not
-    // return on the pre-spawn cancel path (~0ms).
+    // Must have waited for the stalled worker: the cancel landed at 600ms and
+    // the worker only finishes after its 1.5s stall.
     assert!(
-        elapsed >= Duration::from_millis(80),
+        elapsed >= Duration::from_millis(1_000),
         "cancel during critical section must await worker exit; elapsed={elapsed:?}"
     );
-    match attempt {
+    // Whatever the worker produced (install, skip, or a bounded timeout), the
+    // cancellation itself must not be the thing that stopped the apply.
+    match &attempt {
         LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
             assert!(
-                reason.contains("cancel")
-                    || reason.contains("critical section")
-                    || reason.contains("suppressed")
-                    || reason.contains("timed out")
-                    || reason.contains("timeout"),
-                "{reason}"
+                !reason.contains("suppress") && !reason.contains("cancel"),
+                "cancellation must not suppress the host apply: {reason}"
             );
         }
-        other => panic!("expected MidTurnBlocked on cancel, got {other:?}"),
+        LhcCompactAttempt::Installed { .. }
+        | LhcCompactAttempt::MidTurnSkipped { .. }
+        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
+        other => panic!("cancel must stay on a MidTurn outcome, got {other:?}"),
     }
     // Named worker for this attempt must be gone (poll briefly for OS reaping).
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
@@ -1379,12 +1388,22 @@ async fn mid_turn_cancel_during_critical_section_joins_before_return() {
         0,
         "detached midturn worker remains after cancel join"
     );
+    // An install that happened is kept: a cancelled turn ending on the smaller
+    // body is strictly better than a split state.
     let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
-    assert_eq!(
-        history_before.len(),
-        history_after.len(),
-        "cancel must suppress host apply / later mutation"
-    );
+    if let LhcCompactAttempt::Installed { body, .. } = &attempt {
+        assert_eq!(
+            history_after.len(),
+            body.len(),
+            "installed view must be applied to host history despite cancellation"
+        );
+    } else {
+        assert_eq!(
+            history_before.len(),
+            history_after.len(),
+            "without an install there is nothing to apply"
+        );
+    }
 }
 
 /// Deliberately stalled worker hits the bounded in-worker timeout, joins, and
@@ -2667,6 +2686,184 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
         !matches!(fresh, LhcCompactAttempt::Unavailable { .. }),
         "fresh seam after recovery must not native-fall-open: {fresh:?}"
     );
+}
+
+/// R4 (CX-S2): a durable recovery-identity inspect that cannot be read — here
+/// a claim-only owner with no attempt-intent row (the shape a crash or partial
+/// write leaves) — must not block sampling. The arm warns and proceeds with a
+/// fresh attempt; the runtime CAS is what prevents a double write.
+#[tokio::test]
+#[serial]
+async fn mid_turn_recovery_inspect_failure_proceeds_with_fresh_attempt() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 12).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+    // Claim-only owner with no durable attempt-intent row: the resolver cannot
+    // load an identity for it and returns Err.
+    codex_lhc_host::seed_mid_turn_writer_claim_for_tests(
+        &thread_id,
+        root_path.as_deref(),
+        "ghost-owner-no-intent-row",
+    )
+    .expect("seed orphan writer claim");
+    let inspect =
+        codex_lhc_host::resolve_mid_turn_recovery_identity(&thread_id, root_path.as_deref()).await;
+    assert!(
+        inspect.is_err(),
+        "test precondition: recovery inspect must fail on this durable shape, got {inspect:?}"
+    );
+
+    let sess = Arc::new(session);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "fresh-after-unreadable-inspect",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+
+    // Forward-only: the unreadable row named its (dead) owner, the arm reclaimed
+    // that attempt id, and the compact ran to a real install.
+    match attempt {
+        LhcCompactAttempt::Installed { body, .. } => {
+            assert!(!body.is_empty(), "reclaimed attempt must install a body");
+        }
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            panic!("unreadable bookkeeping must not stop the turn: {reason}");
+        }
+        other => panic!("inspect failure must not divert the compact: {other:?}"),
+    }
+}
+
+/// R5 (CX-S2): a writer claim owned by another attempt id is a stale row from
+/// a dead process — Codex is a single writer per thread. The arm re-probes once
+/// and then reclaims; it never holds the session hostage to the dead owner.
+#[tokio::test]
+#[serial]
+async fn mid_turn_stale_writer_claim_is_reclaimed_not_blocked() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    // Crash the first attempt mid-install so it leaves a pending boundary.
+    slot.set_mid_turn_test_hooks(Some(codex_lhc_host::MidTurnTestHooks {
+        fail_install_before_write: true,
+        ..Default::default()
+    }));
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 12).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let crashed = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "conflict-boundary-owner",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("crash arm");
+    assert!(
+        !matches!(crashed, LhcCompactAttempt::Unavailable { .. }),
+        "crash arm must not fall open to native: {crashed:?}"
+    );
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+    // A different attempt id now holds the writer row: pending boundary owner
+    // != claim owner is exactly `WriterClaim::Conflict`.
+    codex_lhc_host::seed_mid_turn_writer_claim_for_tests(
+        &thread_id,
+        root_path.as_deref(),
+        "dead-process-attempt",
+    )
+    .expect("seed foreign writer claim");
+
+    slot.set_mid_turn_test_hooks(None);
+    let after_conflict = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "reclaiming-attempt",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("reclaim arm");
+
+    // The host contributes no stop of its own: it re-probed, reclaimed the
+    // durable owner identity, and handed the seam to the certified runtime.
+    // Durable rows that name two different attempts are self-inconsistent stale
+    // state; the runtime's own CAS refusal there is S8/S12 (CX-S5), not a host
+    // gate this story owns.
+    match after_conflict {
+        LhcCompactAttempt::Installed { .. }
+        | LhcCompactAttempt::MidTurnSkipped { .. }
+        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
+        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+            assert!(
+                !reason.contains("owned by another attempt")
+                    && !reason.contains("refuse without steal"),
+                "a stale claim must be reclaimed, not treated as a live owner: {reason}"
+            );
+            assert!(
+                reason.starts_with("compact_continuation"),
+                "any residual stop must come from the certified runtime, not the host: {reason}"
+            );
+        }
+        other => panic!("stale claim must stay on a MidTurn outcome: {other:?}"),
+    }
 }
 
 /// B3: incomplete model response must skip MidTurn with no mutation.

@@ -498,6 +498,27 @@ pub async fn inspect_compact_continuation_writer_claim(
     }
 }
 
+/// R4/R5 (CX-S2): name the attempt that holds the durable LHC writer row.
+///
+/// A held row is the id a reclaim must re-enter with — the certified runtime
+/// admits the same attempt and refuses any other. Codex writes one thread from
+/// one process, so a row naming a different attempt is a crashed predecessor,
+/// not a live competitor. `None` when the row is absent, foreign-kind, or
+/// unreadable: the caller proceeds fresh rather than stopping.
+pub async fn inspect_compact_continuation_writer_owner(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Option<String> {
+    let claim = inspect_compact_continuation_writer_claim(thread_id, root)
+        .await
+        .ok()?;
+    if claim.claim == lhc::compact_continuation::WriterClaimKind::Lhc {
+        claim.attempt_id
+    } else {
+        None
+    }
+}
+
 /// Durable recovery identity for the next MidTurn entry.
 ///
 /// When a pending/failed_repairable boundary or held LHC writer claim exists,

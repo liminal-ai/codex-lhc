@@ -53,7 +53,6 @@ use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::produce_lhc_compact_with_provenance_and_percentages;
 use codex_lhc_host::read_materialize_surfaces;
 use codex_lhc_host::resolve_mid_turn_recovery_identity;
-use codex_lhc_host::rollback_rollout_after_failed_reopen;
 use codex_lhc_host::run_mid_turn_compact_continuation;
 use codex_lhc_host::token_usage_to_provider_usage_authority;
 use codex_lhc_host::work_continuation_for_mid_turn;
@@ -720,41 +719,81 @@ async fn try_run_mid_turn_compact_continuation(
     };
 
     // B1: inspect durable pending boundary / writer claim before a fresh entry.
-    // Same-attempt re-entry is the only recovery protocol — never invent a
-    // lease/expiry or clear a foreign owner. SDK inspection futures are !Send
-    // — hop to a dedicated thread (same pattern as the MidTurn worker).
+    // Same-attempt re-entry is the preferred recovery protocol; a stale claim
+    // from a dead process is reclaimed below (R5) rather than treated as a live
+    // owner. SDK inspection futures are !Send — hop to a dedicated thread (same
+    // pattern as the MidTurn worker).
     let thread_id = handle.thread_id().to_string();
     let root = handle.root().map(std::path::Path::to_path_buf);
+    // Attempt id a reclaim must re-enter with when durable bookkeeping is
+    // unreadable but a writer row still names its (dead) owner.
+    let mut reclaim_attempt_id: Option<String> = None;
     let recovery = match inspect_mid_turn_recovery_on_thread(&thread_id, root.clone()).await {
         Ok(r) => r,
         Err(err) => {
-            // Inspection failure must not clear durable state. Proceeding fresh
-            // is safe only when there is no held owner (runtime CAS refuses
-            // steal). When claim-only identity cannot be loaded, the resolver
-            // returns Err — do not re-enter with a live seam that permanent-
-            // wedges; surface as blocked without mutation.
-            if err.contains("claim-only") || err.contains("attempt intent") {
-                warn!(%err, "LHC MidTurn recovery identity inspect failed; refuse without clear");
-                return Ok(LhcCompactAttempt::MidTurnBlocked {
-                    reason: format!("durable recovery identity inspect failed: {err}"),
-                    next_provider_request_allowed: false,
-                });
+            // R4 (CX-S2): a bookkeeping read failure — a corrupt or partially
+            // written durable row — is not a reason to strand the turn. The
+            // inspect is how the attempt would *prefer* to resume; when it
+            // cannot be read the attempt proceeds anyway and the runtime CAS is
+            // what prevents a double write. Inspection still never clears
+            // durable state.
+            warn!(
+                %err,
+                "LHC MidTurn durable recovery inspect failed; proceeding without stored identity (runtime CAS guards double writes)"
+            );
+            reclaim_attempt_id = writer_claim_owner_on_thread(&thread_id, root.clone()).await;
+            if let Some(owner) = reclaim_attempt_id.as_deref() {
+                warn!(
+                    owner_attempt = %owner,
+                    "LHC MidTurn reclaim receipt: unreadable recovery state still names a writer owner; \
+                     re-entering with that attempt id rather than stopping"
+                );
             }
-            warn!(%err, "LHC MidTurn durable inspection failed; proceeding with fresh attempt");
             None
         }
     };
 
-    let (attempt_id, writer_claim, stored_operation_identity) = if let Some(rec) = recovery {
-        if matches!(rec.writer_claim, WriterClaim::Conflict) {
-            return Ok(LhcCompactAttempt::MidTurnBlocked {
-                reason: format!(
-                    "durable compact-continuation state owned by another attempt ({}); refuse without steal",
-                    rec.attempt_id
-                ),
-                next_provider_request_allowed: false,
-            });
+    // R5 (CX-S2): a durable writer claim owned by another attempt id is a stale
+    // row, not a live competitor. Codex compacts a thread from one process, so
+    // the "other" owner is a crashed prior attempt; leaving it authoritative
+    // strands the session forever. Re-probe once (the only genuinely racy case
+    // is an inspect that observed a claim mid-write), then reclaim.
+    let recovery = match recovery {
+        Some(rec) if matches!(rec.writer_claim, WriterClaim::Conflict) => {
+            let reprobe = inspect_mid_turn_recovery_on_thread(&thread_id, root.clone())
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(%err, "LHC MidTurn writer-claim re-probe failed; reclaiming on the first observation");
+                    None
+                });
+            match reprobe {
+                Some(fresh) if !matches!(fresh.writer_claim, WriterClaim::Conflict) => Some(fresh),
+                other => {
+                    let rec = other.unwrap_or(rec);
+                    // Reclaim through the protocol the runtime accepts: re-enter
+                    // as the durable owner with the claim reported as ours. A
+                    // durable boundary and writer row that name different
+                    // attempts is self-inconsistent stale state; the runtime's
+                    // own CAS has the last word there (S8/S12, CX-S5). The host
+                    // does not add a stop of its own.
+                    warn!(
+                        owner_attempt = %rec.attempt_id,
+                        pending_boundary = rec.pending_boundary,
+                        claim_only = rec.claim_only,
+                        "LHC MidTurn reclaim receipt: durable writer claim survived re-probe; \
+                         prior owner is a dead process (single-writer host), reclaiming and proceeding"
+                    );
+                    Some(codex_lhc_host::MidTurnRecoveryIdentity {
+                        writer_claim: WriterClaim::Lhc,
+                        ..rec
+                    })
+                }
+            }
         }
+        other => other,
+    };
+
+    let (attempt_id, writer_claim, stored_operation_identity) = if let Some(rec) = recovery {
         info!(
             owner_attempt = %rec.attempt_id,
             pending_boundary = rec.pending_boundary,
@@ -779,6 +818,9 @@ async fn try_run_mid_turn_compact_continuation(
             };
         }
         (rec.attempt_id, rec.writer_claim, rec.stored_identity)
+    } else if let Some(owner) = reclaim_attempt_id {
+        // R4 (CX-S2): unreadable recovery state, live writer row — reclaim it.
+        (owner, WriterClaim::Lhc, None)
     } else {
         (fresh_attempt_id, WriterClaim::None, None)
     };
@@ -890,12 +932,17 @@ async fn try_run_mid_turn_compact_continuation(
         }
     };
 
-    // Host apply suppression if the turn cancelled during the critical section.
+    // R6 (CX-S2): cancellation during the critical section no longer suppresses
+    // the host apply. The SDK may have installed a view already; skipping the
+    // host rewrite would leave a split state for the next seam to repair. If
+    // the turn is really ending the rewrite is harmless; if this is a
+    // cancellation race, the session is better off on the smaller body.
     if cancellation_token.is_cancelled() {
-        return Ok(LhcCompactAttempt::MidTurnBlocked {
-            reason: "turn cancelled during MidTurn compact-continuation critical section; host apply suppressed".into(),
-            next_provider_request_allowed: false,
-        });
+        warn!(
+            attempt_id = %attempt_id,
+            "turn cancelled during MidTurn compact-continuation critical section; \
+             applying the installed view anyway (no split state)"
+        );
     }
 
     // R1/R7 (CX-S1): the post-worker input-epoch recheck is gone. Input that
@@ -953,6 +1000,11 @@ async fn try_run_mid_turn_compact_continuation(
                 });
             }
         };
+        // R6 (CX-S2): the SDK has already installed a serving view, so the host
+        // apply is no longer cancellable — a suppressed rewrite here is exactly
+        // the split state cancellation was supposed to avoid. Install runs
+        // under a token that is never cancelled.
+        let apply_token = CancellationToken::new();
         let install = install_lhc_compact_rewrite(
             sess,
             turn_context,
@@ -964,7 +1016,7 @@ async fn try_run_mid_turn_compact_continuation(
             reference_context_item,
             /*manual*/ false,
             host_validation_spec,
-            cancellation_token,
+            &apply_token,
         )
         .await?;
         match install {
@@ -1056,6 +1108,139 @@ async fn record_host_validation_on_thread(
         Ok(result) => result,
         Err(_) => Err("host validation record thread dropped".into()),
     }
+}
+
+/// R12 (CX-S2): write-behind receipt for a rollout whose append recorder could
+/// not reopen onto the freshly rewritten inode.
+///
+/// The compacted rollout is already durable and stays authoritative. This
+/// records what the next open needs to reconcile appends that will not land in
+/// it: the compacted rollout's identity/hash, the recorder frontier at failure,
+/// and the canonical LHC capture frontier/event order (capture can keep
+/// advancing while this process lives, even with a dead recorder handle).
+///
+/// Every failure in here is swallowed: a receipt that cannot be written costs
+/// the next open its accounting, never the compact.
+async fn persist_reopen_failure_receipt(
+    path: &std::path::Path,
+    thread_id: &str,
+    root: Option<PathBuf>,
+    recorder_frontier_items: u64,
+    reopen_error: &str,
+) {
+    let compacted_rollout = match codex_lhc_host::compacted_rollout_identity(path) {
+        Ok(identity) => identity,
+        Err(err) => {
+            warn!(
+                %err,
+                path = %path.display(),
+                "LHC reopen-failure receipt: compacted rollout identity unreadable; \
+                 recording the receipt without it"
+            );
+            codex_lhc_host::CompactedRolloutIdentity {
+                sha256: String::new(),
+                bytes: 0,
+                items: recorder_frontier_items,
+            }
+        }
+    };
+    let capture_frontier = capture_frontier_on_thread(thread_id, root).await;
+    if capture_frontier.is_none() {
+        warn!(
+            thread_id,
+            "LHC reopen-failure receipt: canonical capture frontier unavailable; \
+             next open falls back to ordinary LHC-view reconstruction"
+        );
+    }
+    let receipt = codex_lhc_host::RolloutReopenFailureReceipt {
+        schema: codex_lhc_host::ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
+        written_at: chrono::Utc::now().to_rfc3339(),
+        thread_id: thread_id.to_string(),
+        rollout_path: path.display().to_string(),
+        compacted_rollout,
+        recorder_frontier_items,
+        capture_frontier,
+        reopen_error: reopen_error.to_string(),
+    };
+    match codex_lhc_host::write_rollout_reopen_failure_receipt(path, &receipt) {
+        Ok(()) => info!(
+            path = %path.display(),
+            recorder_frontier_items,
+            "LHC reopen-failure receipt persisted; compacted rollout remains authoritative"
+        ),
+        Err(err) => warn!(
+            %err,
+            path = %path.display(),
+            "LHC reopen-failure receipt write failed; compact stands (receipts observe, never govern)"
+        ),
+    }
+}
+
+/// Read the canonical LHC capture frontier on a dedicated thread (SDK futures
+/// are `!Send`). `None` whenever the archive cannot be read.
+async fn capture_frontier_on_thread(
+    thread_id: &str,
+    root: Option<PathBuf>,
+) -> Option<codex_lhc_host::CaptureFrontier> {
+    let tid = thread_id.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawn = std::thread::Builder::new()
+        .name(format!("lhc-capture-frontier-{tid}"))
+        .spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                rt.block_on(codex_lhc_host::read_capture_frontier(&tid, root.as_deref()))
+            }))
+            .unwrap_or(None);
+            let _ = tx.send(out);
+        });
+    let join = match spawn {
+        Ok(join) => join,
+        Err(err) => {
+            warn!(%err, "spawn lhc capture-frontier thread failed");
+            return None;
+        }
+    };
+    let frontier = rx.await.ok().flatten();
+    let _ = tokio::task::spawn_blocking(move || join.join()).await;
+    frontier
+}
+
+/// Name the attempt holding the durable LHC writer row, on a dedicated thread
+/// (SDK inspection futures are `!Send`). `None` on any failure — a reclaim
+/// probe never stops a compact.
+async fn writer_claim_owner_on_thread(thread_id: &str, root: Option<PathBuf>) -> Option<String> {
+    let tid = thread_id.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawn = std::thread::Builder::new()
+        .name(format!("lhc-midturn-claim-{tid}"))
+        .spawn(move || {
+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?;
+                rt.block_on(codex_lhc_host::inspect_compact_continuation_writer_owner(
+                    &tid,
+                    root.as_deref(),
+                ))
+            }))
+            .unwrap_or(None);
+            let _ = tx.send(out);
+        });
+    let join = match spawn {
+        Ok(join) => join,
+        Err(err) => {
+            warn!(%err, "spawn lhc-midturn writer-claim probe thread failed");
+            return None;
+        }
+    };
+    let owner = rx.await.ok().flatten();
+    let _ = tokio::task::spawn_blocking(move || join.join()).await;
+    owner
 }
 
 /// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
@@ -1160,14 +1345,16 @@ async fn run_mid_turn_on_thread(
         }
     }
 
+    // R6 (CX-S2): the worker has finished and may have installed a view. A turn
+    // that cancelled while it ran does not un-install that view, so its result
+    // is returned and the caller applies it. Suppressing here is what left the
+    // split state the next seam had to repair.
     match worker_out {
         Ok(r) => {
             if turn_cancel.is_cancelled() {
-                // Worker finished (and may have mutated LHC SQLite). Caller
-                // must suppress host rewrite / next-request apply.
-                return Err(
-                    "lhc-midturn cancelled after critical section; host apply must be suppressed"
-                        .into(),
+                warn!(
+                    "lhc-midturn turn cancelled during the critical section; returning the \
+                     worker outcome so the installed view is applied"
                 );
             }
             r
@@ -1420,15 +1607,20 @@ async fn install_lhc_compact_rewrite(
         }
     };
 
-    // Lookup error is a hard failure (not in-memory-only success). Ok(None) is
-    // the intentional ephemeral / non-persistent session contract.
+    // R18 (CX-S2): a rollout path lookup failure degrades to an in-memory-only
+    // install instead of failing the compact. Ok(None) is the intentional
+    // ephemeral / non-persistent session contract and takes the same path. The
+    // durable source for next-open recovery is the installed LHC thread view
+    // plus the captured canonical tail; reconciliation rewrites the file when a
+    // path is available again.
     let rollout_path = match sess.current_rollout_path().await {
         Ok(p) => p,
         Err(err) => {
-            error!(%err, "current_rollout_path failed; hard stop (no in-memory-only install)");
-            return Ok(failed_attempt(format!(
-                "current_rollout_path failed: {err}"
-            )));
+            warn!(
+                %err,
+                "current_rollout_path failed; installing in memory only (LHC thread view stays the durable source)"
+            );
+            None
         }
     };
 
@@ -1686,8 +1878,8 @@ async fn install_lhc_compact_rewrite(
 
     // Rewrite the rollout file (replaces append of Compacted). Failure leaves
     // the old file authoritative and does not commit the planned window.
-    // Durable install is required when a live path exists — no in-memory-only
-    // install that would desync resume. NO append fallback / native Compacted.
+    // NO append fallback / native Compacted. When no path is available the
+    // install is in-memory only (R18) and reconciliation rewrites at next open.
     if let Some(path) = rollout_path.as_ref() {
         if let Err(err) = sess.flush_rollout().await {
             error!(
@@ -1698,9 +1890,7 @@ async fn install_lhc_compact_rewrite(
         }
         match atomic_rewrite_rollout(path, &materialize_result.items) {
             Ok(()) => {
-                // Reopen the append handle onto the new inode. Orphan-inode
-                // reopen is not soft bookkeeping — retry once, then hard-fail
-                // without claiming a healthy Installed outcome.
+                // Reopen the append handle onto the new inode (retry once).
                 if let Some(live_thread) = sess.live_thread() {
                     let reopen = live_thread.reopen_rollout_after_rewrite().await;
                     let reopen = match reopen {
@@ -1715,28 +1905,27 @@ async fn install_lhc_compact_rewrite(
                         }
                     };
                     if let Err(err) = reopen {
+                        // R12 (CX-S2): the compacted rollout was written and
+                        // fsynced — it stands. Restoring the oversized prior
+                        // generation would throw away a completed compact to
+                        // protect an append handle. Instead record what the
+                        // next open needs to reconcile the appends that will
+                        // not land in this file: which rollout is live, how far
+                        // the recorder got, and where canonical LHC capture is.
                         error!(
                             %err,
                             path = %path.display(),
                             "LHC recorder reopen after rewrite failed after retry; \
-                             restoring prior rollout generation"
+                             compacted rollout stands, later appends may be lost to the orphan inode"
                         );
-                        return match rollback_rollout_after_failed_reopen(path) {
-                            Ok(()) => Ok(failed_attempt(format!(
-                                "recorder reopen after rewrite failed; prior generation restored: {err}"
-                            ))),
-                            Err(rollback_err) => {
-                                error!(
-                                    %rollback_err,
-                                    path = %path.display(),
-                                    "LHC durability unknown: recorder reopen and rollout rollback both failed"
-                                );
-                                Ok(failed_attempt(format!(
-                                    "durability unknown: recorder reopen failed ({err}); \
-                                     prior-generation rollback failed ({rollback_err})"
-                                )))
-                            }
-                        };
+                        persist_reopen_failure_receipt(
+                            path,
+                            &thread_id,
+                            root.clone(),
+                            materialize_result.items.len() as u64,
+                            &err.to_string(),
+                        )
+                        .await;
                     }
                 }
                 info!(
@@ -1774,15 +1963,21 @@ async fn install_lhc_compact_rewrite(
         .await;
     sess.recompute_token_usage(turn_context).await;
 
+    // R13 (CX-S2): law-1 (host history == materialized bands+tail) is checked as
+    // an observation, not a gate. The install already happened and the session
+    // already holds the new body; a mismatch here is a bug in
+    // materialize/install, and aborting the turn after the fact strands a
+    // session that just successfully compacted. Log it loudly and continue.
     let installed = sess.clone_history().await;
     let installed_items = installed.raw_items().cloned().collect::<Vec<_>>();
     if !response_items_structurally_equal(&installed_items, &expected_body) {
-        return Err(CodexErr::UnsupportedOperation(format!(
-            "LHC compact law-1 violation: host history drifted from materialized \
-             bands+tail (host={}, body={})",
-            installed_items.len(),
-            expected_body.len()
-        )));
+        error!(
+            manual,
+            host_items = installed_items.len(),
+            body_items = expected_body.len(),
+            "LHC compact law-1 mismatch after install: host history drifted from \
+             materialized bands+tail; history stays installed (report as a bug)"
+        );
     }
 
     // Validated history is installed. Later marker/provenance bookkeeping

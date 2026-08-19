@@ -8,12 +8,17 @@
 //! behavior). Loud `info!` logs name which state triggered a rewrite.
 
 use std::path::Path;
+use std::path::PathBuf;
 
 use codex_history::CompactedItem;
 use codex_history::RolloutItem;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use serde::Deserialize;
+use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use tracing::info;
 use tracing::warn;
 
@@ -171,6 +176,143 @@ pub enum ReconcileOutcome {
         trigger: RolloutReconcileTrigger,
         items: usize,
     },
+}
+
+/// R12 (CX-S2): filename suffix of the reopen-failure receipt sidecar.
+pub const ROLLOUT_REOPEN_RECEIPT_SUFFIX: &str = ".reopen-failure.json";
+
+/// Sidecar path holding the reopen-failure receipt for `rollout_path`.
+pub fn rollout_reopen_receipt_path(rollout_path: &Path) -> PathBuf {
+    let mut receipt = rollout_path.as_os_str().to_os_string();
+    receipt.push(ROLLOUT_REOPEN_RECEIPT_SUFFIX);
+    PathBuf::from(receipt)
+}
+
+/// Canonical LHC capture frontier at a point in time: the archive's newest
+/// event order plus the number of captured events behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureFrontier {
+    /// Newest `event_order` in the LHC archive (canonical event ordering).
+    pub last_event_order: i64,
+    /// Number of captured events at that frontier.
+    pub event_count: u64,
+}
+
+/// Identity of a compacted rollout generation: content hash plus size, so a
+/// later open can tell whether the file it finds is the one the receipt
+/// describes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactedRolloutIdentity {
+    /// Hex sha256 over the rewritten rollout file's bytes.
+    pub sha256: String,
+    pub bytes: u64,
+    /// Parseable rollout records in the file.
+    pub items: u64,
+}
+
+/// R12 (CX-S2): durable record of a rollout whose append recorder could not
+/// reopen onto the newly installed inode.
+///
+/// The compacted rollout was fsynced and stays authoritative — this receipt is
+/// **write-behind diagnostics**, never authority. It exists so the next open
+/// (CX-S4) can compare the compacted-rollout frontier against the canonical
+/// LHC capture frontier and replay only the suffix that is provably present in
+/// LHC beyond the rollout. Nothing here may veto a compact, and a receipt that
+/// cannot be written only costs the next open its accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RolloutReopenFailureReceipt {
+    /// Schema tag so a future shape change is detectable, not misread.
+    pub schema: String,
+    pub written_at: String,
+    pub thread_id: String,
+    pub rollout_path: String,
+    /// Compacted rollout the recorder failed to reopen onto.
+    pub compacted_rollout: CompactedRolloutIdentity,
+    /// Recorder append frontier at failure: records durably in the compacted
+    /// rollout when appends stopped landing in it.
+    pub recorder_frontier_items: u64,
+    /// Canonical LHC capture frontier at failure (`None` when the archive
+    /// could not be read — the receipt is still worth writing).
+    pub capture_frontier: Option<CaptureFrontier>,
+    /// Reopen error text, for operator diagnosis only.
+    pub reopen_error: String,
+}
+
+/// Current schema tag written into [`RolloutReopenFailureReceipt::schema`].
+pub const ROLLOUT_REOPEN_RECEIPT_SCHEMA: &str = "lhc.rollout_reopen_failure.v1";
+
+/// Hash + measure a rewritten rollout file for [`CompactedRolloutIdentity`].
+pub fn compacted_rollout_identity(
+    rollout_path: &Path,
+) -> std::io::Result<CompactedRolloutIdentity> {
+    let bytes = std::fs::read(rollout_path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let items = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .count() as u64;
+    Ok(CompactedRolloutIdentity {
+        sha256: format!("{:x}", hasher.finalize()),
+        bytes: bytes.len() as u64,
+        items,
+    })
+}
+
+/// Read the canonical LHC capture frontier (newest event order + count).
+///
+/// Returns `None` when the archive is unavailable — the caller records the
+/// receipt without it rather than dropping the receipt.
+pub async fn read_capture_frontier(
+    thread_id: &str,
+    root: Option<&Path>,
+) -> Option<CaptureFrontier> {
+    let root_buf = root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(crate::gating::lhc_root);
+    if !crate::session::thread_file_path(&root_buf, thread_id).exists() {
+        return None;
+    }
+    let callbacks = lhc_inference_callbacks(false).ok()?;
+    let (session, _) =
+        LhcSession::open_with_inference(thread_id, None, Some(root_buf.as_path()), callbacks)
+            .await?;
+    let events = session.list_events().await.ok();
+    session.close().await;
+    let events = events?;
+    Some(CaptureFrontier {
+        last_event_order: events
+            .iter()
+            .map(lhc::intake_stream::EventRecord::event_order)
+            .max()
+            .unwrap_or(0),
+        event_count: events.len() as u64,
+    })
+}
+
+/// Persist a reopen-failure receipt beside `rollout_path`.
+///
+/// Write-behind: the caller warns on failure and keeps the compacted rollout.
+pub fn write_rollout_reopen_failure_receipt(
+    rollout_path: &Path,
+    receipt: &RolloutReopenFailureReceipt,
+) -> std::io::Result<()> {
+    let path = rollout_reopen_receipt_path(rollout_path);
+    let json = serde_json::to_vec_pretty(receipt)
+        .map_err(|e| std::io::Error::other(format!("serialize reopen receipt: {e}")))?;
+    std::fs::write(&path, json)
+}
+
+/// Read a reopen-failure receipt written beside `rollout_path`, if any.
+///
+/// Unreadable / unparseable receipts read as absent: the receipt informs the
+/// next open, it never gates it.
+pub fn read_rollout_reopen_failure_receipt(
+    rollout_path: &Path,
+) -> Option<RolloutReopenFailureReceipt> {
+    let path = rollout_reopen_receipt_path(rollout_path);
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Read the thread's latest compact point from the archive (fail-open → `None`).
