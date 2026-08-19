@@ -13,7 +13,7 @@ use codex_protocol::protocol::TokenUsage;
 use lhc::compact_continuation::CompactContinuationHostFacts;
 use lhc::compact_continuation::CompactContinuationRunResult;
 use lhc::compact_continuation::HostCompactOpts;
-use lhc::compact_continuation::run_compact_continuation;
+
 use lhc::shared_tech::compact_continuation::CompactContinuationHostCapability;
 use lhc::shared_tech::compact_continuation::CompactContinuationPolicy;
 use lhc::shared_tech::compact_continuation::CompactContinuationSeam;
@@ -418,6 +418,7 @@ pub fn build_host_facts(req: &MidTurnCompactContinuationRequest) -> CompactConti
                     .safe_runway_threshold_source
                     .clone()
                     .filter(|s| !s.is_empty()),
+                compact_retry_budget: None,
             },
             COMPACT_CONTINUATION_ACTOR.into(),
             HARNESS.into(),
@@ -846,13 +847,37 @@ pub async fn run_mid_turn_compact_continuation(
     let facts = build_host_facts(&req);
     let ref_ = ThreadRef::file_path(path.to_string_lossy().into_owned());
 
+    // R23-S8: claim in-process ownership of this thread for the attempt and
+    // hand the SDK the host authority for stale-row reclaim. If another live
+    // attempt in this process owns the thread, this attempt is the loser — the
+    // SDK sees a live owner and continues the current request; it never
+    // reclaims and never strands. The guard releases on drop either way.
+    // Guard held for the whole run; releases on scope exit in every path.
+    let _ownership_guard =
+        crate::session::CompactWriterOwnership::claim(&req.thread_id, &req.attempt_id);
+    fn ownership_check() -> lhc::compact_continuation::CompactContinuationWriterOwnershipCheck {
+        std::sync::Arc::new(|query| {
+            Ok(crate::session::live_compact_writer_owner(
+                &query.thread_id,
+                &query.attempt_id,
+            ))
+        })
+    }
+
     // Production path: public certified entry with no test hooks.
     // Fault injection routes only when `feature = "test-util"` is enabled
     // (pulls `lhc/test-util`). Without that feature, any non-None hooks are
     // ignored so release builds cannot reach the fault path.
     #[cfg(feature = "test-util")]
     let op = match &req.test_hooks {
-        None => run_compact_continuation(ref_, facts).await,
+        None => {
+            lhc::compact_continuation::run_compact_continuation_with_ownership(
+                ref_,
+                facts,
+                Some(ownership_check()),
+            )
+            .await
+        }
         Some(hooks) => {
             use lhc::compact_continuation::test_support::CompactContinuationTestHooks;
             use lhc::compact_continuation::test_support::run_compact_continuation_for_tests;
@@ -873,7 +898,12 @@ pub async fn run_mid_turn_compact_continuation(
             req.test_hooks.is_none(),
             "MidTurn test_hooks set without feature = \"test-util\"; ignored"
         );
-        run_compact_continuation(ref_, facts).await
+        lhc::compact_continuation::run_compact_continuation_with_ownership(
+            ref_,
+            facts,
+            Some(ownership_check()),
+        )
+        .await
     };
     match op {
         OpResult::Ok { value } => {
@@ -1322,5 +1352,55 @@ mod tests {
             work_continuation_for_mid_turn(&[], &[], /*total_needs_follow_up*/ false,),
             WorkContinuation::None
         );
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use crate::session::CompactWriterOwnership;
+    use crate::session::live_compact_writer_owner;
+
+    /// R23-S8: two attempts on one LHC thread — one owner; the loser sees a
+    /// live owner (never steals, never strands); release frees the thread;
+    /// re-claim under the same attempt id is idempotent.
+    #[test]
+    fn one_thread_one_owner_loser_sees_live_owner() {
+        let tid = "ownership-test-thread-a";
+        let winner = CompactWriterOwnership::claim(tid, "attempt-1").expect("first claim wins");
+
+        // Second attempt on the same thread loses.
+        assert!(CompactWriterOwnership::claim(tid, "attempt-2").is_none());
+        // The SDK-side authority question: live owner other than me?
+        assert!(live_compact_writer_owner(tid, "attempt-2"));
+        // The owner itself is not "someone else".
+        assert!(!live_compact_writer_owner(tid, "attempt-1"));
+
+        // Same attempt re-claims idempotently.
+        let again = CompactWriterOwnership::claim(tid, "attempt-1");
+        assert!(again.is_some());
+        drop(again);
+        drop(winner);
+
+        // Released: no live owner; a fresh attempt claims.
+        assert!(!live_compact_writer_owner(tid, "attempt-2"));
+        let fresh = CompactWriterOwnership::claim(tid, "attempt-2");
+        assert!(fresh.is_some());
+    }
+
+    /// Threads are independent keys — ownership of one thread never blocks
+    /// another.
+    #[test]
+    fn distinct_threads_are_independent() {
+        let a = CompactWriterOwnership::claim("ownership-test-thread-b", "attempt-1");
+        let b = CompactWriterOwnership::claim("ownership-test-thread-c", "attempt-2");
+        assert!(a.is_some() && b.is_some());
+        assert!(!live_compact_writer_owner(
+            "ownership-test-thread-b",
+            "attempt-1"
+        ));
+        assert!(live_compact_writer_owner(
+            "ownership-test-thread-b",
+            "attempt-2"
+        ));
     }
 }

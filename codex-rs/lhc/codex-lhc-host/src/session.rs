@@ -33,6 +33,61 @@ fn registry_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+/// Process-global compact-writer ownership registry, keyed by LHC `thread_id`.
+///
+/// This is the host authority the SDK consults before reclaiming a stale
+/// `native`/`conflict` writer row (R23-S8). Two Codex sessions or aliases can
+/// map to one LHC thread, so the key must be the canonical thread id — a
+/// per-session flag repeats the session-vs-thread locking bug. The registry
+/// lives host-side by contract; the SDK only consumes the answer.
+fn compact_writer_owners() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static OWNERS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        OnceLock::new();
+    OWNERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Live in-process compact-writer claim on one LHC thread. Dropping releases.
+///
+/// `claim` returns `None` when another live attempt in this process already
+/// owns the thread — the caller is the loser and continues its current
+/// request. Re-claiming under the same attempt id is idempotent.
+pub struct CompactWriterOwnership {
+    thread_id: String,
+    attempt_id: String,
+}
+
+impl CompactWriterOwnership {
+    pub fn claim(thread_id: &str, attempt_id: &str) -> Option<Self> {
+        let mut owners = compact_writer_owners().lock().expect("owners lock");
+        match owners.get(thread_id) {
+            Some(owner) if owner != attempt_id => None,
+            _ => {
+                owners.insert(thread_id.to_string(), attempt_id.to_string());
+                Some(Self {
+                    thread_id: thread_id.to_string(),
+                    attempt_id: attempt_id.to_string(),
+                })
+            }
+        }
+    }
+}
+
+impl Drop for CompactWriterOwnership {
+    fn drop(&mut self) {
+        let mut owners = compact_writer_owners().lock().expect("owners lock");
+        if owners.get(&self.thread_id) == Some(&self.attempt_id) {
+            owners.remove(&self.thread_id);
+        }
+    }
+}
+
+/// Host authority answer for the SDK's stale-row reclaim: is a live attempt
+/// other than `attempt_id` holding `thread_id` in this process right now?
+pub fn live_compact_writer_owner(thread_id: &str, attempt_id: &str) -> bool {
+    let owners = compact_writer_owners().lock().expect("owners lock");
+    matches!(owners.get(thread_id), Some(owner) if owner != attempt_id)
+}
+
 /// Live LHC capture session (owns the SDK instance + thread path).
 pub struct LhcSession {
     pub thread_id: String,
