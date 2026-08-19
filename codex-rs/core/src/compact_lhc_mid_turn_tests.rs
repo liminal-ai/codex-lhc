@@ -3055,7 +3055,7 @@ pub(super) fn assert_provider_sendable(body: &[ResponseItem]) {
     }
 }
 
-async fn seed_escalation_history(
+pub(super) async fn seed_escalation_history(
     session: &Session,
     tc: &crate::session::turn_context::TurnContext,
     protected_id: &str,

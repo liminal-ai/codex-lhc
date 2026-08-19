@@ -209,6 +209,10 @@ pub struct LhcCaptureSlot {
     /// successful core install (negative-path evidence). Production unset.
     #[cfg(any(test, feature = "test-util"))]
     mid_turn_test_force_body_validation_fail: std::sync::atomic::AtomicBool,
+    /// Test-only: force the R11 validation-ACK write to fail after install
+    /// (arm-level warn-and-continue evidence). Production unset.
+    #[cfg(any(test, feature = "test-util"))]
+    mid_turn_test_force_validation_ack_write_fail: std::sync::atomic::AtomicBool,
 }
 
 impl LhcCaptureSlot {
@@ -241,6 +245,10 @@ impl LhcCaptureSlot {
             mid_turn_test_safe_runway: Mutex::new(None),
             #[cfg(any(test, feature = "test-util"))]
             mid_turn_test_force_body_validation_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-util"))]
+            mid_turn_test_force_validation_ack_write_fail: std::sync::atomic::AtomicBool::new(
+                false,
+            ),
         }
     }
 
@@ -367,6 +375,21 @@ impl LhcCaptureSlot {
     #[cfg(any(test, feature = "test-util"))]
     pub fn mid_turn_test_force_body_validation_fail(&self) -> bool {
         self.mid_turn_test_force_body_validation_fail
+            .load(Ordering::SeqCst)
+    }
+
+    /// Test-only: force the R11 validation-ACK write to fail (arm-level
+    /// warn-and-continue evidence).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_mid_turn_test_force_validation_ack_write_fail(&self, fail: bool) {
+        self.mid_turn_test_force_validation_ack_write_fail
+            .store(fail, Ordering::SeqCst);
+    }
+
+    /// Test-only: read the forced ACK-write failure flag.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn mid_turn_test_force_validation_ack_write_fail(&self) -> bool {
+        self.mid_turn_test_force_validation_ack_write_fail
             .load(Ordering::SeqCst)
     }
 

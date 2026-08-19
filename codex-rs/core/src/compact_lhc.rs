@@ -1863,15 +1863,29 @@ async fn install_lhc_compact_rewrite(
         // the body being served, degradations and all. Recording `failed`
         // would gate rollout regeneration for a session that did compact —
         // exactly the bookkeeping-as-authority pattern R10/R11 remove.
-        if let Err(err) = record_host_validation_on_thread(
+        #[cfg(any(test, feature = "test-util"))]
+        let ack_write = if slot.mid_turn_test_force_validation_ack_write_fail() {
+            Err("validation ack write failed (test injection)".to_string())
+        } else {
+            record_host_validation_on_thread(
+                thread_id.clone(),
+                root.clone(),
+                spec.attempt_id.clone(),
+                /*ok*/ true,
+                ack_reason,
+            )
+            .await
+        };
+        #[cfg(not(any(test, feature = "test-util")))]
+        let ack_write = record_host_validation_on_thread(
             thread_id.clone(),
             root.clone(),
             spec.attempt_id.clone(),
             /*ok*/ true,
             ack_reason,
         )
-        .await
-        {
+        .await;
+        if let Err(err) = ack_write {
             warn!(
                 %err,
                 attempt_id = %spec.attempt_id,

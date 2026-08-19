@@ -684,3 +684,143 @@ async fn seed_oversized_protected_pair(
         )
         .await;
 }
+
+/// (g) R11 arm-level: the validation-ACK write fails and the arm warns and
+/// continues. The protected-escalation compact/install stands — no rollback,
+/// no refusal — the session serves the compacted body, and the durable state
+/// stays truthful and consistent: the receipt residual remains `awaiting`, no
+/// fabricated `ok` row exists, and the LIM-67 reload gate conservatively keeps
+/// the rollout on its prior generation until the attempt is resolved or a
+/// later compact supersedes it. Bookkeeping observes; it never governs the
+/// session's next request.
+#[tokio::test]
+#[serial]
+async fn canary_validation_ack_write_failure_warns_and_continues() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    slot.set_mid_turn_test_upper_trigger(Some(100));
+    slot.set_mid_turn_test_safe_runway(Some(5_000));
+    slot.set_mid_turn_test_compact(Some(codex_lhc_host::test_compact_opts(400.0)));
+    // The one fault: the R11 ACK write fails at the real write site.
+    slot.set_mid_turn_test_force_validation_ack_write_fail(true);
+    let handle = wait_for_handle(&slot, CANARY_BOUND).await.expect("handle");
+    seed_turns(&session, &tc, 2).await;
+    let protected_id = "call-prot-ackfail";
+    super::mid_turn_tests::seed_escalation_history(&session, &tc, protected_id).await;
+    inject_response_usage(&session, &tc, 4_800).await;
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let epoch = decision_epoch(&sess);
+    let attempt = tokio::time::timeout(
+        CANARY_BOUND,
+        try_run_lhc_compact_arm(
+            &sess,
+            &tc,
+            InitialContextInjection::DoNotInject,
+            /*manual*/ false,
+            CompactionPhase::MidTurn,
+            Some(mid_facts(
+                "canary-ack-write-fail",
+                true,
+                epoch,
+                vec![protected_id.into()],
+                Some(sample_usage(4_800)),
+            )),
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("bounded")
+    .expect("arm");
+
+    // Compact/install continues: no rollback, no refusal.
+    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
+        panic!("ACK write failure must not stop the install, got {attempt:?}");
+    };
+    assert!(!body.is_empty(), "installed body must not be empty");
+    assert_provider_sendable(body);
+    let installed: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        crate::compact_lhc::response_items_structurally_equal(&installed, body),
+        "the session serves the compacted body despite the failed ACK write"
+    );
+
+    let thread_id = handle.thread_id().to_string();
+    let root_path = handle.root().map(std::path::Path::to_path_buf);
+
+    // Core install retained: boundary + marker survive the failed ACK write.
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, root_path.as_deref())
+            .await
+            .expect("receipts");
+    let last = receipts.last().expect("receipt");
+    let cont = last
+        .continuation_turn_id
+        .as_deref()
+        .expect("continuation turn id");
+    assert!(
+        codex_lhc_host::inspect_has_compact_continuation_marker(
+            &thread_id,
+            root_path.as_deref(),
+            cont
+        )
+        .await
+        .expect("marker"),
+        "core install (boundary + marker) is retained through the ACK-write failure"
+    );
+
+    // Truthful state, no partial/fabricated row: the durable HV row was never
+    // written ok. It is either absent or still awaiting — never Ok.
+    let hv = codex_lhc_host::inspect_mid_turn_host_validation(
+        &thread_id,
+        root_path.as_deref(),
+        "canary-ack-write-fail",
+    )
+    .await
+    .expect("hv inspect");
+    assert!(
+        !matches!(
+            hv.as_ref().map(|row| row.status),
+            Some(codex_lhc_host::HostValidationStatus::Ok)
+        ),
+        "a failed ACK write must never leave a fabricated ok row: {hv:?}"
+    );
+
+    // The LIM-67 reload gate holds the rollout on its prior generation —
+    // conservative bookkeeping about the missing ack. The durable receipt
+    // truthfully records the awaiting posture taken at install time; the
+    // in-process session above already proved compact continued regardless.
+    assert!(
+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+            .await
+            .is_some(),
+        "missing ack must keep rollout regeneration conservative until superseded"
+    );
+
+    // The state is recoverable, not wedged: once the write path works again,
+    // the ordinary host repair op records the ack and the gate clears.
+    slot.set_mid_turn_test_force_validation_ack_write_fail(false);
+    codex_lhc_host::record_mid_turn_host_validation(
+        &thread_id,
+        root_path.as_deref(),
+        "canary-ack-write-fail",
+        /*ok*/ true,
+        Some("ack retried after transient write failure".into()),
+    )
+    .await
+    .expect("ack retry");
+    assert!(
+        codex_lhc_host::host_validation_reload_block(&thread_id, root_path.as_deref())
+            .await
+            .is_none(),
+        "a recorded ack resolves the reload gate"
+    );
+}
