@@ -108,40 +108,7 @@ jobs:
           PY
 
           git fetch --tags origin || true
-          tag_json="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/v${VERSION}" 2>/dev/null || true)"
-          release_json="$(gh release view "v${VERSION}" --json tagName,targetCommitish 2>/dev/null || true)"
-          if [ "$MODE" = backfill ]; then
-            if [ -z "$tag_json" ]; then
-              echo "backfill requires existing tag v${VERSION}" >&2
-              exit 1
-            fi
-            if [ -z "$release_json" ]; then
-              echo "backfill requires existing release v${VERSION}" >&2
-              exit 1
-            fi
-            tag_sha="$(jq -r '.object.sha' <<<"$tag_json")"
-            object_type="$(jq -r '.object.type' <<<"$tag_json")"
-            if [ "$object_type" = tag ]; then
-              tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/${tag_sha}" --jq .object.sha)"
-            fi
-            release_sha="$(jq -r .targetCommitish <<<"$release_json")"
-            test "$tag_sha" = "$candidate_sha"
-            test "$release_sha" = "$candidate_sha"
-            echo "backfill: tag and release target both $candidate_sha"
-          elif [ "$MODE" = forward ]; then
-            if [ -n "$tag_json" ]; then
-              echo "forward mode forbids existing tag v${VERSION}" >&2
-              exit 1
-            fi
-            if [ -n "$release_json" ]; then
-              echo "forward mode forbids existing release v${VERSION}" >&2
-              exit 1
-            fi
-            echo "forward: no tag or release for v${VERSION}"
-          else
-            echo "mode must be forward or backfill, got: $MODE" >&2
-            exit 1
-          fi
+          scripts/lhc-release/tag_release_gate.sh "$MODE" "$VERSION" "$candidate_sha"
 
   build-windows:
     name: Build windows-x86_64
