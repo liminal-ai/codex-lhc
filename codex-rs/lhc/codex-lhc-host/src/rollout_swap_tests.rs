@@ -3,6 +3,7 @@
 use super::*;
 use crate::estimate_response_items_tokens;
 use codex_history::CompactedItem;
+use codex_history::ROLLOUT_GENERATION_ID_FIELD;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_protocol::models::ContentItem;
@@ -66,6 +67,23 @@ fn rollout_lines(path: &Path) -> Vec<RolloutLine> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("parse rollout line"))
         .collect()
+}
+
+fn rollout_generation_id(path: &Path) -> String {
+    let values = std::fs::read_to_string(path)
+        .expect("read rollout generation")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("parse rollout value"))
+        .collect::<Vec<_>>();
+    assert!(
+        values[1..]
+            .iter()
+            .all(|value| value.get(ROLLOUT_GENERATION_ID_FIELD).is_none())
+    );
+    values[0][ROLLOUT_GENERATION_ID_FIELD]
+        .as_str()
+        .expect("SessionMeta generation ID")
+        .to_string()
 }
 
 fn paginated_items(
@@ -147,6 +165,7 @@ fn root_paginated_rewrite_is_contiguous_and_repeatable() {
     );
 
     atomic_rewrite_rollout(&path, &items).expect("first rewrite");
+    let first_generation_id = rollout_generation_id(&path);
     assert_eq!(
         rollout_lines(&path)
             .iter()
@@ -156,6 +175,8 @@ fn root_paginated_rewrite_is_contiguous_and_repeatable() {
     );
 
     atomic_rewrite_rollout(&path, &items).expect("repeated rewrite");
+    let second_generation_id = rollout_generation_id(&path);
+    assert_ne!(second_generation_id, first_generation_id);
     assert_eq!(
         rollout_lines(&path)
             .iter()

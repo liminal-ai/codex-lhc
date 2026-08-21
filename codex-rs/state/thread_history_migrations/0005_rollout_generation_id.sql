@@ -1,0 +1,1 @@
+ALTER TABLE thread_history_projection_state ADD COLUMN rollout_generation_id BLOB;

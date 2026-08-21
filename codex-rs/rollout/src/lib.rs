@@ -55,6 +55,7 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
         .map(serde_json::from_value::<Option<u64>>)
         .transpose()?
         .flatten();
+    fields.remove(codex_history::ROLLOUT_GENERATION_ID_FIELD);
     let item = serde_json::from_value(Value::Object(fields))?;
 
     Ok(RolloutLine {

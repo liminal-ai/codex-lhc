@@ -375,6 +375,59 @@ INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_
 }
 
 #[tokio::test]
+async fn rollout_generation_id_migration_preserves_existing_projection_frontiers() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pre_generation_id_migrator = Migrator {
+        migrations: Cow::Owned(
+            THREAD_HISTORY_MIGRATOR
+                .migrations
+                .iter()
+                .filter(|migration| migration.version < 5)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: THREAD_HISTORY_MIGRATOR.ignore_missing,
+        locking: THREAD_HISTORY_MIGRATOR.locking,
+        table_name: THREAD_HISTORY_MIGRATOR.table_name.clone(),
+        create_schemas: THREAD_HISTORY_MIGRATOR.create_schemas.clone(),
+        no_tx: THREAD_HISTORY_MIGRATOR.no_tx,
+    };
+    let pool = sqlite
+        .open_thread_history_db(
+            &pre_generation_id_migrator,
+            /*telemetry_override*/ None,
+        )
+        .await
+        .expect("pre-generation-ID migrations should apply");
+    sqlx::query(
+        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES ('thread-1', 123, 7)",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy projection frontier should be inserted");
+
+    THREAD_HISTORY_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("generation-ID migration should apply");
+
+    let projection = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
+        "SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id FROM thread_history_projection_state WHERE thread_id = 'thread-1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("migrated projection frontier should load");
+    assert_eq!(projection, (123, 7, None));
+}
+
+#[tokio::test]
 async fn agent_job_tables_are_dropped_when_upgrading() {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)

@@ -329,6 +329,11 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
     let turns = list_active_summary_turns(&store, thread_id).await;
     assert_eq!(turns.turns.len(), 1);
     assert_eq!(turns.turns[0].items.len(), 2);
+    let projection = thread_history::projection_state(&store, thread_id)
+        .await
+        .expect("read migrated projection state")
+        .expect("migration projected rollout");
+    assert!(projection.rollout_generation_id.is_some());
 
     let bytes = fs::read(&path).expect("read first migration");
     let second = store

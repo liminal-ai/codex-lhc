@@ -157,7 +157,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 32 | `cli/Cargo.toml` | Codex-LHC product release version reported by `codex --version` | `0001-workspace-member` |
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
-| 35 | `thread-store/{Cargo.toml,src/local/thread_history.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap, including non-shrinking replacements and lifted subagent ordinals | `0007-lhc-compact-arm` |
+| 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,thread_history_migrations/0005_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals | `0007-lhc-compact-arm` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
@@ -211,6 +211,11 @@ fallback path.** In-memory history installed at compact equals
 Implementation: pure swap in `codex-lhc-host::rollout_swap`; materializer
 wiring in `core/src/compact_lhc.rs`; reopen on `RolloutRecorder` +
 `LiveThread`.
+
+Every rewrite mints a UUIDv4 generation identity and persists it as a top-level
+field on the SessionMeta rollout record. The paginated history projector stores
+that exact identity with its frontier so equal-size, equal-boundary replacements
+cannot be mistaken for append-only growth.
 
 ### The drain correction (Chunk 3, round 11)
 

@@ -1740,6 +1740,73 @@ async fn nonshrinking_replacement_rebuilds_projection_from_reset_ordinals() {
 }
 
 #[tokio::test]
+async fn equal_size_equal_boundary_replacement_rebuilds_changed_identity() {
+    const GENERATION_A: &str = "00000000-0000-4000-8000-000000000001";
+    const GENERATION_B: &str = "00000000-0000-4000-8000-000000000002";
+
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 8),
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    set_rollout_generation_id(rollout_path.as_path(), GENERATION_A);
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("project first nonce-bearing generation");
+    let dead_frontier = projection_state(&pool, thread_id).await;
+    let old_bytes = fs::read(rollout_path.as_path()).expect("read dead generation");
+    let old_boundaries = rollout_line_boundaries(&old_bytes);
+    let old_head = rollout_head_without_generation_id(&old_bytes);
+
+    rewrite_rollout_same_size(rollout_path.as_path(), "dead-turn", "live-turn");
+    rewrite_rollout_same_size(rollout_path.as_path(), GENERATION_A, GENERATION_B);
+
+    let replacement_bytes = fs::read(rollout_path.as_path()).expect("read replacement generation");
+    assert_eq!(replacement_bytes.len(), old_bytes.len());
+    assert_eq!(rollout_line_boundaries(&replacement_bytes), old_boundaries);
+    assert_eq!(
+        rollout_head_without_generation_id(&replacement_bytes),
+        old_head
+    );
+    assert_eq!(
+        i64::try_from(replacement_bytes.len()).expect("replacement length fits i64"),
+        dead_frontier.0
+    );
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("recover equal-boundary replacement");
+
+    assert_eq!(
+        projected_generation(&pool, thread_id).await,
+        (
+            vec![("live-turn".to_string(), 1, "completed".to_string())],
+            vec![("live-turn-item".to_string(), 2)],
+        )
+    );
+    assert_eq!(projection_state(&pool, thread_id).await, dead_frontier);
+}
+
+#[tokio::test]
 async fn committed_generation_reset_is_empty_and_next_pass_converges() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
@@ -2690,6 +2757,67 @@ fn replace_rollout_generation(
     }
     fs::write(rollout_path, replacement.as_bytes()).expect("replace rollout generation");
     i64::try_from(replacement.len()).expect("replacement length fits i64")
+}
+
+fn rewrite_rollout_same_size(rollout_path: &Path, from: &str, to: &str) {
+    assert_eq!(from.len(), to.len());
+    let mut bytes = fs::read(rollout_path).expect("read rollout for equal-size replacement");
+    let from = from.as_bytes();
+    let to = to.as_bytes();
+    let mut replacement_count = 0;
+    let mut search_start = 0;
+    while let Some(index) = bytes[search_start..]
+        .windows(from.len())
+        .position(|window| window == from)
+    {
+        let start = search_start + index;
+        bytes[start..start + from.len()].copy_from_slice(to);
+        replacement_count += 1;
+        search_start = start + from.len();
+    }
+    assert!(replacement_count > 0);
+    fs::write(rollout_path, bytes).expect("write equal-size replacement generation");
+}
+
+fn set_rollout_generation_id(rollout_path: &Path, rollout_generation_id: &str) {
+    let rollout = fs::read(rollout_path).expect("read rollout for generation ID");
+    let session_meta_end = rollout
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .expect("session metadata newline");
+    let mut session_meta =
+        serde_json::from_slice::<serde_json::Value>(&rollout[..session_meta_end])
+            .expect("decode session metadata record");
+    session_meta[codex_history::ROLLOUT_GENERATION_ID_FIELD] =
+        serde_json::Value::String(rollout_generation_id.to_string());
+    let mut replacement =
+        serde_json::to_vec(&session_meta).expect("encode session metadata record");
+    replacement.push(b'\n');
+    replacement.extend(&rollout[session_meta_end..]);
+    fs::write(rollout_path, replacement).expect("write rollout generation ID");
+}
+
+fn rollout_head_without_generation_id(bytes: &[u8]) -> serde_json::Value {
+    let session_meta_end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("session metadata newline");
+    let mut session_meta = serde_json::from_slice::<serde_json::Value>(&bytes[..session_meta_end])
+        .expect("decode session metadata record");
+    session_meta
+        .as_object_mut()
+        .expect("session metadata object")
+        .remove(codex_history::ROLLOUT_GENERATION_ID_FIELD);
+    session_meta
+}
+
+fn rollout_line_boundaries(bytes: &[u8]) -> Vec<usize> {
+    bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
+        .collect()
 }
 
 async fn projected_generation(

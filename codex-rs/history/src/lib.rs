@@ -4,6 +4,9 @@ mod ordinal;
 
 pub use ordinal::RolloutOrdinalState;
 
+/// Top-level SessionMeta field identifying one durable rollout rewrite generation.
+pub const ROLLOUT_GENERATION_ID_FIELD: &str = "rollout_generation_id";
+
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::ops::DerefMut;

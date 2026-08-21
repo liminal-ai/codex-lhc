@@ -35,6 +35,7 @@ use super::LocalThreadStore;
 use super::thread_history;
 use super::thread_history::ProjectedRolloutLine;
 use super::thread_history::RolloutProjectionStep;
+use super::thread_history_generation::rollout_generation_id as generation_id_from_rollout_line;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -904,6 +905,7 @@ impl LocalThreadStore {
         let mut batch = Vec::new();
         let mut batch_start = 0_u64;
         let mut offset = 0_u64;
+        let mut rollout_generation_id = None;
 
         while let Some(record) = read_rollout_record(&mut reader, &mut line_bytes).await? {
             let next_offset = offset
@@ -914,6 +916,11 @@ impl LocalThreadStore {
                 offset = next_offset;
                 continue;
             };
+            if rollout_generation_id.is_none() && matches!(&line.item, RolloutItem::SessionMeta(_))
+            {
+                let value = serde_json::from_slice(&line_bytes).map_err(migration_error)?;
+                rollout_generation_id = Some(generation_id_from_rollout_line(&value, &line_bytes)?);
+            }
             let ordinal = line
                 .ordinal
                 .ok_or_else(|| migration_error("staged rollout line is missing its ordinal"))?;
@@ -940,6 +947,7 @@ impl LocalThreadStore {
                     batch_start,
                     offset,
                     /*initial_ordinal*/ 0,
+                    rollout_generation_id,
                     std::mem::take(&mut batch),
                 )
                 .await?;
@@ -954,6 +962,7 @@ impl LocalThreadStore {
                 batch_start,
                 offset,
                 /*initial_ordinal*/ 0,
+                rollout_generation_id,
                 batch,
             )
             .await?;

@@ -15,6 +15,7 @@ mod rollout_migration;
 mod rollout_lineage;
 mod search_threads;
 mod thread_history;
+mod thread_history_generation;
 mod thread_history_materialization;
 mod thread_rollout_resolver;
 mod thread_sections;

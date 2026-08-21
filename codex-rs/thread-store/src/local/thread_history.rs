@@ -5,6 +5,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
 
 use super::LocalThreadStore;
+use super::thread_history_generation::RolloutGenerationId;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 
@@ -46,6 +47,7 @@ pub(super) enum RolloutProjectionStep {
 pub(super) struct RolloutProjectionState {
     pub next_byte_offset: u64,
     pub next_ordinal: u64,
+    pub rollout_generation_id: Option<RolloutGenerationId>,
 }
 
 pub(super) async fn projection_state(
@@ -64,9 +66,9 @@ pub(super) async fn projection_state(
     }
 
     let pool = store.thread_history_db().await?;
-    let state = sqlx::query_as::<_, (i64, i64)>(
+    let state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
         r#"
-SELECT next_rollout_byte_offset, next_rollout_ordinal
+SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
 FROM thread_history_projection_state
 WHERE thread_id = ?
         "#,
@@ -76,7 +78,7 @@ WHERE thread_id = ?
     .await
     .map_err(thread_history_error)?;
     state
-        .map(|(next_byte_offset, next_ordinal)| {
+        .map(|(next_byte_offset, next_ordinal, rollout_generation_id)| {
             Ok(RolloutProjectionState {
                 next_byte_offset: u64::try_from(next_byte_offset).map_err(|_| {
                     ThreadStoreError::Internal {
@@ -92,6 +94,17 @@ WHERE thread_id = ?
                         ),
                     }
                 })?,
+                rollout_generation_id: rollout_generation_id
+                    .map(|generation_id| {
+                        RolloutGenerationId::decode(&generation_id).ok_or_else(|| {
+                            ThreadStoreError::Internal {
+                            message: format!(
+                                "thread history projection for {thread_id} has an invalid rollout generation ID"
+                            ),
+                        }
+                        })
+                    })
+                    .transpose()?,
             })
         })
         .transpose()
@@ -108,9 +121,9 @@ pub(super) async fn reset_projection(
         .await
         .map_err(thread_history_error)?;
     let thread_id = thread_id.to_string();
-    let projection_state = sqlx::query_as::<_, (i64, i64)>(
+    let projection_state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
         r#"
-SELECT next_rollout_byte_offset, next_rollout_ordinal
+SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
 FROM thread_history_projection_state
 WHERE thread_id = ?
         "#,
@@ -122,6 +135,9 @@ WHERE thread_id = ?
     let expected_state = (
         sqlite_integer(expected_state.next_byte_offset, "rollout byte offset")?,
         sqlite_integer(expected_state.next_ordinal, "rollout ordinal")?,
+        expected_state
+            .rollout_generation_id
+            .map(RolloutGenerationId::encode),
     );
     if projection_state != Some(expected_state) {
         transaction.commit().await.map_err(thread_history_error)?;
@@ -153,6 +169,7 @@ pub(super) async fn apply_projection(
     start_offset: u64,
     next_offset: u64,
     initial_ordinal: u64,
+    rollout_generation_id: Option<RolloutGenerationId>,
     projections: Vec<RolloutProjectionStep>,
 ) -> ThreadStoreResult<()> {
     let pool = store.thread_history_db().await?;
@@ -164,9 +181,9 @@ pub(super) async fn apply_projection(
         .await
         .map_err(thread_history_error)?;
     let thread_id = thread_id.to_string();
-    let projection_state = sqlx::query_as::<_, (i64, i64)>(
+    let projection_state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
         r#"
-SELECT next_rollout_byte_offset, next_rollout_ordinal
+SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
 FROM thread_history_projection_state
 WHERE thread_id = ?
         "#,
@@ -175,8 +192,20 @@ WHERE thread_id = ?
     .fetch_optional(&mut *transaction)
     .await
     .map_err(thread_history_error)?;
-    let (expected_offset, mut next_ordinal) =
-        projection_state.unwrap_or((0, sqlite_integer(initial_ordinal, "rollout ordinal")?));
+    let rollout_generation_id = rollout_generation_id.map(RolloutGenerationId::encode);
+    let (expected_offset, mut next_ordinal) = match projection_state {
+        Some((expected_offset, next_ordinal, expected_generation_id)) => {
+            if expected_generation_id != rollout_generation_id {
+                return Err(ThreadStoreError::Internal {
+                    message: format!(
+                        "thread history projection generation for {thread_id} changed during materialization"
+                    ),
+                });
+            }
+            (expected_offset, next_ordinal)
+        }
+        None => (0, sqlite_integer(initial_ordinal, "rollout ordinal")?),
+    };
     let start_offset = sqlite_integer(start_offset, "rollout byte offset")?;
     if expected_offset != start_offset {
         return Err(ThreadStoreError::Internal {
@@ -243,16 +272,19 @@ WHERE thread_id = ?
 INSERT INTO thread_history_projection_state (
     thread_id,
     next_rollout_byte_offset,
-    next_rollout_ordinal
-) VALUES (?, ?, ?)
+    next_rollout_ordinal,
+    rollout_generation_id
+) VALUES (?, ?, ?, ?)
 ON CONFLICT(thread_id) DO UPDATE SET
     next_rollout_byte_offset = excluded.next_rollout_byte_offset,
-    next_rollout_ordinal = excluded.next_rollout_ordinal
+    next_rollout_ordinal = excluded.next_rollout_ordinal,
+    rollout_generation_id = excluded.rollout_generation_id
         "#,
     )
     .bind(thread_id.as_str())
     .bind(sqlite_integer(next_offset, "rollout byte offset")?)
     .bind(next_ordinal)
+    .bind(rollout_generation_id)
     .execute(&mut *transaction)
     .await
     .map_err(thread_history_error)?;

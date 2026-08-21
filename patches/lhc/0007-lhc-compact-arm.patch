@@ -16076,15 +16076,18 @@ index 699696289d..c96acbf0e8 100644
  async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
      skip_if_no_network!(Ok(()));
 diff --git a/codex-rs/history/src/lib.rs b/codex-rs/history/src/lib.rs
-index f95a9d994e..7498a1c7e0 100644
+index f95a9d994e..73bf0f1eec 100644
 --- a/codex-rs/history/src/lib.rs
 +++ b/codex-rs/history/src/lib.rs
-@@ -1,5 +1,9 @@
+@@ -1,5 +1,12 @@
  //! Model-history and persisted-rollout domain types.
  
 +mod ordinal;
 +
 +pub use ordinal::RolloutOrdinalState;
++
++/// Top-level SessionMeta field identifying one durable rollout rewrite generation.
++pub const ROLLOUT_GENERATION_ID_FIELD: &str = "rollout_generation_id";
 +
  use std::borrow::Borrow;
  use std::ops::Deref;
@@ -16498,6 +16501,18 @@ index 70672cde94..6b0cac4345 100644
      #[test]
      fn model_preset_preserves_availability_nux() {
          let preset = ModelPreset::from(ModelInfo {
+diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
+index 9f38cd569a..afc30c4576 100644
+--- a/codex-rs/rollout/src/lib.rs
++++ b/codex-rs/rollout/src/lib.rs
+@@ -55,6 +55,7 @@ pub fn decode_rollout_line(value: Value) -> serde_json::Result<RolloutLine> {
+         .map(serde_json::from_value::<Option<u64>>)
+         .transpose()?
+         .flatten();
++    fields.remove(codex_history::ROLLOUT_GENERATION_ID_FIELD);
+     let item = serde_json::from_value(Value::Object(fields))?;
+ 
+     Ok(RolloutLine {
 diff --git a/codex-rs/rollout/src/ordinal.rs b/codex-rs/rollout/src/ordinal.rs
 index 3f002aec8a..3c0cd9189e 100644
 --- a/codex-rs/rollout/src/ordinal.rs
@@ -16708,8 +16723,91 @@ index a69919dec5..f507202449 100644
  #[tokio::test]
  async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
      let valid_unterminated = serde_json::to_string(&RolloutLine {
+diff --git a/codex-rs/state/src/migrations.rs b/codex-rs/state/src/migrations.rs
+index 07d36588f0..3aec00d811 100644
+--- a/codex-rs/state/src/migrations.rs
++++ b/codex-rs/state/src/migrations.rs
+@@ -8,6 +8,7 @@ pub(crate) static LOGS_MIGRATOR: Migrator = sqlx::migrate!("./logs_migrations");
+ pub(crate) static GOALS_MIGRATOR: Migrator = sqlx::migrate!("./goals_migrations");
+ pub(crate) static MEMORIES_MIGRATOR: Migrator = sqlx::migrate!("./memory_migrations");
+ pub(crate) static QUEUE_MIGRATOR: Migrator = sqlx::migrate!("./queue_migrations");
++/// Includes projection frontiers and their durable rollout generation identities.
+ pub(crate) static THREAD_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./thread_history_migrations");
+ 
+ /// Allow an older Codex binary to open a database that has already been
+diff --git a/codex-rs/state/src/migrations_tests.rs b/codex-rs/state/src/migrations_tests.rs
+index fea8878d36..f3b1f2e357 100644
+--- a/codex-rs/state/src/migrations_tests.rs
++++ b/codex-rs/state/src/migrations_tests.rs
+@@ -374,6 +374,59 @@ INSERT INTO thread_items (thread_id, turn_id, item_id, rollout_ordinal, created_
+     pool.close().await;
+ }
+ 
++#[tokio::test]
++async fn rollout_generation_id_migration_preserves_existing_projection_frontiers() {
++    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
++    tokio::fs::create_dir_all(&sqlite_home)
++        .await
++        .expect("sqlite home should be created");
++    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
++        let _ = std::fs::remove_dir_all(sqlite_home);
++    });
++    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
++    let pre_generation_id_migrator = Migrator {
++        migrations: Cow::Owned(
++            THREAD_HISTORY_MIGRATOR
++                .migrations
++                .iter()
++                .filter(|migration| migration.version < 5)
++                .cloned()
++                .collect(),
++        ),
++        ignore_missing: THREAD_HISTORY_MIGRATOR.ignore_missing,
++        locking: THREAD_HISTORY_MIGRATOR.locking,
++        table_name: THREAD_HISTORY_MIGRATOR.table_name.clone(),
++        create_schemas: THREAD_HISTORY_MIGRATOR.create_schemas.clone(),
++        no_tx: THREAD_HISTORY_MIGRATOR.no_tx,
++    };
++    let pool = sqlite
++        .open_thread_history_db(
++            &pre_generation_id_migrator,
++            /*telemetry_override*/ None,
++        )
++        .await
++        .expect("pre-generation-ID migrations should apply");
++    sqlx::query(
++        "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES ('thread-1', 123, 7)",
++    )
++    .execute(&pool)
++    .await
++    .expect("legacy projection frontier should be inserted");
++
++    THREAD_HISTORY_MIGRATOR
++        .run(&pool)
++        .await
++        .expect("generation-ID migration should apply");
++
++    let projection = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
++        "SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id FROM thread_history_projection_state WHERE thread_id = 'thread-1'",
++    )
++    .fetch_one(&pool)
++    .await
++    .expect("migrated projection frontier should load");
++    assert_eq!(projection, (123, 7, None));
++}
++
+ #[tokio::test]
+ async fn agent_job_tables_are_dropped_when_upgrading() {
+     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+diff --git a/codex-rs/state/thread_history_migrations/0005_rollout_generation_id.sql b/codex-rs/state/thread_history_migrations/0005_rollout_generation_id.sql
+new file mode 100644
+index 0000000000..0a87d66c1c
+--- /dev/null
++++ b/codex-rs/state/thread_history_migrations/0005_rollout_generation_id.sql
+@@ -0,0 +1 @@
++ALTER TABLE thread_history_projection_state ADD COLUMN rollout_generation_id BLOB;
 diff --git a/codex-rs/thread-store/Cargo.toml b/codex-rs/thread-store/Cargo.toml
-index b0d2b15568..1b3e4bfae3 100644
+index b0d2b15568..6ce901628d 100644
 --- a/codex-rs/thread-store/Cargo.toml
 +++ b/codex-rs/thread-store/Cargo.toml
 @@ -17,6 +17,7 @@ chrono = { workspace = true, features = ["serde"] }
@@ -16720,6 +16818,14 @@ index b0d2b15568..1b3e4bfae3 100644
  codex-install-context = { workspace = true }
  codex-otel = { workspace = true }
  codex-protocol = { workspace = true }
+@@ -29,6 +30,7 @@ futures = { workspace = true }
+ pulldown-cmark = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ sqlx = { workspace = true }
+ thiserror = { workspace = true }
+ tokio = { workspace = true }
 diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
 index 2f043800f2..600dd13f78 100644
 --- a/codex-rs/thread-store/src/live_thread.rs
@@ -16790,10 +16896,18 @@ index 8472027401..e4ef9f0149 100644
      store: &LocalThreadStore,
      thread_id: ThreadId,
 diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
-index e5c12dd11f..3c81c28707 100644
+index e5c12dd11f..22b60a24bb 100644
 --- a/codex-rs/thread-store/src/local/mod.rs
 +++ b/codex-rs/thread-store/src/local/mod.rs
-@@ -267,6 +267,11 @@ impl LocalThreadStore {
+@@ -15,6 +15,7 @@ mod rollout_migration;
+ mod rollout_lineage;
+ mod search_threads;
+ mod thread_history;
++mod thread_history_generation;
+ mod thread_history_materialization;
+ mod thread_rollout_resolver;
+ mod thread_sections;
+@@ -267,6 +268,11 @@ impl LocalThreadStore {
          live_writer::rollout_path(self, thread_id).await
      }
  
@@ -16805,11 +16919,83 @@ index e5c12dd11f..3c81c28707 100644
      pub(super) async fn ensure_live_recorder_absent(
          &self,
          thread_id: ThreadId,
+diff --git a/codex-rs/thread-store/src/local/rollout_migration.rs b/codex-rs/thread-store/src/local/rollout_migration.rs
+index aa70a0d6d8..dff802a9c7 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration.rs
+@@ -35,6 +35,7 @@ use super::LocalThreadStore;
+ use super::thread_history;
+ use super::thread_history::ProjectedRolloutLine;
+ use super::thread_history::RolloutProjectionStep;
++use super::thread_history_generation::rollout_generation_id as generation_id_from_rollout_line;
+ use crate::ThreadStoreError;
+ use crate::ThreadStoreResult;
+ 
+@@ -904,6 +905,7 @@ impl LocalThreadStore {
+         let mut batch = Vec::new();
+         let mut batch_start = 0_u64;
+         let mut offset = 0_u64;
++        let mut rollout_generation_id = None;
+ 
+         while let Some(record) = read_rollout_record(&mut reader, &mut line_bytes).await? {
+             let next_offset = offset
+@@ -914,6 +916,11 @@ impl LocalThreadStore {
+                 offset = next_offset;
+                 continue;
+             };
++            if rollout_generation_id.is_none() && matches!(&line.item, RolloutItem::SessionMeta(_))
++            {
++                let value = serde_json::from_slice(&line_bytes).map_err(migration_error)?;
++                rollout_generation_id = Some(generation_id_from_rollout_line(&value, &line_bytes)?);
++            }
+             let ordinal = line
+                 .ordinal
+                 .ok_or_else(|| migration_error("staged rollout line is missing its ordinal"))?;
+@@ -940,6 +947,7 @@ impl LocalThreadStore {
+                     batch_start,
+                     offset,
+                     /*initial_ordinal*/ 0,
++                    rollout_generation_id,
+                     std::mem::take(&mut batch),
+                 )
+                 .await?;
+@@ -954,6 +962,7 @@ impl LocalThreadStore {
+                 batch_start,
+                 offset,
+                 /*initial_ordinal*/ 0,
++                rollout_generation_id,
+                 batch,
+             )
+             .await?;
+diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+index 174bdf060e..653c4e5ea9 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+@@ -329,6 +329,11 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
+     let turns = list_active_summary_turns(&store, thread_id).await;
+     assert_eq!(turns.turns.len(), 1);
+     assert_eq!(turns.turns[0].items.len(), 2);
++    let projection = thread_history::projection_state(&store, thread_id)
++        .await
++        .expect("read migrated projection state")
++        .expect("migration projected rollout");
++    assert!(projection.rollout_generation_id.is_some());
+ 
+     let bytes = fs::read(&path).expect("read first migration");
+     let second = store
 diff --git a/codex-rs/thread-store/src/local/thread_history.rs b/codex-rs/thread-store/src/local/thread_history.rs
-index c89d1b28b2..06fd3ba294 100644
+index c89d1b28b2..055c986fc6 100644
 --- a/codex-rs/thread-store/src/local/thread_history.rs
 +++ b/codex-rs/thread-store/src/local/thread_history.rs
-@@ -42,6 +42,7 @@ pub(super) enum RolloutProjectionStep {
+@@ -5,6 +5,7 @@ use codex_protocol::ThreadId;
+ use codex_protocol::models::MessagePhase;
+ 
+ use super::LocalThreadStore;
++use super::thread_history_generation::RolloutGenerationId;
+ use crate::ThreadStoreError;
+ use crate::ThreadStoreResult;
+ 
+@@ -42,9 +43,11 @@ pub(super) enum RolloutProjectionStep {
      },
  }
  
@@ -16817,7 +17003,48 @@ index c89d1b28b2..06fd3ba294 100644
  pub(super) struct RolloutProjectionState {
      pub next_byte_offset: u64,
      pub next_ordinal: u64,
-@@ -96,6 +97,56 @@ WHERE thread_id = ?
++    pub rollout_generation_id: Option<RolloutGenerationId>,
+ }
+ 
+ pub(super) async fn projection_state(
+@@ -63,9 +66,9 @@ pub(super) async fn projection_state(
+     }
+ 
+     let pool = store.thread_history_db().await?;
+-    let state = sqlx::query_as::<_, (i64, i64)>(
++    let state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
+         r#"
+-SELECT next_rollout_byte_offset, next_rollout_ordinal
++SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
+ FROM thread_history_projection_state
+ WHERE thread_id = ?
+         "#,
+@@ -75,7 +78,7 @@ WHERE thread_id = ?
+     .await
+     .map_err(thread_history_error)?;
+     state
+-        .map(|(next_byte_offset, next_ordinal)| {
++        .map(|(next_byte_offset, next_ordinal, rollout_generation_id)| {
+             Ok(RolloutProjectionState {
+                 next_byte_offset: u64::try_from(next_byte_offset).map_err(|_| {
+                     ThreadStoreError::Internal {
+@@ -91,17 +94,82 @@ WHERE thread_id = ?
+                         ),
+                     }
+                 })?,
++                rollout_generation_id: rollout_generation_id
++                    .map(|generation_id| {
++                        RolloutGenerationId::decode(&generation_id).ok_or_else(|| {
++                            ThreadStoreError::Internal {
++                            message: format!(
++                                "thread history projection for {thread_id} has an invalid rollout generation ID"
++                            ),
++                        }
++                        })
++                    })
++                    .transpose()?,
+             })
+         })
          .transpose()
  }
  
@@ -16832,9 +17059,9 @@ index c89d1b28b2..06fd3ba294 100644
 +        .await
 +        .map_err(thread_history_error)?;
 +    let thread_id = thread_id.to_string();
-+    let projection_state = sqlx::query_as::<_, (i64, i64)>(
++    let projection_state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
 +        r#"
-+SELECT next_rollout_byte_offset, next_rollout_ordinal
++SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
 +FROM thread_history_projection_state
 +WHERE thread_id = ?
 +        "#,
@@ -16846,6 +17073,9 @@ index c89d1b28b2..06fd3ba294 100644
 +    let expected_state = (
 +        sqlite_integer(expected_state.next_byte_offset, "rollout byte offset")?,
 +        sqlite_integer(expected_state.next_ordinal, "rollout ordinal")?,
++        expected_state
++            .rollout_generation_id
++            .map(RolloutGenerationId::encode),
 +    );
 +    if projection_state != Some(expected_state) {
 +        transaction.commit().await.map_err(thread_history_error)?;
@@ -16874,164 +17104,212 @@ index c89d1b28b2..06fd3ba294 100644
  pub(super) async fn apply_projection(
      store: &LocalThreadStore,
      thread_id: ThreadId,
-diff --git a/codex-rs/thread-store/src/local/thread_history_materialization.rs b/codex-rs/thread-store/src/local/thread_history_materialization.rs
-index e110ecc2f4..4beae5125d 100644
---- a/codex-rs/thread-store/src/local/thread_history_materialization.rs
-+++ b/codex-rs/thread-store/src/local/thread_history_materialization.rs
-@@ -4,9 +4,13 @@ use std::path::Path;
- use chrono::DateTime;
- use codex_app_server_protocol::ThreadHistoryChangeSet;
- use codex_app_server_protocol::project_rollout_line;
-+use codex_history::RolloutOrdinalState;
- use codex_protocol::ThreadId;
-+use codex_protocol::protocol::ThreadHistoryMode;
-+use tokio::io::AsyncBufReadExt;
- use tokio::io::AsyncReadExt;
- use tokio::io::AsyncSeekExt;
-+use tokio::io::BufReader;
- use tracing::warn;
- 
- use super::LocalThreadStore;
-@@ -23,10 +27,7 @@ pub(super) async fn materialize_to_sqlite(
-     if store.state_db.is_none() {
-         return Ok(());
-     }
--    let projection_state = super::thread_history::projection_state(store, thread_id).await?;
--    let start_offset = projection_state
--        .as_ref()
--        .map_or(0, |state| state.next_byte_offset);
-+    let mut projection_state = super::thread_history::projection_state(store, thread_id).await?;
-     if projection_state.is_none()
-         && !tokio::fs::try_exists(rollout_path)
-             .await
-@@ -34,67 +35,265 @@ pub(super) async fn materialize_to_sqlite(
-     {
-         return Ok(());
-     }
--    let session_meta = codex_rollout::read_session_meta_line(rollout_path)
-+    loop {
-+        let (session_meta, persisted_initial_ordinal) =
-+            read_session_meta_rollout_line(rollout_path).await?;
-+        let ordinal_state = match session_meta.history_mode {
-+            ThreadHistoryMode::Legacy => RolloutOrdinalState::Legacy,
-+            ThreadHistoryMode::Paginated => RolloutOrdinalState::Paginated {
-+                next: persisted_initial_ordinal,
-+            },
-+        };
-+        let initial_ordinal = ordinal_state
-+            .current()
-+            .map_err(thread_store_io_error)?
-+            .ok_or_else(|| ThreadStoreError::Internal {
-+                message: format!("thread history projection for {thread_id} is not paginated"),
-+            })?;
-+        let subagent_history_start_ordinal = session_meta.subagent_history_start_ordinal;
-+        let start_offset = projection_state.map_or(0, |state| state.next_byte_offset);
-+        let expected_ordinal = projection_state.map_or(initial_ordinal, |state| state.next_ordinal);
-+        let projection_read = read_projection_steps(
-+            rollout_path,
-+            start_offset,
-+            expected_ordinal,
-+            initial_ordinal,
-+            thread_id,
-+            subagent_history_start_ordinal,
-+        )
-+        .await?;
-+        let ProjectionRead::Steps {
-+            projections,
-+            next_offset,
-+        } = projection_read
-+        else {
-+            let Some(state) = projection_state else {
-+                continue;
-+            };
-+            if super::thread_history::reset_projection(store, thread_id, state).await? {
-+                let active_file_size = tokio::fs::metadata(rollout_path)
-+                    .await
-+                    .map_err(thread_store_io_error)?
-+                    .len();
-+                warn!(
-+                    thread_id = %thread_id,
-+                    rollout_path = %rollout_path.display(),
-+                    prior_next_byte_offset = state.next_byte_offset,
-+                    prior_next_ordinal = state.next_ordinal,
-+                    active_file_size,
-+                    replacement_initial_ordinal = initial_ordinal,
-+                    "resetting thread history projection after durable rollout generation swap"
-+                );
-+                projection_state = None;
-+            } else {
-+                projection_state =
-+                    super::thread_history::projection_state(store, thread_id).await?;
+     start_offset: u64,
+     next_offset: u64,
+     initial_ordinal: u64,
++    rollout_generation_id: Option<RolloutGenerationId>,
+     projections: Vec<RolloutProjectionStep>,
+ ) -> ThreadStoreResult<()> {
+     let pool = store.thread_history_db().await?;
+@@ -113,9 +181,9 @@ pub(super) async fn apply_projection(
+         .await
+         .map_err(thread_history_error)?;
+     let thread_id = thread_id.to_string();
+-    let projection_state = sqlx::query_as::<_, (i64, i64)>(
++    let projection_state = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
+         r#"
+-SELECT next_rollout_byte_offset, next_rollout_ordinal
++SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id
+ FROM thread_history_projection_state
+ WHERE thread_id = ?
+         "#,
+@@ -124,8 +192,20 @@ WHERE thread_id = ?
+     .fetch_optional(&mut *transaction)
+     .await
+     .map_err(thread_history_error)?;
+-    let (expected_offset, mut next_ordinal) =
+-        projection_state.unwrap_or((0, sqlite_integer(initial_ordinal, "rollout ordinal")?));
++    let rollout_generation_id = rollout_generation_id.map(RolloutGenerationId::encode);
++    let (expected_offset, mut next_ordinal) = match projection_state {
++        Some((expected_offset, next_ordinal, expected_generation_id)) => {
++            if expected_generation_id != rollout_generation_id {
++                return Err(ThreadStoreError::Internal {
++                    message: format!(
++                        "thread history projection generation for {thread_id} changed during materialization"
++                    ),
++                });
 +            }
-+            continue;
-+        };
-+        // Empty valid records can still consume bytes through blank complete lines.
-+        if projections.is_empty() && start_offset == next_offset {
-+            return Ok(());
++            (expected_offset, next_ordinal)
 +        }
-+        return super::thread_history::apply_projection(
-+            store,
-+            thread_id,
-+            start_offset,
-+            next_offset,
-+            initial_ordinal,
-+            projections,
-+        )
-+        .await;
++        None => (0, sqlite_integer(initial_ordinal, "rollout ordinal")?),
++    };
+     let start_offset = sqlite_integer(start_offset, "rollout byte offset")?;
+     if expected_offset != start_offset {
+         return Err(ThreadStoreError::Internal {
+@@ -192,16 +272,19 @@ WHERE thread_id = ?
+ INSERT INTO thread_history_projection_state (
+     thread_id,
+     next_rollout_byte_offset,
+-    next_rollout_ordinal
+-) VALUES (?, ?, ?)
++    next_rollout_ordinal,
++    rollout_generation_id
++) VALUES (?, ?, ?, ?)
+ ON CONFLICT(thread_id) DO UPDATE SET
+     next_rollout_byte_offset = excluded.next_rollout_byte_offset,
+-    next_rollout_ordinal = excluded.next_rollout_ordinal
++    next_rollout_ordinal = excluded.next_rollout_ordinal,
++    rollout_generation_id = excluded.rollout_generation_id
+         "#,
+     )
+     .bind(thread_id.as_str())
+     .bind(sqlite_integer(next_offset, "rollout byte offset")?)
+     .bind(next_ordinal)
++    .bind(rollout_generation_id)
+     .execute(&mut *transaction)
+     .await
+     .map_err(thread_history_error)?;
+diff --git a/codex-rs/thread-store/src/local/thread_history_generation.rs b/codex-rs/thread-store/src/local/thread_history_generation.rs
+new file mode 100644
+index 0000000000..76622dbef0
+--- /dev/null
++++ b/codex-rs/thread-store/src/local/thread_history_generation.rs
+@@ -0,0 +1,261 @@
++use std::io::SeekFrom;
++use std::path::Path;
++
++use codex_history::ROLLOUT_GENERATION_ID_FIELD;
++use codex_history::RolloutOrdinalState;
++use codex_protocol::protocol::ThreadHistoryMode;
++use sha2::Digest;
++use sha2::Sha256;
++use tokio::io::AsyncBufReadExt;
++use tokio::io::AsyncReadExt;
++use tokio::io::AsyncSeekExt;
++use tokio::io::BufReader;
++
++use crate::ThreadStoreError;
++use crate::ThreadStoreResult;
++
++const DURABLE_GENERATION_ID_TAG: u8 = 1;
++const LEGACY_HEAD_DIGEST_TAG: u8 = 2;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum RolloutGenerationId {
++    Durable([u8; 36]),
++    LegacyHeadDigest([u8; 32]),
++}
++
++impl RolloutGenerationId {
++    pub fn encode(self) -> Vec<u8> {
++        match self {
++            Self::Durable(generation_id) => {
++                let mut encoded = Vec::with_capacity(generation_id.len() + 1);
++                encoded.push(DURABLE_GENERATION_ID_TAG);
++                encoded.extend(generation_id);
++                encoded
++            }
++            Self::LegacyHeadDigest(digest) => {
++                let mut encoded = Vec::with_capacity(digest.len() + 1);
++                encoded.push(LEGACY_HEAD_DIGEST_TAG);
++                encoded.extend(digest);
++                encoded
++            }
++        }
++    }
++
++    pub fn decode(encoded: &[u8]) -> Option<Self> {
++        match encoded {
++            [DURABLE_GENERATION_ID_TAG, generation_id @ ..] => {
++                Some(Self::Durable(generation_id.try_into().ok()?))
++            }
++            [LEGACY_HEAD_DIGEST_TAG, digest @ ..] => {
++                Some(Self::LegacyHeadDigest(digest.try_into().ok()?))
++            }
++            [] | [_, ..] => None,
++        }
 +    }
 +}
 +
-+enum ProjectionRead {
-+    Steps {
-+        projections: Vec<RolloutProjectionStep>,
-+        next_offset: u64,
-+    },
-+    GenerationSwap,
++pub(super) fn rollout_generation_id(
++    value: &serde_json::Value,
++    persisted_line: &[u8],
++) -> ThreadStoreResult<RolloutGenerationId> {
++    match value.get(ROLLOUT_GENERATION_ID_FIELD) {
++        Some(serde_json::Value::String(generation_id)) => Ok(RolloutGenerationId::Durable(
++            generation_id
++                .as_bytes()
++                .try_into()
++                .map_err(|_| ThreadStoreError::Internal {
++                    message: "durable rollout has an invalid generation ID".to_string(),
++                })?,
++        )),
++        Some(_) => Err(ThreadStoreError::Internal {
++            message: "durable rollout has a non-string generation ID".to_string(),
++        }),
++        None => Ok(RolloutGenerationId::LegacyHeadDigest(
++            Sha256::digest(persisted_line).into(),
++        )),
++    }
 +}
 +
-+async fn read_session_meta_rollout_line(
++pub(super) struct RolloutHead {
++    pub initial_ordinal: u64,
++    pub rollout_generation_id: RolloutGenerationId,
++    pub subagent_history_start_ordinal: Option<u64>,
++}
++
++pub(super) async fn read_rollout_head(
++    reader: &mut BufReader<tokio::fs::File>,
 +    rollout_path: &Path,
-+) -> ThreadStoreResult<(codex_protocol::protocol::SessionMeta, Option<u64>)> {
-+    let file = tokio::fs::File::open(rollout_path)
-         .await
--        .map_err(thread_store_io_error)?
--        .meta;
--    let initial_ordinal = session_meta
--        .history_base
--        .map_or(0, |base| base.end_ordinal_exclusive);
--    let subagent_history_start_ordinal = session_meta.subagent_history_start_ordinal;
--    let expected_ordinal = projection_state
--        .as_ref()
--        .map_or(initial_ordinal, |state| state.next_ordinal);
--    let (projections, next_offset) = read_projection_steps(
--        rollout_path,
--        start_offset,
--        expected_ordinal,
--        thread_id,
--        subagent_history_start_ordinal,
--    )
--    .await?;
--    // Empty valid records can still consume bytes through blank complete lines.
--    if projections.is_empty() && start_offset == next_offset {
--        return Ok(());
-+        .map_err(thread_store_io_error)?;
-+    let mut lines = BufReader::new(file).lines();
-+    while let Some(line) = lines.next_line().await.map_err(thread_store_io_error)? {
-+        let trimmed = line.trim();
-+        if trimmed.is_empty() {
++) -> ThreadStoreResult<RolloutHead> {
++    let mut line = Vec::new();
++    loop {
++        line.clear();
++        if reader
++            .read_until(b'\n', &mut line)
++            .await
++            .map_err(thread_store_io_error)?
++            == 0
++        {
++            break;
++        }
++        if line.iter().all(u8::is_ascii_whitespace) {
 +            continue;
 +        }
-+        let value = match serde_json::from_str::<serde_json::Value>(trimmed) {
++        let value = match serde_json::from_slice::<serde_json::Value>(&line) {
 +            Ok(value) => value,
 +            Err(_) => continue,
 +        };
++        let rollout_generation_id = rollout_generation_id(&value, &line);
 +        let rollout_line = match codex_rollout::decode_rollout_line(value) {
 +            Ok(rollout_line) => rollout_line,
 +            Err(_) => continue,
 +        };
 +        match rollout_line.item {
 +            codex_rollout::RolloutItem::SessionMeta(session_meta) => {
-+                return Ok((session_meta.meta, rollout_line.ordinal));
++                let ordinal_state = match session_meta.meta.history_mode {
++                    ThreadHistoryMode::Legacy => RolloutOrdinalState::Legacy,
++                    ThreadHistoryMode::Paginated => RolloutOrdinalState::Paginated {
++                        next: rollout_line.ordinal,
++                    },
++                };
++                let initial_ordinal = ordinal_state
++                    .current()
++                    .map_err(thread_store_io_error)?
++                    .ok_or_else(|| ThreadStoreError::Internal {
++                        message: format!(
++                            "thread history projection for {} is not paginated",
++                            session_meta.meta.id
++                        ),
++                    })?;
++                return Ok(RolloutHead {
++                    initial_ordinal,
++                    rollout_generation_id: rollout_generation_id?,
++                    subagent_history_start_ordinal: session_meta
++                        .meta
++                        .subagent_history_start_ordinal,
++                });
 +            }
 +            codex_rollout::RolloutItem::ResponseItem(_)
 +            | codex_rollout::RolloutItem::InterAgentCommunication(_) => {
@@ -17055,8 +17333,8 @@ index e110ecc2f4..4beae5125d 100644
 +    })
 +}
 +
-+async fn projection_frontier_matches(
-+    file: &mut tokio::fs::File,
++pub(super) async fn projection_frontier_matches(
++    file: &mut BufReader<tokio::fs::File>,
 +    file_end_offset: u64,
 +    next_byte_offset: u64,
 +    next_ordinal: u64,
@@ -17077,7 +17355,7 @@ index e110ecc2f4..4beae5125d 100644
 +}
 +
 +async fn previous_nonblank_line(
-+    file: &mut tokio::fs::File,
++    file: &mut BufReader<tokio::fs::File>,
 +    mut end_offset: u64,
 +) -> ThreadStoreResult<Option<Vec<u8>>> {
 +    while end_offset > 0 {
@@ -17091,7 +17369,7 @@ index e110ecc2f4..4beae5125d 100644
 +}
 +
 +async fn previous_line(
-+    file: &mut tokio::fs::File,
++    file: &mut BufReader<tokio::fs::File>,
 +    end_offset: u64,
 +) -> ThreadStoreResult<(Vec<u8>, u64)> {
 +    const READ_CHUNK_SIZE: u64 = 8192;
@@ -17150,6 +17428,121 @@ index e110ecc2f4..4beae5125d 100644
 +            return Ok((line, 0));
 +        }
 +        scan_end = scan_start;
++    }
++}
++
++fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
++    ThreadStoreError::Internal {
++        message: err.to_string(),
++    }
++}
+diff --git a/codex-rs/thread-store/src/local/thread_history_materialization.rs b/codex-rs/thread-store/src/local/thread_history_materialization.rs
+index e110ecc2f4..fc8fc9ef85 100644
+--- a/codex-rs/thread-store/src/local/thread_history_materialization.rs
++++ b/codex-rs/thread-store/src/local/thread_history_materialization.rs
+@@ -7,11 +7,16 @@ use codex_app_server_protocol::project_rollout_line;
+ use codex_protocol::ThreadId;
+ use tokio::io::AsyncReadExt;
+ use tokio::io::AsyncSeekExt;
++use tokio::io::BufReader;
+ use tracing::warn;
+ 
+ use super::LocalThreadStore;
+ use super::thread_history::ProjectedRolloutLine;
++use super::thread_history::RolloutProjectionState;
+ use super::thread_history::RolloutProjectionStep;
++use super::thread_history_generation::RolloutGenerationId;
++use super::thread_history_generation::projection_frontier_matches;
++use super::thread_history_generation::read_rollout_head;
+ use crate::ThreadStoreError;
+ use crate::ThreadStoreResult;
+ 
+@@ -23,10 +28,7 @@ pub(super) async fn materialize_to_sqlite(
+     if store.state_db.is_none() {
+         return Ok(());
+     }
+-    let projection_state = super::thread_history::projection_state(store, thread_id).await?;
+-    let start_offset = projection_state
+-        .as_ref()
+-        .map_or(0, |state| state.next_byte_offset);
++    let mut projection_state = super::thread_history::projection_state(store, thread_id).await?;
+     if projection_state.is_none()
+         && !tokio::fs::try_exists(rollout_path)
+             .await
+@@ -34,67 +36,117 @@ pub(super) async fn materialize_to_sqlite(
+     {
+         return Ok(());
+     }
+-    let session_meta = codex_rollout::read_session_meta_line(rollout_path)
+-        .await
+-        .map_err(thread_store_io_error)?
+-        .meta;
+-    let initial_ordinal = session_meta
+-        .history_base
+-        .map_or(0, |base| base.end_ordinal_exclusive);
+-    let subagent_history_start_ordinal = session_meta.subagent_history_start_ordinal;
+-    let expected_ordinal = projection_state
+-        .as_ref()
+-        .map_or(initial_ordinal, |state| state.next_ordinal);
+-    let (projections, next_offset) = read_projection_steps(
+-        rollout_path,
+-        start_offset,
+-        expected_ordinal,
+-        thread_id,
+-        subagent_history_start_ordinal,
+-    )
+-    .await?;
+-    // Empty valid records can still consume bytes through blank complete lines.
+-    if projections.is_empty() && start_offset == next_offset {
+-        return Ok(());
++    loop {
++        match read_projection_steps(rollout_path, projection_state, thread_id).await? {
++            ProjectionRead::Steps {
++                start_offset,
++                initial_ordinal,
++                rollout_generation_id,
++                projections,
++                next_offset,
++            } => {
++                // Empty valid records can still consume bytes through blank complete lines.
++                if projections.is_empty() && start_offset == next_offset {
++                    return Ok(());
++                }
++                return super::thread_history::apply_projection(
++                    store,
++                    thread_id,
++                    start_offset,
++                    next_offset,
++                    initial_ordinal,
++                    Some(rollout_generation_id),
++                    projections,
++                )
++                .await;
++            }
++            ProjectionRead::GenerationSwap {
++                active_file_size,
++                replacement_initial_ordinal,
++            } => {
++                let Some(state) = projection_state else {
++                    continue;
++                };
++                if super::thread_history::reset_projection(store, thread_id, state).await? {
++                    warn!(
++                        thread_id = %thread_id,
++                        rollout_path = %rollout_path.display(),
++                        prior_next_byte_offset = state.next_byte_offset,
++                        prior_next_ordinal = state.next_ordinal,
++                        active_file_size,
++                        replacement_initial_ordinal,
++                        "resetting thread history projection after durable rollout generation swap"
++                    );
++                    projection_state = None;
++                } else {
++                    projection_state =
++                        super::thread_history::projection_state(store, thread_id).await?;
++                }
++            }
++        }
      }
 -    super::thread_history::apply_projection(
 -        store,
@@ -17160,47 +17553,79 @@ index e110ecc2f4..4beae5125d 100644
 -        projections,
 -    )
 -    .await
++}
++
++enum ProjectionRead {
++    Steps {
++        start_offset: u64,
++        initial_ordinal: u64,
++        rollout_generation_id: RolloutGenerationId,
++        projections: Vec<RolloutProjectionStep>,
++        next_offset: u64,
++    },
++    GenerationSwap {
++        active_file_size: u64,
++        replacement_initial_ordinal: u64,
++    },
  }
  
  async fn read_projection_steps(
      rollout_path: &Path,
-     start_offset: u64,
-     expected_ordinal: u64,
-+    initial_ordinal: u64,
+-    start_offset: u64,
+-    expected_ordinal: u64,
++    projection_state: Option<RolloutProjectionState>,
      thread_id: ThreadId,
-     subagent_history_start_ordinal: Option<u64>,
+-    subagent_history_start_ordinal: Option<u64>,
 -) -> ThreadStoreResult<(Vec<RolloutProjectionStep>, u64)> {
 -    let file_end_offset = match tokio::fs::metadata(rollout_path).await {
 -        Ok(metadata) => metadata.len(),
-+) -> ThreadStoreResult<ProjectionRead> {
-+    let mut file = match tokio::fs::File::open(rollout_path).await {
-+        Ok(file) => file,
-         Err(err) if err.kind() == std::io::ErrorKind::NotFound && start_offset == 0 => {
+-        Err(err) if err.kind() == std::io::ErrorKind::NotFound && start_offset == 0 => {
 -            return Ok((Vec::new(), 0));
-+            return Ok(ProjectionRead::Steps {
-+                projections: Vec::new(),
-+                next_offset: 0,
-+            });
-         }
-         Err(err) => return Err(thread_store_io_error(err)),
-     };
+-        }
+-        Err(err) => return Err(thread_store_io_error(err)),
+-    };
 -    let byte_count =
 -        file_end_offset
 -            .checked_sub(start_offset)
 -            .ok_or_else(|| ThreadStoreError::Internal {
 -                message: "durable rollout shrank before projection".to_string(),
 -            })?;
-+    let file_end_offset = file.metadata().await.map_err(thread_store_io_error)?.len();
++) -> ThreadStoreResult<ProjectionRead> {
++    let file = tokio::fs::File::open(rollout_path)
++        .await
++        .map_err(thread_store_io_error)?;
++    let mut file = BufReader::new(file);
++    let head = read_rollout_head(&mut file, rollout_path).await?;
++    let file_end_offset = file
++        .get_ref()
++        .metadata()
++        .await
++        .map_err(thread_store_io_error)?
++        .len();
++    let start_offset = projection_state.map_or(0, |state| state.next_byte_offset);
++    let expected_ordinal =
++        projection_state.map_or(head.initial_ordinal, |state| state.next_ordinal);
++    if projection_state
++        .is_some_and(|state| state.rollout_generation_id != Some(head.rollout_generation_id))
++    {
++        return Ok(ProjectionRead::GenerationSwap {
++            active_file_size: file_end_offset,
++            replacement_initial_ordinal: head.initial_ordinal,
++        });
++    }
 +    if !projection_frontier_matches(
 +        &mut file,
 +        file_end_offset,
 +        start_offset,
 +        expected_ordinal,
-+        initial_ordinal,
++        head.initial_ordinal,
 +    )
 +    .await?
 +    {
-+        return Ok(ProjectionRead::GenerationSwap);
++        return Ok(ProjectionRead::GenerationSwap {
++            active_file_size: file_end_offset,
++            replacement_initial_ordinal: head.initial_ordinal,
++        });
 +    }
 +    let byte_count = file_end_offset - start_offset;
      let byte_count = usize::try_from(byte_count).map_err(|_| ThreadStoreError::Internal {
@@ -17213,12 +17638,27 @@ index e110ecc2f4..4beae5125d 100644
      file.seek(SeekFrom::Start(start_offset))
          .await
          .map_err(thread_store_io_error)?;
-@@ -270,7 +469,10 @@ async fn read_projection_steps(
+@@ -204,7 +256,10 @@ async fn read_projection_steps(
+                 ),
+             });
+         }
+-        let changes = if subagent_history_start_ordinal.is_some_and(|start| ordinal < start) {
++        let changes = if head
++            .subagent_history_start_ordinal
++            .is_some_and(|start| ordinal < start)
++        {
+             ThreadHistoryChangeSet::default()
+         } else {
+             project_rollout_line(&line)
+@@ -270,7 +325,13 @@ async fn read_projection_steps(
          next_offset = line_end_offset;
          line_start_offset = line_end_offset;
      }
 -    Ok((projections, next_offset))
 +    Ok(ProjectionRead::Steps {
++        start_offset,
++        initial_ordinal: head.initial_ordinal,
++        rollout_generation_id: head.rollout_generation_id,
 +        projections,
 +        next_offset,
 +    })
@@ -17226,10 +17666,10 @@ index e110ecc2f4..4beae5125d 100644
  
  fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
 diff --git a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
-index b32aae7d3d..28f17c66c5 100644
+index b32aae7d3d..57609d4fba 100644
 --- a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
 +++ b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
-@@ -1633,6 +1633,302 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
+@@ -1633,6 +1633,369 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
      assert_eq!(status, "sentinel");
  }
  
@@ -17337,6 +17777,73 @@ index b32aae7d3d..28f17c66c5 100644
 +        projection_state(&pool, thread_id).await,
 +        (replacement_len, 4)
 +    );
++}
++
++#[tokio::test]
++async fn equal_size_equal_boundary_replacement_rebuilds_changed_identity() {
++    const GENERATION_A: &str = "00000000-0000-4000-8000-000000000001";
++    const GENERATION_B: &str = "00000000-0000-4000-8000-000000000002";
++
++    let home = TempDir::new().expect("temp dir");
++    let store = projection_store(home.path()).await;
++    let thread_id = ThreadId::default();
++    create_paginated_thread(&store, thread_id).await;
++    store
++        .append_items(AppendThreadItemsParams {
++            thread_id,
++            items: generation_items(thread_id, "dead-turn", /*text_len*/ 8),
++        })
++        .await
++        .expect("project dead generation");
++    let rollout_path = store
++        .live_rollout_path(thread_id)
++        .await
++        .expect("rollout path");
++    store
++        .shutdown_thread(thread_id)
++        .await
++        .expect("close dead generation");
++    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
++        home.path().abs(),
++    ))
++    .await
++    .expect("open thread history db");
++    set_rollout_generation_id(rollout_path.as_path(), GENERATION_A);
++    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
++        .await
++        .expect("project first nonce-bearing generation");
++    let dead_frontier = projection_state(&pool, thread_id).await;
++    let old_bytes = fs::read(rollout_path.as_path()).expect("read dead generation");
++    let old_boundaries = rollout_line_boundaries(&old_bytes);
++    let old_head = rollout_head_without_generation_id(&old_bytes);
++
++    rewrite_rollout_same_size(rollout_path.as_path(), "dead-turn", "live-turn");
++    rewrite_rollout_same_size(rollout_path.as_path(), GENERATION_A, GENERATION_B);
++
++    let replacement_bytes = fs::read(rollout_path.as_path()).expect("read replacement generation");
++    assert_eq!(replacement_bytes.len(), old_bytes.len());
++    assert_eq!(rollout_line_boundaries(&replacement_bytes), old_boundaries);
++    assert_eq!(
++        rollout_head_without_generation_id(&replacement_bytes),
++        old_head
++    );
++    assert_eq!(
++        i64::try_from(replacement_bytes.len()).expect("replacement length fits i64"),
++        dead_frontier.0
++    );
++
++    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
++        .await
++        .expect("recover equal-boundary replacement");
++
++    assert_eq!(
++        projected_generation(&pool, thread_id).await,
++        (
++            vec![("live-turn".to_string(), 1, "completed".to_string())],
++            vec![("live-turn-item".to_string(), 2)],
++        )
++    );
++    assert_eq!(projection_state(&pool, thread_id).await, dead_frontier);
 +}
 +
 +#[tokio::test]
@@ -17532,7 +18039,7 @@ index b32aae7d3d..28f17c66c5 100644
  #[tokio::test]
  async fn catch_up_preserves_trailing_partial_line_boundaries() {
      let home = TempDir::new().expect("temp dir");
-@@ -2335,16 +2631,105 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
+@@ -2335,16 +2698,166 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
  }
  
  fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
@@ -17596,6 +18103,67 @@ index b32aae7d3d..28f17c66c5 100644
 +    }
 +    fs::write(rollout_path, replacement.as_bytes()).expect("replace rollout generation");
 +    i64::try_from(replacement.len()).expect("replacement length fits i64")
++}
++
++fn rewrite_rollout_same_size(rollout_path: &Path, from: &str, to: &str) {
++    assert_eq!(from.len(), to.len());
++    let mut bytes = fs::read(rollout_path).expect("read rollout for equal-size replacement");
++    let from = from.as_bytes();
++    let to = to.as_bytes();
++    let mut replacement_count = 0;
++    let mut search_start = 0;
++    while let Some(index) = bytes[search_start..]
++        .windows(from.len())
++        .position(|window| window == from)
++    {
++        let start = search_start + index;
++        bytes[start..start + from.len()].copy_from_slice(to);
++        replacement_count += 1;
++        search_start = start + from.len();
++    }
++    assert!(replacement_count > 0);
++    fs::write(rollout_path, bytes).expect("write equal-size replacement generation");
++}
++
++fn set_rollout_generation_id(rollout_path: &Path, rollout_generation_id: &str) {
++    let rollout = fs::read(rollout_path).expect("read rollout for generation ID");
++    let session_meta_end = rollout
++        .iter()
++        .position(|byte| *byte == b'\n')
++        .map(|index| index + 1)
++        .expect("session metadata newline");
++    let mut session_meta =
++        serde_json::from_slice::<serde_json::Value>(&rollout[..session_meta_end])
++            .expect("decode session metadata record");
++    session_meta[codex_history::ROLLOUT_GENERATION_ID_FIELD] =
++        serde_json::Value::String(rollout_generation_id.to_string());
++    let mut replacement =
++        serde_json::to_vec(&session_meta).expect("encode session metadata record");
++    replacement.push(b'\n');
++    replacement.extend(&rollout[session_meta_end..]);
++    fs::write(rollout_path, replacement).expect("write rollout generation ID");
++}
++
++fn rollout_head_without_generation_id(bytes: &[u8]) -> serde_json::Value {
++    let session_meta_end = bytes
++        .iter()
++        .position(|byte| *byte == b'\n')
++        .expect("session metadata newline");
++    let mut session_meta = serde_json::from_slice::<serde_json::Value>(&bytes[..session_meta_end])
++        .expect("decode session metadata record");
++    session_meta
++        .as_object_mut()
++        .expect("session metadata object")
++        .remove(codex_history::ROLLOUT_GENERATION_ID_FIELD);
++    session_meta
++}
++
++fn rollout_line_boundaries(bytes: &[u8]) -> Vec<usize> {
++    bytes
++        .iter()
++        .enumerate()
++        .filter_map(|(index, byte)| (*byte == b'\n').then_some(index + 1))
++        .collect()
 +}
 +
 +async fn projected_generation(

@@ -39,6 +39,7 @@ use std::io::Error as IoError;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 // Injectable failpoints for crash-injection tests (`cfg(test)` / `test-util`).
 //
@@ -314,9 +315,12 @@ fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()
                 )
             },
         )?;
+    let rollout_generation_id = Uuid::new_v4().to_string();
     for item in items {
         let ordinal = ordinal_state.current()?;
-        write_one_line(&mut file, item, ordinal)?;
+        let generation_id =
+            matches!(item, RolloutItem::SessionMeta(_)).then_some(rollout_generation_id.as_str());
+        write_one_line(&mut file, item, ordinal, generation_id)?;
         ordinal_state.advance();
     }
     file.flush()?;
@@ -327,6 +331,7 @@ fn write_one_line(
     file: &mut File,
     item: &RolloutItem,
     ordinal: Option<u64>,
+    rollout_generation_id: Option<&str>,
 ) -> std::io::Result<()> {
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
@@ -335,6 +340,11 @@ fn write_one_line(
         timestamp: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         ordinal: Option<u64>,
+        #[serde(
+            rename = "rollout_generation_id",
+            skip_serializing_if = "Option::is_none"
+        )]
+        rollout_generation_id: Option<&'a str>,
         #[serde(flatten)]
         item: &'a RolloutItem,
     }
@@ -342,6 +352,7 @@ fn write_one_line(
     let mut json = serde_json::to_string(&Line {
         timestamp,
         ordinal,
+        rollout_generation_id,
         item,
     })
     .map_err(|e| IoError::other(format!("serialize rollout item: {e}")))?;
