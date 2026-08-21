@@ -6,7 +6,6 @@ use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
 
-use codex_protocol::protocol::HistoryPosition;
 use codex_protocol::protocol::ThreadHistoryMode;
 
 use crate::RolloutItem;
@@ -14,44 +13,7 @@ use crate::RolloutLine;
 use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
 use crate::reverse_jsonl_scanner::ScanOutcome;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RolloutOrdinalState {
-    Legacy,
-    Paginated { next: Option<u64> },
-}
-
-impl RolloutOrdinalState {
-    pub(crate) fn for_new_rollout(
-        history_mode: ThreadHistoryMode,
-        history_base: Option<HistoryPosition>,
-    ) -> Self {
-        match history_mode {
-            ThreadHistoryMode::Legacy => Self::Legacy,
-            ThreadHistoryMode::Paginated => Self::Paginated {
-                next: Some(history_base.map_or(0, |base| base.end_ordinal_exclusive)),
-            },
-        }
-    }
-
-    pub(crate) fn current(&self) -> io::Result<Option<u64>> {
-        match self {
-            Self::Legacy => Ok(None),
-            Self::Paginated { next } => {
-                let ordinal = (*next)
-                    .ok_or_else(|| io::Error::other("paginated rollout record ordinal overflow"))?;
-                Ok(Some(ordinal))
-            }
-        }
-    }
-
-    pub(crate) fn advance(&mut self) {
-        if let Self::Paginated { next } = self
-            && let Some(ordinal) = *next
-        {
-            *next = ordinal.checked_add(1);
-        }
-    }
-}
+pub(crate) use codex_history::RolloutOrdinalState;
 
 pub(crate) fn ordinal_state_for_rollout(
     file: &mut File,

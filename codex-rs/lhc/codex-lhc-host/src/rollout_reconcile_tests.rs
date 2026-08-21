@@ -10,11 +10,13 @@ use crate::parse_rollout_items;
 use codex_extension_api::RawItemProvenance;
 use codex_history::CompactedItem;
 use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadHistoryMode;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::tempdir;
@@ -312,7 +314,17 @@ async fn reconcile_stale_regenerates_when_lhc_compact_ahead() {
     // Whether compact reduces or not, we stamp a high compact point on the
     // *file* as low so classify sees STALE relative to a synthetic lhc point.
     let path = dir.path().join("rollout-stale.jsonl");
-    write_items(&path, &single_boundary_items(0));
+    let mut stale_items = single_boundary_items(0);
+    let RolloutItem::SessionMeta(meta) = &mut stale_items[0] else {
+        panic!("first item must be session metadata");
+    };
+    meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    meta.meta.history_base = Some(codex_protocol::protocol::HistoryPosition {
+        thread_id: meta.meta.id,
+        end_ordinal_exclusive: 17,
+        end_byte_offset: 0,
+    });
+    write_items(&path, &stale_items);
 
     // Bypass open when produce failed — still test STALE classify + regenerate
     // by using regenerate_rollout_from_thread directly after manual classify.
@@ -337,6 +349,16 @@ async fn reconcile_stale_regenerates_when_lhc_compact_ahead() {
         parsed
             .iter()
             .any(|i| matches!(i, RolloutItem::SessionMeta(_)))
+    );
+    let lines = std::fs::read_to_string(&path)
+        .expect("read regenerated rollout")
+        .lines()
+        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse regenerated line"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),
+        (17..17 + lines.len() as u64).map(Some).collect::<Vec<_>>(),
+        "startup reconciliation must use the same paginated rewrite shape"
     );
     // Prior single-boundary generation retained as .prev on swap.
     let prev = crate::rollout_swap::SwapPaths::for_rollout(&path).prev;

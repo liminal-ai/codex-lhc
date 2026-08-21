@@ -28,6 +28,7 @@
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_history::CompactedItem;
+use codex_history::RolloutOrdinalState;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_protocol::models::ResponseItem;
@@ -296,24 +297,53 @@ fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()
         .create(true)
         .truncate(true)
         .open(path)?;
+    let mut ordinal_state = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta) => Some(&meta.meta),
+            _ => None,
+        })
+        .map_or_else(
+            || Ok(RolloutOrdinalState::Legacy),
+            |meta| {
+                RolloutOrdinalState::for_rewrite(
+                    meta.history_mode,
+                    meta.history_base,
+                    meta.subagent_history_start_ordinal,
+                    items.len(),
+                )
+            },
+        )?;
     for item in items {
-        write_one_line(&mut file, item)?;
+        let ordinal = ordinal_state.current()?;
+        write_one_line(&mut file, item, ordinal)?;
+        ordinal_state.advance();
     }
     file.flush()?;
     Ok(())
 }
 
-fn write_one_line(file: &mut File, item: &RolloutItem) -> std::io::Result<()> {
+fn write_one_line(
+    file: &mut File,
+    item: &RolloutItem,
+    ordinal: Option<u64>,
+) -> std::io::Result<()> {
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
 
     #[derive(Serialize)]
     struct Line<'a> {
         timestamp: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ordinal: Option<u64>,
         #[serde(flatten)]
         item: &'a RolloutItem,
     }
 
-    let mut json = serde_json::to_string(&Line { timestamp, item })
+    let mut json = serde_json::to_string(&Line {
+        timestamp,
+        ordinal,
+        item,
+    })
         .map_err(|e| IoError::other(format!("serialize rollout item: {e}")))?;
     json.push('\n');
     file.write_all(json.as_bytes())

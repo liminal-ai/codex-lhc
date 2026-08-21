@@ -4,10 +4,12 @@ use super::*;
 use crate::estimate_response_items_tokens;
 use codex_history::CompactedItem;
 use codex_history::RolloutItem;
+use codex_history::RolloutLine;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadHistoryMode;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -58,6 +60,35 @@ fn write_seed(path: &Path, tag: &str) {
     write_rollout_jsonl(path, &sample_items(tag)).expect("seed write");
 }
 
+fn rollout_lines(path: &Path) -> Vec<RolloutLine> {
+    std::fs::read_to_string(path)
+        .expect("read rollout")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse rollout line"))
+        .collect()
+}
+
+fn paginated_items(
+    tag: &str,
+    history_base: Option<u64>,
+    subagent_history_start_ordinal: Option<u64>,
+) -> Vec<RolloutItem> {
+    let mut items = sample_items(tag);
+    let RolloutItem::SessionMeta(meta) = &mut items[0] else {
+        panic!("first item must be session metadata");
+    };
+    meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    meta.meta.history_base = history_base.map(|end_ordinal_exclusive| {
+        codex_protocol::protocol::HistoryPosition {
+            thread_id: meta.meta.id,
+            end_ordinal_exclusive,
+            end_byte_offset: 0,
+        }
+    });
+    meta.meta.subagent_history_start_ordinal = subagent_history_start_ordinal;
+    items
+}
+
 fn assert_parseable_active(path: &Path, expect_tag: &str) {
     let items = parse_rollout_items(path).expect("parse active");
     assert!(!items.is_empty(), "active generation must be non-empty");
@@ -89,6 +120,85 @@ fn successful_swap_rotates_one_prev_generation() {
     assert!(
         !gen1_text.contains("gen1"),
         "exactly one prior generation; gen1 must be gone"
+    );
+}
+
+#[test]
+fn legacy_rewrite_remains_ordinal_free() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+
+    atomic_rewrite_rollout(&path, &sample_items("legacy")).expect("legacy rewrite");
+
+    assert!(rollout_lines(&path).iter().all(|line| line.ordinal.is_none()));
+}
+
+#[test]
+fn root_paginated_rewrite_is_contiguous_and_repeatable() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    let items = paginated_items(
+        "root",
+        /*history_base*/ None,
+        /*subagent_history_start_ordinal*/ None,
+    );
+
+    atomic_rewrite_rollout(&path, &items).expect("first rewrite");
+    assert_eq!(
+        rollout_lines(&path)
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+
+    atomic_rewrite_rollout(&path, &items).expect("repeated rewrite");
+    assert_eq!(
+        rollout_lines(&path)
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+}
+
+#[test]
+fn paginated_rewrite_honors_history_base_and_subagent_boundary() {
+    let dir = tempdir().unwrap();
+    let base_path = dir.path().join("history-base.jsonl");
+    atomic_rewrite_rollout(
+        &base_path,
+        &paginated_items(
+            "base",
+            /*history_base*/ Some(41),
+            /*subagent_history_start_ordinal*/ None,
+        ),
+    )
+    .expect("history-base rewrite");
+    assert_eq!(
+        rollout_lines(&base_path)
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(41), Some(42), Some(43)]
+    );
+
+    let subagent_path = dir.path().join("subagent.jsonl");
+    atomic_rewrite_rollout(
+        &subagent_path,
+        &paginated_items(
+            "subagent",
+            /*history_base*/ None,
+            /*subagent_history_start_ordinal*/ Some(8),
+        ),
+    )
+    .expect("subagent rewrite");
+    assert_eq!(
+        rollout_lines(&subagent_path)
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(5), Some(6), Some(7)]
     );
 }
 

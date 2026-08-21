@@ -1,5 +1,9 @@
 //! Model-history and persisted-rollout domain types.
 
+mod ordinal;
+
+pub use ordinal::RolloutOrdinalState;
+
 use std::borrow::Borrow;
 use std::ops::Deref;
 use std::ops::DerefMut;

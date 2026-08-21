@@ -977,6 +977,58 @@ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Res
 }
 
 #[tokio::test]
+async fn paginated_recorder_reopens_rewrite_and_appends_next_ordinal() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let rollout_path = home.path().join("rollout.jsonl");
+    let thread_id = ThreadId::new();
+    write_paginated_rollout(&rollout_path, thread_id, &[1, 2, 3])?;
+    let recorder =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
+
+    let rewrite_items = [
+        paginated_session_meta_item(thread_id, home.path()),
+        agent_message_item("rewritten compacted history"),
+    ];
+    let mut ordinal_state = RolloutOrdinalState::for_rewrite(
+        ThreadHistoryMode::Paginated,
+        /*history_base*/ None,
+        /*subagent_history_start_ordinal*/ None,
+        rewrite_items.len(),
+    )?;
+    let rewrite = rewrite_items
+        .into_iter()
+        .map(|item| {
+            let ordinal = ordinal_state.current()?;
+            ordinal_state.advance();
+            serde_json::to_string(&RolloutLine {
+                timestamp: "2026-07-09T00:01:00Z".to_string(),
+                ordinal,
+                item,
+            })
+            .map_err(std::io::Error::other)
+        })
+        .collect::<std::io::Result<Vec<_>>>()?
+        .join("\n");
+    fs::write(&rollout_path, format!("{rewrite}\n"))?;
+
+    recorder.reopen_after_rewrite().await?;
+    recorder
+        .record_canonical_items(&[agent_message_item("first post-rewrite append")])
+        .await?;
+    recorder.flush().await?;
+
+    assert_eq!(
+        read_rollout_lines(&rollout_path)?
+            .iter()
+            .map(|line| line.ordinal)
+            .collect::<Vec<_>>(),
+        vec![Some(0), Some(1), Some(2)]
+    );
+    recorder.shutdown().await
+}
+
+#[tokio::test]
 async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
     let valid_unterminated = serde_json::to_string(&RolloutLine {
         timestamp: "2026-07-09T00:00:05Z".to_string(),
