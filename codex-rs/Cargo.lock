@@ -4308,6 +4308,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-extension-items",
  "codex-git-utils",
+ "codex-history",
  "codex-install-context",
  "codex-otel",
  "codex-protocol",

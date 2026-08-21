@@ -1634,6 +1634,302 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
 }
 
 #[tokio::test]
+async fn shrinking_replacement_rebuilds_projection_without_dead_generation_items() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 16_384),
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let dead_frontier = projection_state(&pool, thread_id).await;
+    let replacement_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        generation_items(thread_id, "live-turn", /*text_len*/ 8),
+    );
+    assert!(replacement_len < dead_frontier.0);
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("recover shrinking replacement");
+
+    assert_eq!(
+        projected_generation(&pool, thread_id).await,
+        (
+            vec![("live-turn".to_string(), 1, "completed".to_string())],
+            vec![("live-turn-item".to_string(), 2)],
+        )
+    );
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (replacement_len, 4)
+    );
+}
+
+#[tokio::test]
+async fn nonshrinking_replacement_rebuilds_projection_from_reset_ordinals() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 8),
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let dead_frontier = projection_state(&pool, thread_id).await;
+    let replacement_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        generation_items(
+            thread_id,
+            "live-turn",
+            usize::try_from(dead_frontier.0).expect("frontier fits usize"),
+        ),
+    );
+    assert!(replacement_len >= dead_frontier.0);
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("recover nonshrinking replacement");
+
+    assert_eq!(
+        projected_generation(&pool, thread_id).await,
+        (
+            vec![("live-turn".to_string(), 1, "completed".to_string())],
+            vec![("live-turn-item".to_string(), 2)],
+        )
+    );
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (replacement_len, 4)
+    );
+}
+
+#[tokio::test]
+async fn committed_generation_reset_is_empty_and_next_pass_converges() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 4096),
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let dead_state = super::super::thread_history::projection_state(&store, thread_id)
+        .await
+        .expect("read dead projection state")
+        .expect("dead projection state");
+    let replacement_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        generation_items(thread_id, "live-turn", /*text_len*/ 8),
+    );
+
+    assert!(
+        super::super::thread_history::reset_projection(&store, thread_id, dead_state)
+            .await
+            .expect("commit projection reset")
+    );
+    assert_eq!(history_row_counts(&pool, thread_id).await, (0, 0, 0));
+    drop(store);
+    let restarted_store = projection_store(home.path()).await;
+
+    super::materialize_to_sqlite(&restarted_store, thread_id, rollout_path.as_path())
+        .await
+        .expect("rebuild after interrupted recovery");
+
+    assert_eq!(history_row_counts(&pool, thread_id).await, (1, 1, 1));
+    assert_eq!(
+        projected_generation(&pool, thread_id).await,
+        (
+            vec![("live-turn".to_string(), 1, "completed".to_string())],
+            vec![("live-turn-item".to_string(), 2)],
+        )
+    );
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (replacement_len, 4)
+    );
+}
+
+#[tokio::test]
+async fn subagent_rewrite_uses_persisted_first_ordinal_above_history_base() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    let history_base = HistoryPosition {
+        thread_id: ThreadId::default(),
+        end_ordinal_exclusive: 10,
+        end_byte_offset: 0,
+    };
+    create_paginated_subagent_thread(
+        &store,
+        thread_id,
+        Some(history_base),
+        /*subagent_history_start_ordinal*/ Some(100),
+    )
+    .await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 4096),
+        })
+        .await
+        .expect("project dead subagent generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    let rewrite_items = generation_items(thread_id, "rewritten-prefix", /*text_len*/ 8);
+    let rewrite_state = codex_history::RolloutOrdinalState::for_rewrite(
+        ThreadHistoryMode::Paginated,
+        Some(history_base),
+        /*subagent_history_start_ordinal*/ Some(100),
+        rewrite_items.len() + 1,
+    )
+    .expect("derive rewrite ordinal state");
+    let replacement_initial_ordinal = rewrite_state
+        .current()
+        .expect("read rewrite ordinal")
+        .expect("paginated rewrite ordinal");
+    assert!(replacement_initial_ordinal > history_base.end_ordinal_exclusive);
+    let mut replacement_items = rewrite_items;
+    replacement_items.extend(generation_items(
+        thread_id,
+        "live-turn",
+        /*text_len*/ 8,
+    ));
+    let replacement_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        replacement_initial_ordinal,
+        replacement_items,
+    );
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("recover lifted subagent rewrite");
+
+    assert_eq!(
+        projected_generation(&pool, thread_id).await,
+        (
+            vec![("live-turn".to_string(), 100, "completed".to_string(),)],
+            vec![("live-turn-item".to_string(), 101)],
+        )
+    );
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (replacement_len, 103)
+    );
+}
+
+#[tokio::test]
+async fn append_only_growth_preserves_existing_projection_rows() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "first-turn", /*text_len*/ 8),
+        })
+        .await
+        .expect("project initial generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    sqlx::query("UPDATE thread_items SET created_at_ms = 777 WHERE thread_id = ?")
+        .bind(thread_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("mark existing projection row");
+
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "second-turn", /*text_len*/ 8),
+        })
+        .await
+        .expect("project append-only growth");
+
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT item_id, created_at_ms FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("read incrementally projected items");
+    assert_eq!(
+        rows,
+        vec![
+            ("first-turn-item".to_string(), 777),
+            ("second-turn-item".to_string(), 0),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn catch_up_preserves_trailing_partial_line_boundaries() {
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
@@ -2335,14 +2631,103 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
 }
 
 fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
+    agent_message_with_text(id, id, phase)
+}
+
+fn agent_message_with_text(id: &str, text: &str, phase: MessagePhase) -> TurnItem {
     TurnItem::AgentMessage(AgentMessageItem {
         id: id.to_string(),
         content: vec![AgentMessageContent::Text {
-            text: id.to_string(),
+            text: text.to_string(),
         }],
         phase: Some(phase),
         memory_citation: None,
     })
+}
+
+fn generation_items(thread_id: ThreadId, turn_id: &str, text_len: usize) -> Vec<RolloutItem> {
+    vec![
+        turn_started(turn_id),
+        completed_item(
+            thread_id,
+            turn_id,
+            agent_message_with_text(
+                format!("{turn_id}-item").as_str(),
+                "x".repeat(text_len).as_str(),
+                MessagePhase::FinalAnswer,
+            ),
+        ),
+        turn_completed(turn_id),
+    ]
+}
+
+fn replace_rollout_generation(
+    rollout_path: &Path,
+    initial_ordinal: u64,
+    items: Vec<RolloutItem>,
+) -> i64 {
+    let old_rollout = fs::read(rollout_path).expect("read old rollout");
+    let session_meta_end = old_rollout
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .expect("session metadata newline");
+    let mut session_meta =
+        serde_json::from_slice::<serde_json::Value>(&old_rollout[..session_meta_end])
+            .expect("decode session metadata record");
+    session_meta["ordinal"] = serde_json::Value::from(initial_ordinal);
+    let mut replacement = format!(
+        "{}\n",
+        serde_json::to_string(&session_meta).expect("encode session metadata record")
+    );
+    for (index, item) in items.into_iter().enumerate() {
+        let ordinal = initial_ordinal
+            .checked_add(u64::try_from(index).expect("item index fits u64"))
+            .and_then(|ordinal| ordinal.checked_add(1))
+            .expect("replacement ordinal");
+        replacement.push_str(rollout_line(Some(ordinal), item).as_str());
+        replacement.push('\n');
+    }
+    fs::write(rollout_path, replacement.as_bytes()).expect("replace rollout generation");
+    i64::try_from(replacement.len()).expect("replacement length fits i64")
+}
+
+async fn projected_generation(
+    pool: &sqlx::SqlitePool,
+    thread_id: ThreadId,
+) -> (Vec<(String, i64, String)>, Vec<(String, i64)>) {
+    let turns = sqlx::query_as::<_, (String, i64, String)>(
+        "SELECT turn_id, rollout_ordinal, status FROM thread_turns WHERE thread_id = ? ORDER BY rollout_ordinal",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read projected turns");
+    let items = sqlx::query_as::<_, (String, i64)>(
+        "SELECT item_id, rollout_ordinal FROM thread_items WHERE thread_id = ? ORDER BY rollout_ordinal",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read projected items");
+    (turns, items)
+}
+
+async fn history_row_counts(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> (i64, i64, i64) {
+    sqlx::query_as::<_, (i64, i64, i64)>(
+        r#"
+SELECT
+    (SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?),
+    (SELECT COUNT(*) FROM thread_items WHERE thread_id = ?),
+    (SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?)
+        "#,
+    )
+    .bind(thread_id.to_string())
+    .bind(thread_id.to_string())
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("read thread history row counts")
 }
 
 fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64) {

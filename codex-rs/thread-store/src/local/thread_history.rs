@@ -42,6 +42,7 @@ pub(super) enum RolloutProjectionStep {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RolloutProjectionState {
     pub next_byte_offset: u64,
     pub next_ordinal: u64,
@@ -94,6 +95,56 @@ WHERE thread_id = ?
             })
         })
         .transpose()
+}
+
+pub(super) async fn reset_projection(
+    store: &LocalThreadStore,
+    thread_id: ThreadId,
+    expected_state: RolloutProjectionState,
+) -> ThreadStoreResult<bool> {
+    let pool = store.thread_history_db().await?;
+    let mut transaction = pool
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(thread_history_error)?;
+    let thread_id = thread_id.to_string();
+    let projection_state = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+SELECT next_rollout_byte_offset, next_rollout_ordinal
+FROM thread_history_projection_state
+WHERE thread_id = ?
+        "#,
+    )
+    .bind(thread_id.as_str())
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(thread_history_error)?;
+    let expected_state = (
+        sqlite_integer(expected_state.next_byte_offset, "rollout byte offset")?,
+        sqlite_integer(expected_state.next_ordinal, "rollout ordinal")?,
+    );
+    if projection_state != Some(expected_state) {
+        transaction.commit().await.map_err(thread_history_error)?;
+        return Ok(false);
+    }
+
+    sqlx::query("DELETE FROM thread_items WHERE thread_id = ?")
+        .bind(thread_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(thread_history_error)?;
+    sqlx::query("DELETE FROM thread_turns WHERE thread_id = ?")
+        .bind(thread_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(thread_history_error)?;
+    sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
+        .bind(thread_id.as_str())
+        .execute(&mut *transaction)
+        .await
+        .map_err(thread_history_error)?;
+    transaction.commit().await.map_err(thread_history_error)?;
+    Ok(true)
 }
 
 pub(super) async fn apply_projection(
