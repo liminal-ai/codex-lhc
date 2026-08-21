@@ -34,7 +34,7 @@ case "$1" in
     ;;
   release)
     if [ "${FAKE_RELEASE_EXISTS:-0}" = 1 ]; then
-      printf '{"tagName":"v0.3.2","targetCommitish":"%s"}' "$FAKE_RELEASE_SHA"
+      printf '{"tagName":"v0.148.0-alpha.20","targetCommitish":"%s"}' "$FAKE_RELEASE_SHA"
       exit 0
     fi
     exit 1
@@ -69,7 +69,7 @@ class TagReleaseGateTests(unittest.TestCase):
             FAKE_RELEASE_EXISTS="1" if release_exists else "0",
         )
         return subprocess.run(
-            ["bash", str(GATE), mode, "0.3.2", CANDIDATE_SHA],
+            ["bash", str(GATE), mode, "0.148.0-alpha.20", CANDIDATE_SHA],
             env=env,
             capture_output=True,
             text=True,

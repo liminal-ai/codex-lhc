@@ -8,9 +8,9 @@ on:
         required: true
         type: string
       version:
-        description: "Candidate SemVer"
+        description: "Candidate version"
         required: true
-        default: "0.2.1"
+        default: "0.148.0-alpha.20"
         type: string
 
 permissions:

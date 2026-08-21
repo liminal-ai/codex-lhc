@@ -910,8 +910,9 @@ mod tests {
 
     #[test]
     fn restart_decision_preserves_forced_refreshes() {
+        let workspace_version = env!("CARGO_PKG_VERSION");
         let current_info = ProbeInfo {
-            app_server_version: "0.1.0".to_string(),
+            app_server_version: workspace_version.to_string(),
         };
 
         assert_eq!(
@@ -919,14 +920,18 @@ mod tests {
                 restart_decision(
                     RestartMode::IfVersionChanged,
                     Some(&current_info),
-                    Some("0.1.0"),
+                    Some(workspace_version),
                 ),
                 restart_decision(
                     RestartMode::IfVersionChanged,
                     /*info*/ None,
                     /*managed_version*/ None,
                 ),
-                restart_decision(RestartMode::Always, Some(&current_info), Some("0.1.0")),
+                restart_decision(
+                    RestartMode::Always,
+                    Some(&current_info),
+                    Some(workspace_version)
+                ),
                 restart_decision(
                     RestartMode::Always,
                     /*info*/ None,

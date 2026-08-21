@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release SemVer (must match the candidate)"
+        description: "Release version (must match the candidate)"
         required: true
         type: string
       candidate_run_id:

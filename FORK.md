@@ -59,11 +59,13 @@ history preserved and rebuildable at full fidelity.
 Release qualification is separate from source synchronization. The manual
 candidate workflow builds one immutable Linux x86-64 bundle and records
 source/upstream/SDK/schema identities plus checksums. A separate Daytona
-workflow installs and exercises those exact bytes. Protected promotion accepts
-the candidate and smoke run IDs, verifies their qualification evidence, and
-publishes without rebuilding only after Lee or CTO approval. Windows x86-64
-and Apple Silicon macOS remain source-readiness targets in
-`lhc-platform-readiness.yml`; they are not current prebuilt release assets.
+workflow installs and exercises those exact bytes. The supplemental workflow
+builds Windows x86-64 and Apple Silicon macOS artifacts from the same source
+identity after Linux qualification. Protected promotion accepts the candidate,
+smoke, and supplemental run IDs, verifies their qualification evidence, and
+publishes all three platform artifacts without rebuilding only after Lee or CTO
+approval. `lhc-platform-readiness.yml` independently keeps all three source
+build and test paths ready.
 
 ## LC Adaptive Service Tier
 
@@ -154,16 +156,18 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
 | 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
-| 32 | `cli/Cargo.toml` | Codex-LHC product release version reported by `codex --version` | `0001-workspace-member` |
+| 32 | `cli/Cargo.toml`, `cli/tests/version.rs` | inherits the mapped upstream workspace version reported by `codex --version`, with fork regression coverage | `0001-workspace-member` (test only; manifest restored to upstream) |
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
 | 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,thread_history_migrations/0005_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals | `0007-lhc-compact-arm` |
+| 36 | `app-server-daemon/src/{lib.rs,managed_install_tests.rs}` | managed CLI/app-server version parsing and same-version restart coherence use the workspace version | `0001-workspace-member` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
 round 9 — see §History-reset recovery R3. Row 31 is likewise non-sentinel build
-policy and is covered by 0001. Row 32 is the fork release identity and is also
-non-sentinel policy. Fork-owned and not sentinel-bearing is a
+policy and is covered by 0001. Row 32 records the upstream-aligned runtime
+version policy; its regression test is covered by 0001 while the CLI manifest
+itself no longer carries a fork delta. Fork-owned and not sentinel-bearing is a
 legitimate combination; fork-owned and *not in any patch* is not. Row 26 is the
 same pattern (impl details under a sentinel-bearing LiveThread API).
 

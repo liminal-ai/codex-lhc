@@ -20,18 +20,84 @@ index 1abbb45e9d..208bf8f6ed 100644
  codex-lmstudio = { path = "lmstudio" }
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
-diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
-index 30e5a52a02..45fa681e8b 100644
---- a/codex-rs/cli/Cargo.toml
-+++ b/codex-rs/cli/Cargo.toml
-@@ -1,6 +1,6 @@
- [package]
- name = "codex-cli"
--version.workspace = true
-+version = "0.3.2"
- edition.workspace = true
- license.workspace = true
- build = "build.rs"
+diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
+index c90978803d..0cd089b9b0 100644
+--- a/codex-rs/app-server-daemon/src/lib.rs
++++ b/codex-rs/app-server-daemon/src/lib.rs
+@@ -910,8 +910,9 @@ mod tests {
+ 
+     #[test]
+     fn restart_decision_preserves_forced_refreshes() {
++        let workspace_version = env!("CARGO_PKG_VERSION");
+         let current_info = ProbeInfo {
+-            app_server_version: "0.1.0".to_string(),
++            app_server_version: workspace_version.to_string(),
+         };
+ 
+         assert_eq!(
+@@ -919,14 +920,18 @@ mod tests {
+                 restart_decision(
+                     RestartMode::IfVersionChanged,
+                     Some(&current_info),
+-                    Some("0.1.0"),
++                    Some(workspace_version),
+                 ),
+                 restart_decision(
+                     RestartMode::IfVersionChanged,
+                     /*info*/ None,
+                     /*managed_version*/ None,
+                 ),
+-                restart_decision(RestartMode::Always, Some(&current_info), Some("0.1.0")),
++                restart_decision(
++                    RestartMode::Always,
++                    Some(&current_info),
++                    Some(workspace_version)
++                ),
+                 restart_decision(
+                     RestartMode::Always,
+                     /*info*/ None,
+diff --git a/codex-rs/app-server-daemon/src/managed_install_tests.rs b/codex-rs/app-server-daemon/src/managed_install_tests.rs
+index 93caa468e4..c2e6a623e5 100644
+--- a/codex-rs/app-server-daemon/src/managed_install_tests.rs
++++ b/codex-rs/app-server-daemon/src/managed_install_tests.rs
+@@ -5,9 +5,10 @@ use super::parse_codex_version;
+ 
+ #[test]
+ fn parses_codex_cli_version_output() {
++    let workspace_version = env!("CARGO_PKG_VERSION");
+     assert_eq!(
+-        parse_codex_version("codex 1.2.3\n").expect("version"),
+-        "1.2.3"
++        parse_codex_version(&format!("codex-cli {workspace_version}\n")).expect("version"),
++        workspace_version
+     );
+ }
+ 
+diff --git a/codex-rs/cli/tests/version.rs b/codex-rs/cli/tests/version.rs
+new file mode 100644
+index 0000000000..9edca52724
+--- /dev/null
++++ b/codex-rs/cli/tests/version.rs
+@@ -0,0 +1,19 @@
++use std::process::Command;
++
++use anyhow::Result;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn reports_workspace_package_version() -> Result<()> {
++    let output = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
++        .arg("--version")
++        .output()?;
++
++    assert!(output.status.success());
++    assert_eq!(
++        String::from_utf8(output.stdout)?,
++        format!("codex-cli {}\n", env!("CARGO_PKG_VERSION"))
++    );
++    assert_eq!(output.stderr, b"");
++    Ok(())
++}
 diff --git a/codex-rs/code-mode-runtime/Cargo.toml b/codex-rs/code-mode-runtime/Cargo.toml
 index e3708b657e..78670b945d 100644
 --- a/codex-rs/code-mode-runtime/Cargo.toml

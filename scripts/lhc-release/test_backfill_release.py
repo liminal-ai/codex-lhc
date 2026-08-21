@@ -11,7 +11,7 @@ from pathlib import Path
 from backfill_release import BACKFILL_MARKER, BackfillError, run_backfill, sha256
 
 
-VERSION = "0.2.2"
+VERSION = "0.148.0-alpha.20"
 SOURCE = "a" * 40
 
 

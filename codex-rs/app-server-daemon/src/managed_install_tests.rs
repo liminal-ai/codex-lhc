@@ -5,9 +5,10 @@ use super::parse_codex_version;
 
 #[test]
 fn parses_codex_cli_version_output() {
+    let workspace_version = env!("CARGO_PKG_VERSION");
     assert_eq!(
-        parse_codex_version("codex 1.2.3\n").expect("version"),
-        "1.2.3"
+        parse_codex_version(&format!("codex-cli {workspace_version}\n")).expect("version"),
+        workspace_version
     );
 }
 

@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "SemVer without the v prefix"
+        description: "Release version without the v prefix"
         required: true
-        default: "0.2.1"
+        default: "0.148.0-alpha.20"
         type: string
 
 permissions:
@@ -38,10 +38,7 @@ jobs:
           VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
-          test "$VERSION" = "$(tr -d '[:space:]' < lhc-release/VERSION)"
-          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' codex-rs/cli/Cargo.toml)"
-          test "$VERSION" = "$cargo_version"
+          python3 scripts/lhc-release/check_version_identity.py --version "$VERSION"
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
