@@ -78,13 +78,14 @@ fn paginated_items(
         panic!("first item must be session metadata");
     };
     meta.meta.history_mode = ThreadHistoryMode::Paginated;
-    meta.meta.history_base = history_base.map(|end_ordinal_exclusive| {
-        codex_protocol::protocol::HistoryPosition {
-            thread_id: meta.meta.id,
-            end_ordinal_exclusive,
-            end_byte_offset: 0,
-        }
-    });
+    meta.meta.history_base =
+        history_base.map(
+            |end_ordinal_exclusive| codex_protocol::protocol::HistoryPosition {
+                thread_id: meta.meta.id,
+                end_ordinal_exclusive,
+                end_byte_offset: 0,
+            },
+        );
     meta.meta.subagent_history_start_ordinal = subagent_history_start_ordinal;
     items
 }
@@ -130,7 +131,11 @@ fn legacy_rewrite_remains_ordinal_free() {
 
     atomic_rewrite_rollout(&path, &sample_items("legacy")).expect("legacy rewrite");
 
-    assert!(rollout_lines(&path).iter().all(|line| line.ordinal.is_none()));
+    assert!(
+        rollout_lines(&path)
+            .iter()
+            .all(|line| line.ordinal.is_none())
+    );
 }
 
 #[test]
@@ -138,9 +143,7 @@ fn root_paginated_rewrite_is_contiguous_and_repeatable() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");
     let items = paginated_items(
-        "root",
-        /*history_base*/ None,
-        /*subagent_history_start_ordinal*/ None,
+        "root", /*history_base*/ None, /*subagent_history_start_ordinal*/ None,
     );
 
     atomic_rewrite_rollout(&path, &items).expect("first rewrite");

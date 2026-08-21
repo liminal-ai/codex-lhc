@@ -28,9 +28,9 @@
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_history::CompactedItem;
-use codex_history::RolloutOrdinalState;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
+use codex_history::RolloutOrdinalState;
 use codex_protocol::models::ResponseItem;
 use serde::Serialize;
 use std::fs::File;
@@ -344,7 +344,7 @@ fn write_one_line(
         ordinal,
         item,
     })
-        .map_err(|e| IoError::other(format!("serialize rollout item: {e}")))?;
+    .map_err(|e| IoError::other(format!("serialize rollout item: {e}")))?;
     json.push('\n');
     file.write_all(json.as_bytes())
 }

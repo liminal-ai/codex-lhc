@@ -16075,6 +16075,101 @@ index 699696289d..c96acbf0e8 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn flex_service_tier_is_applied_to_http_turn() -> Result<()> {
      skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/history/src/lib.rs b/codex-rs/history/src/lib.rs
+index f95a9d994e..7498a1c7e0 100644
+--- a/codex-rs/history/src/lib.rs
++++ b/codex-rs/history/src/lib.rs
+@@ -1,5 +1,9 @@
+ //! Model-history and persisted-rollout domain types.
+ 
++mod ordinal;
++
++pub use ordinal::RolloutOrdinalState;
++
+ use std::borrow::Borrow;
+ use std::ops::Deref;
+ use std::ops::DerefMut;
+diff --git a/codex-rs/history/src/ordinal.rs b/codex-rs/history/src/ordinal.rs
+new file mode 100644
+index 0000000000..71964bfe7c
+--- /dev/null
++++ b/codex-rs/history/src/ordinal.rs
+@@ -0,0 +1,75 @@
++use std::io;
++
++use codex_protocol::protocol::HistoryPosition;
++use codex_protocol::protocol::ThreadHistoryMode;
++
++/// Canonical ordinal assignment state for persisted rollout records.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RolloutOrdinalState {
++    /// Legacy rollout records do not carry top-level ordinals.
++    Legacy,
++    /// Paginated rollout records carry contiguous top-level ordinals.
++    Paginated { next: Option<u64> },
++}
++
++impl RolloutOrdinalState {
++    /// Start a newly created rollout at its history-base boundary.
++    pub fn for_new_rollout(
++        history_mode: ThreadHistoryMode,
++        history_base: Option<HistoryPosition>,
++    ) -> Self {
++        match history_mode {
++            ThreadHistoryMode::Legacy => Self::Legacy,
++            ThreadHistoryMode::Paginated => Self::Paginated {
++                next: Some(history_base.map_or(0, |base| base.end_ordinal_exclusive)),
++            },
++        }
++    }
++
++    /// Start a full rewrite while preserving paginated history-base and subagent boundaries.
++    pub fn for_rewrite(
++        history_mode: ThreadHistoryMode,
++        history_base: Option<HistoryPosition>,
++        subagent_history_start_ordinal: Option<u64>,
++        item_count: usize,
++    ) -> io::Result<Self> {
++        if history_mode == ThreadHistoryMode::Legacy {
++            return Ok(Self::Legacy);
++        }
++        let item_count = u64::try_from(item_count)
++            .map_err(|_| io::Error::other("paginated rollout rewrite is too large"))?;
++        let history_start = history_base.map_or(0, |base| base.end_ordinal_exclusive);
++        let minimum_next = history_start
++            .checked_add(item_count)
++            .ok_or_else(|| io::Error::other("paginated rollout record ordinal overflow"))?;
++        let next_after_rewrite = subagent_history_start_ordinal
++            .map_or(minimum_next, |subagent_start| {
++                subagent_start.max(minimum_next)
++            });
++        let first = next_after_rewrite
++            .checked_sub(item_count)
++            .ok_or_else(|| io::Error::other("paginated rollout record ordinal underflow"))?;
++        Ok(Self::Paginated { next: Some(first) })
++    }
++
++    /// Return the ordinal for the next record, if this is a paginated rollout.
++    pub fn current(&self) -> io::Result<Option<u64>> {
++        match self {
++            Self::Legacy => Ok(None),
++            Self::Paginated { next } => {
++                let ordinal = (*next)
++                    .ok_or_else(|| io::Error::other("paginated rollout record ordinal overflow"))?;
++                Ok(Some(ordinal))
++            }
++        }
++    }
++
++    /// Advance after one record has been durably written.
++    pub fn advance(&mut self) {
++        if let Self::Paginated { next } = self
++            && let Some(ordinal) = *next
++        {
++            *next = ordinal.checked_add(1);
++        }
++    }
++}
 diff --git a/codex-rs/models-manager/models.json b/codex-rs/models-manager/models.json
 index 3b6d62393e..07e96d985e 100644
 --- a/codex-rs/models-manager/models.json
@@ -16403,6 +16498,64 @@ index 70672cde94..6b0cac4345 100644
      #[test]
      fn model_preset_preserves_availability_nux() {
          let preset = ModelPreset::from(ModelInfo {
+diff --git a/codex-rs/rollout/src/ordinal.rs b/codex-rs/rollout/src/ordinal.rs
+index 3f002aec8a..3c0cd9189e 100644
+--- a/codex-rs/rollout/src/ordinal.rs
++++ b/codex-rs/rollout/src/ordinal.rs
+@@ -6,7 +6,6 @@ use std::io::Seek;
+ use std::io::SeekFrom;
+ use std::path::Path;
+ 
+-use codex_protocol::protocol::HistoryPosition;
+ use codex_protocol::protocol::ThreadHistoryMode;
+ 
+ use crate::RolloutItem;
+@@ -14,44 +13,7 @@ use crate::RolloutLine;
+ use crate::reverse_jsonl_scanner::ReverseJsonlScanner;
+ use crate::reverse_jsonl_scanner::ScanOutcome;
+ 
+-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+-pub(crate) enum RolloutOrdinalState {
+-    Legacy,
+-    Paginated { next: Option<u64> },
+-}
+-
+-impl RolloutOrdinalState {
+-    pub(crate) fn for_new_rollout(
+-        history_mode: ThreadHistoryMode,
+-        history_base: Option<HistoryPosition>,
+-    ) -> Self {
+-        match history_mode {
+-            ThreadHistoryMode::Legacy => Self::Legacy,
+-            ThreadHistoryMode::Paginated => Self::Paginated {
+-                next: Some(history_base.map_or(0, |base| base.end_ordinal_exclusive)),
+-            },
+-        }
+-    }
+-
+-    pub(crate) fn current(&self) -> io::Result<Option<u64>> {
+-        match self {
+-            Self::Legacy => Ok(None),
+-            Self::Paginated { next } => {
+-                let ordinal = (*next)
+-                    .ok_or_else(|| io::Error::other("paginated rollout record ordinal overflow"))?;
+-                Ok(Some(ordinal))
+-            }
+-        }
+-    }
+-
+-    pub(crate) fn advance(&mut self) {
+-        if let Self::Paginated { next } = self
+-            && let Some(ordinal) = *next
+-        {
+-            *next = ordinal.checked_add(1);
+-        }
+-    }
+-}
++pub(crate) use codex_history::RolloutOrdinalState;
+ 
+ pub(crate) fn ordinal_state_for_rollout(
+     file: &mut File,
 diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
 index b6fba6b760..23ef6386de 100644
 --- a/codex-rs/rollout/src/recorder.rs
@@ -16492,6 +16645,69 @@ index b6fba6b760..23ef6386de 100644
              RolloutCmd::Shutdown { ack } => match state.shutdown().await {
                  Ok(()) => {
                      let _ = ack.send(Ok(()));
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index a69919dec5..f507202449 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -976,6 +976,58 @@ async fn resumed_paginated_rollout_continues_after_ordinal_gap() -> std::io::Res
+     recorder.shutdown().await
+ }
+ 
++#[tokio::test]
++async fn paginated_recorder_reopens_rewrite_and_appends_next_ordinal() -> std::io::Result<()> {
++    let home = TempDir::new().expect("temp dir");
++    let config = test_config(home.path());
++    let rollout_path = home.path().join("rollout.jsonl");
++    let thread_id = ThreadId::new();
++    write_paginated_rollout(&rollout_path, thread_id, &[1, 2, 3])?;
++    let recorder =
++        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
++
++    let rewrite_items = [
++        paginated_session_meta_item(thread_id, home.path()),
++        agent_message_item("rewritten compacted history"),
++    ];
++    let mut ordinal_state = RolloutOrdinalState::for_rewrite(
++        ThreadHistoryMode::Paginated,
++        /*history_base*/ None,
++        /*subagent_history_start_ordinal*/ None,
++        rewrite_items.len(),
++    )?;
++    let rewrite = rewrite_items
++        .into_iter()
++        .map(|item| {
++            let ordinal = ordinal_state.current()?;
++            ordinal_state.advance();
++            serde_json::to_string(&RolloutLine {
++                timestamp: "2026-07-09T00:01:00Z".to_string(),
++                ordinal,
++                item,
++            })
++            .map_err(std::io::Error::other)
++        })
++        .collect::<std::io::Result<Vec<_>>>()?
++        .join("\n");
++    fs::write(&rollout_path, format!("{rewrite}\n"))?;
++
++    recorder.reopen_after_rewrite().await?;
++    recorder
++        .record_canonical_items(&[agent_message_item("first post-rewrite append")])
++        .await?;
++    recorder.flush().await?;
++
++    assert_eq!(
++        read_rollout_lines(&rollout_path)?
++            .iter()
++            .map(|line| line.ordinal)
++            .collect::<Vec<_>>(),
++        vec![Some(0), Some(1), Some(2)]
++    );
++    recorder.shutdown().await
++}
++
+ #[tokio::test]
+ async fn resumed_paginated_rollout_repairs_unsafe_tail() -> std::io::Result<()> {
+     let valid_unterminated = serde_json::to_string(&RolloutLine {
 diff --git a/codex-rs/thread-store/src/live_thread.rs b/codex-rs/thread-store/src/live_thread.rs
 index 2f043800f2..600dd13f78 100644
 --- a/codex-rs/thread-store/src/live_thread.rs

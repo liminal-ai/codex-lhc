@@ -1288,7 +1288,8 @@ pub(crate) fn graft_prior_active_suffix(
     regenerated: &mut [RolloutItem],
     prior_generation: &[RolloutItem],
 ) -> GraftReport {
-    use crate::body_validation::{client_call_id, output_call_id};
+    use crate::body_validation::client_call_id;
+    use crate::body_validation::output_call_id;
 
     // Extract items after the last Compacted boundary.
     let last_boundary = prior_generation
