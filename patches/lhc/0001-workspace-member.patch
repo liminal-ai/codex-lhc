@@ -21,14 +21,14 @@ index 1abbb45e9d..208bf8f6ed 100644
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
 diff --git a/codex-rs/cli/Cargo.toml b/codex-rs/cli/Cargo.toml
-index 30e5a52a02..d864d53e51 100644
+index 30e5a52a02..45fa681e8b 100644
 --- a/codex-rs/cli/Cargo.toml
 +++ b/codex-rs/cli/Cargo.toml
 @@ -1,6 +1,6 @@
  [package]
  name = "codex-cli"
 -version.workspace = true
-+version = "0.3.1"
++version = "0.3.2"
  edition.workspace = true
  license.workspace = true
  build = "build.rs"
