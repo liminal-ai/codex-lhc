@@ -33,6 +33,8 @@ def main() -> None:
     parser.add_argument("--dist", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--workflow-source")
+    parser.add_argument("--resume-receipt", type=Path)
     parser.add_argument("--upstream-commit", required=True)
     parser.add_argument("--lhc-sdk-commit", required=True)
     parser.add_argument("--run-id", required=True)
@@ -46,6 +48,10 @@ def main() -> None:
     args = parser.parse_args()
 
     require_sha("source-commit", args.source_commit)
+    if args.workflow_source is not None:
+        require_sha("workflow-source", args.workflow_source)
+        if args.workflow_source == args.source_commit:
+            raise SystemExit("workflow-source must be distinct from product source")
     require_sha("upstream-commit", args.upstream_commit)
     require_sha("lhc-sdk-commit", args.lhc_sdk_commit)
     require_run_id("run-id", args.run_id)
@@ -54,6 +60,24 @@ def main() -> None:
         raise SystemExit("duplicate --expected-platform entries")
 
     expected = set(args.expected_platforms)
+
+    resume = None
+    if args.resume_receipt is not None:
+        if args.workflow_source is None:
+            raise SystemExit("--resume-receipt requires --workflow-source")
+        if args.resume_receipt.parent.resolve() != args.dist.resolve():
+            raise SystemExit("resume receipt must be a top-level file in --dist")
+        resume = json.loads(args.resume_receipt.read_text(encoding="utf-8"))
+        expected_resume_identity = {
+            "productSource": args.source_commit,
+            "workflowSource": args.workflow_source,
+            "lhcSdkCommit": args.lhc_sdk_commit,
+        }
+        actual_resume_identity = {
+            key: resume.get(key) for key in expected_resume_identity
+        }
+        if actual_resume_identity != expected_resume_identity:
+            raise SystemExit("resume receipt source identity mismatch")
 
     archives = sorted(
         path
@@ -82,6 +106,23 @@ def main() -> None:
         "product": "codex-lhc",
         "release": args.version,
         "sourceCommit": args.source_commit,
+        "productSource": args.source_commit,
+        **(
+            {
+                "workflowSource": args.workflow_source,
+                "fanoutResume": {
+                    "receipt": args.resume_receipt.name,
+                    "seedRunId": resume["seed"]["runId"],
+                    "seedArtifactId": resume["seed"]["artifactId"],
+                    "qualificationJobId": resume["qualification"]["jobId"],
+                    "qualificationEvidenceArtifactId": resume["qualification"][
+                        "evidenceArtifactId"
+                    ],
+                },
+            }
+            if resume is not None
+            else {}
+        ),
         "upstreamCodexCommit": args.upstream_commit,
         "lhcSdkCommit": args.lhc_sdk_commit,
         "lhcThreadSchema": 11,

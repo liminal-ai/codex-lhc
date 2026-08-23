@@ -11,6 +11,19 @@ LINUX_UAPI_VERSION = "6.8.0-25.25cross1"
 
 
 class InstallMuslBuildToolsTests(unittest.TestCase):
+    def test_empty_apt_argument_arrays_use_bash_32_safe_expansion(self) -> None:
+        text = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn(
+            '${apt_update_args[@]+"${apt_update_args[@]}"}',
+            text,
+        )
+        self.assertIn(
+            '${apt_install_args[@]+"${apt_install_args[@]}"}',
+            text,
+        )
+        self.assertNotIn('update "${apt_update_args[@]}"', text)
+        self.assertNotIn('install -y "${apt_install_args[@]}"', text)
+
     def test_each_target_uses_pinned_uapi_closure_after_musl_and_probes_it(
         self,
     ) -> None:

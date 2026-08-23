@@ -5,6 +5,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
+RESUME_WORKFLOW = ROOT / ".github/workflows/lhc-release-fanout-resume.yml"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
@@ -187,6 +188,128 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("verify_public_release.py", text)
         self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN", text)
         self.assertNotIn("cargo build", text)
+
+
+class FanoutResumeWorkflowContractTests(unittest.TestCase):
+    def test_native_preflights_gate_exact_four_target_matrix(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        matrix = build.split("      matrix:\n", 1)[1].split("    env:\n", 1)[0]
+
+        self.assertIn("needs: [preflight-macos-bash32, preflight-linux-arm64]", build)
+        self.assertIn("/bin/bash -c", text)
+        self.assertIn('BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2', text)
+        self.assertIn("runs-on: ubuntu-24.04-arm", text)
+        self.assertIn("Exercise native fixture mapping and release tests", text)
+        self.assertEqual(
+            re.findall(r"platform: ([a-z0-9_-]+)", matrix),
+            [
+                "macos-aarch64",
+                "linux-aarch64",
+                "windows-x86_64",
+                "windows-aarch64",
+            ],
+        )
+        self.assertEqual(
+            re.findall(r"target: ([a-z0-9_-]+)", matrix),
+            [
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-musl",
+                "x86_64-pc-windows-msvc",
+                "aarch64-pc-windows-msvc",
+            ],
+        )
+        self.assertNotIn("linux-x86_64", matrix)
+        self.assertNotIn("x86_64-unknown-linux-musl", matrix)
+
+    def test_builds_replace_workflow_tree_with_fresh_a25_checkout(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+
+        self.assertIn("Fresh full checkout of accepted product source", build)
+        self.assertIn("ref: a25a81a8d7d6cbd6234011ad3787cd7e59a1f489", build)
+        self.assertIn("submodules: recursive", build)
+        self.assertIn("fetch-depth: 0", build)
+        self.assertIn("clean: true", build)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$PRODUCT_SOURCE"', build)
+        self.assertIn("status --porcelain=v1 --ignore-submodules=none", build)
+        self.assertIn(
+            "test ! -e .github/workflows/lhc-release-fanout-resume.yml", build
+        )
+        self.assertIn('git diff --quiet "$PRODUCT_SOURCE" -- .', build)
+        self.assertIn("scripts/build_codex_package.py", build)
+
+    def test_product_checkout_exempts_only_two_preflighted_synthetic_suites(
+        self,
+    ) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        exemption = build.split(
+            "Test all applicable release helpers with exactly two preflight exemptions",
+            1,
+        )[1].split("      - name: Test Windows installer", 1)[0]
+
+        self.assertIn(
+            "test_install.py|test_install_musl_build_tools.py) continue", exemption
+        )
+        self.assertEqual(exemption.count("continue"), 1)
+        self.assertNotIn("|| true", exemption)
+        self.assertNotIn("continue-on-error", build)
+        self.assertIn('python -m unittest "$@"', exemption)
+
+    def test_retained_artifacts_are_downloaded_by_id_and_hard_fenced(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        candidate = text.split("  candidate:\n", 1)[1]
+
+        for value in (
+            "32669557893",
+            "97274114206",
+            "9501623903",
+            "9501839613",
+        ):
+            self.assertIn(value, candidate)
+        self.assertIn("actions/artifacts/9501623903/zip", candidate)
+        self.assertIn("actions/artifacts/9501839613/zip", candidate)
+        self.assertIn("verify_fanout_resume.py", candidate)
+        self.assertIn("--seed-artifact-json", candidate)
+        self.assertIn("--qualification-artifact-json", candidate)
+        self.assertNotIn("scripts/build_codex_package.py", candidate)
+        self.assertEqual(
+            candidate.count("codex-lhc-v${VERSION}-linux-x86_64.tar.gz"), 1
+        )
+
+        verifier = (ROOT / "scripts/lhc-release/verify_fanout_resume.py").read_text()
+        for value in (
+            "356551728",
+            "4873a72d9ee80725dc51c0e503792291bee71d9a63aefb29d6c841cb2e0d9356",
+            "219676",
+            "cadef3e1e4dcf3da2fb74ef648409c219dee9f447065f1ff861e17dc1f1ce11f",
+        ):
+            self.assertIn(value, verifier)
+        self.assertIn('artifact.get("expired") is False', verifier)
+        self.assertIn('job.get("conclusion") == "success"', verifier)
+
+    def test_candidate_metadata_preserves_dual_source_identity(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        candidate = text.split("  candidate:\n", 1)[1]
+
+        self.assertIn("PRODUCT_SOURCE: a25a81a8d7d6cbd6234011ad3787cd7e59a1f489", text)
+        self.assertIn("WORKFLOW_SOURCE: ${{ github.sha }}", text)
+        self.assertIn('--source-commit "$PRODUCT_SOURCE"', candidate)
+        self.assertIn('--workflow-source "$WORKFLOW_SOURCE"', candidate)
+        self.assertIn("fanout-resume-receipt.json", candidate)
+        self.assertIn("Resumed orchestration workflow source", candidate)
+        self.assertIn("sha256sum -c SHA256SUMS", candidate)
+        self.assertNotIn("softprops/action-gh-release", text)
+        self.assertNotIn("gh release", text)
+        for forbidden in ("daytona", "dgx", "burn-in", "gnome", "git tag"):
+            self.assertNotIn(forbidden, text.lower())
 
 
 if __name__ == "__main__":

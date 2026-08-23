@@ -38,6 +38,8 @@ def run_manifest(
     upstream: str = SHA_B,
     sdk: str = SHA_C,
     run_id: str = "31970651653",
+    workflow_source: str | None = None,
+    resume_receipt: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -55,6 +57,10 @@ def run_manifest(
         "--run-id",
         run_id,
     ]
+    if workflow_source is not None:
+        cmd.extend(["--workflow-source", workflow_source])
+    if resume_receipt is not None:
+        cmd.extend(["--resume-receipt", str(resume_receipt)])
     for platform in platforms:
         cmd.extend(["--expected-platform", platform])
     if extra:
@@ -74,6 +80,7 @@ class PlatformSetTests(unittest.TestCase):
                 [item["platform"] for item in manifest["artifacts"]], ["linux-x86_64"]
             )
             self.assertEqual(manifest["buildRunId"], "31970651653")
+            self.assertEqual(manifest["productSource"], SHA_A)
             self.assertNotIn("supplementalRunId", manifest)
             self.assertEqual(manifest["compactAlgorithmDefault"], "metadata-first")
             self.assertEqual(
@@ -163,6 +170,74 @@ class PlatformSetTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("decimal run id", result.stderr)
+
+    def test_resume_manifest_keeps_product_and_workflow_sources_distinct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
+            receipt = dist / "fanout-resume-receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "productSource": SHA_A,
+                        "workflowSource": SHA_B,
+                        "lhcSdkCommit": SHA_C,
+                        "seed": {"runId": 32669557893, "artifactId": 9501623903},
+                        "qualification": {
+                            "jobId": 97274114206,
+                            "evidenceArtifactId": 9501839613,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_manifest(
+                dist,
+                ALIGNED_VERSION,
+                ["linux-x86_64"],
+                workflow_source=SHA_B,
+                resume_receipt=receipt,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((dist / "release-manifest.json").read_text())
+            self.assertEqual(manifest["sourceCommit"], SHA_A)
+            self.assertEqual(manifest["productSource"], SHA_A)
+            self.assertEqual(manifest["workflowSource"], SHA_B)
+            self.assertEqual(
+                manifest["fanoutResume"],
+                {
+                    "receipt": receipt.name,
+                    "seedRunId": 32669557893,
+                    "seedArtifactId": 9501623903,
+                    "qualificationJobId": 97274114206,
+                    "qualificationEvidenceArtifactId": 9501839613,
+                },
+            )
+
+    def test_resume_manifest_refuses_mixed_source_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = Path(tmp)
+            write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
+            receipt = dist / "fanout-resume-receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "productSource": SHA_B,
+                        "workflowSource": SHA_C,
+                        "lhcSdkCommit": SHA_C,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_manifest(
+                dist,
+                ALIGNED_VERSION,
+                ["linux-x86_64"],
+                workflow_source=SHA_C,
+                resume_receipt=receipt,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("source identity mismatch", result.stderr)
 
 
 if __name__ == "__main__":
