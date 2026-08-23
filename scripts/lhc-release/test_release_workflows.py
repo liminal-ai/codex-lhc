@@ -40,7 +40,20 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "seed_managed_codex_copies_running_fork_bytes_into_isolated_home",
             qualification,
         )
-        self.assertIn("check-lhc-default-capture.py", qualification)
+        self.assertIn(
+            "Run supplemental source regressions (not artifact qualification)",
+            qualification,
+        )
+        self.assertEqual(
+            qualification.count("scripts/check-lhc-installed-lifecycle.py"), 2
+        )
+        self.assertEqual(qualification.count('--binary "$launcher"'), 2)
+        self.assertIn("env -u LHC_COMPACT_ALGORITHM", qualification)
+        self.assertIn("--mode metadata-first", qualification)
+        self.assertIn("LHC_COMPACT_ALGORITHM=legacy", qualification)
+        self.assertIn("--mode legacy", qualification)
+        self.assertIn("app-server daemon bootstrap", qualification)
+        self.assertIn('cmp "$package/bin/codex" "$managed"', qualification)
         self.assertIn("view_compact_bounded", qualification)
         self.assertIn("codex-lhc-host --lib materialize", qualification)
         self.assertIn("slice_d_", qualification)

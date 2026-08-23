@@ -114,7 +114,7 @@ jobs:
             --archive "$archive" --platform linux-x86_64 --version "$VERSION" \
             --lhc-sdk-commit 9d4d18247942f35b356f28bdc4288f0e631a6da9
           (cd seed && sha256sum "codex-lhc-v${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS)
-      - name: Run bounded Compact, resume, materialization, sandbox, and fork-byte canaries
+      - name: Run supplemental source regressions (not artifact qualification)
         working-directory: codex-rs
         env:
           RUST_MIN_STACK: "8388608"
@@ -153,15 +153,33 @@ jobs:
             "$launcher" app-server generate-json-schema --experimental \
             --out "${RUNNER_TEMP}/codex-lhc-seed-app-server-schema"
           test -n "$(find "${RUNNER_TEMP}/codex-lhc-seed-app-server-schema" -type f -print -quit)"
-          HOME="$home" CODEX_HOME="$codex_home" CODEX_LHC_ROOT="$lhc_root" \
-            python scripts/check-lhc-default-capture.py \
-              --binary "$launcher" --lhc-root "$lhc_root"
+          daemon_home="${RUNNER_TEMP}/codex-lhc-seed-daemon-home"
+          mkdir -p "$daemon_home"
+          bootstrap="$(HOME="$home" CODEX_HOME="$daemon_home" \
+            timeout 30 "$launcher" app-server daemon bootstrap)"
+          managed="$(jq -r .managedCodexPath <<<"$bootstrap")"
+          test "$(jq -r .managedCodexVersion <<<"$bootstrap")" = "$VERSION"
+          test "$(jq -r .appServerVersion <<<"$bootstrap")" = "$VERSION"
+          cmp "$package/bin/codex" "$managed"
+          HOME="$home" CODEX_HOME="$daemon_home" \
+            timeout 30 "$launcher" app-server daemon stop >/dev/null
+          env -u LHC_COMPACT_ALGORITHM \
+            python scripts/check-lhc-installed-lifecycle.py \
+              --binary "$launcher" --mode metadata-first \
+              --root "${RUNNER_TEMP}/codex-lhc-seed-default-lifecycle"
+          LHC_COMPACT_ALGORITHM=legacy \
+            python scripts/check-lhc-installed-lifecycle.py \
+              --binary "$launcher" --mode legacy \
+              --root "${RUNNER_TEMP}/codex-lhc-seed-legacy-lifecycle"
           HOME="$home" sh seed/install.sh \
             --name codex-lhc-seed --prefix "$prefix" --install-root "$store" \
             --uninstall
           test ! -e "$launcher"
           test ! -e "$store"
-          test -n "$(find "$lhc_root/threads" -name '*.sqlite' -type f -print -quit)"
+          test -n "$(find "${RUNNER_TEMP}/codex-lhc-seed-default-lifecycle/lhc/threads" \
+            -name '*.sqlite' -type f -print -quit)"
+          test -n "$(find "${RUNNER_TEMP}/codex-lhc-seed-legacy-lifecycle/lhc/threads" \
+            -name '*.sqlite' -type f -print -quit)"
 
   build-remaining:
     name: Build ${{ matrix.platform }} after seed
