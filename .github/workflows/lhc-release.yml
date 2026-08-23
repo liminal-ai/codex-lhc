@@ -17,15 +17,79 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build ${{ matrix.platform }}
+  seed:
+    name: Build and verify linux-x86_64 seed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      PLATFORM: linux-x86_64
+      TARGET: x86_64-unknown-linux-musl
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+      - name: Validate release and public SDK identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/lhc-release/check_version_identity.py --version "$VERSION"
+          sdk_dir=codex-rs/lhc/vendor/long-horizon-context
+          sdk_commit="$(git -C "$sdk_dir" rev-parse HEAD)"
+          test "$sdk_commit" = 9d4d18247942f35b356f28bdc4288f0e631a6da9
+          git -C "$sdk_dir" fetch --no-tags origin main
+          git -C "$sdk_dir" merge-base --is-ancestor "$sdk_commit" origin/main
+      - uses: ./.github/actions/setup-ci
+      - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Install musl build tools
+        run: sudo bash .github/scripts/install-musl-build-tools.sh
+      - name: Test canonical package builder
+        run: python -m unittest discover -s scripts/codex_package -p 'test_*.py'
+      - name: Test release helpers and POSIX installer
+        run: python -m unittest discover -s scripts/lhc-release -p 'test_*.py'
+      - name: Build canonical Codex-LHC seed archive
+        run: |
+          set -euo pipefail
+          package_dir="${RUNNER_TEMP}/codex-lhc-${PLATFORM}"
+          archive="dist/codex-lhc-v${VERSION}-${PLATFORM}.tar.gz"
+          mkdir -p dist
+          python scripts/build_codex_package.py \
+            --target "$TARGET" --variant codex --package-version "$VERSION" \
+            --cargo-profile release --package-dir "$package_dir" \
+            --archive-output "$archive" \
+            --lhc-sdk-commit 9d4d18247942f35b356f28bdc4288f0e631a6da9 \
+            --lhc-thread-schema 11 --force
+          python scripts/lhc-release/verify_package_archive.py \
+            --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
+            --lhc-sdk-commit 9d4d18247942f35b356f28bdc4288f0e631a6da9
+      - name: Prove default LHC capture on seed
+        run: >-
+          python scripts/check-lhc-default-capture.py
+          --binary "${RUNNER_TEMP}/codex-lhc-${PLATFORM}/bin/codex"
+      - name: Upload exact verified seed archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-linux-x86_64
+          path: dist/codex-lhc-v${{ inputs.version }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  build-remaining:
+    name: Build ${{ matrix.platform }} after seed
+    needs: seed
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { platform: linux-x86_64, target: x86_64-unknown-linux-musl, kind: linux, archive: tar.gz, runs_on: ubuntu-24.04 }
           - { platform: linux-aarch64, target: aarch64-unknown-linux-musl, kind: linux, archive: tar.gz, runs_on: ubuntu-24.04-arm }
           - { platform: windows-x86_64, target: x86_64-pc-windows-msvc, kind: windows, archive: zip, runs_on: blacksmith-32vcpu-windows-2025 }
           - platform: windows-aarch64
@@ -106,13 +170,8 @@ jobs:
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
             --lhc-sdk-commit 9d4d18247942f35b356f28bdc4288f0e631a6da9
-      - name: Prove default LHC capture
-        if: matrix.platform == 'linux-x86_64'
-        shell: bash
-        run: >-
-          python scripts/check-lhc-default-capture.py
-          --binary "${RUNNER_TEMP}/codex-lhc-${PLATFORM}/bin/codex"
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - name: Upload immutable platform archive
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: codex-lhc-${{ matrix.platform }}
           path: dist/codex-lhc-v${{ inputs.version }}-${{ matrix.platform }}.${{ matrix.archive }}
@@ -121,7 +180,7 @@ jobs:
 
   candidate:
     name: Assemble immutable five-platform candidate
-    needs: build
+    needs: [seed, build-remaining]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
