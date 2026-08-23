@@ -10,8 +10,8 @@ import urllib.request
 from pathlib import Path
 
 
-def expected_asset_names(version: str) -> set[str]:
-    return {
+def expected_asset_names(version: str, *, resumed: bool = False) -> set[str]:
+    names = {
         f"codex-lhc-v{version}-linux-x86_64.tar.gz",
         f"codex-lhc-v{version}-linux-aarch64.tar.gz",
         f"codex-lhc-v{version}-windows-x86_64.zip",
@@ -22,13 +22,25 @@ def expected_asset_names(version: str) -> set[str]:
         "release-manifest.json",
         "SHA256SUMS",
     }
+    if resumed:
+        names |= {
+            "RELEASE_NOTES.md",
+            "codex-lhc-linux-x86_64-qualification-evidence.zip",
+            "fanout-resume-receipt.json",
+        }
+    return names
 
 
 def validate_public_state(
-    *, tag_sha: str, release: dict, version: str, source_sha: str
+    *,
+    tag_sha: str,
+    release: dict,
+    version: str,
+    product_source: str,
+    workflow_source: str,
 ) -> dict[str, str]:
-    if tag_sha != source_sha:
-        raise ValueError(f"public tag target {tag_sha} != {source_sha}")
+    if tag_sha != product_source:
+        raise ValueError(f"public tag target {tag_sha} != {product_source}")
     if (
         release.get("tag_name") != f"v{version}"
         or release.get("draft") is not False
@@ -37,15 +49,29 @@ def validate_public_state(
         raise ValueError(
             "public release identity is missing, mismatched, or still draft"
         )
+    body = release.get("body") or ""
+    for label, value in (
+        ("Product source", product_source),
+        ("Workflow source", workflow_source),
+    ):
+        if f"- {label}: {value}" not in body:
+            raise ValueError(f"public release body does not disclose {label}")
+
     assets = release.get("assets") or []
     urls = {asset.get("name"): asset.get("browser_download_url") for asset in assets}
-    expected = expected_asset_names(version)
+    expected = expected_asset_names(version, resumed=workflow_source != product_source)
     if set(urls) != expected or any(not url for url in urls.values()):
         raise ValueError(f"public assets {sorted(urls)} != expected {sorted(expected)}")
     return urls
 
 
-def verify_downloaded_assets(candidate_dir: Path, downloaded: dict[str, bytes]) -> None:
+def verify_downloaded_assets(
+    candidate_dir: Path,
+    downloaded: dict[str, bytes],
+    *,
+    product_source: str,
+    workflow_source: str,
+) -> None:
     for name, body in downloaded.items():
         candidate = candidate_dir / name
         if not candidate.is_file() or candidate.read_bytes() != body:
@@ -57,6 +83,17 @@ def verify_downloaded_assets(candidate_dir: Path, downloaded: dict[str, bytes]) 
         actual = hashlib.sha256(downloaded[name]).hexdigest()
         if actual != digest:
             raise ValueError(f"public checksum mismatch for {name}")
+
+    manifest = json.loads(downloaded["release-manifest.json"])
+    if manifest.get("sourceCommit") != product_source:
+        raise ValueError("public manifest sourceCommit is not product source")
+    if manifest.get("productSource", manifest.get("sourceCommit")) != product_source:
+        raise ValueError("public manifest productSource mismatch")
+    if workflow_source != product_source:
+        if manifest.get("workflowSource") != workflow_source:
+            raise ValueError("public manifest workflowSource mismatch")
+    elif manifest.get("workflowSource", product_source) != product_source:
+        raise ValueError("single-source public manifest has mixed workflowSource")
 
 
 def fetch_json(url: str) -> dict:
@@ -73,7 +110,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--product-source", required=True)
+    parser.add_argument("--workflow-source", required=True)
     parser.add_argument("--candidate-dir", type=Path, required=True)
     args = parser.parse_args()
 
@@ -87,13 +125,19 @@ def main() -> None:
         tag_sha=tag_sha,
         release=release,
         version=args.version,
-        source_sha=args.source_sha,
+        product_source=args.product_source,
+        workflow_source=args.workflow_source,
     )
     downloaded = {name: fetch_bytes(url) for name, url in urls.items()}
-    verify_downloaded_assets(args.candidate_dir, downloaded)
+    verify_downloaded_assets(
+        args.candidate_dir,
+        downloaded,
+        product_source=args.product_source,
+        workflow_source=args.workflow_source,
+    )
     print(
         f"Public v{args.version} tag, release, and all expected assets "
-        f"match candidate {args.source_sha}."
+        f"match product {args.product_source} via workflow {args.workflow_source}."
     )
 
 

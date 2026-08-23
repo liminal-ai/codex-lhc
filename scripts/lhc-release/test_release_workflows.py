@@ -187,6 +187,20 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("Hard public tag, release, and exact-asset postconditions", text)
         self.assertIn("verify_public_release.py", text)
         self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN", text)
+        self.assertIn(".github/workflows/lhc-release-fanout-resume.yml", text)
+        self.assertIn(".github/workflows/lhc-release.yml)", text)
+        self.assertIn('product_source="$workflow_source"', text)
+        self.assertIn('artifact_name="codex-lhc-v${VERSION}-candidate"', text)
+        self.assertIn("product_source=a25a81a8d7d6cbd6234011ad3787cd7e59a1f489", text)
+        self.assertIn("git merge-base --is-ancestor", text)
+        self.assertIn(
+            "target_commitish: ${{ steps.identity.outputs.product_source }}", text
+        )
+        self.assertIn('--product-source "$PRODUCT_SOURCE"', text)
+        self.assertIn('--workflow-source "$WORKFLOW_SOURCE"', text)
+        self.assertIn("- Product source: %s", text)
+        self.assertIn("- Workflow source: %s", text)
+        self.assertIn("files: candidate/*", text)
         self.assertNotIn("cargo build", text)
 
 
@@ -198,7 +212,11 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         )[0]
         matrix = build.split("      matrix:\n", 1)[1].split("    env:\n", 1)[0]
 
-        self.assertIn("needs: [preflight-macos-bash32, preflight-linux-arm64]", build)
+        self.assertIn(
+            "needs: [retained-boundary, preflight-macos-bash32, preflight-linux-arm64]",
+            build,
+        )
+        self.assertIn("needs: retained-boundary", text)
         self.assertIn("/bin/bash -c", text)
         self.assertIn('BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}" = 3.2', text)
         self.assertIn("runs-on: ubuntu-24.04-arm", text)
@@ -243,7 +261,7 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         self.assertIn('git diff --quiet "$PRODUCT_SOURCE" -- .', build)
         self.assertIn("scripts/build_codex_package.py", build)
 
-    def test_product_checkout_exempts_only_two_preflighted_synthetic_suites(
+    def test_product_checkout_has_one_platform_specific_preflight_exemption(
         self,
     ) -> None:
         text = RESUME_WORKFLOW.read_text()
@@ -251,13 +269,14 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
             "\n  candidate:\n", 1
         )[0]
         exemption = build.split(
-            "Test all applicable release helpers with exactly two preflight exemptions",
+            "Test release helpers with one platform-specific preflight exemption",
             1,
         )[1].split("      - name: Test Windows installer", 1)[0]
 
         self.assertIn(
-            "test_install.py|test_install_musl_build_tools.py) continue", exemption
+            "macos) exempted_test=test_install_musl_build_tools.py", exemption
         )
+        self.assertIn("linux) exempted_test=test_install.py", exemption)
         self.assertEqual(exemption.count("continue"), 1)
         self.assertNotIn("|| true", exemption)
         self.assertNotIn("continue-on-error", build)
@@ -265,6 +284,9 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
 
     def test_retained_artifacts_are_downloaded_by_id_and_hard_fenced(self) -> None:
         text = RESUME_WORKFLOW.read_text()
+        boundary = text.split("  retained-boundary:\n", 1)[1].split(
+            "\n  preflight-macos-bash32:\n", 1
+        )[0]
         candidate = text.split("  candidate:\n", 1)[1]
 
         for value in (
@@ -273,12 +295,24 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
             "9501623903",
             "9501839613",
         ):
-            self.assertIn(value, candidate)
-        self.assertIn("actions/artifacts/9501623903/zip", candidate)
-        self.assertIn("actions/artifacts/9501839613/zip", candidate)
+            self.assertIn(value, boundary)
+        self.assertIn("actions/artifacts/9501623903/zip", boundary)
+        self.assertIn("actions/artifacts/9501839613/zip", boundary)
+        self.assertIn("actions: read", boundary)
+        self.assertIn("verify_fanout_resume.py", boundary)
+        self.assertNotIn("--platform-root", boundary)
+        self.assertIn("name: codex-lhc-retained-boundary", boundary)
+        self.assertLess(
+            text.index("  retained-boundary:\n"),
+            text.index("  preflight-macos-bash32:\n"),
+        )
+        self.assertIn("needs: [retained-boundary, build-resumed-platforms]", candidate)
+        self.assertNotIn("gh api", candidate)
         self.assertIn("verify_fanout_resume.py", candidate)
+        self.assertIn("name: codex-lhc-retained-boundary", candidate)
         self.assertIn("--seed-artifact-json", candidate)
         self.assertIn("--qualification-artifact-json", candidate)
+        self.assertIn("--platform-root fanout", candidate)
         self.assertNotIn("scripts/build_codex_package.py", candidate)
         self.assertEqual(
             candidate.count("codex-lhc-v${VERSION}-linux-x86_64.tar.gz"), 1

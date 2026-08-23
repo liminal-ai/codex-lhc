@@ -87,6 +87,15 @@ class FanoutResumeVerificationTests(unittest.TestCase):
                 }
             )
 
+        with self.assertRaisesRegex(ValueError, "seed run head mismatch"):
+            resume.validate_run(
+                {
+                    "id": resume.SEED_RUN_ID,
+                    "head_sha": WORKFLOW_SOURCE,
+                    "path": ".github/workflows/lhc-release.yml",
+                }
+            )
+
     def test_artifact_refuses_expiration_digest_and_missing_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -127,6 +136,22 @@ class FanoutResumeVerificationTests(unittest.TestCase):
                 resume.validate_artifact(
                     bad_digest, expected, download, evidence=True, version=VERSION
                 )
+            wrong_size = {**artifact, "size_in_bytes": expected["size"] + 1}
+            with self.assertRaisesRegex(ValueError, "size mismatch"):
+                resume.validate_artifact(
+                    wrong_size, expected, download, evidence=True, version=VERSION
+                )
+            wrong_run = {
+                **artifact,
+                "workflow_run": {
+                    "id": resume.SEED_RUN_ID + 1,
+                    "head_sha": resume.PRODUCT_SOURCE,
+                },
+            }
+            with self.assertRaisesRegex(ValueError, "run mismatch"):
+                resume.validate_artifact(
+                    wrong_run, expected, download, evidence=True, version=VERSION
+                )
 
             empty = root / "empty.zip"
             empty_expected = write_zip(empty, {})
@@ -143,6 +168,25 @@ class FanoutResumeVerificationTests(unittest.TestCase):
                     empty_artifact,
                     empty_expected,
                     empty,
+                    evidence=True,
+                    version=VERSION,
+                )
+
+            unsafe = root / "unsafe.zip"
+            unsafe_expected = write_zip(unsafe, {"../escaped": b"unsafe"})
+            unsafe_artifact = {
+                "id": unsafe_expected["id"],
+                "name": unsafe_expected["name"],
+                "size_in_bytes": unsafe_expected["size"],
+                "digest": unsafe_expected["digest"],
+                "expired": False,
+                "workflow_run": artifact["workflow_run"],
+            }
+            with self.assertRaisesRegex(ValueError, "unsafe path"):
+                resume.validate_artifact(
+                    unsafe_artifact,
+                    unsafe_expected,
+                    unsafe,
                     evidence=True,
                     version=VERSION,
                 )

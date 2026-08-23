@@ -34,7 +34,6 @@ jobs:
     env:
       VERSION: ${{ inputs.version }}
       CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
-      SOURCE_SHA: ""
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -58,19 +57,39 @@ jobs:
           set -euo pipefail
           candidate="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")"
           test "$(jq -r .conclusion <<<"$candidate")" = success
-          test "$(jq -r .path <<<"$candidate")" = .github/workflows/lhc-release.yml
-          source_sha="$(jq -r .head_sha <<<"$candidate")"
-          test "$source_sha" = "$(git rev-parse HEAD)"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          candidate_path="$(jq -r .path <<<"$candidate")"
+          workflow_source="$(jq -r .head_sha <<<"$candidate")"
+          test "$workflow_source" = "$(git rev-parse HEAD)"
+          case "$candidate_path" in
+            .github/workflows/lhc-release.yml)
+              product_source="$workflow_source"
+              artifact_name="codex-lhc-v${VERSION}-candidate"
+              candidate_kind=single-source
+              ;;
+            .github/workflows/lhc-release-fanout-resume.yml)
+              product_source=a25a81a8d7d6cbd6234011ad3787cd7e59a1f489
+              test "$workflow_source" != "$product_source"
+              git merge-base --is-ancestor "$product_source" "$workflow_source"
+              artifact_name="codex-lhc-v${VERSION}-fanout-resume-candidate"
+              candidate_kind=fanout-resume
+              ;;
+            *) echo "unsupported candidate workflow: $candidate_path" >&2; exit 1 ;;
+          esac
+          echo "product_source=$product_source" >> "$GITHUB_OUTPUT"
+          echo "workflow_source=$workflow_source" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$artifact_name" >> "$GITHUB_OUTPUT"
+          echo "candidate_kind=$candidate_kind" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: codex-lhc-v${{ inputs.version }}-candidate
+          name: ${{ steps.identity.outputs.artifact_name }}
           path: candidate
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ inputs.candidate_run_id }}
       - name: Reverify exact immutable aggregate
         env:
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          PRODUCT_SOURCE: ${{ steps.identity.outputs.product_source }}
+          WORKFLOW_SOURCE: ${{ steps.identity.outputs.workflow_source }}
+          CANDIDATE_KIND: ${{ steps.identity.outputs.candidate_kind }}
         run: |
           set -euo pipefail
           (cd candidate && sha256sum -c SHA256SUMS)
@@ -79,7 +98,13 @@ jobs:
           from pathlib import Path
           manifest = json.loads(Path("candidate/release-manifest.json").read_text())
           assert manifest["release"] == os.environ["VERSION"]
-          assert manifest["sourceCommit"] == os.environ["SOURCE_SHA"]
+          assert manifest["sourceCommit"] == os.environ["PRODUCT_SOURCE"]
+          assert manifest.get("productSource", manifest["sourceCommit"]) == os.environ["PRODUCT_SOURCE"]
+          if os.environ["CANDIDATE_KIND"] == "fanout-resume":
+              assert manifest["workflowSource"] == os.environ["WORKFLOW_SOURCE"]
+              assert manifest["fanoutResume"]["receipt"] == "fanout-resume-receipt.json"
+          else:
+              assert manifest.get("workflowSource", os.environ["PRODUCT_SOURCE"]) == os.environ["PRODUCT_SOURCE"]
           assert manifest["buildRunId"] == os.environ["CANDIDATE_RUN_ID"]
           assert manifest["lhcSdkCommit"] == "9d4d18247942f35b356f28bdc4288f0e631a6da9"
           assert manifest["compactAlgorithmDefault"] == "metadata-first"
@@ -94,43 +119,37 @@ jobs:
       - name: Refuse an existing public identity
         env:
           GH_TOKEN: ${{ secrets.CODEX_LHC_RELEASE_TOKEN }}
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
-        run: scripts/lhc-release/tag_release_gate.sh forward "$VERSION" "$SOURCE_SHA"
+          PRODUCT_SOURCE: ${{ steps.identity.outputs.product_source }}
+        run: scripts/lhc-release/tag_release_gate.sh forward "$VERSION" "$PRODUCT_SOURCE"
       - name: Write exact release notes
         env:
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          PRODUCT_SOURCE: ${{ steps.identity.outputs.product_source }}
+          WORKFLOW_SOURCE: ${{ steps.identity.outputs.workflow_source }}
           APPROVAL_RECORD: ${{ inputs.approval_record }}
         run: |
           set -euo pipefail
-          git show "${SOURCE_SHA}:lhc-release/notes/v${VERSION}.md" > RELEASE_NOTES.md
+          git show "${PRODUCT_SOURCE}:lhc-release/notes/v${VERSION}.md" > RELEASE_NOTES.md
           head -1 RELEASE_NOTES.md | grep -qF "v${VERSION}"
-          printf '\n---\n\n- Candidate workflow: %s\n- Approval record: %s\n- Platforms: linux-x86_64, linux-aarch64, windows-x86_64, windows-aarch64, macos-aarch64\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
-            "$CANDIDATE_RUN_ID" "$APPROVAL_RECORD" >> RELEASE_NOTES.md
+          printf '\n---\n\n- Product source: %s\n- Workflow source: %s\n- Candidate workflow run: %s\n- Approval record: %s\n- Platforms: linux-x86_64, linux-aarch64, windows-x86_64, windows-aarch64, macos-aarch64\n- This is not an official OpenAI release. Verify release-manifest.json and SHA256SUMS before installation.\n' \
+            "$PRODUCT_SOURCE" "$WORKFLOW_SOURCE" "$CANDIDATE_RUN_ID" "$APPROVAL_RECORD" >> RELEASE_NOTES.md
       - name: Publish exact candidate without rebuilding
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           token: ${{ secrets.CODEX_LHC_RELEASE_TOKEN }}
           tag_name: v${{ inputs.version }}
           name: Codex + LHC v${{ inputs.version }}
-          target_commitish: ${{ steps.identity.outputs.source_sha }}
+          target_commitish: ${{ steps.identity.outputs.product_source }}
           body_path: RELEASE_NOTES.md
-          files: |
-            candidate/codex-lhc-v*-linux-x86_64.tar.gz
-            candidate/codex-lhc-v*-linux-aarch64.tar.gz
-            candidate/codex-lhc-v*-windows-x86_64.zip
-            candidate/codex-lhc-v*-windows-aarch64.zip
-            candidate/codex-lhc-v*-macos-aarch64.tar.gz
-            candidate/install.sh
-            candidate/install.ps1
-            candidate/release-manifest.json
-            candidate/SHA256SUMS
+          files: candidate/*
           fail_on_unmatched_files: true
           generate_release_notes: false
       - name: Hard public tag, release, and exact-asset postconditions
         env:
-          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          PRODUCT_SOURCE: ${{ steps.identity.outputs.product_source }}
+          WORKFLOW_SOURCE: ${{ steps.identity.outputs.workflow_source }}
         run: |
           set -euo pipefail
           env -u GH_TOKEN -u GITHUB_TOKEN python3 scripts/lhc-release/verify_public_release.py \
             --repository "$GITHUB_REPOSITORY" --version "$VERSION" \
-            --source-sha "$SOURCE_SHA" --candidate-dir candidate
+            --product-source "$PRODUCT_SOURCE" \
+            --workflow-source "$WORKFLOW_SOURCE" --candidate-dir candidate

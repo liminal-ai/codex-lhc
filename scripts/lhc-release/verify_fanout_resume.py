@@ -167,7 +167,7 @@ def main() -> None:
     parser.add_argument("--qualification-artifact-json", type=Path, required=True)
     parser.add_argument("--seed-download", type=Path, required=True)
     parser.add_argument("--qualification-download", type=Path, required=True)
-    parser.add_argument("--platform-root", type=Path, required=True)
+    parser.add_argument("--platform-root", type=Path)
     parser.add_argument("--receipt-output", type=Path, required=True)
     args = parser.parse_args()
 
@@ -201,13 +201,6 @@ def main() -> None:
         evidence=True,
         version=args.version,
     )
-    builds = validate_platform_receipts(
-        args.platform_root,
-        version=args.version,
-        workflow_source=args.workflow_source,
-        current_run_id=args.current_run_id,
-    )
-
     receipt = {
         "schemaVersion": 1,
         "productSource": PRODUCT_SOURCE,
@@ -229,12 +222,21 @@ def main() -> None:
             "evidenceArtifactBytes": QUALIFICATION_ARTIFACT["size"],
             "evidenceArtifactDigest": QUALIFICATION_ARTIFACT["digest"],
         },
-        "resumedBuilds": builds,
     }
+    if args.platform_root is not None:
+        receipt["resumedBuilds"] = validate_platform_receipts(
+            args.platform_root,
+            version=args.version,
+            workflow_source=args.workflow_source,
+            current_run_id=args.current_run_id,
+        )
     args.receipt_output.write_text(
         json.dumps(receipt, indent=2) + "\n", encoding="utf-8"
     )
-    print("verified qualified seed and exact four-platform resumed fanout")
+    if args.platform_root is None:
+        print("verified retained qualified seed boundary")
+    else:
+        print("verified qualified seed and exact four-platform resumed fanout")
 
 
 if __name__ == "__main__":
