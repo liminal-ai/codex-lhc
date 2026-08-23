@@ -1,0 +1,32 @@
+{
+  "checkedAt": "2026-08-23T20:36:11Z",
+  "repository": "liminal-ai/codex-lhc",
+  "repositoryVisibility": "public",
+  "repositorySelfHostedRunnerCount": 0,
+  "repositoryReadback": {
+    "endpoint": "GET /repos/liminal-ai/codex-lhc",
+    "fullName": "liminal-ai/codex-lhc",
+    "visibility": "public",
+    "defaultBranch": "lhc"
+  },
+  "repositoryRunnerReadback": {
+    "endpoint": "GET /repos/liminal-ai/codex-lhc/actions/runners",
+    "totalCount": 0,
+    "runners": []
+  },
+  "organizationHostedRunnerInventory": {
+    "status": 403,
+    "reason": "current token lacks organization hosted-runner administration permission"
+  },
+  "selectedRoute": {
+    "kind": "standard-github-hosted",
+    "label": "windows-11-arm",
+    "operatingSystem": "Windows 11",
+    "architecture": "arm64",
+    "cpu": 4,
+    "memoryGiB": 16,
+    "storageGiB": 14,
+    "availability": "standard runner for public repositories",
+    "source": "https://docs.github.com/en/actions/reference/runners/github-hosted-runners"
+  }
+}

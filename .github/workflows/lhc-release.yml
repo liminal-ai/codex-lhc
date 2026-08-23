@@ -81,9 +81,91 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  qualify-seed:
+    name: Qualify exact downloaded linux-x86_64 seed
+    needs: seed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      actions: read
+      contents: read
+    env:
+      CODEX_REPO_ROOT: ${{ github.workspace }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+      - name: Download exact seed archive without rebuilding
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: codex-lhc-linux-x86_64
+          path: seed
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Verify downloaded canonical package
+        run: |
+          set -euo pipefail
+          archive="seed/codex-lhc-v${VERSION}-linux-x86_64.tar.gz"
+          python scripts/lhc-release/check_version_identity.py --version "$VERSION"
+          python scripts/lhc-release/verify_package_archive.py \
+            --archive "$archive" --platform linux-x86_64 --version "$VERSION" \
+            --lhc-sdk-commit 9d4d18247942f35b356f28bdc4288f0e631a6da9
+          (cd seed && sha256sum "codex-lhc-v${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS)
+      - name: Run bounded Compact, resume, materialization, sandbox, and fork-byte canaries
+        working-directory: codex-rs
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p codex-linux-sandbox bundled_bwrap
+          cargo test --locked -p codex-app-server-daemon \
+            seed_managed_codex_copies_running_fork_bytes_into_isolated_home
+          cargo test --locked -p lhc --test view_compact_bounded
+          cargo test --locked -p codex-lhc-host --lib materialize
+          cargo test --locked -p codex-core --lib slice_d_ -- --test-threads=1
+          cargo test --locked -p codex-core --lib \
+            c1_resume_after_compact_no_reingest_and_durable_provenance_survives \
+            -- --test-threads=1
+      - name: Install and exercise the exact downloaded seed
+        run: |
+          set -euo pipefail
+          archive="seed/codex-lhc-v${VERSION}-linux-x86_64.tar.gz"
+          prefix="${RUNNER_TEMP}/codex-lhc-seed-prefix"
+          store="${RUNNER_TEMP}/codex-lhc-seed-store"
+          home="${RUNNER_TEMP}/codex-lhc-seed-home"
+          codex_home="${RUNNER_TEMP}/codex-lhc-seed-codex-home"
+          lhc_root="${RUNNER_TEMP}/codex-lhc-seed-lhc"
+          mkdir -p "$home" "$codex_home" "$lhc_root"
+          install -m 0755 scripts/lhc-release/install.sh seed/install.sh
+          HOME="$home" sh seed/install.sh \
+            --asset-dir "$(pwd)/seed" --version "$VERSION" \
+            --name codex-lhc-seed --prefix "$prefix" --install-root "$store"
+          launcher="$prefix/bin/codex-lhc-seed"
+          package="$store/versions/$VERSION"
+          test "$("$launcher" --version)" = "codex-cli $VERSION"
+          "$package/bin/codex-code-mode-host" --help >/dev/null
+          "$package/codex-path/rg" --version >/dev/null
+          "$package/codex-resources/bwrap" --version >/dev/null
+          HOME="$home" CODEX_HOME="$codex_home" CODEX_LHC_ROOT="$lhc_root" \
+            "$launcher" app-server generate-json-schema --experimental \
+            --out "${RUNNER_TEMP}/codex-lhc-seed-app-server-schema"
+          test -n "$(find "${RUNNER_TEMP}/codex-lhc-seed-app-server-schema" -type f -print -quit)"
+          HOME="$home" CODEX_HOME="$codex_home" CODEX_LHC_ROOT="$lhc_root" \
+            python scripts/check-lhc-default-capture.py \
+              --binary "$launcher" --lhc-root "$lhc_root"
+          HOME="$home" sh seed/install.sh \
+            --name codex-lhc-seed --prefix "$prefix" --install-root "$store" \
+            --uninstall
+          test ! -e "$launcher"
+          test ! -e "$store"
+          test -n "$(find "$lhc_root/threads" -name '*.sqlite' -type f -print -quit)"
+
   build-remaining:
     name: Build ${{ matrix.platform }} after seed
-    needs: seed
+    needs: qualify-seed
     runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 180
     strategy:
@@ -96,9 +178,7 @@ jobs:
             target: aarch64-pc-windows-msvc
             kind: windows
             archive: zip
-            runs_on:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
+            runs_on: windows-11-arm
           - { platform: macos-aarch64, target: aarch64-apple-darwin, kind: macos, archive: tar.gz, runs_on: blacksmith-12vcpu-macos-15 }
     env:
       CODEX_REPO_ROOT: ${{ github.workspace }}
@@ -180,7 +260,7 @@ jobs:
 
   candidate:
     name: Assemble immutable five-platform candidate
-    needs: [seed, build-remaining]
+    needs: [qualify-seed, build-remaining]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
