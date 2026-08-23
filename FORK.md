@@ -23,13 +23,16 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`2cb04a5`** — LIM-67 contract 2.0.0 protected pending-tool
-  escalation plus non-blocking prepared-view activation. Normal derivation,
-  re-derivation, and source progress cannot cancel a compact. The pin includes
-  sorted `protectedToolCallIds`, protected visibility-boundary preview, atomic
-  view+boundary activation, and the schema v11 host-validation store + ack
-  APIs on shared `main`. It descends the LIM-63 pin `6232317`, LIM-63A pin
-  `98826c1`, and retrieval pin `7062814` / `dd251ec`. The tripwire requires a
+  Current pin: **`9d4d182`** (`9d4d18247942f35b356f28bdc4288f0e631a6da9`) —
+  accepted local Rust LHC candidate (2026-08-23): bounded metadata-first Smart
+  Compact is the default; `LHC_COMPACT_ALGORITHM=legacy` still selects the
+  eager full-read path; skipped compact-continuation records keep their wire
+  casing. Default compact no longer reads every live message and closed-chunk
+  fallback before selecting. This pin is **local-only** (not yet an ancestor of
+  `origin/main`; tripwire pin-drift will warn until it is folded). It descends
+  `f4de85c` (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67
+  contract 2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
+  (LIM-63 / 63A), and retrieval `7062814` / `dd251ec`. The tripwire requires a
   clean tree at the pin and full mid-turn / full-loop layers.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
@@ -307,12 +310,19 @@ an ancestor of 0.149.0; merge-base is `b3cc217378`. Content conflicts:
 `Cargo.toml` (take `0.149.0`, keep LHC workspace member), `core/src/lib.rs`
 (keep LHC modules + take 0.149 network/MCP re-exports), `models.json` (keep
 fork compact windows `370000/1050000/350000` on gpt-5.6-*), `Cargo.lock`
-(regenerate from 0.149 + LHC host). LHC SDK pin remains **`f4de85c`**. Host
-adapter gained 0.149 `CompactedItem.mcp_resource_origins` and
-`AgentMessageEvent.delivery` so materialize still compiles. Isolated
+(regenerate from 0.149 + LHC host). Pre-pin source SHA `95879adda9` kept SDK
+pin **`f4de85c`**. Host adapter gained 0.149 `CompactedItem.mcp_resource_origins`
+and `AgentMessageEvent.delivery` so materialize still compiles. Isolated
 remote-control homes seed running fork bytes (bead 3i7); stock
 `chatgpt.com/codex/install.sh` is not used. Platform docs record published
 Linux/Windows/macOS artifacts (5v7.2). `8y8` left for release-prep.
+
+Fable accepted `95879adda9` as the clean pre-Rust-pin Codex 0.149 candidate,
+then authorized one integration commit: advance the vendored gitlink
+`f4de85c` → accepted local Rust candidate **`9d4d182`**. Default Smart Compact
+is bounded metadata-first; `LHC_COMPACT_ALGORITHM=legacy` remains selectable.
+Patches/BASE stay at `758ef40f50` (vendor lives under `codex-rs/lhc/`, outside
+the patch series). Do not push the LHC or Codex repos for this pin.
 
 ### Drill run 2026-07-26 (Chunk 3 / C2) — clean, and thinner than intended
 
