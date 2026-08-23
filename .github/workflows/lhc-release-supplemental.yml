@@ -170,7 +170,7 @@ jobs:
           test "$(git -C codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)" = "$LHC_SDK_COMMIT"
           test "$(git ls-tree HEAD codex-rs/lhc/vendor/long-horizon-context | awk '{print $3}')" = "$LHC_SDK_COMMIT"
           test -z "$(git status --porcelain=v1 --ignore-submodules=none)"
-          test ! -e .github/workflows/lhc-release-fanout-resume.yml
+          test ! -e .github/workflows/lhc-release-supplemental.yml
           git diff --quiet "$PRODUCT_SOURCE" -- .
           python scripts/lhc-release/check_version_identity.py --version "$VERSION"
       - uses: ./.github/actions/setup-ci
@@ -331,7 +331,7 @@ jobs:
           test "$(git -C product-source rev-parse HEAD)" = "$PRODUCT_SOURCE"
           test "$(git -C product-source/codex-rs/lhc/vendor/long-horizon-context rev-parse HEAD)" = "$LHC_SDK_COMMIT"
           test -z "$(git -C product-source status --porcelain=v1 --ignore-submodules=none)"
-          test ! -e product-source/.github/workflows/lhc-release-fanout-resume.yml
+          test ! -e product-source/.github/workflows/lhc-release-supplemental.yml
           python3 product-source/scripts/lhc-release/check_version_identity.py --version "$VERSION"
       - name: Download exact four current-run platform artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1

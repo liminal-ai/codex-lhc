@@ -5,7 +5,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-RESUME_WORKFLOW = ROOT / ".github/workflows/lhc-release-fanout-resume.yml"
+RESUME_WORKFLOW = ROOT / ".github/workflows/lhc-release-supplemental.yml"
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
@@ -187,7 +187,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("Hard public tag, release, and exact-asset postconditions", text)
         self.assertIn("verify_public_release.py", text)
         self.assertIn("env -u GH_TOKEN -u GITHUB_TOKEN", text)
-        self.assertIn(".github/workflows/lhc-release-fanout-resume.yml", text)
+        self.assertIn(".github/workflows/lhc-release-supplemental.yml", text)
         self.assertIn(".github/workflows/lhc-release.yml)", text)
         self.assertIn('product_source="$workflow_source"', text)
         self.assertIn('artifact_name="codex-lhc-v${VERSION}-candidate"', text)
@@ -255,9 +255,7 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         self.assertIn("clean: true", build)
         self.assertIn('test "$(git rev-parse HEAD)" = "$PRODUCT_SOURCE"', build)
         self.assertIn("status --porcelain=v1 --ignore-submodules=none", build)
-        self.assertIn(
-            "test ! -e .github/workflows/lhc-release-fanout-resume.yml", build
-        )
+        self.assertIn("test ! -e .github/workflows/lhc-release-supplemental.yml", build)
         self.assertIn('git diff --quiet "$PRODUCT_SOURCE" -- .', build)
         self.assertIn("scripts/build_codex_package.py", build)
 
