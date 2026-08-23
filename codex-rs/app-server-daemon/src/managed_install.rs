@@ -24,6 +24,57 @@ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
         .join(managed_codex_file_name())
 }
 
+/// Copy the currently running fork binary into an isolated `CODEX_HOME`
+/// managed standalone slot. Fresh remote-control homes must not download or
+/// select stock Codex.
+#[cfg(unix)]
+pub(crate) fn seed_managed_codex_from_running_fork(managed_codex_bin: &Path) -> Result<()> {
+    if managed_codex_bin.is_file() {
+        return Ok(());
+    }
+    let source =
+        std::env::current_exe().context("failed to resolve running Codex-LHC executable")?;
+    let parent = managed_codex_bin.parent().ok_or_else(|| {
+        anyhow!(
+            "managed Codex path has no parent directory: {}",
+            managed_codex_bin.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create managed Codex directory {}",
+            parent.display()
+        )
+    })?;
+    std::fs::copy(&source, managed_codex_bin).with_context(|| {
+        format!(
+            "failed to seed managed Codex from {} to {}",
+            source.display(),
+            managed_codex_bin.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(managed_codex_bin)
+            .with_context(|| {
+                format!(
+                    "failed to read seeded Codex permissions {}",
+                    managed_codex_bin.display()
+                )
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(managed_codex_bin, perms).with_context(|| {
+            format!(
+                "failed to set seeded Codex executable bit {}",
+                managed_codex_bin.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub(crate) async fn resolved_managed_codex_bin(codex_bin: &Path) -> Result<PathBuf> {
     fs::canonicalize(codex_bin).await.with_context(|| {

@@ -251,6 +251,7 @@ fn compacted(
     RolloutItem::Compacted(CompactedItem {
         message: message.into(),
         replacement_history: Some(bands.into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: Some(window_number),
         first_window_id: Some("first-win".into()),
         previous_window_id: prev.map(str::to_string),

@@ -62,6 +62,16 @@ async fn installer_fetch_rejects_non_success_status() {
     assert_eq!(http.requested_urls(), vec![INSTALL_URL.to_string()]);
 }
 
+#[test]
+fn installer_url_is_fork_release_not_stock_codex() {
+    assert_eq!(
+        INSTALL_URL,
+        "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh"
+    );
+    assert!(!INSTALL_URL.contains("chatgpt.com/codex"));
+    assert!(!INSTALL_URL.contains("openai.com"));
+}
+
 struct FakeInstallerHttp {
     response: InstallerResponse,
     requested_urls: Mutex<Vec<String>>,

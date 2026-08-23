@@ -56,6 +56,7 @@ fn grafted_custom_tool_pair_survives_rollout_resume() {
     #[rustfmt::skip]
     let compacted = CompactedItem {
         message: "lhc".into(), replacement_history: Some(vec![]),
+        mcp_resource_origins: None,
         window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
     };
     let items = vec![

@@ -474,6 +474,7 @@ fn boundary_record_field_completeness_pinned() {
         boundary_completeness_error(&[RolloutItem::Compacted(CompactedItem {
             message: "x".into(),
             replacement_history: Some(Vec::new()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
@@ -485,6 +486,7 @@ fn boundary_record_field_completeness_pinned() {
         boundary_completeness_error(&[RolloutItem::Compacted(CompactedItem {
             message: "x".into(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,
             previous_window_id: None,
@@ -496,6 +498,7 @@ fn boundary_record_field_completeness_pinned() {
         boundary_completeness_error(&[RolloutItem::Compacted(CompactedItem {
             message: "x".into(),
             replacement_history: Some(vec![user_text_message("x").into()]),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -2327,6 +2330,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
         RolloutItem::Compacted(CompactedItem {
             message: "old compact".into(),
             replacement_history: Some(vec![user_text_message("old hist").into()]),
+            mcp_resource_origins: None,
             window_number: Some(0),
             first_window_id: None,
             previous_window_id: None,

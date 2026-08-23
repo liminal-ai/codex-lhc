@@ -75,6 +75,7 @@ fn single_boundary_items(compact_point: i64) -> Vec<RolloutItem> {
         RolloutItem::Compacted(CompactedItem {
             message: durable_message(compact_point),
             replacement_history: Some(vec![user("band", "u1").into()]),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some("first".into()),
             previous_window_id: None,
@@ -89,6 +90,7 @@ fn dual_compacted_polluted() -> Vec<RolloutItem> {
     items.push(RolloutItem::Compacted(CompactedItem {
         message: "native-append-compacted".into(),
         replacement_history: Some(vec![user("native-band", "u3").into()]),
+        mcp_resource_origins: None,
         window_number: Some(2),
         first_window_id: Some("first".into()),
         previous_window_id: Some("win-1".into()),

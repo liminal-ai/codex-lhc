@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index d05a206097..7cebcecba8 100644
+index 3a7ba720ef..b692ef595d 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -615,6 +615,9 @@
+@@ -646,6 +646,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,7 @@ index d05a206097..7cebcecba8 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -1582,9 +1585,81 @@
+@@ -1645,9 +1648,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -94,7 +94,7 @@ index d05a206097..7cebcecba8 100644
      "MarketplaceConfig": {
        "additionalProperties": false,
        "properties": {
-@@ -5373,6 +5448,9 @@
+@@ -5543,6 +5618,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -104,7 +104,7 @@ index d05a206097..7cebcecba8 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -5676,6 +5754,22 @@
+@@ -5849,6 +5927,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -128,10 +128,10 @@ index d05a206097..7cebcecba8 100644
        "allOf": [
          {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index ea07f80cba..e35940549f 100644
+index 71abcb1bd9..11af833341 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -288,6 +288,9 @@ pub enum Feature {
+@@ -301,6 +301,9 @@ pub enum Feature {
      PreventIdleSleep,
      /// Enable remote compaction v2 over the normal Responses API.
      RemoteCompactionV2,
@@ -141,7 +141,7 @@ index ea07f80cba..e35940549f 100644
      /// Retain client-authored developer messages across compacted context windows.
      RetainClientDeveloperMessages,
      /// Use Agent Identity for ChatGPT-authenticated sessions.
-@@ -1492,6 +1495,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1529,6 +1532,13 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },

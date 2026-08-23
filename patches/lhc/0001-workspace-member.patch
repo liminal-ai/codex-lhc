@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 1abbb45e9d..208bf8f6ed 100644
+index 6e5fa01dda..210edcbe6c 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -72,6 +72,8 @@ members = [
+@@ -71,6 +71,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,7 +11,7 @@ index 1abbb45e9d..208bf8f6ed 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -212,6 +214,8 @@ codex-hooks = { path = "hooks" }
+@@ -210,6 +212,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }
@@ -20,11 +20,71 @@ index 1abbb45e9d..208bf8f6ed 100644
  codex-lmstudio = { path = "lmstudio" }
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
+diff --git a/codex-rs/app-server-daemon/README.md b/codex-rs/app-server-daemon/README.md
+index ac512a8037..3bca82e377 100644
+--- a/codex-rs/app-server-daemon/README.md
++++ b/codex-rs/app-server-daemon/README.md
+@@ -36,13 +36,17 @@ running app-server version when applicable.
+ For a new remote machine:
+ 
+ ```sh
+-curl -fsSL https://chatgpt.com/codex/install.sh | sh
++# Isolated remote-control homes must use this fork's bytes, never stock Codex.
++curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh
++sh install.sh
+ $HOME/.codex/packages/standalone/current/codex app-server daemon bootstrap --remote-control
+ ```
+ 
+-`bootstrap` requires the standalone managed install. It records the daemon
+-settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+-pidfile-backed detached process, and launches a detached updater loop.
++`bootstrap` requires the standalone managed install of **this fork**. Fresh
++`CODEX_HOME` trees seed the running Codex-LHC binary instead of downloading
++stock Codex. It records the daemon settings under
++`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed
++detached process, and launches a detached updater loop.
+ 
+ ## Installation and update cases
+ 
 diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index c90978803d..0cd089b9b0 100644
+index c90978803d..258fdbe96f 100644
 --- a/codex-rs/app-server-daemon/src/lib.rs
 +++ b/codex-rs/app-server-daemon/src/lib.rs
-@@ -910,8 +910,9 @@ mod tests {
+@@ -21,6 +21,8 @@ use codex_utils_home_dir::find_codex_home;
+ use managed_install::managed_codex_bin;
+ #[cfg(unix)]
+ use managed_install::managed_codex_version;
++#[cfg(unix)]
++use managed_install::seed_managed_codex_from_running_fork;
+ use serde::Serialize;
+ use settings::DaemonSettings;
+ use tokio::time::sleep;
+@@ -669,12 +671,20 @@ impl Daemon {
+             return Ok(());
+         }
+ 
++        #[cfg(unix)]
++        {
++            seed_managed_codex_from_running_fork(&self.managed_codex_bin)?;
++            if self.managed_codex_bin.is_file() {
++                return Ok(());
++            }
++        }
++
+         let managed_codex_path = self.managed_codex_bin.display();
+         Err(anyhow!(
+-            "managed standalone Codex install not found at {managed_codex_path}\n\n\
+-             This command requires the standalone install managed by the Codex installer, because \
+-             the daemon starts and updates app-server from that fixed path.\n\n\
+-             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
++            "managed standalone Codex-LHC install not found at {managed_codex_path}\n\n\
++             Isolated remote-control homes must use this fork's bytes, never stock Codex.\n\
++             Seed the running `codex`/`codex-lhc` binary, or install from the fork release:\n  \
++             curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh && sh install.sh\n\n\
+              Then rerun the command you just tried."
+         ))
+     }
+@@ -910,8 +920,9 @@ mod tests {
  
      #[test]
      fn restart_decision_preserves_forced_refreshes() {
@@ -35,7 +95,7 @@ index c90978803d..0cd089b9b0 100644
          };
  
          assert_eq!(
-@@ -919,14 +920,18 @@ mod tests {
+@@ -919,14 +930,18 @@ mod tests {
                  restart_decision(
                      RestartMode::IfVersionChanged,
                      Some(&current_info),
@@ -56,11 +116,80 @@ index c90978803d..0cd089b9b0 100644
                  restart_decision(
                      RestartMode::Always,
                      /*info*/ None,
+diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
+index d5ad85b986..5192220cc9 100644
+--- a/codex-rs/app-server-daemon/src/managed_install.rs
++++ b/codex-rs/app-server-daemon/src/managed_install.rs
+@@ -24,6 +24,57 @@ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
+         .join(managed_codex_file_name())
+ }
+ 
++/// Copy the currently running fork binary into an isolated `CODEX_HOME`
++/// managed standalone slot. Fresh remote-control homes must not download or
++/// select stock Codex.
++#[cfg(unix)]
++pub(crate) fn seed_managed_codex_from_running_fork(managed_codex_bin: &Path) -> Result<()> {
++    if managed_codex_bin.is_file() {
++        return Ok(());
++    }
++    let source =
++        std::env::current_exe().context("failed to resolve running Codex-LHC executable")?;
++    let parent = managed_codex_bin.parent().ok_or_else(|| {
++        anyhow!(
++            "managed Codex path has no parent directory: {}",
++            managed_codex_bin.display()
++        )
++    })?;
++    std::fs::create_dir_all(parent).with_context(|| {
++        format!(
++            "failed to create managed Codex directory {}",
++            parent.display()
++        )
++    })?;
++    std::fs::copy(&source, managed_codex_bin).with_context(|| {
++        format!(
++            "failed to seed managed Codex from {} to {}",
++            source.display(),
++            managed_codex_bin.display()
++        )
++    })?;
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        let mut perms = std::fs::metadata(managed_codex_bin)
++            .with_context(|| {
++                format!(
++                    "failed to read seeded Codex permissions {}",
++                    managed_codex_bin.display()
++                )
++            })?
++            .permissions();
++        perms.set_mode(0o755);
++        std::fs::set_permissions(managed_codex_bin, perms).with_context(|| {
++            format!(
++                "failed to set seeded Codex executable bit {}",
++                managed_codex_bin.display()
++            )
++        })?;
++    }
++    Ok(())
++}
++
+ #[cfg(unix)]
+ pub(crate) async fn resolved_managed_codex_bin(codex_bin: &Path) -> Result<PathBuf> {
+     fs::canonicalize(codex_bin).await.with_context(|| {
 diff --git a/codex-rs/app-server-daemon/src/managed_install_tests.rs b/codex-rs/app-server-daemon/src/managed_install_tests.rs
-index 93caa468e4..c2e6a623e5 100644
+index 93caa468e4..426bde996b 100644
 --- a/codex-rs/app-server-daemon/src/managed_install_tests.rs
 +++ b/codex-rs/app-server-daemon/src/managed_install_tests.rs
-@@ -5,9 +5,10 @@ use super::parse_codex_version;
+@@ -1,13 +1,17 @@
+ use pretty_assertions::assert_eq;
++use tempfile::TempDir;
+ 
+ use super::executable_identity_from_bytes;
++use super::managed_codex_bin;
+ use super::parse_codex_version;
++use super::seed_managed_codex_from_running_fork;
  
  #[test]
  fn parses_codex_cli_version_output() {
@@ -73,6 +202,61 @@ index 93caa468e4..c2e6a623e5 100644
      );
  }
  
+@@ -25,3 +29,19 @@ fn executable_identity_uses_binary_contents() {
+     assert_eq!(old, same);
+     assert_ne!(old, new);
+ }
++
++#[test]
++fn seed_managed_codex_copies_running_fork_bytes_into_isolated_home() {
++    let home = TempDir::new().expect("temp dir");
++    let managed = managed_codex_bin(home.path());
++    assert!(!managed.is_file());
++
++    seed_managed_codex_from_running_fork(&managed).expect("seed fork bytes");
++
++    assert!(managed.is_file());
++    let source = std::env::current_exe().expect("current exe");
++    let expected = std::fs::read(&source).expect("read source");
++    let actual = std::fs::read(&managed).expect("read seeded");
++    assert_eq!(actual, expected, "seeded bytes must match the running fork");
++    assert_ne!(managed, source);
++}
+diff --git a/codex-rs/app-server-daemon/src/update_loop.rs b/codex-rs/app-server-daemon/src/update_loop.rs
+index 76fd94837d..6b4b0b149c 100644
+--- a/codex-rs/app-server-daemon/src/update_loop.rs
++++ b/codex-rs/app-server-daemon/src/update_loop.rs
+@@ -54,7 +54,8 @@ const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+ #[cfg(unix)]
+ const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+ #[cfg(unix)]
+-const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
++const INSTALL_URL: &str =
++    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh";
+ 
+ #[cfg(unix)]
+ pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
+diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+index 8c94f91202..e47bd5e95d 100644
+--- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
++++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
+@@ -62,6 +62,16 @@ async fn installer_fetch_rejects_non_success_status() {
+     assert_eq!(http.requested_urls(), vec![INSTALL_URL.to_string()]);
+ }
+ 
++#[test]
++fn installer_url_is_fork_release_not_stock_codex() {
++    assert_eq!(
++        INSTALL_URL,
++        "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh"
++    );
++    assert!(!INSTALL_URL.contains("chatgpt.com/codex"));
++    assert!(!INSTALL_URL.contains("openai.com"));
++}
++
+ struct FakeInstallerHttp {
+     response: InstallerResponse,
+     requested_urls: Mutex<Vec<String>>,
 diff --git a/codex-rs/cli/tests/version.rs b/codex-rs/cli/tests/version.rs
 new file mode 100644
 index 0000000000..9edca52724

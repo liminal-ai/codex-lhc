@@ -160,7 +160,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
 | 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,thread_history_migrations/0005_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals | `0007-lhc-compact-arm` |
-| 36 | `app-server-daemon/src/{lib.rs,managed_install_tests.rs}` | managed CLI/app-server version parsing and same-version restart coherence use the workspace version | `0001-workspace-member` |
+| 36 | `app-server-daemon/{README.md,src/lib.rs,src/managed_install.rs,src/managed_install_tests.rs,src/update_loop.rs,src/update_loop_tests.rs}` | managed CLI/app-server version parsing and same-version restart coherence use the workspace version; isolated remote-control homes seed fork bytes and never download stock Codex | `0001-workspace-member` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
@@ -298,6 +298,21 @@ terminal failure.
    sync**, not cleanup after it.
 5. `./scripts/check-lhc-hooks.sh` — all layers green before push.
 6. Commit with tripwire output summarized in the body; push to origin only.
+
+### Drill run 2026-08-23 — exact stable `rust-v0.149.0`
+
+Merged tag `rust-v0.149.0` (`758ef40f50`) onto accepted local baseline
+`7ebcfc7f6a` (workspace version `0.148.0-alpha.20`). 0.148-alpha.20 is **not**
+an ancestor of 0.149.0; merge-base is `b3cc217378`. Content conflicts:
+`Cargo.toml` (take `0.149.0`, keep LHC workspace member), `core/src/lib.rs`
+(keep LHC modules + take 0.149 network/MCP re-exports), `models.json` (keep
+fork compact windows `370000/1050000/350000` on gpt-5.6-*), `Cargo.lock`
+(regenerate from 0.149 + LHC host). LHC SDK pin remains **`f4de85c`**. Host
+adapter gained 0.149 `CompactedItem.mcp_resource_origins` and
+`AgentMessageEvent.delivery` so materialize still compiles. Isolated
+remote-control homes seed running fork bytes (bead 3i7); stock
+`chatgpt.com/codex/install.sh` is not used. Platform docs record published
+Linux/Windows/macOS artifacts (5v7.2). `8y8` left for release-prep.
 
 ### Drill run 2026-07-26 (Chunk 3 / C2) — clean, and thinner than intended
 

@@ -1,5 +1,5 @@
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index 98dfb724c2..dbc7a466cd 100644
+index 1c16bc50af..91fae9b004 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
 @@ -49,6 +49,8 @@ codex-extension-api = { workspace = true }
@@ -9,5 +9,5 @@ index 98dfb724c2..dbc7a466cd 100644
 +# LHC-HOOK 5/8: fork-only LHC capture adapter dependency.
 +codex-lhc-host = { workspace = true }
  codex-git-attribution = { workspace = true }
- codex-guardian = { workspace = true }
  codex-guardian-v2 = { workspace = true }
+ codex-git-utils = { workspace = true }

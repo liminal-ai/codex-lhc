@@ -998,6 +998,7 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
         RolloutItem::Compacted(CompactedItem {
             message: "c1".into(),
             replacement_history: Some(bands1.into_iter().map(Into::into).collect()),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some("first".into()),
             previous_window_id: None,
@@ -1008,6 +1009,7 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
         RolloutItem::Compacted(CompactedItem {
             message: "c2".into(),
             replacement_history: Some(bands2.clone().into_iter().map(Into::into).collect()),
+            mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: Some("first".into()),
             previous_window_id: Some("win-1".into()),

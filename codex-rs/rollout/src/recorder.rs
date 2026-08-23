@@ -504,6 +504,7 @@ impl RolloutRecorder {
                 /*relation_filter*/ None,
                 archived,
                 /*section*/ None,
+                /*project_id*/ None,
                 search_term,
             )
             .await
@@ -614,6 +615,7 @@ impl RolloutRecorder {
             /*relation_filter*/ None,
             archived,
             /*section*/ None,
+            /*project_id*/ None,
             search_term,
         )
         .await;
@@ -644,6 +646,7 @@ impl RolloutRecorder {
                     /*relation_filter*/ None,
                     archived,
                     /*section*/ None,
+                    /*project_id*/ None,
                     search_term,
                 )
                 .await
@@ -685,6 +688,7 @@ impl RolloutRecorder {
                         /*relation_filter*/ None,
                         archived,
                         /*section*/ None,
+                        /*project_id*/ None,
                         search_term,
                     )
                     .await
@@ -765,6 +769,7 @@ impl RolloutRecorder {
                     /*relation_filter*/ None,
                     /*archived*/ false,
                     /*section*/ None,
+                    /*project_id*/ None,
                     /*search_term*/ None,
                 )
                 .await
@@ -1295,6 +1300,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         first_user_message,
         preview,
         section,
+        project_id,
         cwd,
         git_branch,
         git_sha,
@@ -1318,6 +1324,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         item.preview = preview;
     }
     item.section = section;
+    item.project_id = project_id;
     if item.cwd.is_none() {
         item.cwd = cwd;
     }
@@ -2058,6 +2065,7 @@ fn thread_item_from_state_metadata(
         first_user_message: item.first_user_message,
         preview: item.preview,
         section: item.section,
+        project_id: item.project_id,
         cwd: Some(item.cwd),
         git_branch: item.git_branch,
         git_sha: item.git_sha,

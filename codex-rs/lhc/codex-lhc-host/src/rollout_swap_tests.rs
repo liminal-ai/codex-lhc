@@ -36,6 +36,7 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
             .into(),
         ),
         RolloutItem::Compacted(CompactedItem {
+            mcp_resource_origins: None,
             message: format!("boundary-{tag}"),
             replacement_history: Some(vec![
                 ResponseItem::Message {
@@ -333,6 +334,7 @@ fn history_from_materialized_is_bands_plus_native_tail() {
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
             replacement_history: Some(vec![band.clone().into()]),
+            mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: Some("f".into()),
             previous_window_id: None,
@@ -391,6 +393,7 @@ fn dual_format_history_picks_newest_compacted_only() {
         RolloutItem::Compacted(CompactedItem {
             message: "c1".into(),
             replacement_history: Some(vec![band1.into()]),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,
@@ -400,6 +403,7 @@ fn dual_format_history_picks_newest_compacted_only() {
         RolloutItem::Compacted(CompactedItem {
             message: "c2".into(),
             replacement_history: Some(vec![band2.clone().into()]),
+            mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: Some("f".into()),
             previous_window_id: Some("w1".into()),
@@ -437,6 +441,7 @@ fn fl4_model_context_estimate_like_for_like() {
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
             replacement_history: Some(vec![band.into()]),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,
@@ -491,6 +496,7 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
         RolloutItem::Compacted(CompactedItem {
             message: "m".into(),
             replacement_history: Some(vec![band.clone().into()]),
+            mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: Some("f".into()),
             previous_window_id: None,

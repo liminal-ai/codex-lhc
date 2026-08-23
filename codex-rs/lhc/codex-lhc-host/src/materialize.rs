@@ -194,6 +194,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     let compacted = CompactedItem {
         message: input.boundary.message.clone(),
         replacement_history: Some(model_stream.iter().cloned().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: Some(input.boundary.window_number),
         first_window_id: Some(input.boundary.first_window_id.clone()),
         previous_window_id: input.boundary.previous_window_id.clone(),
@@ -607,6 +608,7 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                         message: text,
                         phase: None,
                         memory_citation: None,
+                        delivery: None,
                     },
                 )));
             }

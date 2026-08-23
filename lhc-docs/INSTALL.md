@@ -57,10 +57,9 @@ pin before it replaces anything.
 
 Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
 fork source commit, upstream base, LHC SDK commit, target, and capture default.
-The current release lane publishes a prebuilt Ubuntu 24.04/glibc Linux x86-64
-archive only. Windows x86-64 and Apple Silicon macOS remain native source and
-readiness targets, but are not currently published as prebuilt artifacts.
-Build from source on those platforms and on other architectures.
+The current release lane publishes prebuilt Ubuntu 24.04/glibc Linux x86-64,
+Windows x86-64, and Apple Silicon macOS artifacts from the same source identity.
+Build from source on other architectures.
 
 ## Build from source
 

@@ -879,6 +879,7 @@ fn band_body_replacement_history_byte_equal() {
     let compacted = CompactedItem {
         message: "lhc".into(),
         replacement_history: Some(body.clone().into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: Some(1),
         first_window_id: Some("a".into()),
         previous_window_id: None,
@@ -947,6 +948,7 @@ fn shape_risk_consumers_see_band_replacement() {
     let compacted = CompactedItem {
         message: "lhc_compact_marker".into(),
         replacement_history: Some(band.clone().into_iter().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: Some(2),
         first_window_id: Some("w0".into()),
         previous_window_id: Some("w1".into()),
@@ -1624,6 +1626,7 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
         codex_history::CompactedItem {
             message: durable.clone(),
             replacement_history: None,
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -1729,6 +1732,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
         codex_history::CompactedItem {
             message: durable.clone(),
             replacement_history: Some(parent_body.clone().into_iter().map(Into::into).collect()),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -2160,6 +2164,7 @@ async fn slice_c_reopen_pin_append_lands_in_new_file() {
                 message: pin.to_string(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         ),
     )])
@@ -2562,6 +2567,7 @@ async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
                 message: "gen2-body".into(),
                 phase: None,
                 memory_citation: None,
+                delivery: None,
             },
         )),
     ];
@@ -3371,6 +3377,7 @@ fn grafted_pair_survives_patch_materialized_history_ids() {
         RolloutItem::Compacted(CompactedItem {
             message: "lhc".into(),
             replacement_history: Some(vec![]),
+            mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
             previous_window_id: None,
@@ -3411,6 +3418,7 @@ fn empty_install_history_keeps_prior_body() {
     let items = vec![RolloutItem::Compacted(CompactedItem {
         message: "lhc".into(),
         replacement_history: Some(vec![]),
+        mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,
@@ -3478,6 +3486,7 @@ fn degraded_drops_keep_rollout_and_installed_body_identical() {
     let mut rollout = vec![RolloutItem::Compacted(CompactedItem {
         message: "lhc".into(),
         replacement_history: Some(bands.iter().cloned().map(Into::into).collect()),
+        mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,
         previous_window_id: None,

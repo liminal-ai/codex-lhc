@@ -36,13 +36,17 @@ running app-server version when applicable.
 For a new remote machine:
 
 ```sh
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
+# Isolated remote-control homes must use this fork's bytes, never stock Codex.
+curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh
+sh install.sh
 $HOME/.codex/packages/standalone/current/codex app-server daemon bootstrap --remote-control
 ```
 
-`bootstrap` requires the standalone managed install. It records the daemon
-settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
-pidfile-backed detached process, and launches a detached updater loop.
+`bootstrap` requires the standalone managed install of **this fork**. Fresh
+`CODEX_HOME` trees seed the running Codex-LHC binary instead of downloading
+stock Codex. It records the daemon settings under
+`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed
+detached process, and launches a detached updater loop.
 
 ## Installation and update cases
 

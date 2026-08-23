@@ -21,6 +21,8 @@ use codex_utils_home_dir::find_codex_home;
 use managed_install::managed_codex_bin;
 #[cfg(unix)]
 use managed_install::managed_codex_version;
+#[cfg(unix)]
+use managed_install::seed_managed_codex_from_running_fork;
 use serde::Serialize;
 use settings::DaemonSettings;
 use tokio::time::sleep;
@@ -669,12 +671,20 @@ impl Daemon {
             return Ok(());
         }
 
+        #[cfg(unix)]
+        {
+            seed_managed_codex_from_running_fork(&self.managed_codex_bin)?;
+            if self.managed_codex_bin.is_file() {
+                return Ok(());
+            }
+        }
+
         let managed_codex_path = self.managed_codex_bin.display();
         Err(anyhow!(
-            "managed standalone Codex install not found at {managed_codex_path}\n\n\
-             This command requires the standalone install managed by the Codex installer, because \
-             the daemon starts and updates app-server from that fixed path.\n\n\
-             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
+            "managed standalone Codex-LHC install not found at {managed_codex_path}\n\n\
+             Isolated remote-control homes must use this fork's bytes, never stock Codex.\n\
+             Seed the running `codex`/`codex-lhc` binary, or install from the fork release:\n  \
+             curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh && sh install.sh\n\n\
              Then rerun the command you just tried."
         ))
     }
