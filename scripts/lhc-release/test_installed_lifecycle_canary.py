@@ -21,6 +21,10 @@ class InstalledLifecycleCanaryTests(unittest.TestCase):
         source = SCRIPT.read_text()
         self.assertNotIn('"lhc_capture"', source)
         self.assertIn("run_command(", source)
+        self.assertIn("NORMAL_RESPONSE_REPETITIONS = 6000", source)
+        self.assertIn('f"{label}.stderr"', source)
+        self.assertIn('"rollout-before-delete.jsonl.prev"', source)
+        self.assertIn('evidence_dir / "result.json"', source)
         self.assertIn(
             "installed launcher did not produce an LHC Compact rewrite", source
         )

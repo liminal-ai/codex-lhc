@@ -55,6 +55,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("--mode legacy", qualification)
         self.assertIn("app-server daemon bootstrap", qualification)
         self.assertIn('cmp "$package/bin/codex" "$managed"', qualification)
+        self.assertIn(
+            "Preserve installed lifecycle qualification evidence", qualification
+        )
+        self.assertIn("if: always()", qualification)
+        self.assertIn("codex-lhc-linux-x86_64-qualification-evidence", qualification)
         self.assertIn("view_compact_bounded", qualification)
         self.assertIn("codex-lhc-host --lib materialize", qualification)
         self.assertIn("slice_d_", qualification)

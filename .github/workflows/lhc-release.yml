@@ -180,6 +180,16 @@ jobs:
             -name '*.sqlite' -type f -print -quit)"
           test -n "$(find "${RUNNER_TEMP}/codex-lhc-seed-legacy-lifecycle/lhc/threads" \
             -name '*.sqlite' -type f -print -quit)"
+      - name: Preserve installed lifecycle qualification evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: codex-lhc-linux-x86_64-qualification-evidence
+          path: |
+            ${{ runner.temp }}/codex-lhc-seed-default-lifecycle/evidence
+            ${{ runner.temp }}/codex-lhc-seed-legacy-lifecycle/evidence
+          if-no-files-found: warn
+          retention-days: 30
 
   build-remaining:
     name: Build ${{ matrix.platform }} after seed

@@ -9,9 +9,11 @@ canary, so release qualification needs neither model credentials nor a soak.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -21,6 +23,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROCESS_TIMEOUT_SECONDS = 60
 GROW_TURNS = 4
+# Four deterministic responses must cross the SDK's 120k production lower
+# bound; below it Compact correctly retains the entire tail with no bands.
+NORMAL_RESPONSE_REPETITIONS = 6000
 LEGACY_DIAGNOSTIC = "LHC_COMPACT_ALGORITHM=legacy"
 
 
@@ -52,7 +57,12 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         text = (
             marker + " condensed derivation evidence"
             if is_derivation
-            else marker + " " + ("bounded compact materialization evidence " * 400)
+            else marker
+            + " "
+            + (
+                "bounded compact materialization evidence "
+                * NORMAL_RESPONSE_REPETITIONS
+            )
         )
         response_id = f"resp-installed-lifecycle-{sequence}"
         events = [
@@ -142,6 +152,14 @@ def captured_closed_turns(lhc_root: Path) -> int:
     return total
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def session_id(stdout: str) -> str:
     for line in stdout.splitlines():
         try:
@@ -156,7 +174,10 @@ def session_id(stdout: str) -> str:
 
 
 def run_command(
-    command: list[str], environment: dict[str, str]
+    command: list[str],
+    environment: dict[str, str],
+    evidence_dir: Path,
+    label: str,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
         command,
@@ -166,6 +187,31 @@ def run_command(
         timeout=PROCESS_TIMEOUT_SECONDS,
         check=False,
     )
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    (evidence_dir / f"{label}.command.json").write_text(
+        json.dumps(
+            {
+                "argv": command,
+                "environment": {
+                    key: environment.get(key)
+                    for key in (
+                        "HOME",
+                        "CODEX_HOME",
+                        "CODEX_SQLITE_HOME",
+                        "CODEX_LHC_ROOT",
+                        "LHC_COMPACT_ALGORITHM",
+                        "RUST_LOG",
+                    )
+                },
+                "returncode": result.returncode,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    (evidence_dir / f"{label}.stdout").write_text(result.stdout)
+    (evidence_dir / f"{label}.stderr").write_text(result.stderr)
     if result.returncode != 0:
         raise RuntimeError(
             f"installed canary command failed ({result.returncode}): {command}\n"
@@ -186,6 +232,7 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
     codex_home = root / "codex-home"
     lhc_root = root / "lhc"
     cwd = root / "workspace"
+    evidence_dir = root / "evidence"
     for path in (home, codex_home, lhc_root, cwd):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -240,6 +287,8 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
                 "INSTALLED-LHC-GROW-0",
             ],
             environment,
+            evidence_dir,
+            "grow-0",
         )
         logs.append(first.stderr)
         thread_id = session_id(first.stdout)
@@ -255,6 +304,8 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
                     f"INSTALLED-LHC-GROW-{turn}",
                 ],
                 environment,
+                evidence_dir,
+                f"grow-{turn}",
             )
             logs.append(result.stderr)
 
@@ -270,6 +321,8 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
                     f"INSTALLED-LHC-COMPACT-{attempt}",
                 ],
                 environment,
+                evidence_dir,
+                f"compact-{attempt}",
             )
             logs.append(result.stderr)
             rollout = latest_rollout(codex_home, thread_id)
@@ -296,12 +349,23 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
                 "INSTALLED-LHC-RESUME-AFTER-COMPACT",
             ],
             environment,
+            evidence_dir,
+            "resume-after-compact",
         )
         logs.append(resumed.stderr)
         if "installed-lhc-lifecycle-reply" not in resumed.stdout:
             raise RuntimeError("installed launcher did not resume after Compact")
 
         rollout = latest_rollout(codex_home, thread_id)
+        previous_rollout = Path(f"{rollout}.prev")
+        if not previous_rollout.is_file():
+            raise RuntimeError(
+                "installed launcher lost .prev before reconciliation probe"
+            )
+        shutil.copy2(rollout, evidence_dir / "rollout-before-delete.jsonl")
+        shutil.copy2(
+            previous_rollout, evidence_dir / "rollout-before-delete.jsonl.prev"
+        )
         rollout.unlink()
         reconciled = run_command(
             [
@@ -314,9 +378,12 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
                 "INSTALLED-LHC-RESUME-AFTER-ROLLOUT-DELETE",
             ],
             environment,
+            evidence_dir,
+            "resume-after-rollout-delete",
         )
         logs.append(reconciled.stderr)
         regenerated = latest_rollout(codex_home, thread_id)
+        shutil.copy2(regenerated, evidence_dir / "rollout-after-reconciliation.jsonl")
         count, bands, window_number = inspect_rollout(regenerated)
         if count != 1 or bands == 0 or window_number is None:
             raise RuntimeError(
@@ -336,10 +403,29 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
             raise RuntimeError(
                 "default installed lifecycle unexpectedly selected legacy"
             )
+        closed_turns = captured_closed_turns(lhc_root)
+        result = {
+            "binary": str(binary),
+            "binarySha256": sha256(binary),
+            "captureOverride": False,
+            "closedTurns": closed_turns,
+            "deletedRolloutReconciled": True,
+            "legacyDiagnosticSeen": LEGACY_DIAGNOSTIC in diagnostics,
+            "lhcBoundaries": count,
+            "mode": mode,
+            "postCompactResume": True,
+            "previousRolloutEvidence": "evidence/rollout-before-delete.jsonl.prev",
+            "replacementHistoryEntries": bands,
+            "threadId": thread_id,
+            "windowNumber": window_number,
+        }
+        (evidence_dir / "result.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n"
+        )
         print(
             f"INSTALLED_LHC_LIFECYCLE_PASS mode={mode} thread={thread_id} "
             f"compacted={count} bands={bands} window={window_number} "
-            f"closed_turns={captured_closed_turns(lhc_root)}"
+            f"closed_turns={closed_turns}"
         )
     finally:
         server.shutdown()
