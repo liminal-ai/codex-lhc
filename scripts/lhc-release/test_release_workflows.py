@@ -48,6 +48,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             qualification.count("scripts/check-lhc-installed-lifecycle.py"), 2
         )
         self.assertEqual(qualification.count('--binary "$launcher"'), 2)
+        self.assertNotIn("--enable lhc_capture", qualification)
         self.assertIn("env -u LHC_COMPACT_ALGORITHM", qualification)
         self.assertIn("--mode metadata-first", qualification)
         self.assertIn("LHC_COMPACT_ALGORITHM=legacy", qualification)

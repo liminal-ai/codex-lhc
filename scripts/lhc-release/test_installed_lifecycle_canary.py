@@ -19,6 +19,7 @@ class InstalledLifecycleCanaryTests(unittest.TestCase):
         self,
     ) -> None:
         source = SCRIPT.read_text()
+        self.assertNotIn('"lhc_capture"', source)
         self.assertIn("run_command(", source)
         self.assertIn(
             "installed launcher did not produce an LHC Compact rewrite", source
@@ -42,7 +43,9 @@ class InstalledLifecycleCanaryTests(unittest.TestCase):
                             {
                                 "type": "compacted",
                                 "payload": {
-                                    "replacement_history": [{"type": "message"}]
+                                    "message": "lhc_compact_durable {}",
+                                    "window_number": 1,
+                                    "replacement_history": [{"type": "message"}],
                                 },
                             }
                         ),
@@ -50,7 +53,35 @@ class InstalledLifecycleCanaryTests(unittest.TestCase):
                 )
                 + "\n"
             )
-            self.assertEqual(MODULE.inspect_rollout(rollout), (1, 1))
+            inspection = MODULE.inspect_rollout(rollout)
+            self.assertEqual(inspection, (1, 1, 1))
+            self.assertTrue(MODULE.qualifies_lhc_boundary(inspection, True))
+
+    def test_rollout_inspection_rejects_native_compacted_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "compacted",
+                        "payload": {
+                            "message": "",
+                            "window_number": 1,
+                            "replacement_history": [{"type": "message"}],
+                        },
+                    }
+                )
+                + "\n"
+            )
+            inspection = MODULE.inspect_rollout(rollout)
+            self.assertEqual(inspection, (0, 0, None))
+            self.assertFalse(MODULE.qualifies_lhc_boundary(inspection, True))
+
+    def test_boundary_requires_history_window_and_prev(self) -> None:
+        self.assertFalse(MODULE.qualifies_lhc_boundary((1, 0, 1), True))
+        self.assertFalse(MODULE.qualifies_lhc_boundary((1, 1, None), True))
+        self.assertFalse(MODULE.qualifies_lhc_boundary((1, 1, 1), False))
+        self.assertFalse(MODULE.qualifies_lhc_boundary((2, 1, 1), True))
 
     def test_session_id_reads_real_exec_event_shape(self) -> None:
         output = json.dumps({"type": "thread.started", "thread_id": "thread-1"})

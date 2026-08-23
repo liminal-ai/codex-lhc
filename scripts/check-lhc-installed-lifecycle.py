@@ -98,15 +98,38 @@ class ResponsesHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def inspect_rollout(path: Path) -> tuple[int, int]:
-    compacted = []
+def inspect_rollout(path: Path) -> tuple[int, int, object | None]:
+    lhc_boundaries = []
     with path.open(encoding="utf-8") as stream:
         for line in stream:
             value = json.loads(line)
             if value.get("type") == "compacted":
-                compacted.append(value.get("payload") or {})
-    bands = len(compacted[-1].get("replacement_history") or []) if compacted else 0
-    return len(compacted), bands
+                payload = value.get("payload") or {}
+                message = payload.get("message")
+                if isinstance(message, str) and message.startswith(
+                    ("lhc_compact_durable", "lhc_compact_marker")
+                ):
+                    lhc_boundaries.append(payload)
+    if not lhc_boundaries:
+        return 0, 0, None
+    boundary = lhc_boundaries[-1]
+    return (
+        len(lhc_boundaries),
+        len(boundary.get("replacement_history") or []),
+        boundary.get("window_number"),
+    )
+
+
+def qualifies_lhc_boundary(
+    inspection: tuple[int, int, object | None], previous_exists: bool
+) -> bool:
+    count, replacement_history_entries, window_number = inspection
+    return (
+        count == 1
+        and replacement_history_entries > 0
+        and window_number is not None
+        and previous_exists
+    )
 
 
 def captured_closed_turns(lhc_root: Path) -> int:
@@ -194,8 +217,6 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
         common = [
             str(binary),
             "exec",
-            "--enable",
-            "lhc_capture",
             "--disable",
             "remote_compaction_v2",
             "-c",
@@ -252,12 +273,16 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
             )
             logs.append(result.stderr)
             rollout = latest_rollout(codex_home, thread_id)
-            count, bands = inspect_rollout(rollout)
-            if count == 1 and bands > 0 and Path(f"{rollout}.prev").is_file():
+            inspection = inspect_rollout(rollout)
+            count, bands, window_number = inspection
+            previous_exists = Path(f"{rollout}.prev").is_file()
+            if qualifies_lhc_boundary(inspection, previous_exists):
                 break
         else:
             raise RuntimeError(
-                "installed launcher did not produce an LHC Compact rewrite"
+                "installed launcher did not produce an LHC Compact rewrite: "
+                f"lhc_boundaries={count} replacement_history={bands} "
+                f"window_number={window_number!r} prev={previous_exists}"
             )
 
         resumed = run_command(
@@ -292,8 +317,8 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
         )
         logs.append(reconciled.stderr)
         regenerated = latest_rollout(codex_home, thread_id)
-        count, bands = inspect_rollout(regenerated)
-        if count != 1 or bands == 0:
+        count, bands, window_number = inspect_rollout(regenerated)
+        if count != 1 or bands == 0 or window_number is None:
             raise RuntimeError(
                 "installed launcher did not reconcile materialized Compact history"
             )
@@ -313,7 +338,8 @@ def run_lifecycle(binary: Path, root: Path, mode: str) -> None:
             )
         print(
             f"INSTALLED_LHC_LIFECYCLE_PASS mode={mode} thread={thread_id} "
-            f"compacted={count} bands={bands} closed_turns={captured_closed_turns(lhc_root)}"
+            f"compacted={count} bands={bands} window={window_number} "
+            f"closed_turns={captured_closed_turns(lhc_root)}"
         )
     finally:
         server.shutdown()
