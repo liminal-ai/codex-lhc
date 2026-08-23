@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/lhc-release/check_version_identity.py"
-ALIGNED_VERSION = "0.148.0-alpha.20"
+ALIGNED_VERSION = "0.149.0"
 
 
 def write_fixture(
@@ -60,7 +60,7 @@ class VersionIdentityTests(unittest.TestCase):
             root = Path(tmp)
             write_fixture(
                 root,
-                release="0.148.0-alpha.19",
+                release="0.148.0-alpha.20",
                 workspace=ALIGNED_VERSION,
                 cli_version="version.workspace = true",
             )

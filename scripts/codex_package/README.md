@@ -43,6 +43,10 @@ The `--variant` flag selects the package entrypoint. Supported variants are
 `codex-package.json`; it defaults to `[workspace.package].version` in
 `codex-rs/Cargo.toml`.
 
+Fork packages may pass `--lhc-sdk-commit` and `--lhc-thread-schema` together.
+This preserves the canonical layout and adds only an `lhc` provenance object to
+`codex-package.json`, identifying the exact public SDK source and thread schema.
+
 ## Source-built artifacts
 
 Artifacts built from this repository are built by the package builder in one

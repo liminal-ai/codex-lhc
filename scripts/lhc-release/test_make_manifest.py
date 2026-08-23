@@ -16,7 +16,7 @@ SCRIPT = ROOT / "scripts/lhc-release/make_manifest.py"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
-ALIGNED_VERSION = "0.148.0-alpha.20"
+ALIGNED_VERSION = "0.149.0"
 
 
 def write_archive(dist: Path, version: str, platform: str, kind: str) -> Path:
@@ -70,41 +70,51 @@ class PlatformSetTests(unittest.TestCase):
             result = run_manifest(dist, ALIGNED_VERSION, ["linux-x86_64"])
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((dist / "release-manifest.json").read_text())
-            self.assertEqual([item["platform"] for item in manifest["artifacts"]], ["linux-x86_64"])
+            self.assertEqual(
+                [item["platform"] for item in manifest["artifacts"]], ["linux-x86_64"]
+            )
             self.assertEqual(manifest["buildRunId"], "31970651653")
             self.assertNotIn("supplementalRunId", manifest)
+            self.assertEqual(manifest["compactAlgorithmDefault"], "metadata-first")
+            self.assertEqual(
+                manifest["compactAlgorithmRollback"],
+                {"environment": "LHC_COMPACT_ALGORITHM", "value": "legacy"},
+            )
             self.assertNotIn("buildRunId", manifest["artifacts"][0])
 
-    def test_three_platforms_with_per_artifact_runs(self) -> None:
+    def test_five_platforms_from_one_exact_build_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
             write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
+            write_archive(dist, ALIGNED_VERSION, "linux-aarch64", "tar")
             write_archive(dist, ALIGNED_VERSION, "windows-x86_64", "zip")
+            write_archive(dist, ALIGNED_VERSION, "windows-aarch64", "zip")
             write_archive(dist, ALIGNED_VERSION, "macos-aarch64", "tar")
             result = run_manifest(
                 dist,
                 ALIGNED_VERSION,
-                ["linux-x86_64", "windows-x86_64", "macos-aarch64"],
-                extra=[
-                    "--supplemental-run-id",
-                    "555",
-                    "--artifact-run",
-                    "linux-x86_64:31970651653",
-                    "--artifact-run",
-                    "windows-x86_64:555",
-                    "--artifact-run",
-                    "macos-aarch64:555",
+                [
+                    "linux-x86_64",
+                    "linux-aarch64",
+                    "windows-x86_64",
+                    "windows-aarch64",
+                    "macos-aarch64",
                 ],
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = json.loads((dist / "release-manifest.json").read_text())
             self.assertEqual(manifest["buildRunId"], "31970651653")
-            self.assertEqual(manifest["supplementalRunId"], "555")
-            by_platform = {item["platform"]: item for item in manifest["artifacts"]}
-            self.assertEqual(set(by_platform), {"linux-x86_64", "windows-x86_64", "macos-aarch64"})
-            self.assertEqual(by_platform["linux-x86_64"]["buildRunId"], "31970651653")
-            self.assertEqual(by_platform["windows-x86_64"]["buildRunId"], "555")
-            self.assertEqual(by_platform["macos-aarch64"]["buildRunId"], "555")
+            self.assertNotIn("supplementalRunId", manifest)
+            self.assertEqual(
+                [item["platform"] for item in manifest["artifacts"]],
+                [
+                    "linux-aarch64",
+                    "linux-x86_64",
+                    "macos-aarch64",
+                    "windows-aarch64",
+                    "windows-x86_64",
+                ],
+            )
 
     def test_missing_platform_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,7 +123,13 @@ class PlatformSetTests(unittest.TestCase):
             result = run_manifest(
                 dist,
                 ALIGNED_VERSION,
-                ["linux-x86_64", "windows-x86_64", "macos-aarch64"],
+                [
+                    "linux-x86_64",
+                    "linux-aarch64",
+                    "windows-x86_64",
+                    "windows-aarch64",
+                    "macos-aarch64",
+                ],
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("artifact platforms", result.stderr)
@@ -122,48 +138,19 @@ class PlatformSetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
             write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
-            result = run_manifest(dist, ALIGNED_VERSION, ["linux-x86_64", "linux-x86_64"])
+            result = run_manifest(
+                dist, ALIGNED_VERSION, ["linux-x86_64", "linux-x86_64"]
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("duplicate --expected-platform", result.stderr)
-
-    def test_duplicate_artifact_run_fails(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            dist = Path(tmp)
-            write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
-            result = run_manifest(
-                dist,
-                ALIGNED_VERSION,
-                ["linux-x86_64"],
-                extra=[
-                    "--artifact-run",
-                    "linux-x86_64:1",
-                    "--artifact-run",
-                    "linux-x86_64:2",
-                ],
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("duplicate --artifact-run", result.stderr)
-
-    def test_supplemental_requires_exact_artifact_run_set(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            dist = Path(tmp)
-            write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
-            write_archive(dist, ALIGNED_VERSION, "windows-x86_64", "zip")
-            write_archive(dist, ALIGNED_VERSION, "macos-aarch64", "tar")
-            result = run_manifest(
-                dist,
-                ALIGNED_VERSION,
-                ["linux-x86_64", "windows-x86_64", "macos-aarch64"],
-                extra=["--supplemental-run-id", "555", "--artifact-run", "linux-x86_64:1"],
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("artifact-run platforms", result.stderr)
 
     def test_rejects_non_hex_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
             write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
-            result = run_manifest(dist, ALIGNED_VERSION, ["linux-x86_64"], source="not-a-sha")
+            result = run_manifest(
+                dist, ALIGNED_VERSION, ["linux-x86_64"], source="not-a-sha"
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("40-hex SHA", result.stderr)
 
@@ -171,7 +158,9 @@ class PlatformSetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             dist = Path(tmp)
             write_archive(dist, ALIGNED_VERSION, "linux-x86_64", "tar")
-            result = run_manifest(dist, ALIGNED_VERSION, ["linux-x86_64"], run_id="linux-run")
+            result = run_manifest(
+                dist, ALIGNED_VERSION, ["linux-x86_64"], run_id="linux-run"
+            )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("decimal run id", result.stderr)
 

@@ -52,6 +52,13 @@ class PackageInputs:
     codex_windows_sandbox_setup_bin: Path | None
 
 
+@dataclass(frozen=True)
+class LhcProvenance:
+    repository: str
+    sdk_commit: str
+    thread_schema: int
+
+
 PACKAGE_VARIANTS: dict[str, PackageVariant] = {
     "codex": PackageVariant(
         name="codex",

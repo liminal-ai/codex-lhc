@@ -8,7 +8,7 @@ for the maintenance contract.
 
 ---
 
-## Release install (Linux x86-64)
+## Release install (Linux x86-64/ARM64 and Apple Silicon macOS)
 
 Download the installer from the latest published release, inspect it, then
 run it. The installer resolves that same release when `--version` is omitted:
@@ -57,8 +57,8 @@ pin before it replaces anything.
 
 Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
 fork source commit, upstream base, LHC SDK commit, target, and capture default.
-The current release lane publishes prebuilt Ubuntu 24.04/glibc Linux x86-64,
-Windows x86-64, and Apple Silicon macOS artifacts from the same source identity.
+The current release lane publishes canonical packages for Linux x86-64/ARM64,
+Windows x86-64/ARM64, and Apple Silicon macOS from the same source identity.
 Build from source on other architectures.
 
 ## Build from source

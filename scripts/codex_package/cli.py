@@ -14,6 +14,7 @@ from .ripgrep import resolve_rg_bin
 from .targets import PACKAGE_VARIANTS
 from .targets import TARGET_SPECS
 from .targets import PackageInputs
+from .targets import LhcProvenance
 from .targets import default_target
 from .targets import resolve_input_path
 from .zsh import resolve_zsh_bin
@@ -28,6 +29,7 @@ SEMVER_PATTERN = re.compile(
     r"(?:-(?P<prerelease>[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
+SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 def parse_package_version(value: str) -> str:
@@ -169,6 +171,16 @@ def parse_args() -> argparse.Namespace:
             "scripts/codex_package/rg."
         ),
     )
+    parser.add_argument(
+        "--lhc-sdk-commit",
+        type=parse_sha,
+        help="Exact public long-horizon-context SDK commit to record in package metadata.",
+    )
+    parser.add_argument(
+        "--lhc-thread-schema",
+        type=int,
+        help="LHC thread schema version to record with --lhc-sdk-commit.",
+    )
     return parser.parse_args()
 
 
@@ -223,10 +235,22 @@ def main() -> int:
         codex_command_runner_bin=source_outputs.codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=source_outputs.codex_windows_sandbox_setup_bin,
     )
+    lhc_provenance = resolve_lhc_provenance(args.lhc_sdk_commit, args.lhc_thread_schema)
     prepare_package_dir(package_dir, force=args.force)
-    build_package_dir(package_dir, args.package_version, variant, spec, inputs)
+    build_package_dir(
+        package_dir,
+        args.package_version,
+        variant,
+        spec,
+        inputs,
+        lhc_provenance,
+    )
     validate_package_dir(
-        package_dir, variant, spec, include_zsh=inputs.zsh_bin is not None
+        package_dir,
+        variant,
+        spec,
+        include_zsh=inputs.zsh_bin is not None,
+        lhc_provenance=lhc_provenance,
     )
 
     for archive_output in args.archive_output:
@@ -247,3 +271,27 @@ def resolve_optional_input_path(
         return None
 
     return resolve_input_path(explicit_path, description, flag_name)
+
+
+def parse_sha(value: str) -> str:
+    if SHA_PATTERN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(
+            "expected an exact 40-character lowercase commit SHA"
+        )
+    return value
+
+
+def resolve_lhc_provenance(
+    sdk_commit: str | None, thread_schema: int | None
+) -> LhcProvenance | None:
+    if sdk_commit is None and thread_schema is None:
+        return None
+    if sdk_commit is None or thread_schema is None or thread_schema < 1:
+        raise RuntimeError(
+            "--lhc-sdk-commit and a positive --lhc-thread-schema must be supplied together"
+        )
+    return LhcProvenance(
+        repository="https://github.com/liminal-ai/long-horizon-context",
+        sdk_commit=sdk_commit,
+        thread_schema=thread_schema,
+    )

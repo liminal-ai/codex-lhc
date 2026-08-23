@@ -8,9 +8,23 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from codex_package.cli import parse_package_version
+from codex_package.cli import parse_sha
+from codex_package.cli import resolve_lhc_provenance
 
 
 class PackageVersionTest(unittest.TestCase):
+    def test_lhc_provenance_requires_exact_public_identity_pair(self) -> None:
+        provenance = resolve_lhc_provenance(
+            "9d4d18247942f35b356f28bdc4288f0e631a6da9", 11
+        )
+        self.assertEqual(
+            provenance.sdk_commit, "9d4d18247942f35b356f28bdc4288f0e631a6da9"
+        )
+        with self.assertRaises(RuntimeError):
+            resolve_lhc_provenance("9d4d18247942f35b356f28bdc4288f0e631a6da9", None)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_sha("9d4d182")
+
     def test_accepts_release_prerelease_and_build_versions(self) -> None:
         for version in (
             "0.0.0",

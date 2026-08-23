@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .targets import PackageInputs
 from .targets import PackageVariant
+from .targets import LhcProvenance
 from .targets import TargetSpec
 from .zsh import ZSH_RESOURCE_PATH
 
@@ -37,6 +38,7 @@ def build_package_dir(
     variant: PackageVariant,
     spec: TargetSpec,
     inputs: PackageInputs,
+    lhc_provenance: LhcProvenance | None = None,
 ) -> None:
     bin_dir = package_dir / "bin"
     resources_dir = package_dir / "codex-resources"
@@ -90,6 +92,17 @@ def build_package_dir(
         "entrypoint": f"bin/{entrypoint_name}",
         "resourcesDir": "codex-resources",
         "pathDir": "codex-path",
+        **(
+            {
+                "lhc": {
+                    "repository": lhc_provenance.repository,
+                    "sdkCommit": lhc_provenance.sdk_commit,
+                    "threadSchema": lhc_provenance.thread_schema,
+                }
+            }
+            if lhc_provenance is not None
+            else {}
+        ),
     }
     write_json(package_dir / "codex-package.json", metadata)
 
@@ -100,6 +113,7 @@ def validate_package_dir(
     spec: TargetSpec,
     *,
     include_zsh: bool,
+    lhc_provenance: LhcProvenance | None = None,
 ) -> None:
     required_dirs = [
         Path("bin"),
@@ -132,6 +146,21 @@ def validate_package_dir(
             raise RuntimeError(
                 f"Invalid package metadata field {key!r}: expected {expected!r}, got {actual!r}"
             )
+
+    expected_lhc = (
+        {
+            "repository": lhc_provenance.repository,
+            "sdkCommit": lhc_provenance.sdk_commit,
+            "threadSchema": lhc_provenance.thread_schema,
+        }
+        if lhc_provenance is not None
+        else None
+    )
+    if metadata.get("lhc") != expected_lhc:
+        raise RuntimeError(
+            f"Invalid package metadata field 'lhc': expected {expected_lhc!r}, "
+            f"got {metadata.get('lhc')!r}"
+        )
 
     required_files = [
         Path("bin") / variant.entrypoint_name(spec),

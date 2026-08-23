@@ -49,7 +49,8 @@ if (-not $Version) {
 $Version = $Version.TrimStart('v')
 if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$') { Fail "invalid version: $Version" }
 
-$asset = "codex-lhc-v$Version-windows-x86_64.zip"
+$platform = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "windows-aarch64" } else { "windows-x86_64" }
+$asset = "codex-lhc-v$Version-$platform.zip"
 $temp = Join-Path ([System.IO.Path]::GetTempPath()) "codex-lhc-$([guid]::NewGuid())"
 New-Item $temp -ItemType Directory | Out-Null
 try {
@@ -78,6 +79,7 @@ try {
     Expand-Archive $archive $stage
     if (-not (Test-Path (Join-Path $stage "bin\codex.exe"))) { Fail "archive is missing bin\codex.exe" }
     if (-not (Test-Path (Join-Path $stage "bin\codex-code-mode-host.exe"))) { Fail "archive is missing bin\codex-code-mode-host.exe" }
+    if (-not (Test-Path (Join-Path $stage "codex-package.json"))) { Fail "archive is missing codex-package.json" }
     if (Test-Path $destination) { Remove-Item $destination -Recurse -Force }
     Move-Item $stage $destination
 

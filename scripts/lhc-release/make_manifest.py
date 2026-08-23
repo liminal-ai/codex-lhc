@@ -36,14 +36,6 @@ def main() -> None:
     parser.add_argument("--upstream-commit", required=True)
     parser.add_argument("--lhc-sdk-commit", required=True)
     parser.add_argument("--run-id", required=True)
-    parser.add_argument("--supplemental-run-id", default=None)
-    parser.add_argument(
-        "--artifact-run",
-        action="append",
-        dest="artifact_runs",
-        default=[],
-        help="Repeatable platform:run_id (e.g. --artifact-run linux-x86_64:123)",
-    )
     parser.add_argument(
         "--expected-platform",
         action="append",
@@ -57,30 +49,11 @@ def main() -> None:
     require_sha("upstream-commit", args.upstream_commit)
     require_sha("lhc-sdk-commit", args.lhc_sdk_commit)
     require_run_id("run-id", args.run_id)
-    if args.supplemental_run_id:
-        require_run_id("supplemental-run-id", args.supplemental_run_id)
 
     if len(args.expected_platforms) != len(set(args.expected_platforms)):
         raise SystemExit("duplicate --expected-platform entries")
 
-    artifact_runs: dict[str, str] = {}
-    for item in args.artifact_runs:
-        if ":" not in item:
-            raise SystemExit(f"invalid --artifact-run {item!r}; expected platform:run_id")
-        platform, run_id = item.split(":", 1)
-        if not platform or not run_id:
-            raise SystemExit(f"invalid --artifact-run {item!r}; expected platform:run_id")
-        if platform in artifact_runs:
-            raise SystemExit(f"duplicate --artifact-run for {platform}")
-        require_run_id(f"artifact-run {platform}", run_id)
-        artifact_runs[platform] = run_id
-
     expected = set(args.expected_platforms)
-    if args.supplemental_run_id is not None:
-        if set(artifact_runs) != expected:
-            raise SystemExit(
-                f"artifact-run platforms {sorted(artifact_runs)} != expected {sorted(expected)}"
-            )
 
     archives = sorted(
         path
@@ -101,8 +74,6 @@ def main() -> None:
             "sha256": sha256(archive),
             "bytes": archive.stat().st_size,
         }
-        if platform in artifact_runs:
-            entry["buildRunId"] = artifact_runs[platform]
         artifacts.append(entry)
     if found != expected:
         raise SystemExit(f"artifact platforms {sorted(found)} != {sorted(expected)}")
@@ -115,10 +86,12 @@ def main() -> None:
         "lhcSdkCommit": args.lhc_sdk_commit,
         "lhcThreadSchema": 11,
         "buildRunId": args.run_id,
-        **({
-            "supplementalRunId": args.supplemental_run_id
-        } if args.supplemental_run_id else {}),
         "captureDefault": "on",
+        "compactAlgorithmDefault": "metadata-first",
+        "compactAlgorithmRollback": {
+            "environment": "LHC_COMPACT_ALGORITHM",
+            "value": "legacy",
+        },
         "artifacts": artifacts,
         "migration": {
             "id": "thread-schema-6-to-11",

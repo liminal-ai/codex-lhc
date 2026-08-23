@@ -24,12 +24,12 @@ history preserved and rebuildable at full fidelity.
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
   Current pin: **`9d4d182`** (`9d4d18247942f35b356f28bdc4288f0e631a6da9`) —
-  accepted local Rust LHC candidate (2026-08-23): bounded metadata-first Smart
+  accepted public Rust LHC source on `origin/main` (2026-08-23): bounded metadata-first Smart
   Compact is the default; `LHC_COMPACT_ALGORITHM=legacy` still selects the
   eager full-read path; skipped compact-continuation records keep their wire
   casing. Default compact no longer reads every live message and closed-chunk
-  fallback before selecting. This pin is **local-only** (not yet an ancestor of
-  `origin/main`; tripwire pin-drift will warn until it is folded). It descends
+  fallback before selecting. The pin is publicly reachable from `origin/main`
+  at this exact identity. It descends
   `f4de85c` (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67
   contract 2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
   (LIM-63 / 63A), and retrieval `7062814` / `dd251ec`. The tripwire requires a
@@ -60,15 +60,13 @@ history preserved and rebuildable at full fidelity.
 ## Release qualification
 
 Release qualification is separate from source synchronization. The manual
-candidate workflow builds one immutable Linux x86-64 bundle and records
-source/upstream/SDK/schema identities plus checksums. A separate Daytona
-workflow installs and exercises those exact bytes. The supplemental workflow
-builds Windows x86-64 and Apple Silicon macOS artifacts from the same source
-identity after Linux qualification. Protected promotion accepts the candidate,
-smoke, and supplemental run IDs, verifies their qualification evidence, and
-publishes all three platform artifacts without rebuilding only after Lee or CTO
-approval. `lhc-platform-readiness.yml` independently keeps all three source
-build and test paths ready.
+candidate workflow builds one immutable aggregate from one source identity on
+hosted Linux x86-64/ARM64, Windows x86-64/ARM64, and Apple Silicon macOS
+runners. Every archive uses the canonical Codex package layout plus exact LHC
+SDK/schema provenance. Protected promotion consumes those exact bytes without
+rebuilding through the audited maintainer token, then fails unless the public
+tag, release, complete asset set, and downloaded hashes read back exactly.
+`lhc-platform-readiness.yml` independently keeps all five native paths ready.
 
 ## LC Adaptive Service Tier
 

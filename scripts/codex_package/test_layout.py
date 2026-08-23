@@ -11,10 +11,64 @@ from codex_package.layout import build_package_dir
 from codex_package.layout import validate_package_dir
 from codex_package.targets import PACKAGE_VARIANTS
 from codex_package.targets import PackageInputs
+from codex_package.targets import LhcProvenance
 from codex_package.targets import TARGET_SPECS
 
 
 class PackageLayoutTest(unittest.TestCase):
+    def test_lhc_package_extends_canonical_metadata_with_exact_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            spec = TARGET_SPECS["aarch64-pc-windows-msvc"]
+            inputs = PackageInputs(
+                entrypoint_bin=touch_executable(root / "codex.exe"),
+                code_mode_host_bin=touch_executable(root / "codex-code-mode-host.exe"),
+                rg_bin=touch_executable(root / "rg.exe"),
+                zsh_bin=None,
+                bwrap_bin=None,
+                codex_command_runner_bin=touch_executable(
+                    root / "codex-command-runner.exe"
+                ),
+                codex_windows_sandbox_setup_bin=touch_executable(
+                    root / "codex-windows-sandbox-setup.exe"
+                ),
+            )
+            provenance = LhcProvenance(
+                repository="https://github.com/liminal-ai/long-horizon-context",
+                sdk_commit="9d4d18247942f35b356f28bdc4288f0e631a6da9",
+                thread_schema=11,
+            )
+
+            build_package_dir(
+                package_dir,
+                "0.149.0",
+                PACKAGE_VARIANTS["codex"],
+                spec,
+                inputs,
+                provenance,
+            )
+            validate_package_dir(
+                package_dir,
+                PACKAGE_VARIANTS["codex"],
+                spec,
+                include_zsh=False,
+                lhc_provenance=provenance,
+            )
+
+            import json
+
+            metadata = json.loads((package_dir / "codex-package.json").read_text())
+            self.assertEqual(
+                metadata["lhc"],
+                {
+                    "repository": "https://github.com/liminal-ai/long-horizon-context",
+                    "sdkCommit": "9d4d18247942f35b356f28bdc4288f0e631a6da9",
+                    "threadSchema": 11,
+                },
+            )
+
     def test_macos_package_preserves_prebuilt_resource_binaries(self) -> None:
         for variant_name in ("codex", "codex-app-server"):
             for target in ("aarch64-apple-darwin", "x86_64-apple-darwin"):

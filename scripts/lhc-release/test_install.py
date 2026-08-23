@@ -49,8 +49,8 @@ class InstallTest(unittest.TestCase):
             path = payload / "bin" / name
             path.write_text("#!/bin/sh\nprintf '%s\\n' fixture\n", encoding="utf-8")
             path.chmod(0o755)
-        (payload / "release-manifest.json").write_text(
-            f'{{"release":"{VERSION}","lhcSdkCommit":"test-pin"}}\n',
+        (payload / "codex-package.json").write_text(
+            f'{{"version":"{VERSION}","lhc":{{"sdkCommit":"test-pin"}}}}\n',
             encoding="utf-8",
         )
         release.mkdir()

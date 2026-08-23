@@ -34,7 +34,7 @@ case "$1" in
     ;;
   release)
     if [ "${FAKE_RELEASE_EXISTS:-0}" = 1 ]; then
-      printf '{"tagName":"v0.148.0-alpha.20","targetCommitish":"%s"}' "$FAKE_RELEASE_SHA"
+      printf '{"tagName":"v0.149.0","targetCommitish":"%s"}' "$FAKE_RELEASE_SHA"
       exit 0
     fi
     exit 1
@@ -69,7 +69,7 @@ class TagReleaseGateTests(unittest.TestCase):
             FAKE_RELEASE_EXISTS="1" if release_exists else "0",
         )
         return subprocess.run(
-            ["bash", str(GATE), mode, "0.148.0-alpha.20", CANDIDATE_SHA],
+            ["bash", str(GATE), mode, "0.149.0", CANDIDATE_SHA],
             env=env,
             capture_output=True,
             text=True,
@@ -90,15 +90,10 @@ class TagReleaseGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("forbids existing release", result.stderr)
 
-    def test_backfill_missing_tag_rejects(self):
+    def test_backfill_mode_is_not_supported(self):
         result = self.run_gate("backfill", tag_exists=False, release_exists=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("requires existing tag", result.stderr)
-
-    def test_backfill_matching_existing_passes(self):
-        result = self.run_gate("backfill", tag_exists=True, release_exists=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("backfill: tag and release target both", result.stdout)
+        self.assertIn("mode must be forward", result.stderr)
 
 
 if __name__ == "__main__":

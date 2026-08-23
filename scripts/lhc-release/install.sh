@@ -108,6 +108,7 @@ esac
 
 case "$(uname -s):$(uname -m)" in
   Linux:x86_64|Linux:amd64) PLATFORM=linux-x86_64 ;;
+  Linux:aarch64|Linux:arm64) PLATFORM=linux-aarch64 ;;
   Darwin:arm64|Darwin:aarch64) PLATFORM=macos-aarch64 ;;
   *) die "v${VERSION} does not provide an artifact for $(uname -s):$(uname -m)" ;;
 esac
@@ -142,7 +143,7 @@ mkdir -p "$STAGE"
 tar -xzf "${TMP}/${ASSET}" -C "$STAGE"
 [ -x "$STAGE/bin/codex" ] || die "release archive is missing bin/codex"
 [ -x "$STAGE/bin/codex-code-mode-host" ] || die "release archive is missing bin/codex-code-mode-host"
-[ -f "$STAGE/release-manifest.json" ] || die "release archive is missing release-manifest.json"
+[ -f "$STAGE/codex-package.json" ] || die "release archive is missing codex-package.json"
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"
 ln -sfn "$DEST" "$STORE/current"
@@ -166,7 +167,7 @@ ln -sfn "$STORE/current/bin/codex" "$LINK"
 printf '%s\n' "$VERSION" > "$STORE/installed-version"
 printf '%s\n' "$NAME" > "$STORE/installed-name"
 
-lhc_pin=$(sed -n 's/.*"lhcSdkCommit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST/release-manifest.json" | head -1)
+lhc_pin=$(sed -n 's/.*"sdkCommit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST/codex-package.json" | head -1)
 say "Installed Codex + LHC: v${old_version} -> v${VERSION}"
 [ -z "$lhc_pin" ] || say "LHC engine updated to ${lhc_pin}."
 say "Command: $LINK"
