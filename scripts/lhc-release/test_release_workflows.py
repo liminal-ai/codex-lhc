@@ -8,6 +8,25 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_musl_tool_install_preserves_target_without_outer_sudo(self) -> None:
+        text = (ROOT / ".github/workflows/lhc-release.yml").read_text()
+        seed = text.split("  seed:\n", 1)[1].split("\n  qualify-seed:\n", 1)[0]
+        remaining = text.split("  build-remaining:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        invocation = (
+            'run: bash "${GITHUB_WORKSPACE}/.github/scripts/'
+            'install-musl-build-tools.sh"'
+        )
+
+        self.assertEqual(text.count(invocation), 2)
+        for line in text.splitlines():
+            if "install-musl-build-tools.sh" in line:
+                self.assertNotIn("sudo", line)
+        self.assertIn("TARGET: x86_64-unknown-linux-musl", seed)
+        self.assertIn("TARGET: ${{ matrix.target }}", remaining)
+        self.assertIn("if: matrix.kind == 'linux'", remaining)
+
     def test_linux_x86_64_seed_gates_paid_fanout(self) -> None:
         text = (ROOT / ".github/workflows/lhc-release.yml").read_text()
         seed = text.split("  seed:\n", 1)[1].split("\n  qualify-seed:\n", 1)[0]

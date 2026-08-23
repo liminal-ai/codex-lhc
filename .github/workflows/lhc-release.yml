@@ -49,7 +49,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
       - name: Install musl build tools
-        run: sudo bash .github/scripts/install-musl-build-tools.sh
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
       - name: Test canonical package builder
         run: python -m unittest discover -s scripts/codex_package -p 'test_*.py'
       - name: Test release helpers and POSIX installer
@@ -238,7 +238,7 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install musl build tools
         if: matrix.kind == 'linux'
-        run: sudo bash .github/scripts/install-musl-build-tools.sh
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
       - name: Configure Windows build paths
         if: matrix.kind == 'windows'
         shell: pwsh
