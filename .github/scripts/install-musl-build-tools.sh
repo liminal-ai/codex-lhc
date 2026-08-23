@@ -4,6 +4,28 @@ set -euo pipefail
 : "${TARGET:?TARGET environment variable is required}"
 : "${GITHUB_ENV:?GITHUB_ENV environment variable is required}"
 
+linux_uapi_version="6.8.0-25.25cross1"
+case "${TARGET}" in
+  x86_64-unknown-linux-musl)
+    arch="x86_64"
+    probe_arch_macro="__x86_64__"
+    linux_uapi_package="linux-libc-dev-amd64-cross_${linux_uapi_version}_all.deb"
+    linux_uapi_sha256="bc504dcc35c15ff606df44ca081d0abaa613b2f3b7a56896d6211eced1368af3"
+    linux_uapi_component="universe"
+    ;;
+  aarch64-unknown-linux-musl)
+    arch="aarch64"
+    probe_arch_macro="__aarch64__"
+    linux_uapi_package="linux-libc-dev-arm64-cross_${linux_uapi_version}_all.deb"
+    linux_uapi_sha256="6a5a00b8ba8de66862e05493def87a5cbbb23b949601e45a5e3cbde56505cb6b"
+    linux_uapi_component="main"
+    ;;
+  *)
+    echo "Unexpected musl target: ${TARGET}" >&2
+    exit 1
+    ;;
+esac
+
 apt_update_args=()
 if [[ -n "${APT_UPDATE_ARGS:-}" ]]; then
   # shellcheck disable=SC2206
@@ -18,19 +40,6 @@ fi
 
 sudo apt-get update "${apt_update_args[@]}"
 sudo apt-get install -y "${apt_install_args[@]}" ca-certificates curl musl-tools pkg-config libcap-dev g++ clang libc++-dev libc++abi-dev lld xz-utils
-
-case "${TARGET}" in
-  x86_64-unknown-linux-musl)
-    arch="x86_64"
-    ;;
-  aarch64-unknown-linux-musl)
-    arch="aarch64"
-    ;;
-  *)
-    echo "Unexpected musl target: ${TARGET}" >&2
-    exit 1
-    ;;
-esac
 
 libcap_version="2.75"
 libcap_sha256="de4e7e064c9ba451d5234dd46e897d7c71c96a9ebf9a0c445bc04f4742d83632"
@@ -51,6 +60,40 @@ zig_target="${TARGET/-unknown-linux-musl/-linux-musl}"
 runner_temp="${RUNNER_TEMP:-/tmp}"
 tool_root="${runner_temp}/codex-musl-tools-${TARGET}"
 mkdir -p "${tool_root}"
+
+# musl intentionally does not ship Linux UAPI headers. Use a pinned Ubuntu
+# cross-toolchain package for the target architecture instead of exposing the
+# host's /usr/include tree. The extracted directory contains the exported
+# linux/, asm/, and asm-generic/ closure, but no glibc userspace headers.
+linux_uapi_url="https://archive.ubuntu.com/ubuntu/pool/${linux_uapi_component}/c/cross-toolchain-base/${linux_uapi_package}"
+linux_uapi_deb="${tool_root}/${linux_uapi_package}"
+linux_uapi_root="${tool_root}/linux-uapi-${linux_uapi_version}-${linux_uapi_sha256}"
+linux_uapi_include="${linux_uapi_root}/usr/${arch}-linux-gnu/include"
+
+if [[ ! -f "${linux_uapi_deb}" ]]; then
+  curl -fsSL "${linux_uapi_url}" -o "${linux_uapi_deb}"
+fi
+echo "${linux_uapi_sha256}  ${linux_uapi_deb}" | sha256sum -c -
+
+if [[ ! -f "${linux_uapi_include}/linux/sched.h" ||
+      ! -f "${linux_uapi_include}/linux/loop.h" ||
+      ! -f "${linux_uapi_include}/asm/types.h" ]]; then
+  mkdir -p "${linux_uapi_root}"
+  dpkg-deb -x "${linux_uapi_deb}" "${linux_uapi_root}"
+fi
+
+for required_header in linux/sched.h linux/loop.h asm/types.h; do
+  if [[ ! -f "${linux_uapi_include}/${required_header}" ]]; then
+    echo "Pinned Linux UAPI package is missing ${required_header}; target=${TARGET}" >&2
+    exit 1
+  fi
+done
+for forbidden_header in features.h stdio.h; do
+  if [[ -e "${linux_uapi_include}/${forbidden_header}" ]]; then
+    echo "Linux UAPI closure unexpectedly contains userspace header ${forbidden_header}" >&2
+    exit 1
+  fi
+done
 
 libcap_root="${tool_root}/libcap-${libcap_version}"
 libcap_src_root="${libcap_root}/src"
@@ -235,12 +278,30 @@ if [[ -n "${sysroot}" && "${sysroot}" != "/" ]]; then
   echo "${boring_sysroot_var}=${sysroot}" >> "$GITHUB_ENV"
 fi
 
-cflags="-pthread"
-cxxflags="-pthread"
+linux_uapi_cflag="-idirafter${linux_uapi_include}"
+cflags="-pthread ${linux_uapi_cflag}"
+cxxflags="-pthread ${linux_uapi_cflag}"
 if [[ "${TARGET}" == "aarch64-unknown-linux-musl" ]]; then
   # BoringSSL enables -Wframe-larger-than=25344 under clang and treats warnings as errors.
   cflags="${cflags} -Wno-error=frame-larger-than"
   cxxflags="${cxxflags} -Wno-error=frame-larger-than"
+fi
+
+# Compile through the selected target compiler before exporting it. -idirafter
+# keeps musl's compiler-provided userspace headers ahead of the pinned UAPI
+# closure while still resolving Linux and target asm headers needed by bwrap.
+if ! printf '%s\n' \
+  '#include <linux/sched.h>' \
+  '#include <linux/loop.h>' \
+  '#include <asm/types.h>' \
+  "#ifndef ${probe_arch_macro}" \
+  '#error target compiler architecture does not match Linux UAPI closure' \
+  '#endif' \
+  'int codex_linux_uapi_probe(void) {' \
+  '  return (int)(sizeof(struct clone_args) + sizeof(struct loop_info64) + sizeof(__u64));' \
+  '}' | "${cc}" -pthread "${linux_uapi_cflag}" -x c -c -o "${tool_root}/linux-uapi-probe.o" -; then
+  echo "Linux UAPI compile probe failed; target=${TARGET} include=${linux_uapi_include}" >&2
+  exit 1
 fi
 
 echo "CFLAGS=${cflags}" >> "$GITHUB_ENV"
