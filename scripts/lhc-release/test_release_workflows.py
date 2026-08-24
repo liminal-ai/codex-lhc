@@ -259,6 +259,42 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         self.assertIn('git diff --quiet "$PRODUCT_SOURCE" -- .', build)
         self.assertIn("scripts/build_codex_package.py", build)
 
+    def test_product_fence_uses_pinned_python_with_tomllib(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        checkout = "      - name: Fresh full checkout of accepted product source"
+        setup = (
+            "      - uses: actions/setup-python@"
+            "a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0"
+        )
+        fence = "      - name: Fence product checkout from workflow source"
+        self.assertEqual(build.count(setup), 1)
+        self.assertLess(build.index(checkout), build.index(setup))
+        self.assertLess(build.index(setup), build.index(fence))
+        setup_block = build.split(setup, 1)[1].split(fence, 1)[0]
+        self.assertIn('python-version: "3.13"', setup_block)
+        fence_block = build.split(fence, 1)[1].split(
+            "      - uses: ./.github/actions/setup-ci", 1
+        )[0]
+        version_probe = "python --version"
+        tomllib_probe = (
+            "python -c 'import sys, tomllib; assert sys.version_info[:2] == (3, 13)'"
+        )
+        identity_check = (
+            'python scripts/lhc-release/check_version_identity.py --version "$VERSION"'
+        )
+        self.assertIn(version_probe, fence_block)
+        self.assertIn(tomllib_probe, fence_block)
+        self.assertIn(identity_check, fence_block)
+        self.assertLess(
+            fence_block.index(version_probe), fence_block.index(tomllib_probe)
+        )
+        self.assertLess(
+            fence_block.index(tomllib_probe), fence_block.index(identity_check)
+        )
+
     def test_product_checkout_has_one_platform_specific_preflight_exemption(
         self,
     ) -> None:

@@ -160,6 +160,9 @@ jobs:
           submodules: recursive
           fetch-depth: 0
           clean: true
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
       - name: Fence product checkout from workflow source
         shell: bash
         run: |
@@ -172,6 +175,8 @@ jobs:
           test -z "$(git status --porcelain=v1 --ignore-submodules=none)"
           test ! -e .github/workflows/lhc-release-supplemental.yml
           git diff --quiet "$PRODUCT_SOURCE" -- .
+          python --version
+          python -c 'import sys, tomllib; assert sys.version_info[:2] == (3, 13)'
           python scripts/lhc-release/check_version_identity.py --version "$VERSION"
       - uses: ./.github/actions/setup-ci
       - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
