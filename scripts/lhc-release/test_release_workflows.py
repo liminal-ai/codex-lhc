@@ -278,6 +278,10 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         self.assertEqual(exemption.count("continue"), 1)
         self.assertNotIn("|| true", exemption)
         self.assertNotIn("continue-on-error", build)
+        self.assertIn(
+            'PYTHONPATH="scripts/lhc-release${PYTHONPATH:+:${PYTHONPATH}}"',
+            exemption,
+        )
         self.assertIn('python -m unittest "$@"', exemption)
 
     def test_retained_artifacts_are_downloaded_by_id_and_hard_fenced(self) -> None:

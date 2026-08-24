@@ -214,7 +214,8 @@ jobs:
             set -- "$@" "$test_file"
           done
           test "$#" -gt 0
-          python -m unittest "$@"
+          PYTHONPATH="scripts/lhc-release${PYTHONPATH:+:${PYTHONPATH}}" \
+            python -m unittest "$@"
       - name: Test Windows installer
         if: matrix.kind == 'windows'
         shell: pwsh
