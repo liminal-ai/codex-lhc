@@ -23,6 +23,7 @@ class InstallMuslBuildToolsTests(unittest.TestCase):
         )
         self.assertNotIn('update "${apt_update_args[@]}"', text)
         self.assertNotIn('install -y "${apt_install_args[@]}"', text)
+        self.assertNotRegex(text, r"\$\{[^}]*\^\^")
 
     def test_each_target_uses_pinned_uapi_closure_after_musl_and_probes_it(
         self,
@@ -32,6 +33,7 @@ class InstallMuslBuildToolsTests(unittest.TestCase):
                 "arch": "x86_64",
                 "macro": "__x86_64__",
                 "package": (f"linux-libc-dev-amd64-cross_{LINUX_UAPI_VERSION}_all.deb"),
+                "cargo_linker_var": "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER",
                 "sha256": (
                     "bc504dcc35c15ff606df44ca081d0abaa613b2f3b7a56896d6211eced1368af3"
                 ),
@@ -40,6 +42,7 @@ class InstallMuslBuildToolsTests(unittest.TestCase):
                 "arch": "aarch64",
                 "macro": "__aarch64__",
                 "package": (f"linux-libc-dev-arm64-cross_{LINUX_UAPI_VERSION}_all.deb"),
+                "cargo_linker_var": "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER",
                 "sha256": (
                     "6a5a00b8ba8de66862e05493def87a5cbbb23b949601e45a5e3cbde56505cb6b"
                 ),
@@ -107,6 +110,10 @@ class InstallMuslBuildToolsTests(unittest.TestCase):
                 self.assertIn(f"CXXFLAGS=-pthread {include_flag}", exported)
                 self.assertNotIn("-I/usr/include", exported)
                 self.assertIn(include_flag, compiler_args.read_text())
+                self.assertIn(
+                    f"{expected['cargo_linker_var']}={compiler}",
+                    exported.splitlines(),
+                )
 
                 source = probe_source.read_text()
                 self.assertIn("#include <linux/sched.h>", source)
