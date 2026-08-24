@@ -181,6 +181,42 @@ jobs:
       - name: Install musl build tools
         if: matrix.kind == 'linux'
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+      - name: Normalize accepted a25 GCC frame warning option
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalid_option=-Wno-error=frame-larger-than
+          corrected_option=-Wno-error=frame-larger-than=
+          normalize_flags() {
+            local input="$1"
+            local flag output="" replacements=0
+            local -a flags
+            read -r -a flags <<< "$input"
+            for flag in "${flags[@]}"; do
+              if [[ "$flag" == "$invalid_option" ]]; then
+                flag="$corrected_option"
+                replacements=$((replacements + 1))
+              fi
+              output="${output:+${output} }${flag}"
+            done
+            test "$replacements" -eq 1 || {
+              echo "expected exactly one standalone $invalid_option" >&2
+              exit 1
+            }
+            NORMALIZED_FLAGS="$output"
+          }
+          normalize_flags "$CFLAGS"
+          corrected_cflags="$NORMALIZED_FLAGS"
+          normalize_flags "$CXXFLAGS"
+          corrected_cxxflags="$NORMALIZED_FLAGS"
+          case " $corrected_cflags " in *" $invalid_option "*) exit 1 ;; esac
+          case " $corrected_cxxflags " in *" $invalid_option "*) exit 1 ;; esac
+          printf '%s\n' 'int codex_frame_option_probe(void) { return 0; }' | \
+            "$CC" "$corrected_option" -x c -c \
+              -o "${RUNNER_TEMP}/frame-option-probe.o" -
+          printf 'CFLAGS=%s\nCXXFLAGS=%s\n' \
+            "$corrected_cflags" "$corrected_cxxflags" >> "$GITHUB_ENV"
       - name: Configure Windows build paths
         if: matrix.kind == 'windows'
         shell: pwsh
@@ -194,8 +230,30 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - name: Test canonical package builder
+        if: matrix.kind != 'windows'
         shell: bash
         run: python -m unittest discover -s scripts/codex_package -p 'test_*.py'
+      - name: Test exactly 11 applicable canonical package tests on Windows
+        if: matrix.kind == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # POSIX executable-mode omissions on native Windows:
+          # - test_layout.PackageLayoutTest.test_app_server_package_places_code_mode_host_beside_entrypoint
+          # - test_layout.PackageLayoutTest.test_macos_package_preserves_prebuilt_resource_binaries
+          # - test_zsh.ResolveZshBinTest.test_uses_prebuilt_executable_override
+          PYTHONPATH=scripts/codex_package python -m unittest \
+            test_archive.ResolveZstdCommandTest.test_prefers_zstd_from_path \
+            test_archive.ResolveZstdCommandTest.test_falls_back_to_dotslash_manifest \
+            test_archive.ResolveZstdCommandTest.test_errors_when_no_zstd_or_dotslash_manifest_is_available \
+            test_cargo.SourceBinariesForTargetTest.test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing \
+            test_cargo.SourceBinariesForTargetTest.test_missing_windows_helpers_are_built \
+            test_cargo.SourceBinariesForTargetTest.test_build_uses_prebuilt_windows_helpers_without_running_cargo \
+            test_cli.PackageVersionTest.test_lhc_provenance_requires_exact_public_identity_pair \
+            test_cli.PackageVersionTest.test_accepts_release_prerelease_and_build_versions \
+            test_cli.PackageVersionTest.test_rejects_versions_the_runtime_cannot_parse \
+            test_layout.PackageLayoutTest.test_lhc_package_extends_canonical_metadata_with_exact_provenance \
+            test_zsh.ResolveZshBinTest.test_uses_manifest_override
       - name: Test release helpers with one platform-specific preflight exemption
         if: matrix.kind != 'windows'
         shell: bash

@@ -284,6 +284,71 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn('python -m unittest "$@"', exemption)
 
+    def test_linux_normalizes_only_the_invalid_a25_gcc_frame_option(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        installer = 'run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"'
+        normalization = "      - name: Normalize accepted a25 GCC frame warning option"
+        self.assertIn(f"{installer}\n{normalization}", build)
+        normalized = build.split(normalization, 1)[1].split(
+            "      - name: Configure Windows build paths", 1
+        )[0]
+        self.assertIn("invalid_option=-Wno-error=frame-larger-than", normalized)
+        self.assertIn("corrected_option=-Wno-error=frame-larger-than=", normalized)
+        self.assertIn('test "$replacements" -eq 1', normalized)
+        self.assertEqual(normalized.count("*) exit 1 ;;"), 2)
+        self.assertIn('"$CC" "$corrected_option" -x c -c', normalized)
+        self.assertIn('>> "$GITHUB_ENV"', normalized)
+        self.assertNotIn("|| true", normalized)
+
+    def test_windows_runs_exact_11_applicable_package_tests(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        self.assertIn(
+            "Test canonical package builder\n        if: matrix.kind != 'windows'",
+            build,
+        )
+        windows = build.split(
+            "      - name: Test exactly 11 applicable canonical package tests on Windows",
+            1,
+        )[1].split(
+            "      - name: Test release helpers with one platform-specific preflight exemption",
+            1,
+        )[0]
+        selected = re.findall(
+            r"^            (test_[A-Za-z0-9_.]+)(?: \\)?$", windows, re.M
+        )
+        self.assertEqual(
+            selected,
+            [
+                "test_archive.ResolveZstdCommandTest.test_prefers_zstd_from_path",
+                "test_archive.ResolveZstdCommandTest.test_falls_back_to_dotslash_manifest",
+                "test_archive.ResolveZstdCommandTest.test_errors_when_no_zstd_or_dotslash_manifest_is_available",
+                "test_cargo.SourceBinariesForTargetTest.test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing",
+                "test_cargo.SourceBinariesForTargetTest.test_missing_windows_helpers_are_built",
+                "test_cargo.SourceBinariesForTargetTest.test_build_uses_prebuilt_windows_helpers_without_running_cargo",
+                "test_cli.PackageVersionTest.test_lhc_provenance_requires_exact_public_identity_pair",
+                "test_cli.PackageVersionTest.test_accepts_release_prerelease_and_build_versions",
+                "test_cli.PackageVersionTest.test_rejects_versions_the_runtime_cannot_parse",
+                "test_layout.PackageLayoutTest.test_lhc_package_extends_canonical_metadata_with_exact_provenance",
+                "test_zsh.ResolveZshBinTest.test_uses_manifest_override",
+            ],
+        )
+        for omitted in (
+            "test_layout.PackageLayoutTest.test_app_server_package_places_code_mode_host_beside_entrypoint",
+            "test_layout.PackageLayoutTest.test_macos_package_preserves_prebuilt_resource_binaries",
+            "test_zsh.ResolveZshBinTest.test_uses_prebuilt_executable_override",
+        ):
+            self.assertIn(f"# - {omitted}", windows)
+            self.assertNotIn(f"            {omitted}\n", windows)
+        self.assertNotIn("discover", windows)
+        self.assertNotIn("|| true", windows)
+        self.assertNotIn("continue-on-error", build)
+
     def test_retained_artifacts_are_downloaded_by_id_and_hard_fenced(self) -> None:
         text = RESUME_WORKFLOW.read_text()
         boundary = text.split("  retained-boundary:\n", 1)[1].split(
