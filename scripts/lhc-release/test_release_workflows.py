@@ -295,6 +295,39 @@ class FanoutResumeWorkflowContractTests(unittest.TestCase):
             fence_block.index(tomllib_probe), fence_block.index(identity_check)
         )
 
+    def test_shared_setup_skips_only_windows_with_prerequisites_preserved(self) -> None:
+        text = RESUME_WORKFLOW.read_text()
+        build = text.split("  build-resumed-platforms:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+        shared_setup = "      - uses: ./.github/actions/setup-ci"
+        dotslash = (
+            "      - uses: facebook/install-dotslash@"
+            "1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2"
+        )
+        rust = (
+            "      - uses: dtolnay/rust-toolchain@"
+            "e081816240890017053eacbb1bdf337761dc5582 # 1.95.0"
+        )
+        windows_paths = "      - name: Configure Windows build paths"
+        msvc = "      - uses: ./.github/actions/setup-msvc-env"
+        self.assertEqual(build.count(shared_setup), 1)
+        shared_block = build.split(shared_setup, 1)[1].split(dotslash, 1)[0]
+        self.assertEqual(shared_block.strip(), "if: matrix.kind != 'windows'")
+        self.assertLess(build.index(shared_setup), build.index(dotslash))
+        self.assertLess(build.index(dotslash), build.index(rust))
+        self.assertLess(build.index(rust), build.index(windows_paths))
+        self.assertLess(build.index(windows_paths), build.index(msvc))
+        windows_block = build.split(windows_paths, 1)[1].split(msvc, 1)[0]
+        self.assertIn("if: matrix.kind == 'windows'", windows_block)
+        self.assertIn("git config --global core.longpaths true", windows_block)
+        self.assertIn('"CARGO_TARGET_DIR=$targetDir"', windows_block)
+        msvc_block = build.split(msvc, 1)[1].split(
+            "      - name: Test canonical package builder", 1
+        )[0]
+        self.assertIn("if: matrix.kind == 'windows'", msvc_block)
+        self.assertIn("target: ${{ matrix.target }}", msvc_block)
+
     def test_product_checkout_has_one_platform_specific_preflight_exemption(
         self,
     ) -> None:
