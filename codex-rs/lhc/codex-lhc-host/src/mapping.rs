@@ -557,6 +557,19 @@ pub fn attach_step_index(event: &mut MappedEvent, step_index: i64) {
         .insert("stepIndex".into(), json!(step_index));
 }
 
+/// Turn parts (Flow 7): mark a `user_prompt` as the host's in-run steer —
+/// a human prompt recorded after the current host turn had already begun
+/// provider cycles. The SDK keeps such a prompt a member of the open turn
+/// instead of closing it and opening a successor. Only `user_prompt` events
+/// carry it; the assertion is the host's lifecycle fact, never inferred from
+/// text.
+pub fn attach_steer(event: &mut MappedEvent) {
+    if event.input.event_kind != "user_prompt" {
+        return;
+    }
+    event.input.payload.insert("steer".into(), json!(true));
+}
+
 /// Host-injected runtime note (degradation / truncation markers). Key is not
 /// content-addressed — each latch uses a distinct `key_suffix`.
 pub fn map_runtime_note(thread_id: &str, text: &str, key_suffix: &str) -> MappedEvent {

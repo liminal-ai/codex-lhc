@@ -4080,3 +4080,245 @@ async fn mid_turn_parts_thread_never_runs_legacy_runtime() {
         "the parts view stands after the refused legacy call"
     );
 }
+
+/// Turn parts (Story 5, correction M2): once the SDK has installed the parts
+/// view, a host rollout-rewrite failure is a retry-later outcome, not a hard
+/// stop. Under the thread-scoped swap failpoint the production arm must keep
+/// the prior body and the on-disk rollout intact, report
+/// `MidTurnBlocked { next_provider_request_allowed: true }` (so strict
+/// dispatch permits the next seam instead of ending the turn), leave no
+/// forced-boundary evidence, and let a later clean seam re-materialize and
+/// install. Strict dispatch itself is then driven under the same failpoint and
+/// must return `Ok(())`, never `UnsupportedOperation`.
+#[tokio::test]
+async fn mid_turn_parts_host_apply_failure_retries_at_later_seam() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let rollout_path = super::slice_d_tests::attach_rollout(&mut session).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 4).await;
+    seed_stepped_active_turn(&session, &tc, 6).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let sess = Arc::new(session);
+    sess.flush_rollout().await.expect("flush rollout");
+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let disk_before = std::fs::read_to_string(&rollout_path).expect("rollout before");
+
+    // Seam 1: the SDK installs the parts view; the host swap fails after the
+    // temp write, so the old rollout stays authoritative and the body stands.
+    let guard =
+        codex_lhc_host::SwapFailpointGuard::arm(codex_lhc_host::SwapFailpoint::PostTempWrite);
+    let first = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "parts-apply-1",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    drop(guard);
+    match first {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(
+                reason.contains("rollout rewrite failed"),
+                "host apply failure surfaces its cause: {reason}"
+            );
+            assert!(
+                reason.contains("retry at a later seam"),
+                "host apply failure is a retry-later outcome: {reason}"
+            );
+            assert!(
+                next_provider_request_allowed,
+                "host apply failure after a parts install must allow the next provider request"
+            );
+        }
+        other => panic!("host apply failure must keep the body and retry later, got {other:?}"),
+    }
+    let history_mid: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(history_before, history_mid, "prior body preserved");
+    assert_eq!(
+        disk_before,
+        std::fs::read_to_string(&rollout_path).expect("rollout after failure"),
+        "old rollout remains authoritative after the failed swap"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
+        .await
+        .expect("describe")
+        .expect("the SDK view installed before the host apply failed");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "the SDK parts view stands while the host retries: {view:?}"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "host apply failure never routes to compact-continuation: {receipts:?}"
+    );
+    assert!(
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(
+            &thread_id,
+            Some(root.as_path())
+        )
+        .await
+        .expect("pending boundary")
+        .is_none(),
+        "no forced-boundary row after a host apply failure"
+    );
+
+    // Seam 2 (clean): the same host turn progresses; the parts compact runs
+    // again and the host apply re-materializes and installs.
+    for k in 0..2 {
+        codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
+        sess.record_conversation_items_with_provenance(
+            &tc,
+            &[ResponseItem::Message {
+                id: None,
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText {
+                    text: format!("progress after failed apply {k} {}", "w".repeat(800)),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
+    }
+    inject_response_usage(&sess, &tc, 5_000).await;
+    handle.flush().await;
+    let history_grown: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let repaired = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "parts-apply-2",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("repair arm");
+    let LhcCompactAttempt::Installed { body, .. } = repaired else {
+        panic!("a later clean seam must re-materialize and install, got {repaired:?}");
+    };
+    assert!(
+        body.len() < history_grown.len(),
+        "repaired install serves a reduced body ({} < {})",
+        body.len(),
+        history_grown.len()
+    );
+    let disk_after = std::fs::read_to_string(&rollout_path).expect("rollout after repair");
+    assert_ne!(
+        disk_before, disk_after,
+        "the repaired install rewrote the rollout"
+    );
+    assert!(
+        !codex_lhc_host::parse_rollout_items(&rollout_path)
+            .expect("rewritten rollout parses")
+            .is_empty(),
+        "rewritten rollout is not torn"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "repair never routes to compact-continuation: {receipts:?}"
+    );
+
+    // Seam 3: strict dispatch under the same failpoint. The parts compact runs
+    // through `run_auto_compact`; the host apply fails again and strict
+    // dispatch must permit the next seam (`Ok(())`), never
+    // `UnsupportedOperation`, with the body it holds preserved.
+    codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
+    sess.record_conversation_items_with_provenance(
+        &tc,
+        &[ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText {
+                text: format!("progress before strict dispatch {}", "v".repeat(800)),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        codex_extension_api::RawItemProvenance::ModelOutput,
+    )
+    .await;
+    inject_response_usage(&sess, &tc, 5_000).await;
+    handle.flush().await;
+    let history_before_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let disk_before_strict = std::fs::read_to_string(&rollout_path).expect("rollout before strict");
+    let epoch = decision_epoch(&sess);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
+    let mut client = inert_model_client_session();
+    let guard =
+        codex_lhc_host::SwapFailpointGuard::arm(codex_lhc_host::SwapFailpoint::PostTempWrite);
+    let strict = run_auto_compact(
+        &sess,
+        step,
+        /*fallback*/ None,
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "parts-apply-3",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await;
+    drop(guard);
+    assert!(
+        strict.is_ok(),
+        "strict dispatch must permit the next seam after a host apply failure, got {:?}",
+        strict.err()
+    );
+    let history_after_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(
+        history_before_strict, history_after_strict,
+        "strict dispatch preserved the current body"
+    );
+    assert_eq!(
+        disk_before_strict,
+        std::fs::read_to_string(&rollout_path).expect("rollout after strict"),
+        "old rollout remains authoritative after the failed swap under strict dispatch"
+    );
+}

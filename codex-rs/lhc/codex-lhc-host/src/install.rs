@@ -108,6 +108,8 @@ enum PendingCmd {
         item: ResponseItem,
         provenance: RawItemProvenance,
         step_index: Option<i64>,
+        /// In-run steer assertion for a user prompt (turn parts, Flow 7).
+        steer: bool,
     },
     ModelOrThinkingChange {
         previous_model: String,
@@ -626,8 +628,13 @@ impl LhcCaptureSlot {
                     item,
                     provenance,
                     step_index,
+                    steer,
                 } => {
-                    handle.persist(&item, provenance, step_index);
+                    if steer {
+                        handle.persist_steer_prompt(&item);
+                    } else {
+                        handle.persist(&item, provenance, step_index);
+                    }
                 }
                 PendingCmd::ModelOrThinkingChange {
                     previous_model,
@@ -1218,14 +1225,29 @@ impl<C: Send + Sync + 'static> RawItemContributor for LhcExtension<C> {
             };
             // Turn parts (F2): the host's provider cycle at record time.
             let step_index = LhcStepIndex::current(input.turn_store);
+            // Turn parts (Flow 7): a human prompt recorded while the current
+            // host turn has already begun provider cycles is an in-run steer.
+            // The fact is the host's own turn lifecycle (`LhcStepIndex` is
+            // begun by `run_turn` before each sampling request and lives in
+            // the turn-scoped store): the opening prompt is recorded before
+            // any cycle begins and is never stamped; a prompt drained from
+            // the pending queue inside the loop always is. Never inferred
+            // from text.
+            let steer =
+                matches!(input.provenance, RawItemProvenance::UserPrompt) && step_index.is_some();
             for item in input.items {
                 let cmd = PendingCmd::Persist {
                     item: item.clone(),
                     provenance: input.provenance,
                     step_index,
+                    steer,
                 };
                 if let Some(handle) = slot.buffer_or_handle(cmd) {
-                    handle.persist(item, input.provenance, step_index);
+                    if steer {
+                        handle.persist_steer_prompt(item);
+                    } else {
+                        handle.persist(item, input.provenance, step_index);
+                    }
                 }
             }
         })

@@ -793,3 +793,394 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
 
     Ok(())
 }
+
+/// Read the durable turn/event record of `thread_id` as JSON (SDK futures are
+/// `!Send`, so the read runs on its own thread). Returns `(turns, events)` in
+/// record order.
+fn durable_record_blocking(
+    thread_id: &str,
+    root: Option<PathBuf>,
+) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+    let tid = thread_id.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let callbacks =
+                codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic callbacks");
+            let (session, _) =
+                codex_lhc_host::LhcSession::open(&tid, None, root.as_deref(), callbacks)
+                    .await
+                    .expect("open durable record");
+            let turns = session
+                .list_turns()
+                .await
+                .expect("list turns")
+                .iter()
+                .map(|t| serde_json::to_value(t).expect("turn json"))
+                .collect();
+            let events = session
+                .list_events()
+                .await
+                .expect("list events")
+                .iter()
+                .map(|e| serde_json::to_value(e).expect("event json"))
+                .collect();
+            (turns, events)
+        })
+    })
+    .join()
+    .expect("durable record thread")
+}
+
+/// F. In-run steer stays in the canonical task turn (turn parts, Flow 7;
+/// correction M1). A real second `start_or_steer_turn` while the first host
+/// turn is active is drained by `run_turn` after cycle 0 and recorded as a
+/// steer prompt. The durable record must show: the opening prompt without a
+/// steer assertion; the in-run prompt with `payload.steer = true`; one task
+/// turn holding both prompts and every step-bearing member (no close/open
+/// transition at the steer — the only closes are the prompt boundary that
+/// opened the task turn and its `turn_end`); the host turn still bound to
+/// that same durable turn; and the later MidTurn parts relief — driven by
+/// sustained post-steer tool pressure under the SDK's production 120k lower
+/// bound — splitting and serving that same turn, with no continuation turn
+/// or forced-boundary marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_loop_in_run_steer_stays_in_task_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    /// Heavy tool cycles after the steer (each ~32k chars of output) so the
+    /// turn crosses the production lower bound and a parts split lands
+    /// after the steer prompt.
+    const POST_STEER_CYCLES: usize = 18;
+    const SCOPE_LIMIT: i64 = 80_000;
+    /// Wave seams where emulated usage approaches the scope limit.
+    const WAVE_SEAMS: [usize; 3] = [6, 12, 17];
+
+    let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
+    let root = lhc_root.path().to_path_buf();
+
+    // Cycle 0: a tool call that holds the turn open long enough to steer it,
+    // below the trigger so no relief runs before the steer is drained.
+    let shell_args = json!({
+        "command": "sleep 1; echo steer-window-open",
+        "timeout_ms": 10_000,
+    })
+    .to_string();
+    let mut responses = vec![sse(vec![
+        ev_response_created("resp-steer-0"),
+        ev_function_call("call-steer-window", "shell_command", &shell_args),
+        ev_completed_with_tokens("resp-steer-0", /*total_tokens*/ 300),
+    ])];
+    // Cycles 1..=N answer the drained steer and keep the task going under
+    // sustained pressure; the parts arm runs at the wave seams.
+    for i in 1..=POST_STEER_CYCLES {
+        let usage: i64 = if WAVE_SEAMS.contains(&i) {
+            78_400
+        } else {
+            40_000
+        };
+        let args = json!({
+            "command": cycle_command(i),
+            "timeout_ms": 10_000,
+        })
+        .to_string();
+        responses.push(sse(vec![
+            ev_response_created(&format!("resp-steer-{i}")),
+            ev_assistant_message(
+                &format!("m-steer-{i}"),
+                &format!("continuing with the steered direction, cycle {i}"),
+            ),
+            ev_function_call(&format!("call-steer-{i}"), "shell_command", &args),
+            ev_completed_with_tokens(&format!("resp-steer-{i}"), usage),
+        ]));
+    }
+    responses.push(sse(vec![
+        ev_response_created("resp-steer-final"),
+        ev_assistant_message(
+            "m-steer-final",
+            "task complete after steer and mid-turn parts compact",
+        ),
+        ev_completed_with_tokens("resp-steer-final", /*total_tokens*/ 300),
+    ]));
+    let mock = mount_sse_sequence(&server, responses).await;
+
+    let model_provider = non_openai_model_provider(&server);
+    let extensions = lhc_extensions_with_model(root, "gpt-5.5");
+    let cwd_for_policy = TempDir::new()?;
+    let cwd_path = cwd_for_policy.path().to_path_buf();
+    let mut builder = test_codex()
+        .with_extensions(extensions)
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            let _ = config.features.enable(Feature::LhcCapture);
+            let _ = config.features.disable(Feature::TokenBudget);
+            // Auto-compact trigger only — not a body-size refuse. The parts
+            // arm runs under the SDK's production lower bound (core's test
+            // knobs are not compiled into integration builds).
+            config.model_auto_compact_token_limit = Some(SCOPE_LIMIT);
+            config.model_context_window = Some(400_000);
+            config.model = Some("gpt-5.5".into());
+            config.compact_prompt = Some(SUMMARIZATION_PROMPT.into());
+        });
+    let test = builder.build(&server).await?;
+    {
+        let slot = test
+            .codex
+            .thread_extension_data()
+            .get::<LhcCaptureSlot>()
+            .expect("slot");
+        let _ = wait_for_handle(&slot, Duration::from_secs(30)).await;
+    }
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
+    const OPENING: &str = "start the long agentic task";
+    const STEER: &str = "steer: also cover the second half of the task";
+    let started = test
+        .codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: OPENING.into(),
+                text_elements: Vec::new(),
+            }])
+            .with_thread_settings(
+                codex_protocol::protocol::ThreadSettingsOverrides {
+                    environments: Some(local_selections(test.cwd_path().abs())),
+                    approval_policy: Some(codex_protocol::protocol::AskForApproval::Never),
+                    sandbox_policy: Some(sandbox_policy),
+                    permission_profile,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await?;
+    let codex_protocol::turn_input::TurnInputSubmission::Started {
+        turn_id: host_turn_id,
+    } = started
+    else {
+        panic!("first submission must start the turn, got {started:?}");
+    };
+    // The turn is active (cycle 0's tool is executing): submit the real steer.
+    wait_for_event(&test.codex, |ev| {
+        matches!(ev, EventMsg::ExecCommandBegin(_))
+    })
+    .await;
+    let steered = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: STEER.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let codex_protocol::turn_input::TurnInputSubmission::Steered {
+        turn_id: steered_id,
+    } = steered
+    else {
+        panic!("second submission must steer the active turn, got {steered:?}");
+    };
+    assert_eq!(
+        steered_id, host_turn_id,
+        "the steer joins the active host turn"
+    );
+    let terminal = wait_for_event(&test.codex, |ev| {
+        matches!(
+            ev,
+            EventMsg::TurnComplete(_) | EventMsg::Error(_) | EventMsg::TurnAborted(_)
+        )
+    })
+    .await;
+    assert!(
+        matches!(terminal, EventMsg::TurnComplete(_)),
+        "steered turn must complete, got {terminal:?}"
+    );
+
+    let bodies = request_bodies(&mock);
+    assert_eq!(
+        bodies.len(),
+        POST_STEER_CYCLES + 2,
+        "cycle 0 (steer window), {POST_STEER_CYCLES} steered cycles, final completion; got {}",
+        bodies.len()
+    );
+    assert!(
+        !bodies.iter().any(|b| body_has_summarization(b)),
+        "native compact must not run on the steered MidTurn path"
+    );
+    assert!(
+        !bodies[0].contains(STEER) && bodies[1].contains(STEER),
+        "the steer is drained into the request after the cycle it interrupted"
+    );
+    assert!(
+        !bodies
+            .iter()
+            .any(|b| b.contains("lhc.compact_continuation")),
+        "no request may carry the forced-boundary marker"
+    );
+
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
+
+    // Durable record: prompts, steer assertion, single task turn.
+    let messages = canonical_message_rows_blocking(&thread_id, lhc_data_root.clone());
+    let prompt_rows: Vec<&(String, String)> = messages
+        .iter()
+        .filter(|(kind, _)| kind == "user_prompt")
+        .collect();
+    assert_eq!(
+        prompt_rows.len(),
+        2,
+        "opening prompt and steer prompt are both recorded: {messages:?}"
+    );
+    let task_turn = prompt_rows[0].1.clone();
+    assert_eq!(
+        prompt_rows[1].1, task_turn,
+        "the steer prompt is a member of the same durable turn as the opening prompt"
+    );
+    let step_kinds = [
+        "assistant_text",
+        "assistant_thinking",
+        "tool_call",
+        "tool_result",
+    ];
+    let foreign: Vec<&(String, String)> = messages
+        .iter()
+        .filter(|(kind, turn)| step_kinds.contains(&kind.as_str()) && *turn != task_turn)
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "every step-bearing member lives on the task turn {task_turn}: {foreign:?}"
+    );
+    assert_eq!(
+        handle.durable_turn_id(&host_turn_id).as_deref(),
+        Some(task_turn.as_str()),
+        "the host turn stays bound to the original durable task turn across the steer"
+    );
+
+    let (turns, events) = durable_record_blocking(&thread_id, lhc_data_root.clone());
+    let prompts: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["eventKind"] == "user_prompt")
+        .collect();
+    assert_eq!(prompts.len(), 2, "two user_prompt events: {events:?}");
+    assert_eq!(prompts[0]["payload"]["text"], OPENING);
+    assert!(
+        prompts[0]["payload"]
+            .get("steer")
+            .is_none_or(|s| s == &json!(false)),
+        "the opening prompt carries no steer assertion: {}",
+        prompts[0]
+    );
+    assert_eq!(prompts[1]["payload"]["text"], STEER);
+    assert_eq!(
+        prompts[1]["payload"]["steer"],
+        json!(true),
+        "the in-run prompt is stamped steer=true: {}",
+        prompts[1]
+    );
+    let opening_order = prompts[0]["eventOrder"].as_i64().expect("order");
+    let steer_order = prompts[1]["eventOrder"].as_i64().expect("order");
+    let turn_ends: Vec<i64> = events
+        .iter()
+        .filter(|e| e["eventKind"] == "turn_end")
+        .map(|e| e["eventOrder"].as_i64().expect("order"))
+        .collect();
+    assert_eq!(turn_ends.len(), 1, "exactly one turn_end: {turn_ends:?}");
+    // Canonical lifecycle: bootstrap turn closed by the opening prompt, the
+    // task turn closed by turn_end, the SDK's empty successor. No close/open
+    // at the steer.
+    assert_eq!(
+        turns.len(),
+        3,
+        "bootstrap, task and empty successor turns only (no continuation, no split at the steer): {turns:?}"
+    );
+    let task = turns
+        .iter()
+        .find(|t| t["turnId"] == task_turn)
+        .unwrap_or_else(|| panic!("task turn {task_turn} in {turns:?}"));
+    assert_eq!(task["status"], "closed");
+    assert_eq!(task["outcome"], "completed");
+    assert_eq!(task["openedAtEventOrder"].as_i64(), Some(opening_order));
+    assert_eq!(task["closedAtEventOrder"].as_i64(), Some(turn_ends[0]));
+    assert!(
+        turns
+            .iter()
+            .all(|t| t["openedAtEventOrder"].as_i64() != Some(steer_order)
+                && t["closedAtEventOrder"].as_i64() != Some(steer_order)),
+        "no turn opens or closes at the steer prompt ({steer_order}): {turns:?}"
+    );
+
+    // Later MidTurn relief served the same durable turn as parts.
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
+            .await
+            .expect("inspect receipts");
+    assert!(
+        receipts.is_empty(),
+        "steered turn never routes to compact-continuation: {receipts:?}"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, lhc_data_root.as_deref())
+        .await
+        .expect("describe")
+        .expect("parts relief after the steer installs a serving view");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "the task turn is served as parts: {view:?}"
+    );
+    assert!(
+        view.arrangement
+            .iter()
+            .filter(|entry| entry.part.is_some())
+            .all(|entry| entry.subject_id == task_turn),
+        "parts relief addresses the same durable task turn {task_turn}: {view:?}"
+    );
+    assert!(
+        bodies.iter().skip(2).any(|b| b.contains("[seam · ")),
+        "a later request after the steer is served across the parts seam"
+    );
+
+    Ok(())
+}
+
+/// `(kind, turn_id)` for every live canonical message, in record order.
+fn canonical_message_rows_blocking(
+    thread_id: &str,
+    root: Option<PathBuf>,
+) -> Vec<(String, String)> {
+    let tid = thread_id.to_string();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async move {
+            let surfaces = codex_lhc_host::read_materialize_surfaces(&tid, root.as_deref())
+                .await
+                .expect("materialize surfaces");
+            surfaces
+                .messages
+                .iter()
+                .map(|m| {
+                    let v = serde_json::to_value(m).expect("message json");
+                    (
+                        v["kind"].as_str().unwrap_or_default().to_string(),
+                        v["turnId"].as_str().unwrap_or_default().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    })
+    .join()
+    .expect("canonical rows thread")
+}

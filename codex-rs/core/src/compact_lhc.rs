@@ -59,6 +59,7 @@ use codex_lhc_host::run_mid_turn_compact_continuation;
 use codex_lhc_host::token_usage_to_provider_usage_authority;
 use codex_lhc_host::work_continuation_for_mid_turn;
 use codex_protocol::error::CodexErr;
+use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
@@ -716,7 +717,7 @@ async fn try_run_mid_turn_arm(
             // completion and runs under a token that is never cancelled so a
             // cancellation race cannot leave a split state.
             let apply_token = CancellationToken::new();
-            Box::pin(install_lhc_compact_rewrite(
+            let applied = Box::pin(install_lhc_compact_rewrite(
                 sess,
                 turn_context,
                 &slot,
@@ -729,7 +730,8 @@ async fn try_run_mid_turn_arm(
                 /*host_validation*/ None,
                 &apply_token,
             ))
-            .await
+            .await;
+            finish_parts_host_apply(applied)
         }
         MidTurnPartsOutcome::ForcedBoundaryThread => {
             // AC-7.3 (typed-only): this thread already took the forced-boundary
@@ -769,6 +771,54 @@ async fn try_run_mid_turn_arm(
             })
         }
     }
+}
+
+/// Turn parts (Story 5): disposition of the host apply that follows an SDK
+/// parts install. The SDK has installed the serving view; the host's
+/// materialize / rollout-rewrite / in-memory install is its atomic completion.
+/// When that completion does not happen, the host still holds the body it
+/// had — nothing is torn (a failed rewrite leaves the old rollout
+/// authoritative) — so the only correct disposition is *retry later*: keep the
+/// current body, allow the next provider request, and let the next eligible
+/// seam run the parts compact again, which re-materializes against the
+/// standing SDK view. It is never a hard stop (strict dispatch must not end
+/// the turn over a host apply that preserved the body), never native
+/// compaction, and never compact-continuation. Cancellation / abort remains
+/// the only deny case: the apply token is never cancelled, and an
+/// interrupted / aborted host error is passed through unchanged.
+fn finish_parts_host_apply(
+    applied: CodexResult<LhcCompactAttempt>,
+) -> CodexResult<LhcCompactAttempt> {
+    let reason = match applied {
+        Ok(attempt @ LhcCompactAttempt::Installed { .. })
+        | Ok(attempt @ LhcCompactAttempt::Cancelled { .. }) => return Ok(attempt),
+        Ok(LhcCompactAttempt::Failed { reason })
+        | Ok(LhcCompactAttempt::Unavailable { reason })
+        | Ok(LhcCompactAttempt::MidTurnSkipped { reason })
+        | Ok(LhcCompactAttempt::ContinuedWithoutCompact { reason })
+        | Ok(LhcCompactAttempt::MidTurnBlocked { reason, .. }) => reason,
+        Err(err)
+            if matches!(
+                err.details(),
+                CodexErrorDetails::Interrupted | CodexErrorDetails::TurnAborted
+            ) =>
+        {
+            return Err(err);
+        }
+        Err(err) => err.to_string(),
+    };
+    warn!(
+        %reason,
+        "LHC mid-turn parts: SDK view installed but the host apply did not complete; \
+         keeping current body, retry at a later seam (no native compact, no continuation)"
+    );
+    Ok(LhcCompactAttempt::MidTurnBlocked {
+        reason: format!(
+            "mid-turn parts view installed but host apply did not complete ({reason}); \
+             keeping current body, retry at a later seam"
+        ),
+        next_provider_request_allowed: true,
+    })
 }
 
 /// Legacy compact-continuation MidTurn path (LIM-63B). Reached in Story 5 only

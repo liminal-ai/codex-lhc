@@ -159,7 +159,7 @@ async fn seed_conversation_bandable(
     }
 }
 
-async fn attach_rollout(session: &mut Session) -> std::path::PathBuf {
+pub(super) async fn attach_rollout(session: &mut Session) -> std::path::PathBuf {
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::protocol::ThreadMemoryMode;
     use codex_thread_store::CreateThreadParams;

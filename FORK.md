@@ -705,6 +705,23 @@ No synthetic continuation turn, no forced-boundary marker.
   nothing, and retries at a later eligible seam. A forced-boundary
   continuation re-binds the host turn to the SDK-opened continuation turn so
   legacy threads keep reaching their typed classification.
+- **In-run steer stays in the task turn (Flow 7).** A human prompt the
+  host records after the current Codex turn has begun provider cycles (a
+  pending `start_or_steer_turn` drained by `run_turn` inside the loop) is
+  stamped `payload.steer=true` by the raw-item contributor from the
+  turn-scoped `LhcStepIndex` fact alone — never from text, never on the
+  opening prompt (recorded before cycle 0). The SDK keeps it a member of the
+  open task turn (no close/open), and capture leaves the host→durable
+  binding untouched (only a forced-boundary continuation re-binds).
+  `full_loop_in_run_steer_stays_in_task_turn`.
+- **Host apply after an SDK parts install retries later.** When the SDK has
+  installed the parts view but the host materialize / rollout rewrite does
+  not complete, the prior body and rollout stand (nothing is torn); the arm
+  reports `MidTurnBlocked { next_provider_request_allowed: true }` so strict
+  dispatch permits the next seam, and the next eligible seam re-runs the
+  parts compact against the standing view. Never `UnsupportedOperation`,
+  never native, never compact-continuation; cancellation/abort stays the
+  only deny. `mid_turn_parts_host_apply_failure_retries_at_later_seam`.
 - **Truthful seam.** A capture flush that does not complete within its bound
   is not a settled seam: keep the body, retry later — never assert a false
   fact (supersedes the LIM-63B "warn and continue" behavior).
@@ -720,9 +737,9 @@ No synthetic continuation turn, no forced-boundary marker.
   `mid_turn_forced_boundary_thread_keeps_legacy_runtime_through_arm`,
   `mid_turn_parts_thread_never_runs_legacy_runtime`.
 - **Evidence:** `compact_lhc::mid_turn_tests` (parts, identity mismatch,
-  generic-failure retry, cancel blocks, flush seam), suite
-  `compact_lhc_mid_turn_loops` (same turn, no marker, sustained pressure
-  splits under the production 120k bound), `lhc_capture_e2e` step stamps,
+  generic-failure retry, host-apply retry, cancel blocks, flush seam), suite
+  `compact_lhc_mid_turn_loops` (same turn, no marker, in-run steer, sustained
+  pressure splits under the production 120k bound), `lhc_capture_e2e` step stamps,
   certification `step_index_round_trips_on_four_kinds_and_null_elsewhere`,
   and tripwire layer 2a2 (`scripts/check-lhc-midturn-parts.py`, bare exec).
 - Not in scope here: threshold/band tuning, Story 6.

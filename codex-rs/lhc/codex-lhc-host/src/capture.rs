@@ -27,6 +27,7 @@ use crate::mapping::MappedEvent;
 use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
 use crate::mapping::attach_provider_usage;
+use crate::mapping::attach_steer;
 use crate::mapping::attach_step_index;
 use crate::mapping::map_item;
 use crate::mapping::map_model_or_thinking_change;
@@ -91,6 +92,10 @@ enum CaptureCmd {
         /// Host step index (turn parts, F2): the zero-based provider cycle
         /// the item belongs to, read at record time; `None` = unknown.
         step_index: Option<i64>,
+        /// In-run steer (turn parts, Flow 7): a user prompt recorded after the
+        /// host turn had begun provider cycles. Stamped `payload.steer=true`
+        /// so the SDK keeps it inside the open task turn.
+        steer: bool,
     },
     TurnEnd {
         turn_id: String,
@@ -182,8 +187,11 @@ pub struct TurnBinding {
 }
 
 /// Worker-side binder: the host turn named by the latest `BindTurn` is bound
-/// to every durable turn the intake opens while it stays current (the turn's
-/// opening prompt; a later steer prompt re-binds to the newer open turn).
+/// to the durable turn the intake opens for its opening prompt (or the empty
+/// open turn that prompt joins). An in-run steer prompt (`payload.steer`)
+/// stays a member of that turn: the SDK opens nothing and the binding is
+/// left untouched. A forced-boundary continuation re-binds explicitly
+/// (`rebind_turn`); nothing else moves a binding.
 struct TurnBinder {
     host_turn_id: Option<String>,
     published: Arc<std::sync::Mutex<Option<TurnBinding>>>,
@@ -217,9 +225,12 @@ impl TurnBinder {
         let lhc_turn_id = match opened {
             Some(id) => id,
             None => {
-                let prompted = events
-                    .iter()
-                    .any(|event| event.input.event_kind == "user_prompt");
+                // Only an opening prompt can bind; a steer prompt is a member
+                // of the already-bound turn and must not move the binding.
+                let prompted = events.iter().any(|event| {
+                    event.input.event_kind == "user_prompt"
+                        && event.input.payload.get("steer") != Some(&Value::Bool(true))
+                });
                 if !prompted || self.bound_for(host_turn_id) {
                     return;
                 }
@@ -298,10 +309,43 @@ impl CaptureHandle {
             self.latch_degraded("persist_full");
             return;
         }
+        self.send_persist(item, provenance, step_index, /*steer*/ false);
+    }
+
+    /// Non-blocking persist of a human prompt the host recorded **after** the
+    /// current host turn had begun provider cycles (turn parts, Flow 7). The
+    /// prompt is stamped `payload.steer=true` so the SDK keeps it a member of
+    /// the open task turn instead of closing it and opening a successor. The
+    /// host asserts this from its own turn lifecycle only — never from text.
+    pub fn persist_steer_prompt(&self, item: &ResponseItem) {
+        self.send_persist(
+            item,
+            RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
+            /*steer*/ true,
+        );
+    }
+
+    fn send_persist(
+        &self,
+        item: &ResponseItem,
+        provenance: RawItemProvenance,
+        step_index: Option<i64>,
+        steer: bool,
+    ) {
+        if self.inner.degraded.load(Ordering::Relaxed) {
+            self.note_drop("degraded_refuse");
+            return;
+        }
+        if !self.user_slots_available() {
+            self.latch_degraded("persist_full");
+            return;
+        }
         match self.inner.tx.try_send(CaptureCmd::Persist {
             item: item.clone(),
             provenance,
             step_index,
+            steer,
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -815,6 +859,7 @@ async fn worker_loop(
                 item,
                 provenance,
                 step_index,
+                steer,
             } => {
                 if matches!(provenance, RawItemProvenance::ModelOutput) {
                     pending_model_output.push((item, provenance, step_index));
@@ -847,6 +892,7 @@ async fn worker_loop(
                     provenance,
                     None,
                     step_index,
+                    /*steer*/ steer,
                     &live_identity,
                     &binder,
                     &mut durability,
@@ -1128,6 +1174,7 @@ async fn flush_pending_model_output(
             provenance,
             provider_usage,
             step_index,
+            /*steer*/ false,
             identity,
             binder,
             durability,
@@ -1148,6 +1195,7 @@ async fn persist_item(
     provenance: RawItemProvenance,
     provider_usage: Option<&Map<String, Value>>,
     step_index: Option<i64>,
+    steer: bool,
     identity: &ModelIdentity,
     binder: &TurnBinder,
     durability: &mut CaptureDurability,
@@ -1193,6 +1241,11 @@ async fn persist_item(
     if let Some(step) = step_index {
         for event in &mut events {
             attach_step_index(event, step);
+        }
+    }
+    if steer {
+        for event in &mut events {
+            attach_steer(event);
         }
     }
     if events.is_empty() {

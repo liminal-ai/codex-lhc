@@ -66,6 +66,7 @@ async fn pre_open_identity_change_replays_in_order() {
             item: user_msg("hi", "u1"),
             provenance: RawItemProvenance::UserPrompt,
             step_index: None,
+            steer: false,
         })
         .is_none()
     );
@@ -74,6 +75,7 @@ async fn pre_open_identity_change_replays_in_order() {
             item: reasoning("rs_a", "CIPHER_A"),
             provenance: RawItemProvenance::ModelOutput,
             step_index: None,
+            steer: false,
         })
         .is_none()
     );
@@ -88,6 +90,7 @@ async fn pre_open_identity_change_replays_in_order() {
             item: reasoning("rs_b", "CIPHER_B"),
             provenance: RawItemProvenance::ModelOutput,
             step_index: None,
+            steer: false,
         })
         .is_none()
     );
@@ -178,6 +181,7 @@ async fn pre_open_overflow_degrades_capture() {
             item: user_msg("x", &format!("u{i}")),
             provenance: RawItemProvenance::UserPrompt,
             step_index: None,
+            steer: false,
         });
     }
     let handle = open_handle(
@@ -233,6 +237,7 @@ async fn pre_open_exact_cap_stays_healthy_and_replays_all() {
             item: user_msg("x", &format!("u{i}")),
             provenance: RawItemProvenance::UserPrompt,
             step_index: None,
+            steer: false,
         });
         assert!(dropped.is_none(), "push {i} must buffer, not hand off");
     }
