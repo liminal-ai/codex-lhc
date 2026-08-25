@@ -39,7 +39,7 @@ use codex_lhc_host::MidTurnPartsOutcome;
 use codex_lhc_host::MidTurnPartsRequest;
 use codex_lhc_host::WorkContinuation;
 use codex_lhc_host::WriterClaim;
-use codex_lhc_host::atomic_rewrite_rollout;
+use codex_lhc_host::atomic_rewrite_rollout_as_generation;
 use codex_lhc_host::commit_compact_marker;
 use codex_lhc_host::compact_opts_with_band_percentages;
 use codex_lhc_host::content_identity_digest;
@@ -2370,12 +2370,21 @@ async fn install_lhc_compact_rewrite(
         // (post-rename fsync or hook error) → the compact stands and the host
         // must complete its matching in-memory / window install, never roll
         // it back; anything unproven → deny sampling with the exact state.
-        let reconciled_after_error = match atomic_rewrite_rollout(path, &materialize_result.items) {
+        // The generation identity this attempt writes is generated here and
+        // retained across the attempt; the proof compares against it exactly
+        // and never reads it back from disk.
+        let generation_id = codex_lhc_host::new_rollout_generation_id();
+        let reconciled_after_error = match atomic_rewrite_rollout_as_generation(
+            path,
+            &materialize_result.items,
+            &generation_id,
+        ) {
             Ok(()) => None,
             Err(err) => {
                 let generations = codex_lhc_host::SwapGenerations {
                     prior_bytes: prior_bytes.as_deref(),
                     new_items: &materialize_result.items,
+                    new_generation_id: &generation_id,
                 };
                 match codex_lhc_host::reconcile_interrupted_swap(path, generations) {
                     codex_lhc_host::SwapReconciliation::OldActive => {

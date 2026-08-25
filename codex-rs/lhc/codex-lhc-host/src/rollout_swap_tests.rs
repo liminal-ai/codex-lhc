@@ -59,7 +59,8 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
 }
 
 fn write_seed(path: &Path, tag: &str) {
-    write_rollout_jsonl(path, &sample_items(tag)).expect("seed write");
+    write_rollout_jsonl(path, &sample_items(tag), &new_rollout_generation_id())
+        .expect("seed write");
 }
 
 fn rollout_lines(path: &Path) -> Vec<RolloutLine> {
@@ -518,6 +519,8 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
 struct Gens {
     prior: Vec<u8>,
     new_items: Vec<RolloutItem>,
+    /// The identity this attempt writes, generated up front and retained.
+    generation_id: String,
 }
 
 impl Gens {
@@ -525,6 +528,7 @@ impl Gens {
         Self {
             prior: std::fs::read(path).expect("prior bytes"),
             new_items: sample_items("new"),
+            generation_id: new_rollout_generation_id(),
         }
     }
 
@@ -532,12 +536,17 @@ impl Gens {
         SwapGenerations {
             prior_bytes: Some(self.prior.as_slice()),
             new_items: &self.new_items,
+            new_generation_id: &self.generation_id,
         }
+    }
+
+    fn rewrite(&self, path: &Path) -> std::io::Result<()> {
+        atomic_rewrite_rollout_as_generation(path, &self.new_items, &self.generation_id)
     }
 }
 
 fn assert_exact_new(path: &Path, gens: &Gens) {
-    proves_new_generation(path, &gens.new_items)
+    proves_new_generation(path, &gens.new_items, &gens.generation_id)
         .unwrap_or_else(|err| panic!("active must be exactly the new generation: {err}"));
 }
 
@@ -555,7 +564,7 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
         let gens = Gens::capture(&path);
-        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        gens.rewrite(&path).expect_err("injected");
         assert_eq!(
             classify_swap_state(&path, gens.as_swap()),
             SwapState::OldActive
@@ -574,7 +583,7 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
         let gens = Gens::capture(&path);
-        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        gens.rewrite(&path).expect_err("injected");
         assert_eq!(
             classify_swap_state(&path, gens.as_swap()),
             SwapState::NoActive {
@@ -608,7 +617,7 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
         let gens = Gens::capture(&path);
-        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        gens.rewrite(&path).expect_err("injected");
         assert_eq!(
             reconcile_interrupted_swap(&path, gens.as_swap()),
             SwapReconciliation::NewActive {
@@ -644,6 +653,7 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
             SwapGenerations {
                 prior_bytes: None,
                 new_items: &new_items,
+                new_generation_id: &new_rollout_generation_id(),
             },
         );
         assert!(
@@ -667,7 +677,12 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
         let gens = Gens::capture(&path);
-        write_rollout_jsonl(&path, &sample_items("foreign")).unwrap();
+        write_rollout_jsonl(
+            &path,
+            &sample_items("foreign"),
+            &new_rollout_generation_id(),
+        )
+        .unwrap();
         let foreign = std::fs::read(&path).unwrap();
         assert!(
             !parse_rollout_items(&path).unwrap().is_empty(),
@@ -714,7 +729,12 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let gens = Gens::capture(&path);
         let paths = paths_of(&path);
         std::fs::remove_file(&path).unwrap();
-        write_rollout_jsonl(&paths.prev, &sample_items("foreign")).unwrap();
+        write_rollout_jsonl(
+            &paths.prev,
+            &sample_items("foreign"),
+            &new_rollout_generation_id(),
+        )
+        .unwrap();
         let foreign = std::fs::read(&paths.prev).unwrap();
         let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         let SwapReconciliation::Unreconciled { detail } = outcome else {
@@ -742,7 +762,12 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let mut torn = gens.prior.clone();
         torn.extend_from_slice(b"{\"timestamp\":\"x\"");
         std::fs::write(&paths.prev, &torn).unwrap();
-        write_rollout_jsonl(&paths.temp, &sample_items("foreign")).unwrap();
+        write_rollout_jsonl(
+            &paths.temp,
+            &sample_items("foreign"),
+            &new_rollout_generation_id(),
+        )
+        .unwrap();
         let foreign_tmp = std::fs::read(&paths.temp).unwrap();
         let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         let SwapReconciliation::Unreconciled { detail } = outcome else {
@@ -768,7 +793,12 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let gens = Gens::capture(&path);
         let paths = paths_of(&path);
         std::fs::rename(&path, &paths.prev).unwrap();
-        write_rollout_jsonl(&paths.temp, &sample_items("foreign")).unwrap();
+        write_rollout_jsonl(
+            &paths.temp,
+            &sample_items("foreign"),
+            &new_rollout_generation_id(),
+        )
+        .unwrap();
         let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         let SwapReconciliation::RestoredOld { detail } = outcome else {
             panic!("byte-exact prev must be restored: {outcome:?}");
@@ -790,7 +820,7 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let paths = paths_of(&path);
         {
             let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostOldRename);
-            atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+            gens.rewrite(&path).expect_err("injected");
         }
         let outcome = {
             let _guard = SwapFailpointGuard::arm(SwapFailpoint::ReconcileDirSync);
@@ -841,7 +871,7 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
         let gens = Gens::capture(&path);
-        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        gens.rewrite(&path).expect_err("injected");
         let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         assert!(
             matches!(outcome, SwapReconciliation::Unreconciled { .. }),
@@ -876,28 +906,32 @@ fn mutate_line(path: &Path, index: usize, mutate: LineMutation) {
 fn strict_new_generation_proof_requires_exact_envelope() {
     let new_items = paginated_items("new", Some(10), None);
     let legacy_items = sample_items("new");
+    let generation_id = new_rollout_generation_id();
     // Baseline: the writer's own output proves, for both output shapes.
     let dir = tempdir().unwrap();
     let path = dir.path().join("rollout.jsonl");
     write_seed(&path, "old");
     let prior = std::fs::read(&path).unwrap();
-    write_rollout_jsonl(&path, &new_items).unwrap();
+    write_rollout_jsonl(&path, &new_items, &generation_id).unwrap();
     let rows = strict_read_generation(&path).expect("strict");
     assert_eq!(
         rows.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
         vec![Some(10), Some(11), Some(12)],
         "paginated output carries the for_rewrite plan"
     );
-    assert!(rows[0].generation_id.as_deref().is_some_and(|id| {
-        uuid::Uuid::parse_str(id).unwrap().get_version() == Some(uuid::Version::Random)
-    }));
+    assert_eq!(
+        rows[0].generation_id.as_deref(),
+        Some(generation_id.as_str()),
+        "SessionMeta carries exactly the retained identity"
+    );
     assert!(rows[1..].iter().all(|r| r.generation_id.is_none()));
     let gens = SwapGenerations {
         prior_bytes: Some(prior.as_slice()),
         new_items: &new_items,
+        new_generation_id: &generation_id,
     };
     assert_eq!(classify_swap_state(&path, gens), SwapState::NewActive);
-    write_rollout_jsonl(&path, &legacy_items).unwrap();
+    write_rollout_jsonl(&path, &legacy_items, &generation_id).unwrap();
     assert!(
         strict_read_generation(&path)
             .unwrap()
@@ -908,6 +942,7 @@ fn strict_new_generation_proof_requires_exact_envelope() {
     let legacy_gens = SwapGenerations {
         prior_bytes: Some(prior.as_slice()),
         new_items: &legacy_items,
+        new_generation_id: &generation_id,
     };
     assert_eq!(
         classify_swap_state(&path, legacy_gens),
@@ -997,6 +1032,18 @@ fn strict_new_generation_proof_requires_exact_envelope() {
             "is not a generated identity",
         ),
         (
+            "valid but different uuid v4",
+            &new_items,
+            0,
+            |o| {
+                o.insert(
+                    ROLLOUT_GENERATION_ID_FIELD.into(),
+                    new_rollout_generation_id().into(),
+                );
+            },
+            "differs from the expected generation",
+        ),
+        (
             "non-generated (nil) uuid",
             &new_items,
             0,
@@ -1049,18 +1096,19 @@ fn strict_new_generation_proof_requires_exact_envelope() {
         ),
     ];
     for (name, items, line, mutate, expect) in mutations {
-        write_rollout_jsonl(&path, items).unwrap();
+        write_rollout_jsonl(&path, items, &generation_id).unwrap();
         mutate_line(&path, line, mutate);
         let mutated = std::fs::read(&path).unwrap();
         assert!(
             !parse_rollout_items(&path).unwrap().is_empty(),
             "{name}: the tolerant reader still yields rows"
         );
-        let proof = proves_new_generation(&path, items).expect_err(name);
+        let proof = proves_new_generation(&path, items, &generation_id).expect_err(name);
         assert!(proof.contains(expect), "{name}: {proof}");
         let gens = SwapGenerations {
             prior_bytes: Some(prior.as_slice()),
             new_items: items,
+            new_generation_id: &generation_id,
         };
         let state = classify_swap_state(&path, gens);
         let SwapState::Unknown { detail } = state else {
@@ -1082,15 +1130,18 @@ fn strict_new_generation_proof_requires_exact_envelope() {
     {
         let mut two_meta = new_items.clone();
         two_meta.push(two_meta[0].clone());
-        write_rollout_jsonl(&path, &two_meta).unwrap();
-        proves_new_generation(&path, &two_meta).expect("writer output proves");
+        write_rollout_jsonl(&path, &two_meta, &generation_id).unwrap();
+        proves_new_generation(&path, &two_meta, &generation_id).expect("writer output proves");
         mutate_line(&path, 3, |o| {
             o.insert(
                 ROLLOUT_GENERATION_ID_FIELD.into(),
                 uuid::Uuid::new_v4().to_string().into(),
             );
         });
-        let proof = proves_new_generation(&path, &two_meta).expect_err("split id");
-        assert!(proof.contains("differs from"), "{proof}");
+        let proof = proves_new_generation(&path, &two_meta, &generation_id).expect_err("split id");
+        assert!(
+            proof.contains("differs from the expected generation"),
+            "{proof}"
+        );
     }
 }

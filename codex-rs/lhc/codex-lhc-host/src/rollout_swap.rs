@@ -56,7 +56,8 @@
 //!   form, and the envelope must be exactly what [`write_rollout_jsonl`]
 //!   emits — ordinals derived by the same [`RolloutOrdinalState::for_rewrite`]
 //!   (none for legacy output, exact contiguous values for paginated output),
-//!   one valid generated (UUID v4) `rollout_generation_id` on every
+//!   the exact `rollout_generation_id` this swap attempt generated (a UUID
+//!   v4, retained by the caller — never inferred back from disk) on every
 //!   `SessionMeta` row and on no other row, and an RFC 3339 timestamp (the
 //!   value is nondeterministic; the contract is not). The tolerant
 //!   [`parse_rollout_items`] (which skips rows it cannot read) is an
@@ -146,12 +147,31 @@ impl SwapPaths {
     }
 }
 
-/// Atomically rewrite `rollout_path` with `items`.
+/// Generate the identity of one rollout rewrite generation (UUID v4), the
+/// value [`write_rollout_jsonl`] stamps on every `SessionMeta` row. A caller
+/// that must prove the generation after an interrupted swap generates it
+/// here, passes it to [`atomic_rewrite_rollout_as_generation`], and retains
+/// it for [`SwapGenerations::new_generation_id`].
+pub fn new_rollout_generation_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Atomically rewrite `rollout_path` with `items` as a fresh generation.
 ///
 /// On success the active path holds the new generation and at most one prior
 /// generation sits at `*.prev`. On any error before the final rename, the
 /// previous active file (if any) is left intact.
 pub fn atomic_rewrite_rollout(rollout_path: &Path, items: &[RolloutItem]) -> std::io::Result<()> {
+    atomic_rewrite_rollout_as_generation(rollout_path, items, &new_rollout_generation_id())
+}
+
+/// [`atomic_rewrite_rollout`] with the generation identity supplied by the
+/// caller (see [`new_rollout_generation_id`]) so it survives the attempt.
+pub fn atomic_rewrite_rollout_as_generation(
+    rollout_path: &Path,
+    items: &[RolloutItem],
+    generation_id: &str,
+) -> std::io::Result<()> {
     let paths = SwapPaths::for_rollout(rollout_path);
     let parent = paths.active.parent().ok_or_else(|| {
         IoError::other(format!(
@@ -161,7 +181,7 @@ pub fn atomic_rewrite_rollout(rollout_path: &Path, items: &[RolloutItem]) -> std
     })?;
 
     // 1. Write full sequence to temp.
-    write_rollout_jsonl(&paths.temp, items)?;
+    write_rollout_jsonl(&paths.temp, items, generation_id)?;
     maybe_fail(SwapFailpoint::PostTempWrite)?;
 
     // 2. fsync temp file.
@@ -230,6 +250,10 @@ pub struct SwapGenerations<'a> {
     pub prior_bytes: Option<&'a [u8]>,
     /// The ordered items the swap wrote — the new generation's wire content.
     pub new_items: &'a [RolloutItem],
+    /// The exact `rollout_generation_id` this swap attempt wrote (from
+    /// [`new_rollout_generation_id`], retained by the caller — never read
+    /// back from disk). Emitted on `SessionMeta` rows only.
+    pub new_generation_id: &'a str,
 }
 
 /// Envelope keys the writer adds around each item's own wire object.
@@ -333,10 +357,19 @@ fn is_generated_identity(id: &str) -> bool {
 /// [`strict_read_generation`]): same row count, same order, each row's item
 /// wire object equal to the expected item's wire form, and the envelope the
 /// writer emits for exactly these items — every ordinal equal to the
-/// [`RolloutOrdinalState::for_rewrite`] plan (absent on legacy output), one
-/// generated identity shared by every `SessionMeta` row and present on no
-/// other row.
-pub fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), String> {
+/// [`RolloutOrdinalState::for_rewrite`] plan (absent on legacy output), and
+/// exactly `generation_id` — the identity this attempt wrote — on every
+/// `SessionMeta` row and on no other row.
+pub fn proves_new_generation(
+    path: &Path,
+    items: &[RolloutItem],
+    generation_id: &str,
+) -> Result<(), String> {
+    if !is_generated_identity(generation_id) {
+        return Err(format!(
+            "expected {ROLLOUT_GENERATION_ID_FIELD} {generation_id:?} is not a generated identity"
+        ));
+    }
     let rows = strict_read_generation(path)?;
     if rows.len() != items.len() {
         return Err(format!(
@@ -346,7 +379,6 @@ pub fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), S
         ));
     }
     let envelope = expected_envelope(items)?;
-    let mut generation_id: Option<&str> = None;
     for (index, ((row, expected), (expected_ordinal, carries_generation_id))) in
         rows.iter().zip(items.iter()).zip(envelope).enumerate()
     {
@@ -382,14 +414,10 @@ pub fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), S
                         "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} is not a generated identity"
                     ));
                 }
-                match generation_id {
-                    None => generation_id = Some(id),
-                    Some(first) if first == id => {}
-                    Some(first) => {
-                        return Err(format!(
-                            "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} differs from {first:?}"
-                        ));
-                    }
+                if id != generation_id {
+                    return Err(format!(
+                        "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} differs from the expected generation {generation_id:?}"
+                    ));
                 }
             }
         }
@@ -453,7 +481,11 @@ pub fn classify_swap_state(rollout_path: &Path, generations: SwapGenerations<'_>
         Ok(()) => return SwapState::OldActive,
         Err(reason) => reason,
     };
-    let new_reason = match proves_new_generation(&paths.active, generations.new_items) {
+    let new_reason = match proves_new_generation(
+        &paths.active,
+        generations.new_items,
+        generations.new_generation_id,
+    ) {
         Ok(()) => return SwapState::NewActive,
         Err(reason) => reason,
     };
@@ -501,7 +533,11 @@ pub fn reconcile_interrupted_swap(
             let parent = paths.active.parent();
             // Finish the intended swap only onto a proven new generation.
             let temp_proof = if temp_exists {
-                proves_new_generation(&paths.temp, generations.new_items)
+                proves_new_generation(
+                    &paths.temp,
+                    generations.new_items,
+                    generations.new_generation_id,
+                )
             } else {
                 Err("absent".to_string())
             };
@@ -719,7 +755,11 @@ fn maybe_fail(point: SwapFailpoint) -> std::io::Result<()> {
     Ok(())
 }
 
-fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()> {
+fn write_rollout_jsonl(
+    path: &Path,
+    items: &[RolloutItem],
+    rollout_generation_id: &str,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -729,11 +769,10 @@ fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()
         .truncate(true)
         .open(path)?;
     let mut ordinal_state = ordinal_state_for_items(items)?;
-    let rollout_generation_id = Uuid::new_v4().to_string();
     for item in items {
         let ordinal = ordinal_state.current()?;
         let generation_id =
-            matches!(item, RolloutItem::SessionMeta(_)).then_some(rollout_generation_id.as_str());
+            matches!(item, RolloutItem::SessionMeta(_)).then_some(rollout_generation_id);
         write_one_line(&mut file, item, ordinal, generation_id)?;
         ordinal_state.advance();
     }
