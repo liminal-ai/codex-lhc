@@ -201,7 +201,7 @@ async fn seed_thread(root: &Path, tid: &str, items: &[ResponseItem]) {
             ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
             _ => RawItemProvenance::ModelOutput,
         };
-        handle.persist(item, prov);
+        handle.persist(item, prov, /*step_index*/ None);
     }
     handle.flush().await;
     assert!(
@@ -436,7 +436,11 @@ async fn encrypted_reasoning_round_trip_identity_gate() {
     )
     .await
     .expect("capture");
-    handle.persist(&user("please think", "u1"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &user("please think", "u1"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     handle.persist(
         &ResponseItem::Reasoning {
             id: Some(ResponseItemId::from_server("rs_rt".into())),
@@ -446,8 +450,13 @@ async fn encrypted_reasoning_round_trip_identity_gate() {
             internal_chat_message_metadata_passthrough: None,
         },
         RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
     );
-    handle.persist(&assistant("done", "a1"), RawItemProvenance::ModelOutput);
+    handle.persist(
+        &assistant("done", "a1"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
     handle.flush().await;
     assert!(
         handle

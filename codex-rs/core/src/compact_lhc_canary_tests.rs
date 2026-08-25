@@ -127,6 +127,7 @@ async fn canary_degraded_capture_plus_flush_timeout_still_yields_a_body() {
             internal_chat_message_metadata_passthrough: None,
         },
         codex_extension_api::RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
 
     let sess = Arc::new(session);

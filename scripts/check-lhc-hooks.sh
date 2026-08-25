@@ -71,7 +71,7 @@ if ! check_vendor_clean start; then
 fi
 
 # ── Layer 1: sentinel count ────────────────────────────────────────────
-EXPECTED_HOOKS=52
+EXPECTED_HOOKS=53
 found=$(grep -rl "LHC-HOOK" codex-rs --include="*.rs" --include="*.toml" 2>/dev/null \
         | grep -v "codex-rs/lhc/" | xargs -r grep -o "LHC-HOOK" | wc -l)
 if [ "$found" -ne "$EXPECTED_HOOKS" ]; then

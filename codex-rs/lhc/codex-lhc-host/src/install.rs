@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -106,6 +107,7 @@ enum PendingCmd {
     Persist {
         item: ResponseItem,
         provenance: RawItemProvenance,
+        step_index: Option<i64>,
     },
     ModelOrThinkingChange {
         previous_model: String,
@@ -617,8 +619,12 @@ impl LhcCaptureSlot {
     fn replay(&self, handle: &CaptureHandle, pending: std::collections::VecDeque<PendingCmd>) {
         for cmd in pending {
             match cmd {
-                PendingCmd::Persist { item, provenance } => {
-                    handle.persist(&item, provenance);
+                PendingCmd::Persist {
+                    item,
+                    provenance,
+                    step_index,
+                } => {
+                    handle.persist(&item, provenance, step_index);
                 }
                 PendingCmd::ModelOrThinkingChange {
                     previous_model,
@@ -690,6 +696,37 @@ impl LhcCaptureSlot {
 
 /// Marker type stored in turn-scoped ExtensionData for turn_id correlation.
 pub struct LhcTurnId(pub String);
+
+/// Zero-based provider request/response cycle of the active turn, kept in the
+/// turn-scoped `ExtensionData` (turn parts, F2 — recorded at intake).
+///
+/// The host advances it once per outer sampling cycle, before the provider
+/// request is sent; transport retries inside that cycle never advance it, so
+/// a retried response and its tool results share the cycle of the request
+/// they answer. Raw-item capture reads the current value at record time and
+/// stamps it on the four step-bearing kinds. Absent (or not yet begun) means
+/// unknown: the stored index stays NULL and LHC never splits that turn.
+pub struct LhcStepIndex(AtomicI64);
+
+impl LhcStepIndex {
+    /// Host seam: begin the next provider cycle for the turn owning
+    /// `turn_store`. The first call of a turn yields cycle 0.
+    pub fn begin_cycle(turn_store: &ExtensionData) {
+        turn_store
+            .get_or_init(|| LhcStepIndex(AtomicI64::new(-1)))
+            .0
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The cycle in progress for `turn_store`, or `None` before the first
+    /// cycle (turn-start input, host context) or outside any turn.
+    pub fn current(turn_store: Option<&ExtensionData>) -> Option<i64> {
+        turn_store?
+            .get::<LhcStepIndex>()
+            .map(|index| index.0.load(Ordering::SeqCst))
+            .filter(|index| *index >= 0)
+    }
+}
 
 /// Backward-compat name used by tests.
 #[allow(dead_code)]
@@ -1162,13 +1199,16 @@ impl<C: Send + Sync + 'static> RawItemContributor for LhcExtension<C> {
             let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
                 return;
             };
+            // Turn parts (F2): the host's provider cycle at record time.
+            let step_index = LhcStepIndex::current(input.turn_store);
             for item in input.items {
                 let cmd = PendingCmd::Persist {
                     item: item.clone(),
                     provenance: input.provenance,
+                    step_index,
                 };
                 if let Some(handle) = slot.buffer_or_handle(cmd) {
-                    handle.persist(item, input.provenance);
+                    handle.persist(item, input.provenance, step_index);
                 }
             }
         })
@@ -1363,6 +1403,7 @@ mod tests {
                     &format!("u{i}"),
                 ),
                 RawItemProvenance::UserPrompt,
+                /*step_index*/ None,
             );
             handle.persist(
                 &msg(
@@ -1371,6 +1412,7 @@ mod tests {
                     &format!("a{i}"),
                 ),
                 RawItemProvenance::ModelOutput,
+                /*step_index*/ None,
             );
         }
         handle.flush().await;

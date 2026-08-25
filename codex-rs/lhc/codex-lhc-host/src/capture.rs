@@ -27,6 +27,7 @@ use crate::mapping::MappedEvent;
 use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
 use crate::mapping::attach_provider_usage;
+use crate::mapping::attach_step_index;
 use crate::mapping::map_item;
 use crate::mapping::map_model_or_thinking_change;
 use crate::mapping::map_runtime_note;
@@ -87,6 +88,9 @@ enum CaptureCmd {
     Persist {
         item: ResponseItem,
         provenance: RawItemProvenance,
+        /// Host step index (turn parts, F2): the zero-based provider cycle
+        /// the item belongs to, read at record time; `None` = unknown.
+        step_index: Option<i64>,
     },
     TurnEnd {
         turn_id: String,
@@ -182,7 +186,16 @@ impl CaptureHandle {
     }
 
     /// Non-blocking persist. Drops with error + degrades when the queue is full.
-    pub fn persist(&self, item: &ResponseItem, provenance: RawItemProvenance) {
+    ///
+    /// `step_index` is the host's zero-based provider request/response cycle
+    /// for step-bearing kinds (turn parts, F2); it is recorded verbatim and
+    /// never inferred. `None` leaves the stored index NULL.
+    pub fn persist(
+        &self,
+        item: &ResponseItem,
+        provenance: RawItemProvenance,
+        step_index: Option<i64>,
+    ) {
         if self.inner.degraded.load(Ordering::Relaxed) {
             self.note_drop("degraded_refuse");
             return;
@@ -194,6 +207,7 @@ impl CaptureHandle {
         match self.inner.tx.try_send(CaptureCmd::Persist {
             item: item.clone(),
             provenance,
+            step_index,
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -635,14 +649,18 @@ async fn worker_loop(
     // ResponseEvent::Completed (token usage). Buffer them so assistant_text
     // can carry providerUsage on the same event (schema v5 / D3) without
     // reordering relative to thinking/tool_call siblings.
-    let mut pending_model_output: Vec<(ResponseItem, RawItemProvenance)> = Vec::new();
+    let mut pending_model_output: Vec<(ResponseItem, RawItemProvenance, Option<i64>)> = Vec::new();
     let mut durability = CaptureDurability::default();
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            CaptureCmd::Persist { item, provenance } => {
+            CaptureCmd::Persist {
+                item,
+                provenance,
+                step_index,
+            } => {
                 if matches!(provenance, RawItemProvenance::ModelOutput) {
-                    pending_model_output.push((item, provenance));
+                    pending_model_output.push((item, provenance, step_index));
                     continue;
                 }
                 if let Err(err) = flush_pending_model_output(
@@ -670,6 +688,7 @@ async fn worker_loop(
                     &item,
                     provenance,
                     None,
+                    step_index,
                     &live_identity,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
@@ -921,7 +940,7 @@ async fn flush_pending_model_output(
     tracker: &mut OccurrenceTracker,
     thread_id: &str,
     degraded: &AtomicBool,
-    pending: &mut Vec<(ResponseItem, RawItemProvenance)>,
+    pending: &mut Vec<(ResponseItem, RawItemProvenance, Option<i64>)>,
     provider_usage: Option<&Map<String, Value>>,
     identity: &ModelIdentity,
     durability: &mut CaptureDurability,
@@ -931,7 +950,7 @@ async fn flush_pending_model_output(
         return Ok(());
     }
     let items = std::mem::take(pending);
-    for (item, provenance) in items {
+    for (item, provenance, step_index) in items {
         persist_item(
             session,
             tracker,
@@ -940,6 +959,7 @@ async fn flush_pending_model_output(
             &item,
             provenance,
             provider_usage,
+            step_index,
             identity,
             durability,
             #[cfg(any(test, feature = "test-util"))]
@@ -958,6 +978,7 @@ async fn persist_item(
     item: &ResponseItem,
     provenance: RawItemProvenance,
     provider_usage: Option<&Map<String, Value>>,
+    step_index: Option<i64>,
     identity: &ModelIdentity,
     durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
@@ -997,6 +1018,11 @@ async fn persist_item(
     if let Some(usage) = provider_usage {
         for event in &mut events {
             attach_provider_usage(event, usage);
+        }
+    }
+    if let Some(step) = step_index {
+        for event in &mut events {
+            attach_step_index(event, step);
         }
     }
     if events.is_empty() {

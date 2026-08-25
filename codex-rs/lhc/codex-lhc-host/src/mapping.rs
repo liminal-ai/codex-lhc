@@ -539,6 +539,24 @@ pub fn attach_provider_usage(event: &mut MappedEvent, usage: &Map<String, Value>
         .insert("providerUsage".into(), Value::Object(usage.clone()));
 }
 
+/// Attach the host step index (turn parts, F2) to a mapped event of one of the
+/// four step-bearing kinds — `assistant_text`, `assistant_thinking`,
+/// `tool_call`, `tool_result`. Every other kind (user prompts, runtime notes,
+/// turn ends, config changes) never carries a step. Called at persist time
+/// with the index the host recorded for the item; never derived from content.
+pub fn attach_step_index(event: &mut MappedEvent, step_index: i64) {
+    if !matches!(
+        event.input.event_kind.as_str(),
+        "assistant_text" | "assistant_thinking" | "tool_call" | "tool_result"
+    ) {
+        return;
+    }
+    event
+        .input
+        .payload
+        .insert("stepIndex".into(), json!(step_index));
+}
+
 /// Host-injected runtime note (degradation / truncation markers). Key is not
 /// content-addressed — each latch uses a distinct `key_suffix`.
 pub fn map_runtime_note(thread_id: &str, text: &str, key_suffix: &str) -> MappedEvent {

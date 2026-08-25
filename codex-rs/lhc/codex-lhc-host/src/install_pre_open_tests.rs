@@ -65,6 +65,7 @@ async fn pre_open_identity_change_replays_in_order() {
         slot.buffer_or_handle(PendingCmd::Persist {
             item: user_msg("hi", "u1"),
             provenance: RawItemProvenance::UserPrompt,
+            step_index: None,
         })
         .is_none()
     );
@@ -72,6 +73,7 @@ async fn pre_open_identity_change_replays_in_order() {
         slot.buffer_or_handle(PendingCmd::Persist {
             item: reasoning("rs_a", "CIPHER_A"),
             provenance: RawItemProvenance::ModelOutput,
+            step_index: None,
         })
         .is_none()
     );
@@ -85,6 +87,7 @@ async fn pre_open_identity_change_replays_in_order() {
         slot.buffer_or_handle(PendingCmd::Persist {
             item: reasoning("rs_b", "CIPHER_B"),
             provenance: RawItemProvenance::ModelOutput,
+            step_index: None,
         })
         .is_none()
     );
@@ -174,6 +177,7 @@ async fn pre_open_overflow_degrades_capture() {
         let _ = slot.buffer_or_handle(PendingCmd::Persist {
             item: user_msg("x", &format!("u{i}")),
             provenance: RawItemProvenance::UserPrompt,
+            step_index: None,
         });
     }
     let handle = open_handle(
@@ -228,6 +232,7 @@ async fn pre_open_exact_cap_stays_healthy_and_replays_all() {
         let dropped = slot.buffer_or_handle(PendingCmd::Persist {
             item: user_msg("x", &format!("u{i}")),
             provenance: RawItemProvenance::UserPrompt,
+            step_index: None,
         });
         assert!(dropped.is_none(), "push {i} must buffer, not hand off");
     }

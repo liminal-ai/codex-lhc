@@ -330,7 +330,7 @@ async fn mapping_goldens_round_trip_and_match_fixtures() {
         )
         .await
         .expect("spawn");
-        handle.persist(&item, provenance);
+        handle.persist(&item, provenance, /*step_index*/ None);
         handle.flush().await;
         let stored = handle.list_events().await.expect("list");
         handle.shutdown().await;
@@ -425,7 +425,11 @@ async fn arguments_raw_byte_exact_round_trip() {
         )
         .await
         .expect("spawn");
-        handle.persist(&item, RawItemProvenance::ModelOutput);
+        handle.persist(
+            &item,
+            RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
+        );
         handle.flush().await;
         let events = handle.list_events().await.expect("list");
         assert_eq!(events.len(), 1, "raw={raw}");
@@ -464,7 +468,11 @@ async fn image_url_full_round_trip() {
     )
     .await
     .expect("spawn");
-    handle.persist(&item, RawItemProvenance::UserPrompt);
+    handle.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     assert_eq!(events.len(), 1);
@@ -495,7 +503,11 @@ async fn production_restart_replay_records_once() {
     )
     .await
     .expect("spawn");
-    h1.persist(&item, RawItemProvenance::UserPrompt);
+    h1.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     h1.flush().await;
     let before = h1.list_events().await.expect("list").len();
     assert_eq!(before, 1);
@@ -511,7 +523,11 @@ async fn production_restart_replay_records_once() {
     )
     .await
     .expect("reopen");
-    h2.persist(&item, RawItemProvenance::UserPrompt);
+    h2.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     h2.flush().await;
     let after = h2.list_events().await.expect("list").len();
     assert_eq!(
@@ -541,8 +557,8 @@ async fn distinct_ids_same_text_record_twice() {
     if let ResponseItem::Message { id, .. } = &mut b {
         *id = Some(ResponseItemId::from_server("msg_second_occ".into()));
     }
-    handle.persist(&a, RawItemProvenance::UserPrompt);
-    handle.persist(&b, RawItemProvenance::UserPrompt);
+    handle.persist(&a, RawItemProvenance::UserPrompt, /*step_index*/ None);
+    handle.persist(&b, RawItemProvenance::UserPrompt, /*step_index*/ None);
     handle.flush().await;
     let n = handle.list_events().await.expect("list").len();
     assert_eq!(n, 2, "distinct ResponseItemIds must both record");
@@ -593,7 +609,11 @@ async fn crash_partial_submit_then_retry_no_double() {
             .await
             .expect("spawn");
             h.arm_crash_mid_persist(after).await;
-            h.persist(&item, RawItemProvenance::ModelOutput);
+            h.persist(
+                &item,
+                RawItemProvenance::ModelOutput,
+                /*step_index*/ None,
+            );
             // ModelOutput is buffered until flush/provider_usage/turn_end so
             // assistant_text can carry providerUsage; flush forces the crash.
             let _ = h.flush().await;
@@ -609,7 +629,11 @@ async fn crash_partial_submit_then_retry_no_double() {
             )
             .await
             .expect("respawn");
-            h2.persist(&item, RawItemProvenance::ModelOutput);
+            h2.persist(
+                &item,
+                RawItemProvenance::ModelOutput,
+                /*step_index*/ None,
+            );
             h2.flush().await;
             let events = h2.list_events().await.expect("list");
             assert_eq!(
@@ -637,7 +661,11 @@ async fn abort_turn_emits_turn_end() {
     )
     .await
     .expect("spawn");
-    handle.persist(&user_msg("start"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &user_msg("start"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     handle.turn_end(
         "turn-1",
         "aborted",
@@ -832,7 +860,11 @@ async fn queue_full_latches_degraded_and_counts_drops() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        handle.persist(&item, RawItemProvenance::UserPrompt);
+        handle.persist(
+            &item,
+            RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
+        );
     }
 
     let dropped = handle.dropped_count();
@@ -893,8 +925,16 @@ async fn status_advance_same_id_records_both() {
         result: "b64-final".into(),
         internal_chat_message_metadata_passthrough: None,
     };
-    handle.persist(&in_progress, RawItemProvenance::ModelOutput);
-    handle.persist(&completed, RawItemProvenance::ModelOutput);
+    handle.persist(
+        &in_progress,
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &completed,
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     // Each ImageGenerationCall maps to tool_call + tool_result → 4 events.
@@ -950,8 +990,16 @@ async fn open_seeds_occurrence_from_stored_anon_keys() {
     )
     .await
     .expect("spawn");
-    h1.persist(&item, RawItemProvenance::UserPrompt);
-    h1.persist(&item, RawItemProvenance::UserPrompt);
+    h1.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    h1.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     h1.flush().await;
     assert_eq!(h1.list_events().await.unwrap().len(), 2);
     h1.shutdown().await;
@@ -966,7 +1014,11 @@ async fn open_seeds_occurrence_from_stored_anon_keys() {
     )
     .await
     .expect("reopen");
-    h2.persist(&item, RawItemProvenance::UserPrompt);
+    h2.persist(
+        &item,
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     h2.flush().await;
     let events = h2.list_events().await.unwrap();
     assert_eq!(
@@ -1183,11 +1235,20 @@ async fn worker_survives_many_items() {
         handle.persist(
             &user_msg(&format!("item-{i}")),
             RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
         );
     }
     // Other maps to nothing — must not break the worker.
-    handle.persist(&ResponseItem::Other, RawItemProvenance::HostContext);
-    handle.persist(&user_msg("after-other"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &ResponseItem::Other,
+        RawItemProvenance::HostContext,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &user_msg("after-other"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     assert_eq!(events.len(), 21);
@@ -1215,8 +1276,13 @@ async fn worker_survives_map_item_panic_and_records_later_items() {
     handle.persist(
         &user_msg("this-map-panics-once"),
         RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
-    handle.persist(&user_msg("after-map-panic"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &user_msg("after-map-panic"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     assert_eq!(
@@ -1263,6 +1329,7 @@ async fn unsettleable_drain_neither_hangs_caller_nor_wedges_worker() {
     handle.persist(
         &user_msg("a prompt that queues smoothing work"),
         RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
     handle.flush().await;
 
@@ -1278,7 +1345,11 @@ async fn unsettleable_drain_neither_hangs_caller_nor_wedges_worker() {
     //    must still run. If the settle-wait were awaited unbounded on the
     //    worker, this flush (and Shutdown below) would never be processed.
     //    Bounded so a wedged worker fails the test instead of hanging it.
-    handle.persist(&user_msg("second prompt"), RawItemProvenance::UserPrompt);
+    handle.persist(
+        &user_msg("second prompt"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     tokio::time::timeout(Duration::from_secs(10), handle.flush())
         .await
         .expect("worker must process a flush queued behind a timed-out settle-wait");
@@ -1334,6 +1405,7 @@ async fn shutdown_is_bounded_when_seeded_derivation_hangs() {
     handle.persist(
         &user_msg("a prompt whose smoothing call hangs forever"),
         RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
     handle.flush().await;
 
@@ -1342,4 +1414,114 @@ async fn shutdown_is_bounded_when_seeded_derivation_hangs() {
     tokio::time::timeout(Duration::from_secs(20), handle.shutdown())
         .await
         .expect("shutdown must be bounded while a seeded derivation call hangs");
+}
+
+/// Turn parts F2 (Story 5): the host step index is stored verbatim on the four
+/// step-bearing message kinds and left NULL on everything else. Rule zero: the
+/// four events are submitted through the real capture handle, then read back as
+/// stored `MessageRecord`s (not intake events) through a fresh `LhcSession`.
+/// A tool_call and its result recorded under the same cycle share the index;
+/// the user prompt of the same turn carries no index.
+#[tokio::test]
+async fn f2_step_index_stamped_on_step_bearing_kinds_only() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let tid = "f2-step-index";
+    let handle = spawn_capture(
+        tid,
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::seeded(
+            codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+        ),
+    )
+    .await
+    .expect("spawn");
+
+    // Cycle 0: user prompt (NULL — not step-bearing), then the four kinds.
+    handle.persist(
+        &user_msg("do the work"),
+        RawItemProvenance::UserPrompt,
+        None,
+    );
+    handle.persist(
+        &ResponseItem::Message {
+            id: Some(ResponseItemId::from_server("a0".into())),
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText {
+                text: "thinking then acting".into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        RawItemProvenance::ModelOutput,
+        Some(0),
+    );
+    handle.persist(
+        &ResponseItem::Reasoning {
+            id: Some(ResponseItemId::from_server("r0".into())),
+            summary: vec![ReasoningItemReasoningSummary::SummaryText {
+                text: "plan".into(),
+            }],
+            content: None,
+            encrypted_content: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        RawItemProvenance::ModelOutput,
+        Some(0),
+    );
+    handle.persist(
+        &ResponseItem::FunctionCall {
+            id: Some(ResponseItemId::from_server("fc0".into())),
+            name: "read".into(),
+            namespace: None,
+            arguments: "{}".into(),
+            encrypted_function_args: None,
+            call_id: "call-0".into(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        RawItemProvenance::ModelOutput,
+        Some(0),
+    );
+    handle.persist(
+        &ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-0".into(),
+            output: FunctionCallOutputPayload::from_text("file contents".into()),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        RawItemProvenance::ModelOutput,
+        Some(0),
+    );
+    handle.flush().await;
+    handle.shutdown().await;
+
+    // Rule zero: read the stored MessageRecords back through a real session.
+    let (session, _) = LhcSession::open(
+        tid,
+        None,
+        Some(root.as_path()),
+        codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+    )
+    .await
+    .expect("reopen");
+    let messages = session.list_messages().await.expect("messages");
+    session.close().await;
+
+    let by_kind = |kind: &str| -> Option<i64> {
+        messages
+            .iter()
+            .find(|m| m.kind.as_str() == kind)
+            .unwrap_or_else(|| panic!("no stored {kind} message: {messages:?}"))
+            .step_index
+    };
+    assert_eq!(by_kind("user_prompt"), None, "user_prompt is never stamped");
+    assert_eq!(by_kind("assistant_text"), Some(0));
+    assert_eq!(by_kind("assistant_thinking"), Some(0));
+    assert_eq!(by_kind("tool_call"), Some(0));
+    assert_eq!(
+        by_kind("tool_result"),
+        Some(0),
+        "a tool result shares its call's cycle"
+    );
 }

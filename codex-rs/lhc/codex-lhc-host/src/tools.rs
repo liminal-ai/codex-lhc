@@ -618,10 +618,12 @@ mod tests {
         handle.persist(
             &msg("user", "what does the config do?", "u1"),
             RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
         );
         handle.persist(
             &msg("assistant", "it configures the server", "a1"),
             RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
         );
         handle.turn_end(
             "host-turn-1",
@@ -636,10 +638,12 @@ mod tests {
         handle.persist(
             &msg("user", "read the file please", "u2"),
             RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
         );
         handle.persist(
             &msg("assistant", "here is the file contents", "a2"),
             RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
         );
         handle.turn_end(
             "host-turn-2",
@@ -672,6 +676,7 @@ mod tests {
         handle.persist(
             &msg("user", "dump the log please", "u-big"),
             RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
         );
         handle.persist(
             &msg(
@@ -680,6 +685,7 @@ mod tests {
                 "a-big",
             ),
             RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
         );
         handle.turn_end(
             "host-big",
@@ -905,6 +911,7 @@ mod tests {
         handle.persist(
             &msg("user", "dump the log", "u1"),
             RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
         );
         // ~400KB of '=' runs: BPE packs long runs into few tokens, so this
         // is token-cheap but byte-heavy — the exact core-truncation hazard.
@@ -912,6 +919,7 @@ mod tests {
         handle.persist(
             &msg("assistant", &dense, "a1"),
             RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
         );
         handle.turn_end(
             "host-turn-1",

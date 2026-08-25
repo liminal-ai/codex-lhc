@@ -160,6 +160,7 @@ pub use idempotency::seed_occurrence_from_keys;
 pub use idempotency::thinking_level_change_key;
 pub use idempotency::turn_end_key;
 pub use install::LhcCaptureSlot;
+pub use install::LhcStepIndex;
 pub use install::LhcTurnId;
 pub use install::LiveRetrievalThread;
 pub use install::RetrievalLifecycleError;

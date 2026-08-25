@@ -2814,7 +2814,11 @@ async fn queue_loss_imports_missing_tool_and_reasoning() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         };
-        handle.persist(&flood, codex_extension_api::RawItemProvenance::UserPrompt);
+        handle.persist(
+            &flood,
+            codex_extension_api::RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
+        );
     }
     assert!(
         handle.is_degraded(),
@@ -3135,6 +3139,7 @@ async fn blocked_capture_flush_does_not_hang_lhc_compact() {
             internal_chat_message_metadata_passthrough: None,
         },
         codex_extension_api::RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
 
     let sess = Arc::new(session);

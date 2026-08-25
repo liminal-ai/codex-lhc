@@ -375,6 +375,11 @@ pub(crate) async fn run_turn(
                 window_id,
                 CodexResponsesRequestKind::Turn,
             );
+            // LHC-HOOK: turn parts F2 — begin the next provider request/response
+            // cycle before sending. One increment per outer sampling cycle
+            // (transport retries inside `run_sampling_request` do not advance);
+            // raw-item capture stamps this index on the four step-bearing kinds.
+            codex_lhc_host::LhcStepIndex::begin_cycle(turn_context.extension_data.as_ref());
             run_sampling_request(
                 Arc::clone(&sess),
                 Arc::clone(&step_context),

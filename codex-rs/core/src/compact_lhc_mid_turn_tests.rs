@@ -592,6 +592,7 @@ async fn mid_turn_blocked_capture_flush_warns_and_compact_continues() {
             internal_chat_message_metadata_passthrough: None,
         },
         codex_extension_api::RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
     );
 
     let sess = Arc::new(session);

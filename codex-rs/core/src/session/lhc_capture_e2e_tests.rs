@@ -238,8 +238,16 @@ async fn e2e_core_id_assignment_is_restart_stable() {
         .await
         .expect("reopen");
     // Re-present the same prepared item twice — must collide.
-    h2.persist(&prepared[0], RawItemProvenance::UserPrompt);
-    h2.persist(&prepared[0], RawItemProvenance::UserPrompt);
+    h2.persist(
+        &prepared[0],
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    h2.persist(
+        &prepared[0],
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
     h2.flush().await;
     let after = h2.list_events().await.expect("list");
     // First open already recorded one user_prompt; the prepared item is new.
@@ -1037,4 +1045,158 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
         "first-generation content must not leak into production resume"
     );
     assert_eq!(reconstructed.window_number, 2);
+}
+
+/// Turn parts F2 (Story 5): through the real `Session` recording seam, the
+/// host provider-cycle index is stamped on step-bearing model output. Two
+/// provider cycles are driven; cycle 0 issues two parallel tool calls whose
+/// results arrive interleaved. The stored record must show sequential cycle
+/// stamps and both call/result pairs sharing cycle 0 (tool pairs never
+/// straddle a step edge). Rule zero: read stored `MessageRecord`s back through
+/// a fresh `LhcSession`, not the intake events alone.
+#[tokio::test]
+async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
+    use codex_protocol::ResponseItemId;
+    use codex_protocol::models::FunctionCallOutputPayload;
+
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let (mut session, turn_context) = make_session_and_context().await;
+    install_lhc_on_session(&mut session, root.clone()).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+    let thread_id = handle.thread_id().to_string();
+
+    // Turn prompt (recorded before any cycle begins -> NULL step).
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &turn_context,
+            &[text_input("run two tools then finish")],
+            None,
+            PersistContext::TurnStart,
+        )
+        .await;
+
+    let assistant = |id: &str, text: &str| ResponseItem::Message {
+        id: Some(ResponseItemId::from_server(id.into())),
+        role: "assistant".into(),
+        content: vec![ContentItem::OutputText { text: text.into() }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let call = |call_id: &str| ResponseItem::FunctionCall {
+        id: Some(ResponseItemId::from_server(format!("fc-{call_id}"))),
+        name: "read".into(),
+        namespace: None,
+        arguments: "{}".into(),
+        encrypted_function_args: None,
+        call_id: call_id.into(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = |call_id: &str| ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: call_id.into(),
+        output: FunctionCallOutputPayload::from_text(format!("out-{call_id}")),
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    // Cycle 0: the model text plus two parallel calls; the results settle
+    // interleaved (still the same cycle — no begin_cycle between).
+    codex_lhc_host::LhcStepIndex::begin_cycle(turn_context.extension_data.as_ref());
+    session
+        .record_conversation_items_with_provenance(
+            &turn_context,
+            &[
+                assistant("a0", "calling both tools"),
+                call("call-a"),
+                call("call-b"),
+            ],
+            RawItemProvenance::ModelOutput,
+        )
+        .await;
+    session
+        .record_conversation_items_with_provenance(
+            &turn_context,
+            &[output("call-a")],
+            RawItemProvenance::ModelOutput,
+        )
+        .await;
+    session
+        .record_conversation_items_with_provenance(
+            &turn_context,
+            &[output("call-b")],
+            RawItemProvenance::ModelOutput,
+        )
+        .await;
+
+    // Cycle 1: the follow-up answer.
+    codex_lhc_host::LhcStepIndex::begin_cycle(turn_context.extension_data.as_ref());
+    session
+        .record_conversation_items_with_provenance(
+            &turn_context,
+            &[assistant("a1", "done")],
+            RawItemProvenance::ModelOutput,
+        )
+        .await;
+
+    handle.flush().await;
+    handle.shutdown().await;
+
+    // Rule zero: stored rows, not intake events.
+    let (lhc_session, _) = codex_lhc_host::LhcSession::open(
+        &thread_id,
+        None,
+        Some(root.as_path()),
+        codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic"),
+    )
+    .await
+    .expect("reopen");
+    let messages = lhc_session.list_messages().await.expect("messages");
+    lhc_session.close().await;
+
+    // The user prompt is never stamped.
+    let prompt = messages
+        .iter()
+        .find(|m| m.kind.as_str() == "user_prompt")
+        .expect("user_prompt row");
+    assert_eq!(prompt.step_index, None, "user_prompt carries no step index");
+
+    // Sequential assistant text cycles: 0 then 1.
+    let assistant_steps: Vec<Option<i64>> = messages
+        .iter()
+        .filter(|m| m.kind.as_str() == "assistant_text")
+        .map(|m| m.step_index)
+        .collect();
+    assert_eq!(
+        assistant_steps,
+        vec![Some(0), Some(1)],
+        "assistant text must carry sequential cycle stamps"
+    );
+
+    // Both parallel tool pairs share cycle 0: the call and its result never
+    // straddle a step edge.
+    for call_id in ["call-a", "call-b"] {
+        let tool_steps: Vec<Option<i64>> = messages
+            .iter()
+            .filter(|m| {
+                matches!(m.kind.as_str(), "tool_call" | "tool_result")
+                    && m.blocks.iter().any(|b| {
+                        b.content.get("toolCallId").and_then(|v| v.as_str()) == Some(call_id)
+                    })
+            })
+            .map(|m| m.step_index)
+            .collect();
+        assert_eq!(
+            tool_steps,
+            vec![Some(0), Some(0)],
+            "call/result pair for {call_id} must share cycle 0"
+        );
+    }
 }

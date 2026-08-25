@@ -141,6 +141,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + LIM-63B MidTurn compact-continuation (one-writer, no native fall-open) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
 | 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch) | (with 0007) |
+| 13b | `core/src/session/turn.rs` | turn parts F2: begin the provider request/response cycle before each outer sampling request so raw-item capture stamps `stepIndex` on assistant_text/assistant_thinking/tool_call/tool_result | (with 0007) |
 | 13a | `core/src/session/input_queue.rs` | monotonic pending-input epoch for MidTurn input-epoch gate (steer/mailbox enqueue) | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
 | 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
@@ -175,7 +176,9 @@ itself no longer carries a fork delta. Fork-owned and not sentinel-bearing is a
 legitimate combination; fork-owned and *not in any patch* is not. Row 26 is the
 same pattern (impl details under a sentinel-bearing LiveThread API).
 
-Expected markers: **52** (`EXPECTED_HOOKS` in the tripwire script).
+Expected markers: **53** (`EXPECTED_HOOKS` in the tripwire script).
+Was 52 before turn parts Story 5 (+1 for the F2 provider-cycle begin seam in
+`core/src/session/turn.rs`).
 Was 54 before the 2026-08-06 upstream sync removed two marker sites while
 preserving the raw-item contributor behavior (see the sync record below).
 Was 51 before slice E (startup reconciliation); +3 for reconcile entry +

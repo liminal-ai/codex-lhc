@@ -1163,7 +1163,7 @@ mod tests {
                 }
                 _ => RawItemProvenance::ModelOutput,
             };
-            handle.persist(item, prov);
+            handle.persist(item, prov, /*step_index*/ None);
         }
         handle.flush().await;
         assert!(
@@ -1195,7 +1195,7 @@ mod tests {
                 }
                 _ => RawItemProvenance::ModelOutput,
             };
-            handle.persist(item, prov);
+            handle.persist(item, prov, /*step_index*/ None);
         }
         handle.flush().await;
         let settled = handle
