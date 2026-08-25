@@ -24,6 +24,22 @@
 //!    inode (an unreopened fd silently follows the orphaned prior file).
 //!
 //! There is **no** append fallback on failure.
+//!
+//! # Interrupted-swap reconciliation
+//!
+//! An error out of [`atomic_rewrite_rollout`] does not by itself say which
+//! generation is active: steps 1–5 leave `P` (old) authoritative, an error
+//! between steps 5 and 6 leaves *no* active generation (old at `P.prev`, new
+//! at `P.rewrite-tmp`), and an error after step 6 (directory fsync, or the
+//! caller's post-swap hook) leaves the **new** generation active while the
+//! caller's in-memory state is still old. [`classify_swap_state`] reads the
+//! actual on-disk state and [`reconcile_interrupted_swap`] establishes exactly
+//! one authoritative active generation before the caller decides anything:
+//! it finishes an interrupted swap (`tmp → P`) when the new generation is
+//! complete, restores `P.prev → P` when it is not, and reports a state it
+//! cannot repair instead of guessing. It runs synchronously in the caller's
+//! one-writer context (the compact arm that owns the thread), never from a
+//! second writer.
 
 use chrono::SecondsFormat;
 use chrono::Utc;
@@ -149,6 +165,184 @@ pub fn atomic_rewrite_rollout(rollout_path: &Path, items: &[RolloutItem]) -> std
     maybe_fail(SwapFailpoint::PostNewRenamePreReopen)?;
 
     Ok(())
+}
+
+/// Which generation is active on disk after an interrupted rewrite, as
+/// classified by [`classify_swap_state`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapState {
+    /// `P` holds the old generation (steps 1–5 failed, or never ran).
+    OldActive,
+    /// `P` holds the new generation (steps 1–6 completed; the error came from
+    /// the directory fsync after the final rename or from the caller's
+    /// post-swap hook).
+    NewActive,
+    /// `P` is absent: the old generation was moved to `P.prev` and the new
+    /// generation (if complete) sits at `P.rewrite-tmp` (failure between
+    /// steps 5 and 6).
+    NoActive {
+        prev_exists: bool,
+        temp_exists: bool,
+    },
+    /// `P` exists but is neither the old nor the recognised new generation
+    /// (torn or foreign content). Never repaired automatically.
+    Unknown { detail: String },
+}
+
+/// What [`reconcile_interrupted_swap`] established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwapReconciliation {
+    /// The old generation is (still) the single active generation; the
+    /// caller keeps its current in-memory state and may retry later.
+    OldActive,
+    /// The new generation is the single active generation — either it already
+    /// was (`finished_here == false`) or the interrupted `tmp → P` rename was
+    /// completed here (`finished_here == true`). The caller must complete its
+    /// matching in-memory install; it must not roll the compact back.
+    NewActive { finished_here: bool },
+    /// The old generation was restored to `P` from `P.prev` because the new
+    /// generation could not be made active. Retry later.
+    RestoredOld { detail: String },
+    /// No single authoritative generation could be established. The caller
+    /// must not allow further sampling on this rollout until a human or the
+    /// next-open reconciliation resolves it; `detail` names the exact state.
+    Unreconciled { detail: String },
+}
+
+/// Read the on-disk swap state of `rollout_path`. `is_new_generation` decides
+/// whether a parsed active file is the generation the caller just wrote (the
+/// caller knows its own boundary record); anything else that parses is taken
+/// as the old generation only when it still parses as a rollout.
+pub fn classify_swap_state(
+    rollout_path: &Path,
+    is_new_generation: &dyn Fn(&[RolloutItem]) -> bool,
+) -> SwapState {
+    let paths = SwapPaths::for_rollout(rollout_path);
+    if !paths.active.exists() {
+        return SwapState::NoActive {
+            prev_exists: paths.prev.exists(),
+            temp_exists: paths.temp.exists(),
+        };
+    }
+    match parse_rollout_items(&paths.active) {
+        Ok(items) if is_new_generation(&items) => SwapState::NewActive,
+        Ok(items) if !items.is_empty() => SwapState::OldActive,
+        Ok(_) => SwapState::Unknown {
+            detail: format!(
+                "active rollout {} parses to no items",
+                paths.active.display()
+            ),
+        },
+        Err(err) => SwapState::Unknown {
+            detail: format!(
+                "active rollout {} unreadable: {err}",
+                paths.active.display()
+            ),
+        },
+    }
+}
+
+/// Establish exactly one authoritative active generation after
+/// [`atomic_rewrite_rollout`] returned an error (see the module docs).
+///
+/// Only the two rename edges are repaired: `tmp → P` is finished when the new
+/// generation is complete (the temp file parses and `is_new_generation`
+/// accepts it), otherwise `P.prev → P` restores the old generation. Every
+/// other state is reported, never guessed.
+pub fn reconcile_interrupted_swap(
+    rollout_path: &Path,
+    is_new_generation: &dyn Fn(&[RolloutItem]) -> bool,
+) -> SwapReconciliation {
+    let paths = SwapPaths::for_rollout(rollout_path);
+    match classify_swap_state(rollout_path, is_new_generation) {
+        SwapState::OldActive => SwapReconciliation::OldActive,
+        SwapState::NewActive => SwapReconciliation::NewActive {
+            finished_here: false,
+        },
+        SwapState::Unknown { detail } => SwapReconciliation::Unreconciled { detail },
+        SwapState::NoActive {
+            prev_exists,
+            temp_exists,
+        } => {
+            let parent = paths.active.parent();
+            // Finish the intended swap when the new generation is complete.
+            if temp_exists {
+                let complete = matches!(
+                    parse_rollout_items(&paths.temp),
+                    Ok(items) if is_new_generation(&items)
+                );
+                if complete {
+                    match std::fs::rename(&paths.temp, &paths.active) {
+                        Ok(()) => {
+                            if let Some(parent) = parent
+                                && let Err(err) = fsync_dir(parent)
+                            {
+                                // The rename is durable-or-not independently of
+                                // this fsync; the active path is the new
+                                // generation either way.
+                                let _ = err;
+                            }
+                            return SwapReconciliation::NewActive {
+                                finished_here: true,
+                            };
+                        }
+                        Err(err) => {
+                            if !prev_exists {
+                                return SwapReconciliation::Unreconciled {
+                                    detail: format!(
+                                        "no active rollout at {}; finishing tmp → active failed ({err}) and no prior generation exists at {}",
+                                        paths.active.display(),
+                                        paths.prev.display()
+                                    ),
+                                };
+                            }
+                            // Fall through to restoring the old generation.
+                        }
+                    }
+                }
+            }
+            if prev_exists {
+                return match std::fs::rename(&paths.prev, &paths.active) {
+                    Ok(()) => {
+                        if let Some(parent) = parent {
+                            let _ = fsync_dir(parent);
+                        }
+                        SwapReconciliation::RestoredOld {
+                            detail: format!(
+                                "restored prior generation {} → {} (new generation {})",
+                                paths.prev.display(),
+                                paths.active.display(),
+                                if temp_exists {
+                                    "left incomplete at tmp"
+                                } else {
+                                    "absent"
+                                }
+                            ),
+                        }
+                    }
+                    Err(err) => SwapReconciliation::Unreconciled {
+                        detail: format!(
+                            "no active rollout at {}; restoring {} failed: {err}",
+                            paths.active.display(),
+                            paths.prev.display()
+                        ),
+                    },
+                };
+            }
+            SwapReconciliation::Unreconciled {
+                detail: format!(
+                    "no active rollout at {}, no prior generation at {}, temp {}",
+                    paths.active.display(),
+                    paths.prev.display(),
+                    if temp_exists {
+                        "present but not the expected new generation"
+                    } else {
+                        "absent"
+                    }
+                ),
+            }
+        }
+    }
 }
 
 // R12 (CX-S2): there is no rollback after a failed recorder reopen. The new

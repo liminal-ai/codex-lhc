@@ -426,6 +426,7 @@ async fn sub_threshold_does_not_grow_model_context() {
     match attempt {
         LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::Cancelled { reason }
         | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             // NoReduction is fine; other hard stops also fine for tiny seed.
@@ -492,6 +493,7 @@ async fn production_three_compacts_do_not_reingest_body() {
             }
             LhcCompactAttempt::Failed { reason }
             | LhcCompactAttempt::Unavailable { reason }
+            | LhcCompactAttempt::RolloutUnreconciled { reason }
             | LhcCompactAttempt::Cancelled { reason }
             | LhcCompactAttempt::MidTurnSkipped { reason }
             | LhcCompactAttempt::MidTurnBlocked { reason, .. }
@@ -1116,6 +1118,7 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
         }
         LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::Cancelled { reason }
         | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             assert!(!reason.is_empty(), "hard-stop reason should be non-empty");
@@ -1479,6 +1482,8 @@ async fn background_derivation_leaves_compact_with_no_inference_to_do() {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
             LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+            LhcCompactAttempt::RolloutUnreconciled { reason } =>
+                format!("RolloutUnreconciled({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
             LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -1654,6 +1659,8 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
             LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+            LhcCompactAttempt::RolloutUnreconciled { reason } =>
+                format!("RolloutUnreconciled({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
             LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -1770,6 +1777,8 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
             LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
             LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
             LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
+            LhcCompactAttempt::RolloutUnreconciled { reason } =>
+                format!("RolloutUnreconciled({reason})"),
             LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
             LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
             LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -1791,6 +1800,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
         }
         LhcCompactAttempt::Failed { .. }
         | LhcCompactAttempt::Unavailable { .. }
+        | LhcCompactAttempt::RolloutUnreconciled { .. }
         | LhcCompactAttempt::Cancelled { .. }
         | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
         LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
@@ -3194,6 +3204,7 @@ async fn blocked_capture_flush_does_not_hang_lhc_compact() {
         }
         LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
             let history_after = sess.clone_history().await.into_raw_items();
             assert!(

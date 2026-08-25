@@ -511,3 +511,98 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
     );
     assert_eq!(history[0], band);
 }
+
+fn is_new(items: &[RolloutItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(item, RolloutItem::Compacted(CompactedItem { message, .. }) if message == "boundary-new")
+    })
+}
+
+/// Interrupted-swap reconciliation establishes one authoritative active
+/// generation per injected stage: old still active (retry later), old moved
+/// with the complete new generation at tmp (finish the swap), new already
+/// active (nothing to move; caller completes its install).
+#[test]
+fn reconcile_interrupted_swap_establishes_one_active_generation() {
+    // PostTempWrite: old stays active, nothing moved.
+    {
+        let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostTempWrite);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
+        assert_eq!(classify_swap_state(&path, &is_new), SwapState::OldActive);
+        assert_eq!(
+            reconcile_interrupted_swap(&path, &is_new),
+            SwapReconciliation::OldActive
+        );
+        assert_parseable_active(&path, "old");
+    }
+    // PostOldRename: no active; the complete new generation at tmp is moved
+    // into place and the old generation stays at prev.
+    {
+        let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostOldRename);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
+        assert_eq!(
+            classify_swap_state(&path, &is_new),
+            SwapState::NoActive {
+                prev_exists: true,
+                temp_exists: true
+            }
+        );
+        assert_eq!(
+            reconcile_interrupted_swap(&path, &is_new),
+            SwapReconciliation::NewActive {
+                finished_here: true
+            }
+        );
+        let paths = SwapPaths::for_rollout(&path);
+        assert!(!paths.temp.exists(), "tmp consumed by the finished swap");
+        assert!(paths.prev.exists(), "old generation retained at prev");
+        assert_eq!(classify_swap_state(&path, &is_new), SwapState::NewActive);
+        assert!(is_new(&parse_rollout_items(&path).expect("active parses")));
+    }
+    // PostNewRenamePreReopen: new already active; reconciliation moves nothing.
+    {
+        let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostNewRenamePreReopen);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
+        assert_eq!(
+            reconcile_interrupted_swap(&path, &is_new),
+            SwapReconciliation::NewActive {
+                finished_here: false
+            }
+        );
+        assert!(is_new(&parse_rollout_items(&path).expect("active parses")));
+    }
+    // Old moved, new generation incomplete at tmp: restore the old generation.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let paths = SwapPaths::for_rollout(&path);
+        std::fs::rename(&paths.active, &paths.prev).unwrap();
+        std::fs::write(&paths.temp, "{not a rollout line\n").unwrap();
+        let outcome = reconcile_interrupted_swap(&path, &is_new);
+        assert!(
+            matches!(outcome, SwapReconciliation::RestoredOld { .. }),
+            "{outcome:?}"
+        );
+        assert_parseable_active(&path, "old");
+    }
+    // Nothing to restore: reported, never guessed.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let outcome = reconcile_interrupted_swap(&path, &is_new);
+        assert!(
+            matches!(outcome, SwapReconciliation::Unreconciled { .. }),
+            "{outcome:?}"
+        );
+    }
+}

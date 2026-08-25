@@ -234,6 +234,13 @@ pub(crate) enum LhcCompactAttempt {
     },
     /// Hard stop: preserve current history. Never permission for native compact.
     Failed { reason: String },
+    /// The rollout swap was interrupted and reconciliation could not establish
+    /// one authoritative active generation on disk (see
+    /// `codex_lhc_host::reconcile_interrupted_swap`). Sampling must not
+    /// continue on this rollout: the current in-memory body is preserved and
+    /// the exact on-disk state is reported. Never permission for native
+    /// compact or compact-continuation.
+    RolloutUnreconciled { reason: String },
     /// The LHC arm could not run. Strict dispatch treats this as a hard stop;
     /// it is never permission for native compact.
     Unavailable { reason: String },
@@ -320,6 +327,17 @@ pub(crate) async fn run_strict_lhc_compact(
             error!(%reason, manual, "LHC compact hard failure; preserving history (no native compact)");
             Err(CodexErr::UnsupportedOperation(format!(
                 "LHC compact failed: {reason}"
+            )))
+        }
+        LhcCompactAttempt::RolloutUnreconciled { reason } => {
+            error!(
+                %reason,
+                manual,
+                "LHC rollout swap left no single authoritative generation; denying further \
+                 sampling on this rollout (history preserved, no native compact)"
+            );
+            Err(CodexErr::UnsupportedOperation(format!(
+                "LHC rollout swap unreconciled: {reason}"
             )))
         }
         LhcCompactAttempt::MidTurnSkipped { reason } => {
@@ -783,15 +801,27 @@ async fn try_run_mid_turn_arm(
 /// seam run the parts compact again, which re-materializes against the
 /// standing SDK view. It is never a hard stop (strict dispatch must not end
 /// the turn over a host apply that preserved the body), never native
-/// compaction, and never compact-continuation. Cancellation / abort remains
-/// the only deny case: the apply token is never cancelled, and an
-/// interrupted / aborted host error is passed through unchanged.
+/// compaction, and never compact-continuation. Cancellation / abort remains a
+/// deny case: the apply token is never cancelled, and an interrupted /
+/// aborted host error is passed through unchanged. The only other deny is
+/// `RolloutUnreconciled`: the rewrite was interrupted between its rename
+/// edges and `reconcile_interrupted_swap` could not establish one
+/// authoritative on-disk generation — sampling on a rollout whose authority
+/// is unknown would split disk from served memory. Every state it *could*
+/// resolve is handled before this function sees it: old-active /
+/// restored-old arrive as `Failed` (retry later), and new-active arrives as
+/// `Installed` because the host completed its in-memory / window install
+/// against the generation that is actually on disk.
 fn finish_parts_host_apply(
     applied: CodexResult<LhcCompactAttempt>,
 ) -> CodexResult<LhcCompactAttempt> {
     let reason = match applied {
         Ok(attempt @ LhcCompactAttempt::Installed { .. })
-        | Ok(attempt @ LhcCompactAttempt::Cancelled { .. }) => return Ok(attempt),
+        | Ok(attempt @ LhcCompactAttempt::Cancelled { .. })
+        // An interrupted swap that reconciliation could not resolve to one
+        // authoritative generation denies sampling (see the variant docs);
+        // every reconciled state below is either installed or retry-later.
+        | Ok(attempt @ LhcCompactAttempt::RolloutUnreconciled { .. }) => return Ok(attempt),
         Ok(LhcCompactAttempt::Failed { reason })
         | Ok(LhcCompactAttempt::Unavailable { reason })
         | Ok(LhcCompactAttempt::MidTurnSkipped { reason })
@@ -2306,8 +2336,74 @@ async fn install_lhc_compact_rewrite(
                 "LHC rollout flush before rewrite failed; continuing with rewrite attempt"
             );
         }
-        match atomic_rewrite_rollout(path, &materialize_result.items) {
-            Ok(()) => {
+        // Interrupted-swap reconciliation (turn parts, Story 5 M2 residual):
+        // an error out of the swap does not say which generation is active.
+        // Classify the actual on-disk state under this arm's one-writer
+        // authority and establish exactly one authoritative generation before
+        // deciding: old still active → retry later; old moved and the new
+        // generation complete at tmp → finish the swap; new already active
+        // (post-rename fsync or hook error) → the compact stands and the host
+        // must complete its matching in-memory / window install, never roll
+        // it back; anything else → deny sampling with the exact state.
+        let reconciled_after_error = match atomic_rewrite_rollout(path, &materialize_result.items) {
+            Ok(()) => None,
+            Err(err) => {
+                let boundary = durable_message.clone();
+                let is_new_generation = move |items: &[RolloutItem]| {
+                    items.iter().any(|item| {
+                        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == boundary)
+                    })
+                };
+                match codex_lhc_host::reconcile_interrupted_swap(path, &is_new_generation) {
+                    codex_lhc_host::SwapReconciliation::OldActive => {
+                        error!(
+                            %err,
+                            path = %path.display(),
+                            "LHC rollout rewrite failed; old file remains authoritative; \
+                             preserving in-memory history (no native compact)"
+                        );
+                        return Ok(failed_attempt(format!("rollout rewrite failed: {err}")));
+                    }
+                    codex_lhc_host::SwapReconciliation::RestoredOld { detail } => {
+                        error!(
+                            %err,
+                            %detail,
+                            path = %path.display(),
+                            "LHC rollout rewrite failed after moving the old generation; \
+                             restored it as the authoritative active file; \
+                             preserving in-memory history (no native compact)"
+                        );
+                        return Ok(failed_attempt(format!(
+                            "rollout rewrite failed: {err}; {detail}"
+                        )));
+                    }
+                    codex_lhc_host::SwapReconciliation::Unreconciled { detail } => {
+                        error!(
+                            %err,
+                            %detail,
+                            path = %path.display(),
+                            "LHC rollout rewrite failed and no single authoritative generation \
+                             could be established; denying further sampling on this rollout"
+                        );
+                        return Ok(LhcCompactAttempt::RolloutUnreconciled {
+                            reason: format!("rollout rewrite failed: {err}; {detail}"),
+                        });
+                    }
+                    codex_lhc_host::SwapReconciliation::NewActive { finished_here } => {
+                        warn!(
+                            %err,
+                            finished_here,
+                            path = %path.display(),
+                            "LHC rollout rewrite reported an error but the new generation is \
+                             the active file; completing the host install against it"
+                        );
+                        Some(finished_here)
+                    }
+                }
+            }
+        };
+        match reconciled_after_error {
+            Some(_) | None => {
                 // Reopen the append handle onto the new inode (retry once).
                 if let Some(live_thread) = sess.live_thread() {
                     let reopen = live_thread.reopen_rollout_after_rewrite().await;
@@ -2349,17 +2445,9 @@ async fn install_lhc_compact_rewrite(
                 info!(
                     path = %path.display(),
                     items = materialize_result.items.len(),
+                    reconciled = reconciled_after_error.is_some(),
                     "LHC rollout rewrite installed (atomic swap)"
                 );
-            }
-            Err(err) => {
-                error!(
-                    %err,
-                    path = %path.display(),
-                    "LHC rollout rewrite failed; old file remains authoritative; \
-                     preserving in-memory history (no native compact)"
-                );
-                return Ok(failed_attempt(format!("rollout rewrite failed: {err}")));
             }
         }
     } else {

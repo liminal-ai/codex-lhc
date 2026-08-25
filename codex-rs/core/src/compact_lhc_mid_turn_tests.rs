@@ -731,6 +731,7 @@ async fn mid_turn_active_non_tool_runs_certified_runtime() {
             let _ = next_provider_request_allowed;
         }
         LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Cancelled { reason } => {
             panic!("MidTurn must not hard-stop when LHC is healthy: {reason}");
@@ -2256,6 +2257,7 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
                 assert!(!reason.is_empty(), "degradation residual must be truthful");
             }
             LhcCompactAttempt::Unavailable { reason }
+            | LhcCompactAttempt::RolloutUnreconciled { reason }
             | LhcCompactAttempt::Failed { reason }
             | LhcCompactAttempt::Cancelled { reason } => {
                 panic!("degraded MidTurn path must use explicit MidTurn outcome: {reason}");
@@ -2565,6 +2567,7 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
             );
         }
         LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Cancelled { reason } => {
             panic!("repair must use explicit MidTurn outcome: {reason}");
@@ -2722,6 +2725,7 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
 
     match repaired {
         LhcCompactAttempt::Unavailable { reason }
+        | LhcCompactAttempt::RolloutUnreconciled { reason }
         | LhcCompactAttempt::Failed { reason }
         | LhcCompactAttempt::Cancelled { reason } => {
             panic!("claim-only preserve recovery must use explicit MidTurn outcome: {reason}");
@@ -4321,4 +4325,261 @@ async fn mid_turn_parts_host_apply_failure_retries_at_later_seam() {
         std::fs::read_to_string(&rollout_path).expect("rollout after strict"),
         "old rollout remains authoritative after the failed swap under strict dispatch"
     );
+}
+
+/// The in-memory body the session serves must equal, on the wire, what
+/// resume rebuilds from the active rollout generation (law 1): one
+/// disk/memory authority. Compared as serialized JSON so round-tripped items
+/// (tool outputs) are held to exact wire equality.
+fn assert_memory_matches_active_rollout(
+    history: &[ResponseItem],
+    rollout_path: &std::path::Path,
+    what: &str,
+) {
+    let items = codex_lhc_host::parse_rollout_items(rollout_path).expect("active rollout parses");
+    assert!(!items.is_empty(), "{what}: active rollout is not torn");
+    let rebuilt = codex_lhc_host::history_from_materialized_items(&items);
+    let memory_json = serde_json::to_value(history).expect("memory json");
+    let disk_json = serde_json::to_value(&rebuilt).expect("disk json");
+    assert_eq!(
+        memory_json,
+        disk_json,
+        "{what}: served memory ({} items) must equal the active rollout generation ({} items)",
+        history.len(),
+        rebuilt.len()
+    );
+}
+
+/// Drive one more provider cycle of model output on the active turn and
+/// flush capture, so the next seam is truthful and has something to compact.
+async fn advance_one_cycle(
+    sess: &Arc<Session>,
+    tc: &crate::session::turn_context::TurnContext,
+    handle: &codex_lhc_host::CaptureHandle,
+    tag: &str,
+) {
+    codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
+    sess.record_conversation_items_with_provenance(
+        tc,
+        &[ResponseItem::Message {
+            id: None,
+            role: "assistant".into(),
+            content: vec![ContentItem::OutputText {
+                text: format!("progress {tag} {}", "u".repeat(800)),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }],
+        codex_extension_api::RawItemProvenance::ModelOutput,
+    )
+    .await;
+    inject_response_usage(sess, tc, 5_000).await;
+    handle.flush().await;
+}
+
+/// Shared body for the two late-stage swap failures (M2 residual): the SDK
+/// installs the parts view, the rewrite is interrupted at `point`, and the
+/// production arm must reconcile the on-disk state to one authoritative
+/// generation, complete the host install against it, and report
+/// `Installed` — the compact stands, served memory equals the active rollout,
+/// the old generation is retained at `.prev`, no forced-boundary evidence
+/// exists, and strict dispatch under the same failpoint at a later seam
+/// returns `Ok(())` with memory still equal to disk.
+async fn late_stage_swap_failure_reconciles_and_installs(
+    point: codex_lhc_host::SwapFailpoint,
+    tag: &str,
+) {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let rollout_path = super::slice_d_tests::attach_rollout(&mut session).await;
+    let paths = codex_lhc_host::SwapPaths::for_rollout(&rollout_path);
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 4).await;
+    seed_stepped_active_turn(&session, &tc, 6).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let sess = Arc::new(session);
+    sess.flush_rollout().await.expect("flush rollout");
+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let disk_before = std::fs::read_to_string(&rollout_path).expect("rollout before");
+
+    // Seam 1 under the late-stage failpoint via the production arm.
+    let guard = codex_lhc_host::SwapFailpointGuard::arm(point);
+    let first = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            &format!("{tag}-1"),
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    drop(guard);
+    let LhcCompactAttempt::Installed { body, .. } = first else {
+        panic!(
+            "{point:?}: reconciled new generation must complete the host install, got {first:?}"
+        );
+    };
+    assert!(
+        body.len() < history_before.len(),
+        "{point:?}: installed body is reduced ({} < {})",
+        body.len(),
+        history_before.len()
+    );
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        super::response_items_structurally_equal(&history_after, &body),
+        "{point:?}: the session serves the installed body"
+    );
+    // One authority: the active file is the new generation and memory equals
+    // it; the old generation is retained at .prev; no tmp remains.
+    assert_ne!(
+        disk_before,
+        std::fs::read_to_string(&rollout_path).expect("active after"),
+        "{point:?}: the active rollout is the new generation"
+    );
+    assert_memory_matches_active_rollout(
+        &history_after,
+        &rollout_path,
+        &format!("{point:?} seam 1"),
+    );
+    assert_eq!(
+        std::fs::read_to_string(&paths.prev).expect("prev retained"),
+        disk_before,
+        "{point:?}: the old generation is retained at .prev"
+    );
+    assert!(
+        !paths.temp.exists(),
+        "{point:?}: no rewrite temp file remains"
+    );
+    assert_eq!(
+        codex_lhc_host::classify_swap_state(&rollout_path, &|items| {
+            items
+                .iter()
+                .any(|item| matches!(item, codex_history::RolloutItem::Compacted(_)))
+        }),
+        codex_lhc_host::SwapState::NewActive,
+        "{point:?}: exactly one active generation, the compacted one"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "{point:?}: no compact-continuation receipt: {receipts:?}"
+    );
+    assert!(
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(
+            &thread_id,
+            Some(root.as_path())
+        )
+        .await
+        .expect("pending boundary")
+        .is_none(),
+        "{point:?}: no forced-boundary row"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
+        .await
+        .expect("describe")
+        .expect("installed view");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "{point:?}: the SDK parts view stands: {view:?}"
+    );
+
+    // Seam 2: strict dispatch under the same failpoint must permit the turn
+    // to continue (`Ok(())`, never `UnsupportedOperation` / abort) and leave
+    // memory equal to the (again reconciled) active generation.
+    advance_one_cycle(&sess, &tc, &handle, &format!("{tag}-2")).await;
+    let epoch = decision_epoch(&sess);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
+    let mut client = inert_model_client_session();
+    let guard = codex_lhc_host::SwapFailpointGuard::arm(point);
+    let strict = run_auto_compact(
+        &sess,
+        step,
+        /*fallback*/ None,
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            &format!("{tag}-3"),
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await;
+    drop(guard);
+    assert!(
+        strict.is_ok(),
+        "{point:?}: strict dispatch must permit the next seam after reconciliation, got {:?}",
+        strict.err()
+    );
+    let history_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_memory_matches_active_rollout(
+        &history_strict,
+        &rollout_path,
+        &format!("{point:?} seam 2"),
+    );
+    assert!(
+        !paths.temp.exists(),
+        "{point:?}: no rewrite temp file remains after seam 2"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "{point:?}: still no compact-continuation receipt"
+    );
+}
+
+/// M2 residual, `PostOldRename`: the old generation was moved to `.prev` and
+/// the complete new generation sits at `.rewrite-tmp` with no active file.
+/// Reconciliation finishes the intended swap and the host installs against
+/// it; sampling never runs with no active generation.
+#[tokio::test]
+async fn mid_turn_parts_host_apply_post_old_rename_finishes_swap_and_installs() {
+    late_stage_swap_failure_reconciles_and_installs(
+        codex_lhc_host::SwapFailpoint::PostOldRename,
+        "post-old-rename",
+    )
+    .await;
+}
+
+/// M2 residual, `PostNewRenamePreReopen`: the new compacted generation is
+/// already the active file while memory/window state is still old. The
+/// compact stands (never rolled back) and the host completes its matching
+/// in-memory / window install before sampling continues.
+#[tokio::test]
+async fn mid_turn_parts_host_apply_post_new_rename_completes_install() {
+    late_stage_swap_failure_reconciles_and_installs(
+        codex_lhc_host::SwapFailpoint::PostNewRenamePreReopen,
+        "post-new-rename",
+    )
+    .await;
 }

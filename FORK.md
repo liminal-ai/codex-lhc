@@ -714,14 +714,28 @@ No synthetic continuation turn, no forced-boundary marker.
   open task turn (no close/open), and capture leaves the host→durable
   binding untouched (only a forced-boundary continuation re-binds).
   `full_loop_in_run_steer_stays_in_task_turn`.
-- **Host apply after an SDK parts install retries later.** When the SDK has
-  installed the parts view but the host materialize / rollout rewrite does
-  not complete, the prior body and rollout stand (nothing is torn); the arm
-  reports `MidTurnBlocked { next_provider_request_allowed: true }` so strict
-  dispatch permits the next seam, and the next eligible seam re-runs the
-  parts compact against the standing view. Never `UnsupportedOperation`,
-  never native, never compact-continuation; cancellation/abort stays the
-  only deny. `mid_turn_parts_host_apply_failure_retries_at_later_seam`.
+- **Host apply after an SDK parts install retries later — after the swap
+  state is reconciled.** When the SDK has installed the parts view but the
+  host materialize / rollout rewrite does not complete, the arm first reads
+  the actual on-disk swap state under its own one-writer authority
+  (`codex_lhc_host::reconcile_interrupted_swap`, synchronous, same arm) and
+  establishes exactly one authoritative active generation before deciding:
+  old still active (`PostTempWrite`/`PostFsync` class) → prior body and
+  rollout stand, `MidTurnBlocked { next_provider_request_allowed: true }`,
+  retry at the next seam; old moved to `.prev` with the complete new
+  generation at `.rewrite-tmp` (`PostOldRename` class) → the swap is
+  finished (`tmp → active`) and the host completes its in-memory / window
+  install against it (`Installed`); new generation already active
+  (`PostNewRenamePreReopen` / post-rename directory fsync) → the compact
+  stands, never rolled back, host install completed (`Installed`); old
+  moved but the new generation incomplete → `.prev` restored, retry later;
+  no single authority establishable → `RolloutUnreconciled` denies further
+  sampling with the exact state (history preserved). Never native, never
+  compact-continuation; cancellation/abort and `RolloutUnreconciled` are
+  the only denies. `mid_turn_parts_host_apply_failure_retries_at_later_seam`
+  (old active), `mid_turn_parts_host_apply_post_old_rename_finishes_swap_and_installs`,
+  `mid_turn_parts_host_apply_post_new_rename_completes_install`, host
+  `reconcile_interrupted_swap_establishes_one_active_generation`.
 - **Truthful seam.** A capture flush that does not complete within its bound
   is not a settled seam: keep the body, retry later — never assert a false
   fact (supersedes the LIM-63B "warn and continue" behavior).

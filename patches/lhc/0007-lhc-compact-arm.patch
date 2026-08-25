@@ -95,10 +95,10 @@ index ff683fb5f9..463a91c5d3 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..bbb15f228b
+index 0000000000..31e543a548
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,2921 @@
+@@ -0,0 +1,3009 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -335,6 +335,13 @@ index 0000000000..bbb15f228b
 +    },
 +    /// Hard stop: preserve current history. Never permission for native compact.
 +    Failed { reason: String },
++    /// The rollout swap was interrupted and reconciliation could not establish
++    /// one authoritative active generation on disk (see
++    /// `codex_lhc_host::reconcile_interrupted_swap`). Sampling must not
++    /// continue on this rollout: the current in-memory body is preserved and
++    /// the exact on-disk state is reported. Never permission for native
++    /// compact or compact-continuation.
++    RolloutUnreconciled { reason: String },
 +    /// The LHC arm could not run. Strict dispatch treats this as a hard stop;
 +    /// it is never permission for native compact.
 +    Unavailable { reason: String },
@@ -421,6 +428,17 @@ index 0000000000..bbb15f228b
 +            error!(%reason, manual, "LHC compact hard failure; preserving history (no native compact)");
 +            Err(CodexErr::UnsupportedOperation(format!(
 +                "LHC compact failed: {reason}"
++            )))
++        }
++        LhcCompactAttempt::RolloutUnreconciled { reason } => {
++            error!(
++                %reason,
++                manual,
++                "LHC rollout swap left no single authoritative generation; denying further \
++                 sampling on this rollout (history preserved, no native compact)"
++            );
++            Err(CodexErr::UnsupportedOperation(format!(
++                "LHC rollout swap unreconciled: {reason}"
 +            )))
 +        }
 +        LhcCompactAttempt::MidTurnSkipped { reason } => {
@@ -884,15 +902,27 @@ index 0000000000..bbb15f228b
 +/// seam run the parts compact again, which re-materializes against the
 +/// standing SDK view. It is never a hard stop (strict dispatch must not end
 +/// the turn over a host apply that preserved the body), never native
-+/// compaction, and never compact-continuation. Cancellation / abort remains
-+/// the only deny case: the apply token is never cancelled, and an
-+/// interrupted / aborted host error is passed through unchanged.
++/// compaction, and never compact-continuation. Cancellation / abort remains a
++/// deny case: the apply token is never cancelled, and an interrupted /
++/// aborted host error is passed through unchanged. The only other deny is
++/// `RolloutUnreconciled`: the rewrite was interrupted between its rename
++/// edges and `reconcile_interrupted_swap` could not establish one
++/// authoritative on-disk generation — sampling on a rollout whose authority
++/// is unknown would split disk from served memory. Every state it *could*
++/// resolve is handled before this function sees it: old-active /
++/// restored-old arrive as `Failed` (retry later), and new-active arrives as
++/// `Installed` because the host completed its in-memory / window install
++/// against the generation that is actually on disk.
 +fn finish_parts_host_apply(
 +    applied: CodexResult<LhcCompactAttempt>,
 +) -> CodexResult<LhcCompactAttempt> {
 +    let reason = match applied {
 +        Ok(attempt @ LhcCompactAttempt::Installed { .. })
-+        | Ok(attempt @ LhcCompactAttempt::Cancelled { .. }) => return Ok(attempt),
++        | Ok(attempt @ LhcCompactAttempt::Cancelled { .. })
++        // An interrupted swap that reconciliation could not resolve to one
++        // authoritative generation denies sampling (see the variant docs);
++        // every reconciled state below is either installed or retry-later.
++        | Ok(attempt @ LhcCompactAttempt::RolloutUnreconciled { .. }) => return Ok(attempt),
 +        Ok(LhcCompactAttempt::Failed { reason })
 +        | Ok(LhcCompactAttempt::Unavailable { reason })
 +        | Ok(LhcCompactAttempt::MidTurnSkipped { reason })
@@ -2407,8 +2437,74 @@ index 0000000000..bbb15f228b
 +                "LHC rollout flush before rewrite failed; continuing with rewrite attempt"
 +            );
 +        }
-+        match atomic_rewrite_rollout(path, &materialize_result.items) {
-+            Ok(()) => {
++        // Interrupted-swap reconciliation (turn parts, Story 5 M2 residual):
++        // an error out of the swap does not say which generation is active.
++        // Classify the actual on-disk state under this arm's one-writer
++        // authority and establish exactly one authoritative generation before
++        // deciding: old still active → retry later; old moved and the new
++        // generation complete at tmp → finish the swap; new already active
++        // (post-rename fsync or hook error) → the compact stands and the host
++        // must complete its matching in-memory / window install, never roll
++        // it back; anything else → deny sampling with the exact state.
++        let reconciled_after_error = match atomic_rewrite_rollout(path, &materialize_result.items) {
++            Ok(()) => None,
++            Err(err) => {
++                let boundary = durable_message.clone();
++                let is_new_generation = move |items: &[RolloutItem]| {
++                    items.iter().any(|item| {
++                        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == boundary)
++                    })
++                };
++                match codex_lhc_host::reconcile_interrupted_swap(path, &is_new_generation) {
++                    codex_lhc_host::SwapReconciliation::OldActive => {
++                        error!(
++                            %err,
++                            path = %path.display(),
++                            "LHC rollout rewrite failed; old file remains authoritative; \
++                             preserving in-memory history (no native compact)"
++                        );
++                        return Ok(failed_attempt(format!("rollout rewrite failed: {err}")));
++                    }
++                    codex_lhc_host::SwapReconciliation::RestoredOld { detail } => {
++                        error!(
++                            %err,
++                            %detail,
++                            path = %path.display(),
++                            "LHC rollout rewrite failed after moving the old generation; \
++                             restored it as the authoritative active file; \
++                             preserving in-memory history (no native compact)"
++                        );
++                        return Ok(failed_attempt(format!(
++                            "rollout rewrite failed: {err}; {detail}"
++                        )));
++                    }
++                    codex_lhc_host::SwapReconciliation::Unreconciled { detail } => {
++                        error!(
++                            %err,
++                            %detail,
++                            path = %path.display(),
++                            "LHC rollout rewrite failed and no single authoritative generation \
++                             could be established; denying further sampling on this rollout"
++                        );
++                        return Ok(LhcCompactAttempt::RolloutUnreconciled {
++                            reason: format!("rollout rewrite failed: {err}; {detail}"),
++                        });
++                    }
++                    codex_lhc_host::SwapReconciliation::NewActive { finished_here } => {
++                        warn!(
++                            %err,
++                            finished_here,
++                            path = %path.display(),
++                            "LHC rollout rewrite reported an error but the new generation is \
++                             the active file; completing the host install against it"
++                        );
++                        Some(finished_here)
++                    }
++                }
++            }
++        };
++        match reconciled_after_error {
++            Some(_) | None => {
 +                // Reopen the append handle onto the new inode (retry once).
 +                if let Some(live_thread) = sess.live_thread() {
 +                    let reopen = live_thread.reopen_rollout_after_rewrite().await;
@@ -2450,17 +2546,9 @@ index 0000000000..bbb15f228b
 +                info!(
 +                    path = %path.display(),
 +                    items = materialize_result.items.len(),
++                    reconciled = reconciled_after_error.is_some(),
 +                    "LHC rollout rewrite installed (atomic swap)"
 +                );
-+            }
-+            Err(err) => {
-+                error!(
-+                    %err,
-+                    path = %path.display(),
-+                    "LHC rollout rewrite failed; old file remains authoritative; \
-+                     preserving in-memory history (no native compact)"
-+                );
-+                return Ok(failed_attempt(format!("rollout rewrite failed: {err}")));
 +            }
 +        }
 +    } else {
@@ -3922,10 +4010,10 @@ index 0000000000..7933355990
 +}
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..11cf8175a9
+index 0000000000..19a28072b2
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,4324 @@
+@@ -0,0 +1,4585 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -4659,6 +4747,7 @@ index 0000000000..11cf8175a9
 +            let _ = next_provider_request_allowed;
 +        }
 +        LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Cancelled { reason } => {
 +            panic!("MidTurn must not hard-stop when LHC is healthy: {reason}");
@@ -6184,6 +6273,7 @@ index 0000000000..11cf8175a9
 +                assert!(!reason.is_empty(), "degradation residual must be truthful");
 +            }
 +            LhcCompactAttempt::Unavailable { reason }
++            | LhcCompactAttempt::RolloutUnreconciled { reason }
 +            | LhcCompactAttempt::Failed { reason }
 +            | LhcCompactAttempt::Cancelled { reason } => {
 +                panic!("degraded MidTurn path must use explicit MidTurn outcome: {reason}");
@@ -6493,6 +6583,7 @@ index 0000000000..11cf8175a9
 +            );
 +        }
 +        LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Cancelled { reason } => {
 +            panic!("repair must use explicit MidTurn outcome: {reason}");
@@ -6650,6 +6741,7 @@ index 0000000000..11cf8175a9
 +
 +    match repaired {
 +        LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Cancelled { reason } => {
 +            panic!("claim-only preserve recovery must use explicit MidTurn outcome: {reason}");
@@ -8250,6 +8342,263 @@ index 0000000000..11cf8175a9
 +        "old rollout remains authoritative after the failed swap under strict dispatch"
 +    );
 +}
++
++/// The in-memory body the session serves must equal, on the wire, what
++/// resume rebuilds from the active rollout generation (law 1): one
++/// disk/memory authority. Compared as serialized JSON so round-tripped items
++/// (tool outputs) are held to exact wire equality.
++fn assert_memory_matches_active_rollout(
++    history: &[ResponseItem],
++    rollout_path: &std::path::Path,
++    what: &str,
++) {
++    let items = codex_lhc_host::parse_rollout_items(rollout_path).expect("active rollout parses");
++    assert!(!items.is_empty(), "{what}: active rollout is not torn");
++    let rebuilt = codex_lhc_host::history_from_materialized_items(&items);
++    let memory_json = serde_json::to_value(history).expect("memory json");
++    let disk_json = serde_json::to_value(&rebuilt).expect("disk json");
++    assert_eq!(
++        memory_json,
++        disk_json,
++        "{what}: served memory ({} items) must equal the active rollout generation ({} items)",
++        history.len(),
++        rebuilt.len()
++    );
++}
++
++/// Drive one more provider cycle of model output on the active turn and
++/// flush capture, so the next seam is truthful and has something to compact.
++async fn advance_one_cycle(
++    sess: &Arc<Session>,
++    tc: &crate::session::turn_context::TurnContext,
++    handle: &codex_lhc_host::CaptureHandle,
++    tag: &str,
++) {
++    codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
++    sess.record_conversation_items_with_provenance(
++        tc,
++        &[ResponseItem::Message {
++            id: None,
++            role: "assistant".into(),
++            content: vec![ContentItem::OutputText {
++                text: format!("progress {tag} {}", "u".repeat(800)),
++            }],
++            phase: None,
++            internal_chat_message_metadata_passthrough: None,
++        }],
++        codex_extension_api::RawItemProvenance::ModelOutput,
++    )
++    .await;
++    inject_response_usage(sess, tc, 5_000).await;
++    handle.flush().await;
++}
++
++/// Shared body for the two late-stage swap failures (M2 residual): the SDK
++/// installs the parts view, the rewrite is interrupted at `point`, and the
++/// production arm must reconcile the on-disk state to one authoritative
++/// generation, complete the host install against it, and report
++/// `Installed` — the compact stands, served memory equals the active rollout,
++/// the old generation is retained at `.prev`, no forced-boundary evidence
++/// exists, and strict dispatch under the same failpoint at a later seam
++/// returns `Ok(())` with memory still equal to disk.
++async fn late_stage_swap_failure_reconciles_and_installs(
++    point: codex_lhc_host::SwapFailpoint,
++    tag: &str,
++) {
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_midturn(&mut session, root.clone()).await;
++    let rollout_path = super::slice_d_tests::attach_rollout(&mut session).await;
++    let paths = codex_lhc_host::SwapPaths::for_rollout(&rollout_path);
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("handle");
++    seed_turns(&session, &tc, 4).await;
++    seed_stepped_active_turn(&session, &tc, 6).await;
++    inject_response_usage(&session, &tc, 5_000).await;
++    handle.flush().await;
++    let thread_id = handle.thread_id().to_string();
++    let sess = Arc::new(session);
++    sess.flush_rollout().await.expect("flush rollout");
++    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    let disk_before = std::fs::read_to_string(&rollout_path).expect("rollout before");
++
++    // Seam 1 under the late-stage failpoint via the production arm.
++    let guard = codex_lhc_host::SwapFailpointGuard::arm(point);
++    let first = try_run_lhc_compact_arm(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            &format!("{tag}-1"),
++            true,
++            decision_epoch(&sess),
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++    drop(guard);
++    let LhcCompactAttempt::Installed { body, .. } = first else {
++        panic!(
++            "{point:?}: reconciled new generation must complete the host install, got {first:?}"
++        );
++    };
++    assert!(
++        body.len() < history_before.len(),
++        "{point:?}: installed body is reduced ({} < {})",
++        body.len(),
++        history_before.len()
++    );
++    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert!(
++        super::response_items_structurally_equal(&history_after, &body),
++        "{point:?}: the session serves the installed body"
++    );
++    // One authority: the active file is the new generation and memory equals
++    // it; the old generation is retained at .prev; no tmp remains.
++    assert_ne!(
++        disk_before,
++        std::fs::read_to_string(&rollout_path).expect("active after"),
++        "{point:?}: the active rollout is the new generation"
++    );
++    assert_memory_matches_active_rollout(
++        &history_after,
++        &rollout_path,
++        &format!("{point:?} seam 1"),
++    );
++    assert_eq!(
++        std::fs::read_to_string(&paths.prev).expect("prev retained"),
++        disk_before,
++        "{point:?}: the old generation is retained at .prev"
++    );
++    assert!(
++        !paths.temp.exists(),
++        "{point:?}: no rewrite temp file remains"
++    );
++    assert_eq!(
++        codex_lhc_host::classify_swap_state(&rollout_path, &|items| {
++            items
++                .iter()
++                .any(|item| matches!(item, codex_history::RolloutItem::Compacted(_)))
++        }),
++        codex_lhc_host::SwapState::NewActive,
++        "{point:?}: exactly one active generation, the compacted one"
++    );
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
++            .await
++            .expect("receipts");
++    assert!(
++        receipts.is_empty(),
++        "{point:?}: no compact-continuation receipt: {receipts:?}"
++    );
++    assert!(
++        codex_lhc_host::inspect_pending_compact_continuation_boundary(
++            &thread_id,
++            Some(root.as_path())
++        )
++        .await
++        .expect("pending boundary")
++        .is_none(),
++        "{point:?}: no forced-boundary row"
++    );
++    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
++        .await
++        .expect("describe")
++        .expect("installed view");
++    assert!(
++        codex_lhc_host::view_serves_parts(&view),
++        "{point:?}: the SDK parts view stands: {view:?}"
++    );
++
++    // Seam 2: strict dispatch under the same failpoint must permit the turn
++    // to continue (`Ok(())`, never `UnsupportedOperation` / abort) and leave
++    // memory equal to the (again reconciled) active generation.
++    advance_one_cycle(&sess, &tc, &handle, &format!("{tag}-2")).await;
++    let epoch = decision_epoch(&sess);
++    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
++    let mut client = inert_model_client_session();
++    let guard = codex_lhc_host::SwapFailpointGuard::arm(point);
++    let strict = run_auto_compact(
++        &sess,
++        step,
++        /*fallback*/ None,
++        &mut client,
++        InitialContextInjection::DoNotInject,
++        CompactionReason::ContextLimit,
++        CompactionPhase::MidTurn,
++        Some(mid_facts(
++            &format!("{tag}-3"),
++            true,
++            epoch,
++            Vec::new(),
++            Some(sample_usage(5_000)),
++        )),
++        &CancellationToken::new(),
++    )
++    .await;
++    drop(guard);
++    assert!(
++        strict.is_ok(),
++        "{point:?}: strict dispatch must permit the next seam after reconciliation, got {:?}",
++        strict.err()
++    );
++    let history_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
++    assert_memory_matches_active_rollout(
++        &history_strict,
++        &rollout_path,
++        &format!("{point:?} seam 2"),
++    );
++    assert!(
++        !paths.temp.exists(),
++        "{point:?}: no rewrite temp file remains after seam 2"
++    );
++    let receipts =
++        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
++            .await
++            .expect("receipts");
++    assert!(
++        receipts.is_empty(),
++        "{point:?}: still no compact-continuation receipt"
++    );
++}
++
++/// M2 residual, `PostOldRename`: the old generation was moved to `.prev` and
++/// the complete new generation sits at `.rewrite-tmp` with no active file.
++/// Reconciliation finishes the intended swap and the host installs against
++/// it; sampling never runs with no active generation.
++#[tokio::test]
++async fn mid_turn_parts_host_apply_post_old_rename_finishes_swap_and_installs() {
++    late_stage_swap_failure_reconciles_and_installs(
++        codex_lhc_host::SwapFailpoint::PostOldRename,
++        "post-old-rename",
++    )
++    .await;
++}
++
++/// M2 residual, `PostNewRenamePreReopen`: the new compacted generation is
++/// already the active file while memory/window state is still old. The
++/// compact stands (never rolled back) and the host completes its matching
++/// in-memory / window install before sampling continues.
++#[tokio::test]
++async fn mid_turn_parts_host_apply_post_new_rename_completes_install() {
++    late_stage_swap_failure_reconciles_and_installs(
++        codex_lhc_host::SwapFailpoint::PostNewRenamePreReopen,
++        "post-new-rename",
++    )
++    .await;
++}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
 index 0000000000..ade2f31b7d
@@ -9677,10 +10026,10 @@ index 0000000000..ade2f31b7d
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..2ebe81607f
+index 0000000000..21f3236f40
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3530 @@
+@@ -0,0 +1,3541 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -10109,6 +10458,7 @@ index 0000000000..2ebe81607f
 +    match attempt {
 +        LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::Cancelled { reason }
 +        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            // NoReduction is fine; other hard stops also fine for tiny seed.
@@ -10175,6 +10525,7 @@ index 0000000000..2ebe81607f
 +            }
 +            LhcCompactAttempt::Failed { reason }
 +            | LhcCompactAttempt::Unavailable { reason }
++            | LhcCompactAttempt::RolloutUnreconciled { reason }
 +            | LhcCompactAttempt::Cancelled { reason }
 +            | LhcCompactAttempt::MidTurnSkipped { reason }
 +            | LhcCompactAttempt::MidTurnBlocked { reason, .. }
@@ -10799,6 +11150,7 @@ index 0000000000..2ebe81607f
 +        }
 +        LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::Cancelled { reason }
 +        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            assert!(!reason.is_empty(), "hard-stop reason should be non-empty");
@@ -11162,6 +11514,8 @@ index 0000000000..2ebe81607f
 +            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
 +            LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
++            LhcCompactAttempt::RolloutUnreconciled { reason } =>
++                format!("RolloutUnreconciled({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
 +            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -11337,6 +11691,8 @@ index 0000000000..2ebe81607f
 +            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
 +            LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
++            LhcCompactAttempt::RolloutUnreconciled { reason } =>
++                format!("RolloutUnreconciled({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
 +            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -11453,6 +11809,8 @@ index 0000000000..2ebe81607f
 +            LhcCompactAttempt::Installed { body, .. } => format!("Installed({} items)", body.len()),
 +            LhcCompactAttempt::Failed { reason } => format!("Failed({reason})"),
 +            LhcCompactAttempt::Unavailable { reason } => format!("Unavailable({reason})"),
++            LhcCompactAttempt::RolloutUnreconciled { reason } =>
++                format!("RolloutUnreconciled({reason})"),
 +            LhcCompactAttempt::Cancelled { reason } => format!("Cancelled({reason})"),
 +            LhcCompactAttempt::MidTurnSkipped { reason } => format!("MidTurnSkipped({reason})"),
 +            LhcCompactAttempt::ContinuedWithoutCompact { reason } =>
@@ -11474,6 +11832,7 @@ index 0000000000..2ebe81607f
 +        }
 +        LhcCompactAttempt::Failed { .. }
 +        | LhcCompactAttempt::Unavailable { .. }
++        | LhcCompactAttempt::RolloutUnreconciled { .. }
 +        | LhcCompactAttempt::Cancelled { .. }
 +        | LhcCompactAttempt::ContinuedWithoutCompact { .. } => {}
 +        LhcCompactAttempt::MidTurnSkipped { .. } | LhcCompactAttempt::MidTurnBlocked { .. } => {
@@ -12877,6 +13236,7 @@ index 0000000000..2ebe81607f
 +        }
 +        LhcCompactAttempt::Failed { reason }
 +        | LhcCompactAttempt::Unavailable { reason }
++        | LhcCompactAttempt::RolloutUnreconciled { reason }
 +        | LhcCompactAttempt::ContinuedWithoutCompact { reason } => {
 +            let history_after = sess.clone_history().await.into_raw_items();
 +            assert!(
