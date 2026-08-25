@@ -2,33 +2,46 @@
 > [`openai/codex`](https://github.com/openai/codex).**
 >
 > **Codex + LHC** keeps the full transcript of a session and serves
-> **long-horizon views** with a smooth fidelity ramp: recent work verbatim,
-> older work progressively compressed, and the original record preserved
-> underneath. The ambition is coherent, crisp work across histories on the
-> scale of **tens of millions of tokens**, not only until the first context
-> cliff.
+> **long-horizon views** with a fidelity ramp: recent work verbatim, older work
+> progressively compressed, and the original record preserved underneath.
 >
 > Compressed spans carry stable turn and message IDs. When a thin view is not
-> enough, Codex can call **`get_turns`** or **`get_messages`** to pull the
-> high-fidelity source back into the working context by ID.
+> enough, Codex can call **`get_turns`** or **`get_messages`** to retrieve the
+> exact source by ID.
 >
 > Built on [**LHC (Long Horizon Context)**](https://github.com/liminal-ai/long-horizon-context).
 > Product branch **`lhc`**; **`main`** tracks upstream only.
 >
-> - [**What this fork is**](lhc-docs/README.md) — purpose, LHC concepts, and
->   how it is integrated.
-> - [**Install & use**](lhc-docs/INSTALL.md) — build, configure, and verify from
->   source.
+> - [**What this fork is**](lhc-docs/README.md) — behavior, LHC concepts, and
+>   the Codex integration.
+> - [**Install & use**](lhc-docs/INSTALL.md) — release installation, updates,
+>   source builds, storage, and verification.
+> - [**Current release notes**](https://github.com/liminal-ai/codex-lhc/releases/latest)
+>   — changes, compatibility, packages, and checksums.
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the
 >   shared engine and design.
 >
-> Fork releases publish **Linux x86-64, Windows x86-64, and Apple Silicon macOS**
-> artifacts from the same source identity. The installer chooses `codex` when no
-> Codex command exists and `codex-lhc` for a side-by-side install; see
-> [Install & use](lhc-docs/INSTALL.md). Official Codex installers and
-> `openai/codex` releases do **not** include LHC.
+> Install the latest fork release on Linux or macOS:
 >
-> Everything below is upstream's README.
+> ```sh
+> curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh
+> sh install.sh
+> ```
+>
+> On Windows PowerShell:
+>
+> ```powershell
+> Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1 -OutFile install.ps1
+> .\install.ps1
+> ```
+>
+> Releases provide **Linux x86-64/ARM64, Windows x86-64/ARM64, and Apple
+> Silicon macOS** packages from one source identity. The installer uses `codex`
+> when no Codex command exists and `codex-lhc` for a side-by-side install.
+> Official Codex installers and `openai/codex` releases do **not** include LHC.
+>
+> Everything below is upstream's README. Its install commands install stock
+> Codex, not Codex + LHC.
 
 <p align="center"><strong>Codex CLI</strong> is a coding agent from OpenAI that runs locally on your computer.
 <p align="center">

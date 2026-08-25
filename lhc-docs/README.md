@@ -1,49 +1,40 @@
 # codex-lhc — what this fork is
 
 **Codex + LHC** is a maintained fork of
-[`openai/codex`](https://github.com/openai/codex) with better long-horizon
-context management.
+[`openai/codex`](https://github.com/openai/codex) that integrates Long Horizon
+Context (LHC).
 
 It keeps the **full transcript** of a session and serves **long-horizon
-views**: recent work stays verbatim, older work is progressively compressed,
-and the transition between them is a smooth ramp rather than one destructive
-summary boundary. The goal is coherent, crisp work across histories on the
-order of **tens of millions of tokens**, not only until the first context
-window fills.
+views**. Recent work stays verbatim. Older work is progressively compressed.
+The full record remains available underneath each view.
 
 Every compressed span remains addressable. Stable turn and message IDs let
-Codex pull the high-fidelity source back with `get_turns` and `get_messages`
-when a thin view only sketches something it needs.
+Codex retrieve the exact source with `get_turns` and `get_messages` when a
+compressed view does not contain enough detail.
 
 The shared engine is
 [**LHC (Long Horizon Context)**](https://github.com/liminal-ai/long-horizon-context).
 This repository is its Codex host.
 
-This page is for someone deciding whether the fork is interesting: what
-problem it attacks, the LHC concepts you need to read the code, and how LHC
-is wired into Codex. For the maintenance contract — touchpoint inventory,
-laws, tripwire, sync and recovery drills — see [`FORK.md`](../FORK.md).
+This page explains the problem, the LHC concepts used by the fork, and how LHC
+is integrated into Codex. For the maintenance contract — touchpoint inventory,
+tripwire, sync, and recovery drills — see [`FORK.md`](../FORK.md).
 
 Install: [Install & use](INSTALL.md).
 
 ---
 
-## Why it matters
+## Why it exists
 
-An agent's context window is finite, so every long session eventually has to
-throw something away. The usual answer is to summarize the older part of the
-conversation into a block of prose and drop the originals. That works once.
-Done repeatedly it compounds: summaries get summarized, detail that mattered
-is gone with no way back, and the agent's sense of the session degrades
-sharply somewhere in the first day of work.
+An Agent's context window is finite. Long sessions must eventually reduce the
+history sent to the model. A conventional compact replaces older history with
+one summary and removes the original content from the working context.
+Repeated compaction can reduce detail further because summaries become inputs
+to later summaries.
 
-The result is memory with a cliff. Everything up to the compact is sharp,
-everything before it is a paragraph, and nothing in between.
-
-This fork's bet is simple: **retain the trail, show a ramp, and pull exact
-evidence on demand**. It is plausible if you already feel the cliff in
-multi-day work; it is skippable if you only run short, self-contained
-sessions.
+LHC instead keeps the canonical record, serves older material at several
+fidelity levels, and leaves stable addresses that can retrieve exact history.
+Short sessions may not need this additional storage and context machinery.
 
 ## What LHC does instead
 
@@ -62,14 +53,13 @@ fidelity tiers called **bands**, oldest to newest:
 | **smooth** | turn renderings at full texture | high |
 | *(live tail)* | everything since the compact point, verbatim | full |
 
-Recent work reads verbatim. Work from earlier today reads as smooth prose
-that still carries texture. Yesterday is detailed summary. Last week is a
-line about what came of it. Each compact re-ranks the whole thread down the
-ramp, so material ages continuously rather than falling off an edge.
+Placement depends on the context budget and the size of the stored material,
+not on wall-clock age. The live tail stays verbatim. Newer closed Turns use
+higher-fidelity representations when they fit. Older chunks move through the
+detailed and brief bands as space becomes tighter.
 
-That shape is the point: it degrades the way human memory of a project
-degrades — over days and weeks, not hours — and it stays honest, because the
-full record is still there underneath and every band is rebuildable from it.
+Each band is derived from the canonical record and can be rebuilt. Compact
+changes the served view. It does not replace the stored transcript.
 
 ---
 
@@ -91,11 +81,9 @@ Results are wrapped as historical material, so old prompts are evidence under
 discussion rather than fresh instructions. IDs survive compaction because
 they belong to the durable record, not to a particular rendered view.
 
-In this fork's own long certification and stewardship threads, that changed
-the recovery pattern materially: after compaction, Codex could reopen an old
-validator exchange by turn ID, then pull the exact original message when the
-turn rendering was not enough. It did not have to trust a regenerated summary
-or ask the user to restate the past.
+After compaction, Codex can retrieve a complete historical Turn by ID and then
+retrieve one exact message if the Turn-level representation is not sufficient.
+The user does not need to restate content that remains in the canonical record.
 
 ## What you get in practice
 
@@ -105,7 +93,7 @@ or ask the user to restate the past.
 | Fidelity ramp | Oldest material is brief; recent work keeps texture; the live tail is verbatim |
 | Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
 | Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
-| Failure behavior | PreTurn/manual: fail open to native ladder. MidTurn (in-task rollover) with LHC on: one writer — refuse/skip, never silent native fallback |
+| Failure behavior | PreTurn/manual can continue down the native compact ladder when LHC is unavailable. MidTurn uses LHC as the single writer: safe transient failures keep the current body for a later seam; cancellation or an unproven rollout state can stop the next request; there is no silent native fallback |
 | Current default | Capture on; set `lhc_capture = false` only for troubleshooting |
 
 ## What this fork is not
@@ -154,9 +142,16 @@ queued background work.
 assistant text and thinking, tool calls and results, model changes, turn
 markers. LHC records these into the thread.
 
-**Turns and chunks.** A turn is one full exchange: a prompt plus everything
-that follows it. Chunks are groups of turns, and they are what the summary
-bands are built over.
+**Turns and chunks.** A Turn is one unit of Agent work: its opening prompt,
+provider request/response cycles, tool activity, in-run steering, and terminal
+response. Chunks are groups of closed Turns used by the summary bands.
+
+**Steps and turn parts.** A step is one completed provider request/response
+cycle. LHC records step edges for assistant text, thinking, tool calls, and tool
+results. When an active Turn is too large to keep whole, a compact can represent
+an older step range as a turn part while keeping later steps verbatim. A tool
+call and its result are never split. After the Turn closes, LHC rebuilds its
+whole-Turn representation from canonical messages.
 
 **Stable addresses.** Turns and messages receive IDs in the durable record.
 Rendered views keep those IDs visible so retrieval can move from a broad turn
@@ -184,15 +179,17 @@ process — there is no daemon.
 during the session, spread across turns, so that by the time a compact is
 needed the material it needs already exists.
 
-**Smart compact.** The operation that produces a new thread view: it takes a
-token target and per-band percentages and arranges turns and chunks into
-bands. **Compact never calls a model** — it assembles from derivations that
-already exist. Missing material degrades an entry to a cruder rung; damage
-to the record itself makes compact refuse rather than write a bad view.
+**Smart compact.** The operation that produces a new thread view. It takes a
+token target and per-band percentages and arranges Turns and chunks into
+bands. For an active oversized Turn, it can also install turn parts at recorded
+step edges. **Compact never calls a model**. It assembles from derivations that
+already exist. Missing material can use a lower-fidelity representation. A
+structural problem with the record makes compact refuse rather than install an
+unproven view.
 
-That last point explains the fork's whole cadence design. Compaction is
-cheap and fast *if* derivation kept up during the session. If it didn't,
-compaction doesn't get slow — it gets degraded, or declines.
+Compaction is fast when background derivation has prepared the required
+representations. If derivation has not kept up, the new view can contain lower-
+fidelity material or the compact can decline.
 
 ---
 
@@ -206,13 +203,15 @@ survive upstream merging into it indefinitely.
 ```
 codex-rs/lhc/
   vendor/long-horizon-context/   LHC itself (submodule, pinned)
-  codex-lhc-host/                the adapter — ALL LHC logic lives here
+  codex-lhc-host/                host mapping, storage, and rollout adapter
   goldens/                       capture mapping fixtures
 ```
 
-Core touchpoints never contain LHC logic. They call into the adapter crate
-and nothing else. Every one is marked with an `LHC-HOOK` comment and listed
-in `FORK.md`'s touchpoint inventory; the tripwire counts them.
+Codex core owns the lifecycle seams that decide when capture, compact,
+retrieval, and rollout installation occur. The adapter owns LHC-specific event
+mapping, SDK calls, storage access, and rollout operations. Every core
+touchpoint is marked with an `LHC-HOOK` comment and listed in `FORK.md`; the
+tripwire verifies that inventory.
 
 ### Three seams
 
@@ -236,14 +235,22 @@ Codex proceeds down its native ladder. Failure paths (derivation not ready,
 inference failure, no token reduction, cancellation) fail open. There is no
 path that produces placeholder or partial content.
 
-**MidTurn (LIM-63B compact-continuation):** when a long agentic turn crosses
-the context threshold between provider requests, LHC owns the seam as the
-**single writer**. Pending tool-result continuation keeps the call/result
-pair verbatim (no marker). Active non-tool continuation forces a
-`context_compact_continue` boundary, installs one typed marker, and continues
-the same task. With LHC enabled, MidTurn does **not** silently fall open to
-native compaction — refuse/skip residuals leave the prior view intact and
-may block the next provider request when required.
+**MidTurn (turn parts):** when an active Turn crosses the context threshold,
+Codex waits for a settled seam between provider requests. The current model
+response must be complete, requested tools must be settled, capture must be
+flushed, and no next provider request may have started.
+
+At that seam, LHC can compact the active Turn at recorded step edges. The
+canonical Turn does not close. Later steps remain verbatim, tool call/result
+pairs stay together, and in-run steering remains in the same Turn. No synthetic
+continuation Turn or boundary marker is created for a turn-parts thread.
+
+Threads that already used the older forced-boundary continuation path retain
+that compatibility path. A thread with turn parts does not use the old runtime.
+MidTurn has one writer and never silently falls through to native Codex
+compaction. Safe transient failures preserve the current body and can retry at
+a later settled seam. Cancellation, abort, or a rollout state that cannot be
+proved can stop the next provider request.
 
 **3. Retrieval** — while capture is active, the extension registry exposes
 `get_turns` and `get_messages` as direct typed tools. They resolve the current
@@ -270,9 +277,9 @@ Four mechanisms keep the fork honest, all enforced by
 - **`patches/lhc/`** — the entire fork diff as a re-appliable series from
   one recorded upstream base, with the gate applying it at that base and
   requiring byte-identity with the working tree.
-- **Tripwire** — 13 layers: sentinel count, vendor pin cleanliness, cross-crate
-  compile, five test suites, fmt, clippy, goldens, the patch drill, and an
-  upstream-test-breakage check.
+- **Tripwire** — sentinel count, vendor pin cleanliness, cross-crate compile,
+  host and core tests, MidTurn and sustained-loop tests, fmt, clippy, goldens,
+  the patch drill, and upstream-test-breakage checks.
 
 Upstream is merged in (not rebased onto), so fork commits stay stable and
 `git diff upstream/main...HEAD` is always the live answer to "what's
@@ -282,8 +289,13 @@ different here."
 
 ## Status
 
-Capture, background derivation, banded compact/write-back, resume, and stable-ID
-retrieval are integrated and gated. The full tripwire covers the host seams,
-the certified SDK, rollout reconstruction, model-visible retrieval output,
-and patch reproduction. Capture is on by default in product releases; see
-[Install & use](INSTALL.md) for storage, side-by-side, and disable guidance.
+Capture, background derivation, banded compact/write-back, turn-parts MidTurn
+Compact, resume, and stable-ID retrieval are integrated and gated. Product
+releases use LHC thread schema 12. Opening schema-11 state migrates it to schema
+12; downgrade to a schema-11 binary is unsupported after migration.
+
+The tripwire covers the host seams, certified SDK, step capture, turn-parts and
+legacy-thread exclusivity, rollout reconstruction and interrupted-swap
+recovery, model-visible retrieval output, and patch reproduction. Capture is on
+by default in product releases. See [Install & use](INSTALL.md) for release
+installation, migration, storage, side-by-side commands, and troubleshooting.

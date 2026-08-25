@@ -8,15 +8,49 @@ for the maintenance contract.
 
 ---
 
-## Release install (Linux x86-64/ARM64 and Apple Silicon macOS)
+## Release install
 
-Download the installer from the latest published release, inspect it, then
-run it. The installer resolves that same release when `--version` is omitted:
+The [latest release](https://github.com/liminal-ai/codex-lhc/releases/latest)
+contains release notes, checksums, a provenance manifest, installers, and all
+five native packages.
+
+### Linux and macOS
+
+Download the installer, inspect it, then run it. Without `--version`, the
+installer resolves the latest published release:
 
 ```bash
 curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh
 sh install.sh
 ```
+
+To install a specific release:
+
+```bash
+sh install.sh --version 0.149.1
+```
+
+Supported release targets are Linux x86-64/ARM64 and Apple Silicon macOS.
+
+### Windows
+
+Run these commands in PowerShell:
+
+```powershell
+Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1 -OutFile install.ps1
+.\install.ps1
+```
+
+To install a specific release:
+
+```powershell
+.\install.ps1 -Version 0.149.1
+```
+
+The installer selects the Windows x86-64 or ARM64 package from the process
+architecture.
+
+### Command name and managed updates
 
 The default command name is deliberate:
 
@@ -25,41 +59,81 @@ The default command name is deliberate:
 | no `codex` found | `codex` — Codex + LHC becomes the primary Codex |
 | `codex` already exists | `codex-lhc` — stock and LHC builds remain side by side |
 
-Choose another name or prefix explicitly:
+Choose another name or prefix explicitly on Linux or macOS:
 
 ```bash
 sh install.sh --name codex-memory
 sh install.sh --prefix /opt/codex-lhc
 ```
 
-Re-running the installer updates the managed package and prints both the fork
-version transition and the newly installed LHC SDK commit. It does not replace
-an unrelated command. Uninstall the selected managed command with:
+On Windows:
+
+```powershell
+.\install.ps1 -Name codex-memory
+.\install.ps1 -Prefix C:\Tools\CodexLHC
+```
+
+Re-running the installer updates the managed package. The Unix installer
+prints the fork version transition and installed LHC SDK commit. Neither
+installer replaces an unrelated command.
+
+Uninstall an installer-managed command on Linux or macOS:
 
 ```bash
 sh install.sh --name codex-lhc --uninstall
 ```
 
+On Windows:
+
+```powershell
+.\install.ps1 -Name codex-lhc -Uninstall
+```
+
 Uninstall removes only installer-owned packages and command links. It preserves
-`~/.codex` and LHC archives.
+Codex configuration and LHC archives.
 
 For published releases, **re-running this fork installer is the supported
-update path**.
-Do not use upstream's `codex update`: that channel belongs to official OpenAI
-builds and cannot preserve the LHC integration. A fork-aware in-product updater
-is release follow-up work; it must report both the Codex-LHC version and LHC SDK
-pin before it replaces anything.
+update path**. Do not use upstream's `codex update`: that channel installs
+official OpenAI builds without LHC.
+
+## Upgrade and compatibility
+
+The current `v0.149.1` release advances LHC thread schema from 11 to 12.
+
+> **One-way migration:** opening schema-11 state with `v0.149.1` migrates it to
+> schema 12. After migration, downgrade to `v0.149.0` is unsupported.
+
+The bounded selector is the default. To run the legacy eager selector on Linux
+or macOS:
+
+```bash
+LHC_COMPACT_ALGORITHM=legacy codex-lhc
+```
+
+On Windows PowerShell:
+
+```powershell
+$env:LHC_COMPACT_ALGORITHM = "legacy"
+codex-lhc
+```
+
+This setting changes compact selection. It does not reverse a schema migration
+or make schema-12 state compatible with `v0.149.0`.
+
+Threads that already used the older forced-boundary MidTurn path retain that
+compatibility behavior. New turn-parts threads do not switch between the old
+and new MidTurn mechanisms.
 
 > **Disk usage:** LHC retains the full transcript plus derived views in local
 > SQLite archives. Long-running sessions can use substantially more disk space
 > than stock Codex. The default archive root is `~/.codex/lhc/`; set
 > `CODEX_LHC_ROOT` to place it on another volume.
 
-Release assets include `SHA256SUMS` and `release-manifest.json`, which pin the
-fork source commit, upstream base, LHC SDK commit, target, and capture default.
-The current release lane publishes canonical packages for Linux x86-64/ARM64,
-Windows x86-64/ARM64, and Apple Silicon macOS from the same source identity.
-Build from source on other architectures.
+Release assets include `SHA256SUMS` and `release-manifest.json`. They record the
+fork source commit, upstream base, LHC SDK commit, thread schema, target, and
+capture default. Releases publish packages for Linux x86-64/ARM64, Windows
+x86-64/ARM64, and Apple Silicon macOS from the same source identity. Build from
+source on other architectures.
 
 ## Build from source
 
