@@ -221,6 +221,7 @@ pub use rollout_reconcile::regenerate_rollout_from_thread;
 pub use rollout_reconcile::rollout_reopen_receipt_path;
 pub use rollout_reconcile::write_rollout_reopen_failure_receipt;
 pub use rollout_swap::SwapFailpoint;
+pub use rollout_swap::SwapGenerations;
 pub use rollout_swap::SwapPaths;
 pub use rollout_swap::SwapReconciliation;
 pub use rollout_swap::SwapState;
@@ -230,6 +231,7 @@ pub use rollout_swap::history_from_materialized_items;
 pub use rollout_swap::model_context_token_estimate_from_rollout_items;
 pub use rollout_swap::parse_rollout_items;
 pub use rollout_swap::reconcile_interrupted_swap;
+pub use rollout_swap::strict_read_generation;
 pub use session::encode_thread_id_for_path;
 pub use session::thread_file_path;
 

@@ -4470,14 +4470,16 @@ async fn late_stage_swap_failure_reconciles_and_installs(
         !paths.temp.exists(),
         "{point:?}: no rewrite temp file remains"
     );
+    // Exactly one active generation, proven strictly: every row is a complete
+    // rollout line and exactly one is the compact boundary.
+    let rows = codex_lhc_host::strict_read_generation(&rollout_path)
+        .unwrap_or_else(|err| panic!("{point:?}: active must strictly parse: {err}"));
     assert_eq!(
-        codex_lhc_host::classify_swap_state(&rollout_path, &|items| {
-            items
-                .iter()
-                .any(|item| matches!(item, codex_history::RolloutItem::Compacted(_)))
-        }),
-        codex_lhc_host::SwapState::NewActive,
-        "{point:?}: exactly one active generation, the compacted one"
+        rows.iter()
+            .filter(|row| row.get("type").and_then(|t| t.as_str()) == Some("compacted"))
+            .count(),
+        1,
+        "{point:?}: exactly one compact boundary in the active generation"
     );
     let receipts =
         codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
@@ -4582,4 +4584,172 @@ async fn mid_turn_parts_host_apply_post_new_rename_completes_install() {
         "post-new-rename",
     )
     .await;
+}
+
+/// M2 residual (generation proof): when the interrupted swap is repaired but
+/// the repair's directory sync fails, authority is unproven — the production
+/// arm returns `RolloutUnreconciled`, strict dispatch denies the next
+/// provider request (`UnsupportedOperation`, never abort-by-native, never
+/// compact-continuation), the served body is untouched, no forced-boundary
+/// evidence exists, and a later clean seam re-establishes one authority and
+/// installs.
+#[tokio::test]
+async fn mid_turn_parts_host_apply_unproven_repair_sync_denies_sampling() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let rollout_path = super::slice_d_tests::attach_rollout(&mut session).await;
+    let paths = codex_lhc_host::SwapPaths::for_rollout(&rollout_path);
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 4).await;
+    seed_stepped_active_turn(&session, &tc, 6).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let sess = Arc::new(session);
+    let tc = Arc::new(tc);
+    sess.flush_rollout().await.expect("flush rollout");
+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let disk_before = std::fs::read(&rollout_path).expect("rollout before");
+    let points = [
+        codex_lhc_host::SwapFailpoint::PostOldRename,
+        codex_lhc_host::SwapFailpoint::ReconcileDirSync,
+    ];
+
+    // Seam 1: the arm reports the exact unproven state and preserves the body.
+    let guard = codex_lhc_host::SwapFailpointGuard::arm_all(&points);
+    let first = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "unproven-sync-1",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    drop(guard);
+    let LhcCompactAttempt::RolloutUnreconciled { reason } = first else {
+        panic!("unproven repair sync must be RolloutUnreconciled, got {first:?}");
+    };
+    assert!(reason.contains("directory sync failed"), "{reason}");
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        super::response_items_structurally_equal(&history_after, &history_before),
+        "served body untouched"
+    );
+    assert_eq!(
+        std::fs::read(&paths.prev).expect("prev"),
+        disk_before,
+        "prior generation retained byte-exactly at .prev"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "no compact-continuation receipt: {receipts:?}"
+    );
+    assert!(
+        codex_lhc_host::inspect_pending_compact_continuation_boundary(
+            &thread_id,
+            Some(root.as_path())
+        )
+        .await
+        .expect("pending boundary")
+        .is_none(),
+        "no forced-boundary row"
+    );
+
+    // Seam 2: strict dispatch under the same state denies the next provider
+    // request with the exact reason — not an abort, not native.
+    advance_one_cycle(&sess, &tc, &handle, "unproven-sync-2").await;
+    let history_pre_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let epoch = decision_epoch(&sess);
+    let step = crate::session::step_context::StepContext::for_test(Arc::clone(&tc));
+    let mut client = inert_model_client_session();
+    let guard = codex_lhc_host::SwapFailpointGuard::arm_all(&points);
+    let strict = run_auto_compact(
+        &sess,
+        step,
+        /*fallback*/ None,
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "unproven-sync-3",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await;
+    drop(guard);
+    let err = strict.expect_err("strict dispatch must deny sampling on an unproven rollout");
+    assert!(
+        matches!(
+            err.details(),
+            CodexErrorDetails::UnsupportedOperation(message) if message.contains("unreconciled")
+        ),
+        "deny is an explicit unsupported-operation, got {err:?}"
+    );
+    let history_strict: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        super::response_items_structurally_equal(&history_strict, &history_pre_strict),
+        "served body still untouched after the deny"
+    );
+
+    // Later clean seam: one authority re-established, install completes.
+    advance_one_cycle(&sess, &tc, &handle, "unproven-sync-4").await;
+    let later = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "unproven-sync-5",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    let LhcCompactAttempt::Installed { body, .. } = later else {
+        panic!("clean seam must install, got {later:?}");
+    };
+    let history_later: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert!(
+        super::response_items_structurally_equal(&history_later, &body),
+        "the session serves the installed body"
+    );
+    assert_memory_matches_active_rollout(&history_later, &rollout_path, "clean seam");
+    assert!(!paths.temp.exists(), "no rewrite temp file remains");
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(receipts.is_empty(), "still no compact-continuation receipt");
 }

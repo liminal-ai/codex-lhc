@@ -715,27 +715,47 @@ No synthetic continuation turn, no forced-boundary marker.
   binding untouched (only a forced-boundary continuation re-binds).
   `full_loop_in_run_steer_stays_in_task_turn`.
 - **Host apply after an SDK parts install retries later — after the swap
-  state is reconciled.** When the SDK has installed the parts view but the
-  host materialize / rollout rewrite does not complete, the arm first reads
-  the actual on-disk swap state under its own one-writer authority
-  (`codex_lhc_host::reconcile_interrupted_swap`, synchronous, same arm) and
-  establishes exactly one authoritative active generation before deciding:
-  old still active (`PostTempWrite`/`PostFsync` class) → prior body and
-  rollout stand, `MidTurnBlocked { next_provider_request_allowed: true }`,
-  retry at the next seam; old moved to `.prev` with the complete new
-  generation at `.rewrite-tmp` (`PostOldRename` class) → the swap is
-  finished (`tmp → active`) and the host completes its in-memory / window
-  install against it (`Installed`); new generation already active
-  (`PostNewRenamePreReopen` / post-rename directory fsync) → the compact
-  stands, never rolled back, host install completed (`Installed`); old
-  moved but the new generation incomplete → `.prev` restored, retry later;
-  no single authority establishable → `RolloutUnreconciled` denies further
-  sampling with the exact state (history preserved). Never native, never
-  compact-continuation; cancellation/abort and `RolloutUnreconciled` are
-  the only denies. `mid_turn_parts_host_apply_failure_retries_at_later_seam`
-  (old active), `mid_turn_parts_host_apply_post_old_rename_finishes_swap_and_installs`,
-  `mid_turn_parts_host_apply_post_new_rename_completes_install`, host
-  `reconcile_interrupted_swap_establishes_one_active_generation`.
+  state is reconciled against exact generation identities.** When the SDK
+  has installed the parts view but the host materialize / rollout rewrite
+  does not complete, the arm first reads the actual on-disk swap state under
+  its own one-writer authority (`codex_lhc_host::reconcile_interrupted_swap`,
+  synchronous, same arm) and establishes exactly one authoritative active
+  generation before deciding. Both generations are identified exactly
+  (`SwapGenerations`): the *prior* generation is the byte content of the
+  authoritative active file captured after the final flush immediately
+  before the swap (`.prev` is that inode renamed, so only a byte-exact match
+  proves it; an unreadable file there means no swap is attempted and the
+  seam retries); the *new* generation is the ordered wire content the swap
+  wrote, proven by `strict_read_generation` — every row a complete rollout
+  line, nothing skipped, exact row count/order, each row's item object equal
+  to the expected item's wire form. The tolerant `parse_rollout_items`
+  never establishes authority. Dispositions: old still active
+  (`PostTempWrite`/`PostFsync` class) → prior body and rollout stand,
+  `MidTurnBlocked { next_provider_request_allowed: true }`, retry at the
+  next seam; old moved to `.prev` with the proven new generation at
+  `.rewrite-tmp` (`PostOldRename` class) → the swap is finished
+  (`tmp → active`, directory sync proven) and the host completes its
+  in-memory / window install against it (`Installed`); new generation
+  already active (`PostNewRenamePreReopen` / post-rename directory fsync) →
+  the compact stands, never rolled back, host install completed
+  (`Installed`); old moved and tmp unproven → `.prev` restored only when it
+  proves the prior generation byte-exactly (directory sync proven), retry
+  later; anything else — foreign or torn active, foreign/torn `.prev`,
+  unproven tmp with no proven prior, or a repair rename whose directory sync
+  failed — → `RolloutUnreconciled` denies further sampling with the exact
+  state (history preserved; nothing promoted, restored, or guessed). Never
+  native, never compact-continuation; cancellation/abort and
+  `RolloutUnreconciled` are the only denies.
+  `mid_turn_parts_host_apply_failure_retries_at_later_seam` (old active),
+  `mid_turn_parts_host_apply_post_old_rename_finishes_swap_and_installs`,
+  `mid_turn_parts_host_apply_post_new_rename_completes_install`,
+  `mid_turn_parts_host_apply_unproven_repair_sync_denies_sampling`; host
+  `reconcile_interrupted_swap_establishes_one_active_generation`,
+  `reconcile_interrupted_swap_refuses_unproven_generations`. Foreign/torn
+  active or `.prev` cannot be produced through the arm under one-writer
+  authority (the arm snapshots and swaps in one critical section; `.prev`
+  is the renamed prior inode), so those refusals are proven at the exact
+  reconciliation function the arm calls.
 - **Truthful seam.** A capture flush that does not complete within its bound
   is not a settled seam: keep the body, retry later — never assert a false
   fact (supersedes the LIM-63B "warn and continue" behavior).

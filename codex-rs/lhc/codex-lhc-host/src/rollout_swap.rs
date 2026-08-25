@@ -40,10 +40,33 @@
 //! cannot repair instead of guessing. It runs synchronously in the caller's
 //! one-writer context (the compact arm that owns the thread), never from a
 //! second writer.
+//!
+//! Both generations are identified **exactly** ([`SwapGenerations`]), never
+//! by "parses and contains the boundary":
+//!
+//! * the **old** generation is the exact byte content of the authoritative
+//!   active file immediately before the swap (captured by the caller after
+//!   its final flush). `P.prev` is that same inode renamed, so a byte-exact
+//!   match is the only proof that a file *is* the prior generation; any
+//!   extra, missing, or altered row fails it;
+//! * the **new** generation is the exact ordered wire content the swap wrote
+//!   (`items`), proven by [`strict_read_generation`]: every line must be a
+//!   complete JSON rollout line, nothing is skipped, the row count must
+//!   match, and each row's item object must equal the expected item's wire
+//!   form. The tolerant [`parse_rollout_items`] (which skips rows it cannot
+//!   read) is an operational reader and is never used to establish
+//!   authority.
+//!
+//! Anything that proves neither is `Unknown`/`Unreconciled`: it is never
+//! promoted, restored, or treated as old. A repair rename (`tmp → P` or
+//! `P.prev → P`) is only reported as established when the parent directory
+//! sync after it succeeds; a failed sync is reported as `Unreconciled` with
+//! the exact state, because the rename's durability is unproven.
 
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_history::CompactedItem;
+use codex_history::ROLLOUT_GENERATION_ID_FIELD;
 use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_history::RolloutOrdinalState;
@@ -59,8 +82,10 @@ use uuid::Uuid;
 
 // Injectable failpoints for crash-injection tests (`cfg(test)` / `test-util`).
 //
-// Values match [`SwapFailpoint`] discriminants. `0` = no injection.
-// Thread-local so parallel tests cannot inject failures into unrelated swaps.
+// A bit mask over [`SwapFailpoint`] discriminants (`1 << discriminant`); `0`
+// = no injection. A mask (not a single point) so a swap-stage failure and a
+// reconciliation-repair failure can be armed together. Thread-local so
+// parallel tests cannot inject failures into unrelated swaps.
 #[cfg(any(test, feature = "test-util"))]
 std::thread_local! {
     static SWAP_FAILPOINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -79,17 +104,17 @@ pub enum SwapFailpoint {
     PostOldRename = 3,
     /// After `tmp → P` (before the caller reopens the recorder).
     PostNewRenamePreReopen = 4,
+    /// Inside [`reconcile_interrupted_swap`]: the parent-directory sync after
+    /// a repair rename (`tmp → P` or `P.prev → P`) fails.
+    ReconcileDirSync = 5,
 }
 
 #[cfg(any(test, feature = "test-util"))]
 impl SwapFailpoint {
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::PostTempWrite,
-            2 => Self::PostFsync,
-            3 => Self::PostOldRename,
-            4 => Self::PostNewRenamePreReopen,
-            _ => Self::None,
+    fn bit(self) -> u8 {
+        match self {
+            Self::None => 0,
+            point => 1u8 << (point as u8),
         }
     }
 }
@@ -184,9 +209,108 @@ pub enum SwapState {
         prev_exists: bool,
         temp_exists: bool,
     },
-    /// `P` exists but is neither the old nor the recognised new generation
-    /// (torn or foreign content). Never repaired automatically.
+    /// `P` exists but proves neither the exact old nor the exact new
+    /// generation (torn, foreign, or altered content). Never repaired
+    /// automatically.
     Unknown { detail: String },
+}
+
+/// Exact identities of the two generations an interrupted swap moved between.
+#[derive(Debug, Clone, Copy)]
+pub struct SwapGenerations<'a> {
+    /// Exact bytes of the authoritative active file immediately before the
+    /// swap (after the caller's final flush); `None` when no active file
+    /// existed. `P.prev` is that inode renamed, so only a byte-exact match
+    /// proves a file is the prior generation.
+    pub prior_bytes: Option<&'a [u8]>,
+    /// The ordered items the swap wrote — the new generation's wire content.
+    pub new_items: &'a [RolloutItem],
+}
+
+/// Envelope keys the writer adds around each item's own wire object.
+const LINE_ENVELOPE_KEYS: [&str; 3] = ["timestamp", "ordinal", ROLLOUT_GENERATION_ID_FIELD];
+
+/// Strict, authority-grade read of one rollout generation: the file must be
+/// UTF-8, newline-terminated, and every line must be one complete JSON
+/// rollout line (envelope + item) — nothing is skipped or tolerated. Returns
+/// each line's item wire object (envelope keys removed), in file order, or
+/// the first violation with its line number.
+pub fn strict_read_generation(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("unreadable: {err}"))?;
+    let text = std::str::from_utf8(&bytes).map_err(|err| format!("not UTF-8: {err}"))?;
+    if text.is_empty() {
+        return Err("empty file".to_string());
+    }
+    if !text.ends_with('\n') {
+        return Err("last line is not newline-terminated (torn write)".to_string());
+    }
+    let mut rows = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let number = index + 1;
+        if line.trim().is_empty() {
+            return Err(format!("line {number}: blank line"));
+        }
+        // The typed decode validates the envelope and the item shape…
+        serde_json::from_str::<RolloutLine>(line)
+            .map_err(|err| format!("line {number}: not a rollout line: {err}"))?;
+        // …and the raw object is what gets compared, so an unknown or extra
+        // key (which a typed decode would silently drop) still fails.
+        let mut value: serde_json::Value =
+            serde_json::from_str(line).map_err(|err| format!("line {number}: not JSON: {err}"))?;
+        let Some(object) = value.as_object_mut() else {
+            return Err(format!("line {number}: not a JSON object"));
+        };
+        for key in LINE_ENVELOPE_KEYS {
+            object.remove(key);
+        }
+        rows.push(value);
+    }
+    Ok(rows)
+}
+
+/// Prove `path` is exactly the new generation `items` (see
+/// [`strict_read_generation`]): same row count, same order, each row's item
+/// wire object equal to the expected item's wire form.
+fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), String> {
+    let rows = strict_read_generation(path)?;
+    if rows.len() != items.len() {
+        return Err(format!(
+            "row count {} != expected new generation {}",
+            rows.len(),
+            items.len()
+        ));
+    }
+    for (index, (row, expected)) in rows.iter().zip(items.iter()).enumerate() {
+        let expected = serde_json::to_value(expected)
+            .map_err(|err| format!("expected item {index} unserializable: {err}"))?;
+        if *row != expected {
+            return Err(format!(
+                "line {}: item differs from the expected new generation",
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Prove `path` is exactly the prior generation: byte-identical to the
+/// authoritative active file captured before the swap.
+fn proves_old_generation(path: &Path, prior_bytes: Option<&[u8]>) -> Result<(), String> {
+    let Some(expected) = prior_bytes else {
+        return Err("no prior generation existed before the swap".to_string());
+    };
+    let bytes = std::fs::read(path).map_err(|err| format!("unreadable: {err}"))?;
+    if bytes.len() != expected.len() {
+        return Err(format!(
+            "{} bytes != prior generation {} bytes",
+            bytes.len(),
+            expected.len()
+        ));
+    }
+    if bytes != expected {
+        return Err("content differs from the prior generation".to_string());
+    }
+    Ok(())
 }
 
 /// What [`reconcile_interrupted_swap`] established.
@@ -209,14 +333,11 @@ pub enum SwapReconciliation {
     Unreconciled { detail: String },
 }
 
-/// Read the on-disk swap state of `rollout_path`. `is_new_generation` decides
-/// whether a parsed active file is the generation the caller just wrote (the
-/// caller knows its own boundary record); anything else that parses is taken
-/// as the old generation only when it still parses as a rollout.
-pub fn classify_swap_state(
-    rollout_path: &Path,
-    is_new_generation: &dyn Fn(&[RolloutItem]) -> bool,
-) -> SwapState {
+/// Read the on-disk swap state of `rollout_path`. The active file is old only
+/// when it proves the exact prior generation and new only when it proves the
+/// exact new generation ([`SwapGenerations`]); any other content is
+/// `Unknown`.
+pub fn classify_swap_state(rollout_path: &Path, generations: SwapGenerations<'_>) -> SwapState {
     let paths = SwapPaths::for_rollout(rollout_path);
     if !paths.active.exists() {
         return SwapState::NoActive {
@@ -224,37 +345,46 @@ pub fn classify_swap_state(
             temp_exists: paths.temp.exists(),
         };
     }
-    match parse_rollout_items(&paths.active) {
-        Ok(items) if is_new_generation(&items) => SwapState::NewActive,
-        Ok(items) if !items.is_empty() => SwapState::OldActive,
-        Ok(_) => SwapState::Unknown {
-            detail: format!(
-                "active rollout {} parses to no items",
-                paths.active.display()
-            ),
-        },
-        Err(err) => SwapState::Unknown {
-            detail: format!(
-                "active rollout {} unreadable: {err}",
-                paths.active.display()
-            ),
-        },
+    let old_reason = match proves_old_generation(&paths.active, generations.prior_bytes) {
+        Ok(()) => return SwapState::OldActive,
+        Err(reason) => reason,
+    };
+    let new_reason = match proves_new_generation(&paths.active, generations.new_items) {
+        Ok(()) => return SwapState::NewActive,
+        Err(reason) => reason,
+    };
+    SwapState::Unknown {
+        detail: format!(
+            "active rollout {} proves neither generation (old: {old_reason}; new: {new_reason})",
+            paths.active.display()
+        ),
+    }
+}
+
+/// Sync `parent` after a repair rename; a failure means the rename's
+/// durability is unproven.
+fn sync_repair(parent: Option<&Path>) -> std::io::Result<()> {
+    maybe_fail(SwapFailpoint::ReconcileDirSync)?;
+    match parent {
+        Some(parent) => fsync_dir(parent),
+        None => Ok(()),
     }
 }
 
 /// Establish exactly one authoritative active generation after
 /// [`atomic_rewrite_rollout`] returned an error (see the module docs).
 ///
-/// Only the two rename edges are repaired: `tmp → P` is finished when the new
-/// generation is complete (the temp file parses and `is_new_generation`
-/// accepts it), otherwise `P.prev → P` restores the old generation. Every
-/// other state is reported, never guessed.
+/// Only the two rename edges are repaired, and only onto proven files:
+/// `tmp → P` is finished when the temp file proves the exact new generation;
+/// otherwise `P.prev → P` restores the prior generation when `P.prev` proves
+/// it byte-exactly. A repair counts only once the directory sync after it
+/// succeeds. Every other state is reported, never guessed.
 pub fn reconcile_interrupted_swap(
     rollout_path: &Path,
-    is_new_generation: &dyn Fn(&[RolloutItem]) -> bool,
+    generations: SwapGenerations<'_>,
 ) -> SwapReconciliation {
     let paths = SwapPaths::for_rollout(rollout_path);
-    match classify_swap_state(rollout_path, is_new_generation) {
+    match classify_swap_state(rollout_path, generations) {
         SwapState::OldActive => SwapReconciliation::OldActive,
         SwapState::NewActive => SwapReconciliation::NewActive {
             finished_here: false,
@@ -265,80 +395,74 @@ pub fn reconcile_interrupted_swap(
             temp_exists,
         } => {
             let parent = paths.active.parent();
-            // Finish the intended swap when the new generation is complete.
-            if temp_exists {
-                let complete = matches!(
-                    parse_rollout_items(&paths.temp),
-                    Ok(items) if is_new_generation(&items)
-                );
-                if complete {
-                    match std::fs::rename(&paths.temp, &paths.active) {
-                        Ok(()) => {
-                            if let Some(parent) = parent
-                                && let Err(err) = fsync_dir(parent)
-                            {
-                                // The rename is durable-or-not independently of
-                                // this fsync; the active path is the new
-                                // generation either way.
-                                let _ = err;
-                            }
-                            return SwapReconciliation::NewActive {
+            // Finish the intended swap only onto a proven new generation.
+            let temp_proof = if temp_exists {
+                proves_new_generation(&paths.temp, generations.new_items)
+            } else {
+                Err("absent".to_string())
+            };
+            let mut temp_disposition = match temp_proof {
+                Ok(()) => match std::fs::rename(&paths.temp, &paths.active) {
+                    Ok(()) => {
+                        return match sync_repair(parent) {
+                            Ok(()) => SwapReconciliation::NewActive {
                                 finished_here: true,
-                            };
-                        }
-                        Err(err) => {
-                            if !prev_exists {
-                                return SwapReconciliation::Unreconciled {
+                            },
+                            Err(err) => SwapReconciliation::Unreconciled {
+                                detail: format!(
+                                    "finished tmp → {} but the directory sync failed ({err}); the new generation is in place without proven durability",
+                                    paths.active.display()
+                                ),
+                            },
+                        };
+                    }
+                    Err(err) => {
+                        format!("proven new generation at tmp but tmp → active failed: {err}")
+                    }
+                },
+                Err(reason) => format!("tmp does not prove the new generation: {reason}"),
+            };
+            // Restore only a byte-exact prior generation.
+            if prev_exists {
+                match proves_old_generation(&paths.prev, generations.prior_bytes) {
+                    Ok(()) => {
+                        return match std::fs::rename(&paths.prev, &paths.active) {
+                            Ok(()) => match sync_repair(parent) {
+                                Ok(()) => SwapReconciliation::RestoredOld {
                                     detail: format!(
-                                        "no active rollout at {}; finishing tmp → active failed ({err}) and no prior generation exists at {}",
-                                        paths.active.display(),
-                                        paths.prev.display()
+                                        "restored prior generation {} → {} ({temp_disposition})",
+                                        paths.prev.display(),
+                                        paths.active.display()
                                     ),
-                                };
-                            }
-                            // Fall through to restoring the old generation.
-                        }
+                                },
+                                Err(err) => SwapReconciliation::Unreconciled {
+                                    detail: format!(
+                                        "restored prev → {} but the directory sync failed ({err}); the prior generation is in place without proven durability",
+                                        paths.active.display()
+                                    ),
+                                },
+                            },
+                            Err(err) => SwapReconciliation::Unreconciled {
+                                detail: format!(
+                                    "no active rollout at {}; restoring the proven prior generation failed: {err} ({temp_disposition})",
+                                    paths.active.display()
+                                ),
+                            },
+                        };
+                    }
+                    Err(reason) => {
+                        temp_disposition.push_str(&format!(
+                            "; prev does not prove the prior generation: {reason}"
+                        ));
                     }
                 }
-            }
-            if prev_exists {
-                return match std::fs::rename(&paths.prev, &paths.active) {
-                    Ok(()) => {
-                        if let Some(parent) = parent {
-                            let _ = fsync_dir(parent);
-                        }
-                        SwapReconciliation::RestoredOld {
-                            detail: format!(
-                                "restored prior generation {} → {} (new generation {})",
-                                paths.prev.display(),
-                                paths.active.display(),
-                                if temp_exists {
-                                    "left incomplete at tmp"
-                                } else {
-                                    "absent"
-                                }
-                            ),
-                        }
-                    }
-                    Err(err) => SwapReconciliation::Unreconciled {
-                        detail: format!(
-                            "no active rollout at {}; restoring {} failed: {err}",
-                            paths.active.display(),
-                            paths.prev.display()
-                        ),
-                    },
-                };
+            } else {
+                temp_disposition.push_str("; no prev");
             }
             SwapReconciliation::Unreconciled {
                 detail: format!(
-                    "no active rollout at {}, no prior generation at {}, temp {}",
-                    paths.active.display(),
-                    paths.prev.display(),
-                    if temp_exists {
-                        "present but not the expected new generation"
-                    } else {
-                        "absent"
-                    }
+                    "no active rollout at {} ({temp_disposition})",
+                    paths.active.display()
                 ),
             }
         }
@@ -444,7 +568,15 @@ pub struct SwapFailpointGuard {
 #[cfg(any(test, feature = "test-util"))]
 impl SwapFailpointGuard {
     pub fn arm(point: SwapFailpoint) -> Self {
-        let previous = SWAP_FAILPOINT.with(|slot| slot.replace(point as u8));
+        let previous = SWAP_FAILPOINT.with(|slot| slot.replace(point.bit()));
+        Self { previous }
+    }
+
+    /// Arm several points at once (e.g. a swap stage plus a reconciliation
+    /// repair failure).
+    pub fn arm_all(points: &[SwapFailpoint]) -> Self {
+        let mask = points.iter().fold(0u8, |mask, point| mask | point.bit());
+        let previous = SWAP_FAILPOINT.with(|slot| slot.replace(mask));
         Self { previous }
     }
 }
@@ -458,7 +590,7 @@ impl Drop for SwapFailpointGuard {
 
 #[cfg(any(test, feature = "test-util"))]
 pub fn set_swap_failpoint(point: SwapFailpoint) {
-    SWAP_FAILPOINT.with(|slot| slot.set(point as u8));
+    SWAP_FAILPOINT.with(|slot| slot.set(point.bit()));
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -469,8 +601,8 @@ pub fn clear_swap_failpoint() {
 fn maybe_fail(point: SwapFailpoint) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-util"))]
     {
-        let active = SWAP_FAILPOINT.with(|slot| SwapFailpoint::from_u8(slot.get()));
-        if active == point && active != SwapFailpoint::None {
+        let mask = SWAP_FAILPOINT.with(std::cell::Cell::get);
+        if point != SwapFailpoint::None && mask & point.bit() != 0 {
             return Err(IoError::other(format!(
                 "injected swap failpoint: {point:?}"
             )));

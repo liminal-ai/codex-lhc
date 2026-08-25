@@ -512,16 +512,45 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
     assert_eq!(history[0], band);
 }
 
-fn is_new(items: &[RolloutItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(item, RolloutItem::Compacted(CompactedItem { message, .. }) if message == "boundary-new")
-    })
+/// Exact generations for a seed of `sample_items("old")` swapped to
+/// `sample_items("new")`: prior bytes captured from the active file before
+/// the swap, new items as written.
+struct Gens {
+    prior: Vec<u8>,
+    new_items: Vec<RolloutItem>,
+}
+
+impl Gens {
+    fn capture(path: &Path) -> Self {
+        Self {
+            prior: std::fs::read(path).expect("prior bytes"),
+            new_items: sample_items("new"),
+        }
+    }
+
+    fn as_swap(&self) -> SwapGenerations<'_> {
+        SwapGenerations {
+            prior_bytes: Some(self.prior.as_slice()),
+            new_items: &self.new_items,
+        }
+    }
+}
+
+fn assert_exact_new(path: &Path, gens: &Gens) {
+    let rows = strict_read_generation(path).expect("active strictly parses");
+    let expected: Vec<serde_json::Value> = gens
+        .new_items
+        .iter()
+        .map(|item| serde_json::to_value(item).unwrap())
+        .collect();
+    assert_eq!(rows, expected, "active must be exactly the new generation");
 }
 
 /// Interrupted-swap reconciliation establishes one authoritative active
 /// generation per injected stage: old still active (retry later), old moved
-/// with the complete new generation at tmp (finish the swap), new already
-/// active (nothing to move; caller completes its install).
+/// with the proven new generation at tmp (finish the swap), new already
+/// active (nothing to move; caller completes its install), old moved with an
+/// unproven tmp (restore the byte-exact prior), nothing provable (reported).
 #[test]
 fn reconcile_interrupted_swap_establishes_one_active_generation() {
     // PostTempWrite: old stays active, nothing moved.
@@ -530,40 +559,52 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
-        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
-        assert_eq!(classify_swap_state(&path, &is_new), SwapState::OldActive);
+        let gens = Gens::capture(&path);
+        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
         assert_eq!(
-            reconcile_interrupted_swap(&path, &is_new),
+            classify_swap_state(&path, gens.as_swap()),
+            SwapState::OldActive
+        );
+        assert_eq!(
+            reconcile_interrupted_swap(&path, gens.as_swap()),
             SwapReconciliation::OldActive
         );
-        assert_parseable_active(&path, "old");
+        assert_eq!(std::fs::read(&path).unwrap(), gens.prior);
     }
-    // PostOldRename: no active; the complete new generation at tmp is moved
+    // PostOldRename: no active; the proven new generation at tmp is moved
     // into place and the old generation stays at prev.
     {
         let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostOldRename);
         let dir = tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
-        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
+        let gens = Gens::capture(&path);
+        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
         assert_eq!(
-            classify_swap_state(&path, &is_new),
+            classify_swap_state(&path, gens.as_swap()),
             SwapState::NoActive {
                 prev_exists: true,
                 temp_exists: true
             }
         );
         assert_eq!(
-            reconcile_interrupted_swap(&path, &is_new),
+            reconcile_interrupted_swap(&path, gens.as_swap()),
             SwapReconciliation::NewActive {
                 finished_here: true
             }
         );
         let paths = SwapPaths::for_rollout(&path);
         assert!(!paths.temp.exists(), "tmp consumed by the finished swap");
-        assert!(paths.prev.exists(), "old generation retained at prev");
-        assert_eq!(classify_swap_state(&path, &is_new), SwapState::NewActive);
-        assert!(is_new(&parse_rollout_items(&path).expect("active parses")));
+        assert_eq!(
+            std::fs::read(&paths.prev).unwrap(),
+            gens.prior,
+            "old generation retained byte-exactly at prev"
+        );
+        assert_eq!(
+            classify_swap_state(&path, gens.as_swap()),
+            SwapState::NewActive
+        );
+        assert_exact_new(&path, &gens);
     }
     // PostNewRenamePreReopen: new already active; reconciliation moves nothing.
     {
@@ -571,35 +612,242 @@ fn reconcile_interrupted_swap_establishes_one_active_generation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
-        atomic_rewrite_rollout(&path, &sample_items("new")).expect_err("injected");
+        let gens = Gens::capture(&path);
+        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
         assert_eq!(
-            reconcile_interrupted_swap(&path, &is_new),
+            reconcile_interrupted_swap(&path, gens.as_swap()),
             SwapReconciliation::NewActive {
                 finished_here: false
             }
         );
-        assert!(is_new(&parse_rollout_items(&path).expect("active parses")));
+        assert_exact_new(&path, &gens);
     }
-    // Old moved, new generation incomplete at tmp: restore the old generation.
+    // Old moved, tmp unproven (torn): restore the byte-exact prior generation.
     {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         write_seed(&path, "old");
+        let gens = Gens::capture(&path);
         let paths = SwapPaths::for_rollout(&path);
         std::fs::rename(&paths.active, &paths.prev).unwrap();
         std::fs::write(&paths.temp, "{not a rollout line\n").unwrap();
-        let outcome = reconcile_interrupted_swap(&path, &is_new);
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         assert!(
             matches!(outcome, SwapReconciliation::RestoredOld { .. }),
             "{outcome:?}"
         );
-        assert_parseable_active(&path, "old");
+        assert_eq!(std::fs::read(&path).unwrap(), gens.prior);
+        assert!(!paths.prev.exists());
     }
     // Nothing to restore: reported, never guessed.
     {
         let dir = tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
-        let outcome = reconcile_interrupted_swap(&path, &is_new);
+        let new_items = sample_items("new");
+        let outcome = reconcile_interrupted_swap(
+            &path,
+            SwapGenerations {
+                prior_bytes: None,
+                new_items: &new_items,
+            },
+        );
+        assert!(
+            matches!(outcome, SwapReconciliation::Unreconciled { .. }),
+            "{outcome:?}"
+        );
+    }
+}
+
+/// Torn/foreign content never becomes authoritative: a parseable foreign
+/// active file, a torn active file that the tolerant reader would still
+/// accept, a foreign or torn `.prev`, a parseable-but-foreign tmp, and a
+/// failed directory sync after a repair rename each refuse promotion and
+/// report `Unreconciled` with the exact state, leaving every file in place.
+#[test]
+fn reconcile_interrupted_swap_refuses_unproven_generations() {
+    let paths_of = SwapPaths::for_rollout;
+    // Parseable foreign active: neither generation.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        write_rollout_jsonl(&path, &sample_items("foreign")).unwrap();
+        let foreign = std::fs::read(&path).unwrap();
+        assert!(
+            !parse_rollout_items(&path).unwrap().is_empty(),
+            "tolerant reader accepts it"
+        );
+        let state = classify_swap_state(&path, gens.as_swap());
+        assert!(matches!(state, SwapState::Unknown { .. }), "{state:?}");
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("foreign active must be unreconciled: {outcome:?}");
+        };
+        assert!(detail.contains("proves neither generation"), "{detail}");
+        assert_eq!(std::fs::read(&path).unwrap(), foreign, "left untouched");
+    }
+    // Torn active retaining valid rows: the tolerant reader yields the old
+    // rows; the exact proof refuses.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let mut torn = gens.prior.clone();
+        torn.extend_from_slice(br#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"message","#);
+        std::fs::write(&path, &torn).unwrap();
+        assert_eq!(
+            parse_rollout_items(&path).unwrap().len(),
+            sample_items("old").len(),
+            "tolerant reader skips the torn row and would have called this old"
+        );
+        assert!(strict_read_generation(&path).is_err());
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("torn active must be unreconciled: {outcome:?}");
+        };
+        assert!(detail.contains("bytes != prior generation"), "{detail}");
+        assert!(detail.contains("not newline-terminated"), "{detail}");
+        assert_eq!(std::fs::read(&path).unwrap(), torn, "left untouched");
+    }
+    // Foreign prev (no active, no tmp): never restored.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let paths = paths_of(&path);
+        std::fs::remove_file(&path).unwrap();
+        write_rollout_jsonl(&paths.prev, &sample_items("foreign")).unwrap();
+        let foreign = std::fs::read(&paths.prev).unwrap();
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("foreign prev must not be restored: {outcome:?}");
+        };
+        assert!(
+            detail.contains("prev does not prove the prior generation"),
+            "{detail}"
+        );
+        assert!(!path.exists(), "nothing promoted to active");
+        assert_eq!(
+            std::fs::read(&paths.prev).unwrap(),
+            foreign,
+            "prev untouched"
+        );
+    }
+    // Torn prev with valid rows + parseable foreign tmp: neither promoted.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let paths = paths_of(&path);
+        std::fs::rename(&path, &paths.prev).unwrap();
+        let mut torn = gens.prior.clone();
+        torn.extend_from_slice(b"{\"timestamp\":\"x\"");
+        std::fs::write(&paths.prev, &torn).unwrap();
+        write_rollout_jsonl(&paths.temp, &sample_items("foreign")).unwrap();
+        let foreign_tmp = std::fs::read(&paths.temp).unwrap();
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("torn prev / foreign tmp must not be promoted: {outcome:?}");
+        };
+        assert!(
+            detail.contains("tmp does not prove the new generation"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("prev does not prove the prior generation"),
+            "{detail}"
+        );
+        assert!(!path.exists(), "nothing promoted to active");
+        assert_eq!(std::fs::read(&paths.prev).unwrap(), torn);
+        assert_eq!(std::fs::read(&paths.temp).unwrap(), foreign_tmp);
+    }
+    // Parseable foreign tmp with a byte-exact prev: tmp refused, prev restored.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let paths = paths_of(&path);
+        std::fs::rename(&path, &paths.prev).unwrap();
+        write_rollout_jsonl(&paths.temp, &sample_items("foreign")).unwrap();
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
+        let SwapReconciliation::RestoredOld { detail } = outcome else {
+            panic!("byte-exact prev must be restored: {outcome:?}");
+        };
+        assert!(
+            detail.contains("tmp does not prove the new generation"),
+            "{detail}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), gens.prior);
+        assert!(paths.temp.exists(), "foreign tmp left for inspection");
+    }
+    // Repair sync failure after tmp → active: reported, not established; a
+    // later reconciliation (sync working) finds the new generation active.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let paths = paths_of(&path);
+        {
+            let _guard = SwapFailpointGuard::arm(SwapFailpoint::PostOldRename);
+            atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        }
+        let outcome = {
+            let _guard = SwapFailpointGuard::arm(SwapFailpoint::ReconcileDirSync);
+            reconcile_interrupted_swap(&path, gens.as_swap())
+        };
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("repair without a proven sync must be unreconciled: {outcome:?}");
+        };
+        assert!(detail.contains("directory sync failed"), "{detail}");
+        assert!(detail.contains("finished tmp"), "{detail}");
+        assert_eq!(std::fs::read(&paths.prev).unwrap(), gens.prior);
+        assert_eq!(
+            reconcile_interrupted_swap(&path, gens.as_swap()),
+            SwapReconciliation::NewActive {
+                finished_here: false
+            }
+        );
+    }
+    // Repair sync failure after prev → active: same disposition.
+    {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        let paths = paths_of(&path);
+        std::fs::rename(&path, &paths.prev).unwrap();
+        let outcome = {
+            let _guard = SwapFailpointGuard::arm(SwapFailpoint::ReconcileDirSync);
+            reconcile_interrupted_swap(&path, gens.as_swap())
+        };
+        let SwapReconciliation::Unreconciled { detail } = outcome else {
+            panic!("restore without a proven sync must be unreconciled: {outcome:?}");
+        };
+        assert!(detail.contains("restored prev"), "{detail}");
+        assert!(detail.contains("directory sync failed"), "{detail}");
+        assert_eq!(
+            reconcile_interrupted_swap(&path, gens.as_swap()),
+            SwapReconciliation::OldActive
+        );
+    }
+    // Both a swap stage and a repair failure armed together (mask).
+    {
+        let _guard = SwapFailpointGuard::arm_all(&[
+            SwapFailpoint::PostOldRename,
+            SwapFailpoint::ReconcileDirSync,
+        ]);
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        write_seed(&path, "old");
+        let gens = Gens::capture(&path);
+        atomic_rewrite_rollout(&path, &gens.new_items).expect_err("injected");
+        let outcome = reconcile_interrupted_swap(&path, gens.as_swap());
         assert!(
             matches!(outcome, SwapReconciliation::Unreconciled { .. }),
             "{outcome:?}"

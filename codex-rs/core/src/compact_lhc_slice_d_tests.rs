@@ -1192,7 +1192,7 @@ async fn slice_d_l2_crash_injection_full_stack() {
                 let active = parse_rollout_items(&rollout_path).expect("new active");
                 assert_eq!(compacted_count(&active), 1, "{point:?}: new is parseable");
             }
-            SwapFailpoint::None => {}
+            SwapFailpoint::None | SwapFailpoint::ReconcileDirSync => {}
         }
         // Cleanup temp leftovers so next iteration is clean.
         let _ = std::fs::remove_file(&paths.temp);

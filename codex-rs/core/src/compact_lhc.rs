@@ -2336,25 +2336,48 @@ async fn install_lhc_compact_rewrite(
                 "LHC rollout flush before rewrite failed; continuing with rewrite attempt"
             );
         }
-        // Interrupted-swap reconciliation (turn parts, Story 5 M2 residual):
-        // an error out of the swap does not say which generation is active.
-        // Classify the actual on-disk state under this arm's one-writer
-        // authority and establish exactly one authoritative generation before
-        // deciding: old still active → retry later; old moved and the new
-        // generation complete at tmp → finish the swap; new already active
+        // Exact prior-generation identity (turn parts, Story 5 M2 residual):
+        // the bytes of the authoritative active file right now, after the
+        // final flush and before the swap. `.prev` is this inode renamed, so
+        // only a byte-exact match later proves a file is the prior
+        // generation. If it cannot be captured, nothing is swapped: the old
+        // file stays authoritative and the seam retries later.
+        let prior_bytes = if path.exists() {
+            match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(err) => {
+                    error!(
+                        %err,
+                        path = %path.display(),
+                        "LHC rollout unreadable before rewrite; not swapping; \
+                         preserving in-memory history (no native compact)"
+                    );
+                    return Ok(failed_attempt(format!(
+                        "prior rollout unreadable before rewrite: {err}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        // Interrupted-swap reconciliation: an error out of the swap does not
+        // say which generation is active. Classify the actual on-disk state
+        // under this arm's one-writer authority against the exact identities
+        // of both generations (prior bytes; the new items' wire content) and
+        // establish exactly one authoritative generation before deciding: old
+        // still active → retry later; old moved and the proven new generation
+        // at tmp → finish the swap (proven durable); new already active
         // (post-rename fsync or hook error) → the compact stands and the host
         // must complete its matching in-memory / window install, never roll
-        // it back; anything else → deny sampling with the exact state.
+        // it back; anything unproven → deny sampling with the exact state.
         let reconciled_after_error = match atomic_rewrite_rollout(path, &materialize_result.items) {
             Ok(()) => None,
             Err(err) => {
-                let boundary = durable_message.clone();
-                let is_new_generation = move |items: &[RolloutItem]| {
-                    items.iter().any(|item| {
-                        matches!(item, RolloutItem::Compacted(compacted) if compacted.message == boundary)
-                    })
+                let generations = codex_lhc_host::SwapGenerations {
+                    prior_bytes: prior_bytes.as_deref(),
+                    new_items: &materialize_result.items,
                 };
-                match codex_lhc_host::reconcile_interrupted_swap(path, &is_new_generation) {
+                match codex_lhc_host::reconcile_interrupted_swap(path, generations) {
                     codex_lhc_host::SwapReconciliation::OldActive => {
                         error!(
                             %err,
