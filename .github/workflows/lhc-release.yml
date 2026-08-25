@@ -235,6 +235,7 @@ jobs:
           git -C "$sdk_dir" fetch --no-tags origin main
           git -C "$sdk_dir" merge-base --is-ancestor "$sdk_commit" origin/main
       - uses: ./.github/actions/setup-ci
+        if: matrix.kind != 'windows'
       - uses: facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a # v2
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -242,6 +243,42 @@ jobs:
       - name: Install musl build tools
         if: matrix.kind == 'linux'
         run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+      - name: Normalize accepted a25 GCC frame warning option
+        if: matrix.kind == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalid_option=-Wno-error=frame-larger-than
+          corrected_option=-Wno-error=frame-larger-than=
+          normalize_flags() {
+            local input="$1"
+            local flag output="" replacements=0
+            local -a flags
+            read -r -a flags <<< "$input"
+            for flag in "${flags[@]}"; do
+              if [[ "$flag" == "$invalid_option" ]]; then
+                flag="$corrected_option"
+                replacements=$((replacements + 1))
+              fi
+              output="${output:+${output} }${flag}"
+            done
+            test "$replacements" -eq 1 || {
+              echo "expected exactly one standalone $invalid_option" >&2
+              exit 1
+            }
+            NORMALIZED_FLAGS="$output"
+          }
+          normalize_flags "$CFLAGS"
+          corrected_cflags="$NORMALIZED_FLAGS"
+          normalize_flags "$CXXFLAGS"
+          corrected_cxxflags="$NORMALIZED_FLAGS"
+          case " $corrected_cflags " in *" $invalid_option "*) exit 1 ;; esac
+          case " $corrected_cxxflags " in *" $invalid_option "*) exit 1 ;; esac
+          printf '%s\n' 'int codex_frame_option_probe(void) { return 0; }' | \
+            "$CC" "$corrected_option" -x c -c \
+              -o "${RUNNER_TEMP}/frame-option-probe.o" -
+          printf 'CFLAGS=%s\nCXXFLAGS=%s\n' \
+            "$corrected_cflags" "$corrected_cxxflags" >> "$GITHUB_ENV"
       - name: Configure Windows build paths
         if: matrix.kind == 'windows'
         shell: pwsh

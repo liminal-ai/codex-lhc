@@ -244,6 +244,81 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("--lhc-thread-schema 12 --force", remaining)
         self.assertIn("verify_package_archive.py", remaining)
 
+    def test_remaining_normalizes_the_inherited_gcc_frame_warning_option(
+        self,
+    ) -> None:
+        text = (ROOT / ".github/workflows/lhc-release.yml").read_text()
+        remaining = text.split("  build-remaining:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+
+        # The shared CI setup is POSIX-only; native Windows supplies its own
+        # toolchain through setup-msvc-env.
+        self.assertIn(
+            "- uses: ./.github/actions/setup-ci\n        if: matrix.kind != "
+            "'windows'",
+            remaining,
+        )
+        self.assertLess(
+            remaining.index("- uses: ./.github/actions/setup-ci"),
+            remaining.index("facebook/install-dotslash"),
+        )
+
+        # Normalization is Linux-only and runs immediately after the musl
+        # tools that export the inherited flags it corrects.
+        musl = remaining.index("- name: Install musl build tools")
+        normalize = remaining.index(
+            "- name: Normalize accepted a25 GCC frame warning option"
+        )
+        self.assertLess(musl, normalize)
+        self.assertLess(
+            normalize, remaining.index("- name: Configure Windows build paths")
+        )
+        block = remaining[normalize:].split("- name: ", 2)[1]
+        self.assertIn("if: matrix.kind == 'linux'", block)
+
+        # The standalone invalid token is replaced by the trailing-equals form
+        # in both variables, exactly once each.
+        self.assertIn("invalid_option=-Wno-error=frame-larger-than\n", block)
+        self.assertIn("corrected_option=-Wno-error=frame-larger-than=\n", block)
+        self.assertIn("replacements=$((replacements + 1))", block)
+        self.assertIn('test "$replacements" -eq 1 ||', block)
+        self.assertIn('normalize_flags "$CFLAGS"', block)
+        self.assertIn('normalize_flags "$CXXFLAGS"', block)
+        self.assertIn(
+            'case " $corrected_cflags " in *" $invalid_option "*) exit 1 ;; esac',
+            block,
+        )
+        self.assertIn(
+            'case " $corrected_cxxflags " in *" $invalid_option "*) exit 1 ;; esac',
+            block,
+        )
+
+        # The corrected option is proven against the compiler before either
+        # value is exported, and both are exported to GITHUB_ENV.
+        probe = block.index('"$CC" "$corrected_option" -x c -c')
+        export = block.index('>> "$GITHUB_ENV"')
+        self.assertLess(probe, export)
+        self.assertIn(
+            "printf 'CFLAGS=%s\\nCXXFLAGS=%s\\n' \\\n"
+            '            "$corrected_cflags" "$corrected_cxxflags" '
+            '>> "$GITHUB_ENV"',
+            block,
+        )
+
+        # Round-1 controls and the build contract are untouched.
+        self.assertIn("- name: Configure Windows build paths", remaining)
+        self.assertIn("./.github/actions/setup-msvc-env", remaining)
+        self.assertIn(
+            "facebook/install-dotslash@1e4e7b3e07eaca387acb98f1d4720e0bee8dbb6a",
+            remaining,
+        )
+        self.assertIn(
+            "dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582",
+            remaining,
+        )
+        self.assertIn("CARGO_TARGET_DIR=$targetDir", remaining)
+
     def test_posix_installer_fixture_maps_linux_arm64(self) -> None:
         text = (ROOT / "scripts/lhc-release/test_install.py").read_text()
         self.assertIn('if system == "Linux" and machine in {"aarch64", "arm64"}', text)
