@@ -28,13 +28,11 @@ history preserved and rebuildable at full fidelity.
   index on messages, host metadata surface, `mid_turn_compact` entry with the
   four-fact seam assertion and per-thread mechanism exclusivity (typed
   `forced_boundary_thread` / `compact_continuation_parts_thread` refusals),
-  walk split/settle/parts, newest-closed protection. The commit is local-only
-  on `feature/turn-parts` at `/srv/work/long-horizon-context` until that
-  campaign publishes; the tripwire pin-drift check warns until it lands on
-  `origin/main`. It descends `9d4d182` (bounded metadata-first Smart Compact;
-  `LHC_COMPACT_ALGORITHM=legacy` still selects the eager path), `f4de85c`
-  (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67 contract
-  2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
+  walk split/settle/parts, newest-closed protection. The commit is public on
+  LHC `origin/main`. It descends `9d4d182` (bounded selector default;
+  `LHC_COMPACT_ALGORITHM=legacy` still selects the legacy eager selector),
+  `f4de85c` (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67
+  contract 2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
   (LIM-63 / 63A), and retrieval `7062814` / `dd251ec`. The tripwire requires a
   clean tree at the pin and full mid-turn / full-loop layers.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
@@ -316,7 +314,7 @@ Merged annotated tag `rust-v0.149.1` (peeled `ff29a44391`) onto product base
 re-verified (`just write-config-schema`). `patches/lhc/BASE` advanced to
 `ff29a44391`; all seven patches regenerated (drift-only deltas). `Cargo.lock`
 regenerated. Vendored SDK advanced `9d4d182` → **`713b38d`** (accepted Rust
-turn-parts source; local-only, obtained from `/srv/work/long-horizon-context`).
+turn-parts source, since published on LHC `origin/main`).
 Adapter absorbed two SDK shape additions without semantic change:
 `ViewCompactParams.newest_closed_protection` (left `None`, profile default) and
 `MessageRecord.step_index` in materialize test fixtures. `just fmt` reformats

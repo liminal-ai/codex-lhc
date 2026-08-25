@@ -84,21 +84,21 @@ def main() -> None:
         "sourceCommit": args.source_commit,
         "upstreamCodexCommit": args.upstream_commit,
         "lhcSdkCommit": args.lhc_sdk_commit,
-        "lhcThreadSchema": 11,
+        "lhcThreadSchema": 12,
         "buildRunId": args.run_id,
         "captureDefault": "on",
-        "compactAlgorithmDefault": "metadata-first",
+        "compactAlgorithmDefault": "bounded",
         "compactAlgorithmRollback": {
             "environment": "LHC_COMPACT_ALGORITHM",
             "value": "legacy",
         },
         "artifacts": artifacts,
         "migration": {
-            "id": "thread-schema-6-to-11",
-            "fromSchema": 6,
-            "toSchema": 11,
+            "id": "thread-schema-11-to-12",
+            "fromSchema": 11,
+            "toSchema": 12,
             "rollbackSupported": False,
-            "rollbackBoundary": f"Opening a schema-v6 thread with v{args.version} migrates it to schema 11; downgrade to v0.2.1 is unsupported.",
+            "rollbackBoundary": f"Opening a schema-v11 thread with v{args.version} migrates it to schema 12; downgrade to v0.149.0 is unsupported.",
         },
     }
     manifest_path = args.dist / "release-manifest.json"

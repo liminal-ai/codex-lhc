@@ -57,7 +57,7 @@ def verify(path: Path, platform: str, version: str, sdk_commit: str) -> dict:
         "lhc": {
             "repository": "https://github.com/liminal-ai/long-horizon-context",
             "sdkCommit": sdk_commit,
-            "threadSchema": 11,
+            "threadSchema": 12,
         },
     }
     if metadata != expected_metadata:

@@ -10,7 +10,7 @@ from pathlib import Path
 from verify_package_archive import PLATFORMS, verify
 
 
-SDK = "9d4d18247942f35b356f28bdc4288f0e631a6da9"
+SDK = "713b38d9eb8497b48023977cec2d84df9568bd58"
 
 
 def fixture(root: Path, platform: str) -> Path:
@@ -34,7 +34,7 @@ def fixture(root: Path, platform: str) -> Path:
         path.write_bytes(b"fixture")
     metadata = {
         "layoutVersion": 1,
-        "version": "0.149.0",
+        "version": "0.149.1",
         "target": target,
         "variant": "codex",
         "entrypoint": f"bin/codex{suffix}",
@@ -43,7 +43,7 @@ def fixture(root: Path, platform: str) -> Path:
         "lhc": {
             "repository": "https://github.com/liminal-ai/long-horizon-context",
             "sdkCommit": SDK,
-            "threadSchema": 11,
+            "threadSchema": 12,
         },
     }
     (package / "codex-package.json").write_text(json.dumps(metadata))
@@ -75,7 +75,7 @@ class PackageContractTests(unittest.TestCase):
         )
         for platform in PLATFORMS:
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
-                verify(fixture(Path(tmp), platform), platform, "0.149.0", SDK)
+                verify(fixture(Path(tmp), platform), platform, "0.149.1", SDK)
 
     def test_missing_linux_zsh_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,7 +87,7 @@ class PackageContractTests(unittest.TestCase):
                 for path in package.rglob("*"):
                     output.add(path, arcname=path.relative_to(package), recursive=False)
             with self.assertRaisesRegex(ValueError, "zsh"):
-                verify(archive, "linux-x86_64", "0.149.0", SDK)
+                verify(archive, "linux-x86_64", "0.149.1", SDK)
 
 
 if __name__ == "__main__":
