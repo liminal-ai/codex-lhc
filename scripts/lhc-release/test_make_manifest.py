@@ -75,7 +75,7 @@ class PlatformSetTests(unittest.TestCase):
             )
             self.assertEqual(manifest["buildRunId"], "31970651653")
             self.assertNotIn("supplementalRunId", manifest)
-            self.assertEqual(manifest["compactAlgorithmDefault"], "bounded")
+            self.assertEqual(manifest["compactAlgorithmDefault"], "bounded-selector")
             self.assertEqual(
                 manifest["compactAlgorithmRollback"],
                 {"environment": "LHC_COMPACT_ALGORITHM", "value": "legacy"},

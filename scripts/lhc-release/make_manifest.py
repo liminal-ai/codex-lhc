@@ -87,7 +87,7 @@ def main() -> None:
         "lhcThreadSchema": 12,
         "buildRunId": args.run_id,
         "captureDefault": "on",
-        "compactAlgorithmDefault": "bounded",
+        "compactAlgorithmDefault": "bounded-selector",
         "compactAlgorithmRollback": {
             "environment": "LHC_COMPACT_ALGORITHM",
             "value": "legacy",
