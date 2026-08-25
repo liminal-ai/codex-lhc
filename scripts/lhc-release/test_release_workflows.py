@@ -180,6 +180,76 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             ],
         )
 
+    def test_remaining_matrix_is_portable_across_the_four_native_hosts(self) -> None:
+        text = (ROOT / ".github/workflows/lhc-release.yml").read_text()
+        remaining = text.split("  build-remaining:\n", 1)[1].split(
+            "\n  candidate:\n", 1
+        )[0]
+
+        # A Python with tomllib must exist before release identity validation,
+        # which imports it via check_version_identity.py.
+        setup_python = (
+            "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
+        )
+        self.assertIn(setup_python, remaining)
+        self.assertIn('python-version: "3.13"', remaining)
+        self.assertLess(
+            remaining.index(setup_python),
+            remaining.index("Validate release and public SDK identity"),
+        )
+
+        # Full package discovery on POSIX; exactly 11 applicable tests on
+        # native Windows, which lacks POSIX executable mode bits.
+        self.assertIn(
+            "- name: Test canonical package builder\n        if: "
+            "matrix.kind != 'windows'",
+            remaining,
+        )
+        windows_packages = remaining.split(
+            "Test exactly 11 applicable canonical package tests on Windows", 1
+        )[1].split("- name: ", 1)[0]
+        self.assertIn("if: matrix.kind == 'windows'", windows_packages)
+        command = windows_packages.split("PYTHONPATH=scripts/codex_package", 1)[1]
+        self.assertEqual(
+            len(re.findall(r"test_\w+\.\w+\.test_\w+", command)), 11
+        )
+
+        # Linux keeps full release-helper discovery, including the musl UAPI
+        # helper test and the POSIX installer ARM64 fixture mapping.
+        self.assertIn(
+            "- name: Test release helpers and POSIX installer\n        if: "
+            "matrix.kind == 'linux'\n        shell: bash\n        run: python "
+            "-m unittest discover -s scripts/lhc-release -p 'test_*.py'",
+            remaining,
+        )
+
+        # macOS runs every release helper test except the Linux-only musl one.
+        macos_helpers = remaining.split(
+            "Test release helpers except the Linux-only musl helper", 1
+        )[1].split("- name: ", 1)[0]
+        self.assertIn("if: matrix.kind == 'macos'", macos_helpers)
+        self.assertIn("exempted_test=test_install_musl_build_tools.py", macos_helpers)
+        self.assertIn("for test_file in scripts/lhc-release/test_*.py", macos_helpers)
+        self.assertIn('test "$#" -gt 0', macos_helpers)
+
+        # Windows still runs only the PowerShell installer test.
+        self.assertIn(
+            "- name: Test Windows installer\n        if: matrix.kind == "
+            "'windows'\n        shell: pwsh\n        run: "
+            "./scripts/lhc-release/test_install.ps1",
+            remaining,
+        )
+
+        # The build and archive contract is unchanged.
+        self.assertIn("--lhc-thread-schema 12 --force", remaining)
+        self.assertIn("verify_package_archive.py", remaining)
+
+    def test_posix_installer_fixture_maps_linux_arm64(self) -> None:
+        text = (ROOT / "scripts/lhc-release/test_install.py").read_text()
+        self.assertIn('if system == "Linux" and machine in {"aarch64", "arm64"}', text)
+        self.assertIn('return "linux-aarch64"', text)
+        self.assertIn("def test_linux_aarch64_uses_native_release_fixture", text)
+
     def test_promotion_uses_maintainer_token_and_hard_public_readback(self) -> None:
         text = (ROOT / ".github/workflows/lhc-release-promote.yml").read_text()
         self.assertIn("CODEX_LHC_RELEASE_TOKEN", text)

@@ -221,6 +221,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
           fetch-depth: 0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
       - name: Validate release and public SDK identity
         shell: bash
         run: |
@@ -252,12 +255,59 @@ jobs:
         with:
           target: ${{ matrix.target }}
       - name: Test canonical package builder
-        shell: bash
-        run: python -m unittest discover -s scripts/codex_package -p 'test_*.py'
-      - name: Test release helpers and POSIX installer
         if: matrix.kind != 'windows'
         shell: bash
+        run: python -m unittest discover -s scripts/codex_package -p 'test_*.py'
+      - name: Test exactly 11 applicable canonical package tests on Windows
+        if: matrix.kind == 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # POSIX executable-mode omissions on native Windows:
+          # - test_layout.PackageLayoutTest.test_app_server_package_places_code_mode_host_beside_entrypoint
+          # - test_layout.PackageLayoutTest.test_macos_package_preserves_prebuilt_resource_binaries
+          # - test_zsh.ResolveZshBinTest.test_uses_prebuilt_executable_override
+          # Carried forward as omissions from the same proven list, and covered
+          # in full by the POSIX jobs above:
+          # - test_cargo.SourceBinariesForTargetTest.test_linux_package_with_prebuilt_entrypoint_and_bwrap_builds_nothing
+          # - test_cargo.SourceBinariesForTargetTest.test_macos_package_with_prebuilt_entrypoint_builds_nothing
+          # - test_cargo.SourceBinariesForTargetTest.test_missing_code_mode_host_is_built_for_app_server
+          PYTHONPATH=scripts/codex_package python -m unittest \
+            test_archive.ResolveZstdCommandTest.test_prefers_zstd_from_path \
+            test_archive.ResolveZstdCommandTest.test_falls_back_to_dotslash_manifest \
+            test_archive.ResolveZstdCommandTest.test_errors_when_no_zstd_or_dotslash_manifest_is_available \
+            test_cargo.SourceBinariesForTargetTest.test_windows_package_with_prebuilt_entrypoint_and_helpers_builds_nothing \
+            test_cargo.SourceBinariesForTargetTest.test_missing_windows_helpers_are_built \
+            test_cargo.SourceBinariesForTargetTest.test_build_uses_prebuilt_windows_helpers_without_running_cargo \
+            test_cli.PackageVersionTest.test_lhc_provenance_requires_exact_public_identity_pair \
+            test_cli.PackageVersionTest.test_accepts_release_prerelease_and_build_versions \
+            test_cli.PackageVersionTest.test_rejects_versions_the_runtime_cannot_parse \
+            test_layout.PackageLayoutTest.test_lhc_package_extends_canonical_metadata_with_exact_provenance \
+            test_zsh.ResolveZshBinTest.test_uses_manifest_override
+      - name: Test release helpers and POSIX installer
+        if: matrix.kind == 'linux'
+        shell: bash
         run: python -m unittest discover -s scripts/lhc-release -p 'test_*.py'
+      - name: Test release helpers except the Linux-only musl helper
+        if: matrix.kind == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # test_install_musl_build_tools.py exercises the Linux-only musl UAPI
+          # helper in .github/scripts/install-musl-build-tools.sh; it is not
+          # applicable on macOS. Every other release helper test still runs,
+          # including the POSIX installer fixture coverage.
+          exempted_test=test_install_musl_build_tools.py
+          set --
+          for test_file in scripts/lhc-release/test_*.py; do
+            if [[ "$(basename "$test_file")" == "$exempted_test" ]]; then
+              continue
+            fi
+            set -- "$@" "$test_file"
+          done
+          test "$#" -gt 0
+          PYTHONPATH="scripts/lhc-release${PYTHONPATH:+:${PYTHONPATH}}" \
+            python -m unittest "$@"
       - name: Test Windows installer
         if: matrix.kind == 'windows'
         shell: pwsh

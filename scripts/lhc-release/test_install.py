@@ -13,6 +13,7 @@ import tarfile
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,6 +26,8 @@ def native_unix_platform() -> str:
     machine = platform.machine().lower()
     if system == "Linux" and machine in {"x86_64", "amd64"}:
         return "linux-x86_64"
+    if system == "Linux" and machine in {"aarch64", "arm64"}:
+        return "linux-aarch64"
     if system == "Darwin" and machine in {"arm64", "aarch64"}:
         return "macos-aarch64"
     raise RuntimeError(f"unsupported POSIX installer fixture host: {system} {machine}")
@@ -39,6 +42,13 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class InstallTest(unittest.TestCase):
+    def test_linux_aarch64_uses_native_release_fixture(self) -> None:
+        with (
+            mock.patch.object(platform, "system", return_value="Linux"),
+            mock.patch.object(platform, "machine", return_value="aarch64"),
+        ):
+            self.assertEqual(native_unix_platform(), "linux-aarch64")
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
