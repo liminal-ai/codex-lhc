@@ -726,9 +726,17 @@ No synthetic continuation turn, no forced-boundary marker.
   before the swap (`.prev` is that inode renamed, so only a byte-exact match
   proves it; an unreadable file there means no swap is attempted and the
   seam retries); the *new* generation is the ordered wire content the swap
-  wrote, proven by `strict_read_generation` — every row a complete rollout
-  line, nothing skipped, exact row count/order, each row's item object equal
-  to the expected item's wire form. The tolerant `parse_rollout_items`
+  wrote, proven by `strict_read_generation` + `proves_new_generation` —
+  every row a complete rollout line, nothing skipped, exact row count/order,
+  each row's item object equal to the expected item's wire form, and the
+  envelope exactly as `write_rollout_jsonl` emits it: ordinals derived by
+  the same `RolloutOrdinalState::for_rewrite` plan (none on legacy output,
+  exact contiguous values on paginated output — missing, duplicate,
+  shifted, reordered, malformed, or foreign ordinals fail), one generated
+  UUID v4 `rollout_generation_id` shared by every `SessionMeta` row and
+  present on no other row (missing, foreign, non-generated, non-string,
+  misplaced, or split identities fail), and RFC 3339 timestamps (value
+  nondeterministic, contract not). The tolerant `parse_rollout_items`
   never establishes authority. Dispositions: old still active
   (`PostTempWrite`/`PostFsync` class) → prior body and rollout stand,
   `MidTurnBlocked { next_provider_request_allowed: true }`, retry at the
@@ -751,7 +759,8 @@ No synthetic continuation turn, no forced-boundary marker.
   `mid_turn_parts_host_apply_post_new_rename_completes_install`,
   `mid_turn_parts_host_apply_unproven_repair_sync_denies_sampling`; host
   `reconcile_interrupted_swap_establishes_one_active_generation`,
-  `reconcile_interrupted_swap_refuses_unproven_generations`. Foreign/torn
+  `reconcile_interrupted_swap_refuses_unproven_generations`,
+  `strict_new_generation_proof_requires_exact_envelope`. Foreign/torn
   active or `.prev` cannot be produced through the arm under one-writer
   authority (the arm snapshots and swaps in one critical section; `.prev`
   is the renamed prior inode), so those refusals are proven at the exact

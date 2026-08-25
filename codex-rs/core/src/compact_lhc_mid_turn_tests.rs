@@ -4476,7 +4476,7 @@ async fn late_stage_swap_failure_reconciles_and_installs(
         .unwrap_or_else(|err| panic!("{point:?}: active must strictly parse: {err}"));
     assert_eq!(
         rows.iter()
-            .filter(|row| row.get("type").and_then(|t| t.as_str()) == Some("compacted"))
+            .filter(|row| row.item.get("type").and_then(|t| t.as_str()) == Some("compacted"))
             .count(),
         1,
         "{point:?}: exactly one compact boundary in the active generation"

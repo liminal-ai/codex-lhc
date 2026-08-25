@@ -537,13 +537,8 @@ impl Gens {
 }
 
 fn assert_exact_new(path: &Path, gens: &Gens) {
-    let rows = strict_read_generation(path).expect("active strictly parses");
-    let expected: Vec<serde_json::Value> = gens
-        .new_items
-        .iter()
-        .map(|item| serde_json::to_value(item).unwrap())
-        .collect();
-    assert_eq!(rows, expected, "active must be exactly the new generation");
+    proves_new_generation(path, &gens.new_items)
+        .unwrap_or_else(|err| panic!("active must be exactly the new generation: {err}"));
 }
 
 /// Interrupted-swap reconciliation establishes one authoritative active
@@ -852,5 +847,250 @@ fn reconcile_interrupted_swap_refuses_unproven_generations() {
             matches!(outcome, SwapReconciliation::Unreconciled { .. }),
             "{outcome:?}"
         );
+    }
+}
+
+type LineMutation = fn(&mut serde_json::Map<String, serde_json::Value>);
+
+/// Rewrite line `index` (0-based) of `path` through `mutate` on its raw JSON
+/// object, preserving every other line.
+fn mutate_line(path: &Path, index: usize, mutate: LineMutation) {
+    let text = std::fs::read_to_string(path).expect("read");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut value: serde_json::Value = serde_json::from_str(&lines[index]).expect("line json");
+    mutate(value.as_object_mut().expect("object"));
+    lines[index] = serde_json::to_string(&value).expect("ser");
+    std::fs::write(path, format!("{}\n", lines.join("\n"))).expect("write");
+}
+
+/// Envelope derivation: the strict proof accepts exactly the envelope the
+/// writer emits — no ordinals on legacy output, the `for_rewrite` contiguous
+/// plan on paginated output, one UUID v4 generation id on `SessionMeta` rows
+/// only, RFC 3339 timestamps — and every mutation of it (missing, duplicate,
+/// shifted, reordered, malformed, or foreign ordinals; missing, foreign,
+/// non-generated, misplaced, non-string, or split generation ids; arbitrary
+/// or missing timestamps) is refused: `classify_swap_state` reports
+/// `Unknown` and `reconcile_interrupted_swap` reports `Unreconciled`,
+/// promoting nothing.
+#[test]
+fn strict_new_generation_proof_requires_exact_envelope() {
+    let new_items = paginated_items("new", Some(10), None);
+    let legacy_items = sample_items("new");
+    // Baseline: the writer's own output proves, for both output shapes.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    write_seed(&path, "old");
+    let prior = std::fs::read(&path).unwrap();
+    write_rollout_jsonl(&path, &new_items).unwrap();
+    let rows = strict_read_generation(&path).expect("strict");
+    assert_eq!(
+        rows.iter().map(|r| r.ordinal).collect::<Vec<_>>(),
+        vec![Some(10), Some(11), Some(12)],
+        "paginated output carries the for_rewrite plan"
+    );
+    assert!(rows[0].generation_id.as_deref().is_some_and(|id| {
+        uuid::Uuid::parse_str(id).unwrap().get_version() == Some(uuid::Version::Random)
+    }));
+    assert!(rows[1..].iter().all(|r| r.generation_id.is_none()));
+    let gens = SwapGenerations {
+        prior_bytes: Some(prior.as_slice()),
+        new_items: &new_items,
+    };
+    assert_eq!(classify_swap_state(&path, gens), SwapState::NewActive);
+    write_rollout_jsonl(&path, &legacy_items).unwrap();
+    assert!(
+        strict_read_generation(&path)
+            .unwrap()
+            .iter()
+            .all(|r| r.ordinal.is_none()),
+        "legacy output carries no ordinals"
+    );
+    let legacy_gens = SwapGenerations {
+        prior_bytes: Some(prior.as_slice()),
+        new_items: &legacy_items,
+    };
+    assert_eq!(
+        classify_swap_state(&path, legacy_gens),
+        SwapState::NewActive
+    );
+
+    let mutations: Vec<(&str, &[RolloutItem], usize, LineMutation, &str)> = vec![
+        (
+            "missing ordinal",
+            &new_items,
+            1,
+            |o| {
+                o.remove("ordinal");
+            },
+            "ordinal None != expected Some(11)",
+        ),
+        (
+            "duplicate ordinal",
+            &new_items,
+            2,
+            |o| {
+                o.insert("ordinal".into(), 11.into());
+            },
+            "ordinal Some(11) != expected Some(12)",
+        ),
+        (
+            "shifted ordinal",
+            &new_items,
+            0,
+            |o| {
+                o.insert("ordinal".into(), 9.into());
+            },
+            "ordinal Some(9) != expected Some(10)",
+        ),
+        (
+            "reordered ordinals",
+            &new_items,
+            1,
+            |o| {
+                o.insert("ordinal".into(), 12.into());
+            },
+            "ordinal Some(12) != expected Some(11)",
+        ),
+        (
+            "malformed ordinal (string)",
+            &new_items,
+            1,
+            |o| {
+                o.insert("ordinal".into(), "11".into());
+            },
+            "not a rollout line",
+        ),
+        (
+            "malformed ordinal (negative)",
+            &new_items,
+            1,
+            |o| {
+                o.insert("ordinal".into(), (-1).into());
+            },
+            "not a rollout line",
+        ),
+        (
+            "ordinal on legacy output",
+            &legacy_items,
+            0,
+            |o| {
+                o.insert("ordinal".into(), 0.into());
+            },
+            "ordinal Some(0) != expected None",
+        ),
+        (
+            "missing generation id",
+            &new_items,
+            0,
+            |o| {
+                o.remove(ROLLOUT_GENERATION_ID_FIELD);
+            },
+            "SessionMeta row without rollout_generation_id",
+        ),
+        (
+            "foreign generation id",
+            &new_items,
+            0,
+            |o| {
+                o.insert(ROLLOUT_GENERATION_ID_FIELD.into(), "gen-foreign".into());
+            },
+            "is not a generated identity",
+        ),
+        (
+            "non-generated (nil) uuid",
+            &new_items,
+            0,
+            |o| {
+                o.insert(
+                    ROLLOUT_GENERATION_ID_FIELD.into(),
+                    uuid::Uuid::nil().to_string().into(),
+                );
+            },
+            "is not a generated identity",
+        ),
+        (
+            "generation id not a string",
+            &new_items,
+            0,
+            |o| {
+                o.insert(ROLLOUT_GENERATION_ID_FIELD.into(), 7.into());
+            },
+            "is not a string",
+        ),
+        (
+            "generation id on a non-SessionMeta row",
+            &new_items,
+            1,
+            |o| {
+                o.insert(
+                    ROLLOUT_GENERATION_ID_FIELD.into(),
+                    uuid::Uuid::new_v4().to_string().into(),
+                );
+            },
+            "on a non-SessionMeta row",
+        ),
+        (
+            "arbitrary timestamp text",
+            &new_items,
+            2,
+            |o| {
+                o.insert("timestamp".into(), "yesterday".into());
+            },
+            "timestamp is not RFC 3339",
+        ),
+        (
+            "missing timestamp",
+            &new_items,
+            2,
+            |o| {
+                o.remove("timestamp");
+            },
+            "not a rollout line",
+        ),
+    ];
+    for (name, items, line, mutate, expect) in mutations {
+        write_rollout_jsonl(&path, items).unwrap();
+        mutate_line(&path, line, mutate);
+        let mutated = std::fs::read(&path).unwrap();
+        assert!(
+            !parse_rollout_items(&path).unwrap().is_empty(),
+            "{name}: the tolerant reader still yields rows"
+        );
+        let proof = proves_new_generation(&path, items).expect_err(name);
+        assert!(proof.contains(expect), "{name}: {proof}");
+        let gens = SwapGenerations {
+            prior_bytes: Some(prior.as_slice()),
+            new_items: items,
+        };
+        let state = classify_swap_state(&path, gens);
+        let SwapState::Unknown { detail } = state else {
+            panic!("{name}: must be Unknown, got {state:?}");
+        };
+        assert!(detail.contains(expect), "{name}: {detail}");
+        let outcome = reconcile_interrupted_swap(&path, gens);
+        assert!(
+            matches!(outcome, SwapReconciliation::Unreconciled { .. }),
+            "{name}: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            mutated,
+            "{name}: left untouched"
+        );
+    }
+    // Split generation identity: two SessionMeta rows with different ids.
+    {
+        let mut two_meta = new_items.clone();
+        two_meta.push(two_meta[0].clone());
+        write_rollout_jsonl(&path, &two_meta).unwrap();
+        proves_new_generation(&path, &two_meta).expect("writer output proves");
+        mutate_line(&path, 3, |o| {
+            o.insert(
+                ROLLOUT_GENERATION_ID_FIELD.into(),
+                uuid::Uuid::new_v4().to_string().into(),
+            );
+        });
+        let proof = proves_new_generation(&path, &two_meta).expect_err("split id");
+        assert!(proof.contains("differs from"), "{proof}");
     }
 }

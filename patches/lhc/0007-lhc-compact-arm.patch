@@ -4033,7 +4033,7 @@ index 0000000000..7933355990
 +}
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..0c8cf66623
+index 0000000000..e22cccb7cd
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 @@ -0,0 +1,4755 @@
@@ -8515,7 +8515,7 @@ index 0000000000..0c8cf66623
 +        .unwrap_or_else(|err| panic!("{point:?}: active must strictly parse: {err}"));
 +    assert_eq!(
 +        rows.iter()
-+            .filter(|row| row.get("type").and_then(|t| t.as_str()) == Some("compacted"))
++            .filter(|row| row.item.get("type").and_then(|t| t.as_str()) == Some("compacted"))
 +            .count(),
 +        1,
 +        "{point:?}: exactly one compact boundary in the active generation"

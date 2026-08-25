@@ -52,10 +52,15 @@
 //! * the **new** generation is the exact ordered wire content the swap wrote
 //!   (`items`), proven by [`strict_read_generation`]: every line must be a
 //!   complete JSON rollout line, nothing is skipped, the row count must
-//!   match, and each row's item object must equal the expected item's wire
-//!   form. The tolerant [`parse_rollout_items`] (which skips rows it cannot
-//!   read) is an operational reader and is never used to establish
-//!   authority.
+//!   match, each row's item object must equal the expected item's wire
+//!   form, and the envelope must be exactly what [`write_rollout_jsonl`]
+//!   emits — ordinals derived by the same [`RolloutOrdinalState::for_rewrite`]
+//!   (none for legacy output, exact contiguous values for paginated output),
+//!   one valid generated (UUID v4) `rollout_generation_id` on every
+//!   `SessionMeta` row and on no other row, and an RFC 3339 timestamp (the
+//!   value is nondeterministic; the contract is not). The tolerant
+//!   [`parse_rollout_items`] (which skips rows it cannot read) is an
+//!   operational reader and is never used to establish authority.
 //!
 //! Anything that proves neither is `Unknown`/`Unreconciled`: it is never
 //! promoted, restored, or treated as old. A repair rename (`tmp → P` or
@@ -230,12 +235,29 @@ pub struct SwapGenerations<'a> {
 /// Envelope keys the writer adds around each item's own wire object.
 const LINE_ENVELOPE_KEYS: [&str; 3] = ["timestamp", "ordinal", ROLLOUT_GENERATION_ID_FIELD];
 
+/// One strictly read rollout line: the validated envelope and the item's
+/// own wire object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictRow {
+    /// RFC 3339 timestamp as written (validated, not compared).
+    pub timestamp: String,
+    /// Top-level ordinal, when present (a JSON unsigned integer).
+    pub ordinal: Option<u64>,
+    /// `rollout_generation_id`, when present (a JSON string).
+    pub generation_id: Option<String>,
+    /// The item's wire object with the envelope keys removed.
+    pub item: serde_json::Value,
+}
+
 /// Strict, authority-grade read of one rollout generation: the file must be
 /// UTF-8, newline-terminated, and every line must be one complete JSON
-/// rollout line (envelope + item) — nothing is skipped or tolerated. Returns
-/// each line's item wire object (envelope keys removed), in file order, or
-/// the first violation with its line number.
-pub fn strict_read_generation(path: &Path) -> Result<Vec<serde_json::Value>, String> {
+/// rollout line (envelope + item) — nothing is skipped or tolerated. The
+/// envelope is validated per line (RFC 3339 timestamp, unsigned-integer
+/// ordinal, string generation id); whether the envelope is the one the
+/// writer would have emitted for a given generation is
+/// [`proves_new_generation`]'s job. Returns the rows in file order, or the
+/// first violation with its line number.
+pub fn strict_read_generation(path: &Path) -> Result<Vec<StrictRow>, String> {
     let bytes = std::fs::read(path).map_err(|err| format!("unreadable: {err}"))?;
     let text = std::str::from_utf8(&bytes).map_err(|err| format!("not UTF-8: {err}"))?;
     if text.is_empty() {
@@ -250,9 +272,11 @@ pub fn strict_read_generation(path: &Path) -> Result<Vec<serde_json::Value>, Str
         if line.trim().is_empty() {
             return Err(format!("line {number}: blank line"));
         }
-        // The typed decode validates the envelope and the item shape…
-        serde_json::from_str::<RolloutLine>(line)
+        // The typed decode validates the envelope types and the item shape…
+        let typed = serde_json::from_str::<RolloutLine>(line)
             .map_err(|err| format!("line {number}: not a rollout line: {err}"))?;
+        chrono::DateTime::parse_from_rfc3339(&typed.timestamp)
+            .map_err(|err| format!("line {number}: timestamp is not RFC 3339: {err}"))?;
         // …and the raw object is what gets compared, so an unknown or extra
         // key (which a typed decode would silently drop) still fails.
         let mut value: serde_json::Value =
@@ -260,18 +284,59 @@ pub fn strict_read_generation(path: &Path) -> Result<Vec<serde_json::Value>, Str
         let Some(object) = value.as_object_mut() else {
             return Err(format!("line {number}: not a JSON object"));
         };
+        let generation_id = match object.get(ROLLOUT_GENERATION_ID_FIELD) {
+            None => None,
+            Some(serde_json::Value::String(id)) => Some(id.clone()),
+            Some(other) => {
+                return Err(format!(
+                    "line {number}: {ROLLOUT_GENERATION_ID_FIELD} is not a string: {other}"
+                ));
+            }
+        };
         for key in LINE_ENVELOPE_KEYS {
             object.remove(key);
         }
-        rows.push(value);
+        rows.push(StrictRow {
+            timestamp: typed.timestamp,
+            ordinal: typed.ordinal,
+            generation_id,
+            item: value,
+        });
     }
     Ok(rows)
 }
 
+/// The exact envelope [`write_rollout_jsonl`] emits for `items`: the ordinal
+/// of every row (from the same [`RolloutOrdinalState::for_rewrite`] the writer
+/// uses — none for legacy output, contiguous values for paginated output) and
+/// whether the row carries the generation id (`SessionMeta` rows only).
+fn expected_envelope(items: &[RolloutItem]) -> Result<Vec<(Option<u64>, bool)>, String> {
+    let mut ordinal_state = ordinal_state_for_items(items)
+        .map_err(|err| format!("expected new generation has no valid ordinal plan: {err}"))?;
+    let mut envelope = Vec::with_capacity(items.len());
+    for item in items {
+        let ordinal = ordinal_state
+            .current()
+            .map_err(|err| format!("expected new generation ordinal plan: {err}"))?;
+        envelope.push((ordinal, matches!(item, RolloutItem::SessionMeta(_))));
+        ordinal_state.advance();
+    }
+    Ok(envelope)
+}
+
+/// A generation id is exactly what the writer emits: a UUID v4 string.
+fn is_generated_identity(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok_and(|uuid| uuid.get_version() == Some(uuid::Version::Random))
+}
+
 /// Prove `path` is exactly the new generation `items` (see
 /// [`strict_read_generation`]): same row count, same order, each row's item
-/// wire object equal to the expected item's wire form.
-fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), String> {
+/// wire object equal to the expected item's wire form, and the envelope the
+/// writer emits for exactly these items — every ordinal equal to the
+/// [`RolloutOrdinalState::for_rewrite`] plan (absent on legacy output), one
+/// generated identity shared by every `SessionMeta` row and present on no
+/// other row.
+pub fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), String> {
     let rows = strict_read_generation(path)?;
     if rows.len() != items.len() {
         return Err(format!(
@@ -280,14 +345,53 @@ fn proves_new_generation(path: &Path, items: &[RolloutItem]) -> Result<(), Strin
             items.len()
         ));
     }
-    for (index, (row, expected)) in rows.iter().zip(items.iter()).enumerate() {
+    let envelope = expected_envelope(items)?;
+    let mut generation_id: Option<&str> = None;
+    for (index, ((row, expected), (expected_ordinal, carries_generation_id))) in
+        rows.iter().zip(items.iter()).zip(envelope).enumerate()
+    {
+        let number = index + 1;
         let expected = serde_json::to_value(expected)
             .map_err(|err| format!("expected item {index} unserializable: {err}"))?;
-        if *row != expected {
+        if row.item != expected {
             return Err(format!(
-                "line {}: item differs from the expected new generation",
-                index + 1
+                "line {number}: item differs from the expected new generation"
             ));
+        }
+        if row.ordinal != expected_ordinal {
+            return Err(format!(
+                "line {number}: ordinal {:?} != expected {:?}",
+                row.ordinal, expected_ordinal
+            ));
+        }
+        match (row.generation_id.as_deref(), carries_generation_id) {
+            (None, false) => {}
+            (Some(id), false) => {
+                return Err(format!(
+                    "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} on a non-SessionMeta row"
+                ));
+            }
+            (None, true) => {
+                return Err(format!(
+                    "line {number}: SessionMeta row without {ROLLOUT_GENERATION_ID_FIELD}"
+                ));
+            }
+            (Some(id), true) => {
+                if !is_generated_identity(id) {
+                    return Err(format!(
+                        "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} is not a generated identity"
+                    ));
+                }
+                match generation_id {
+                    None => generation_id = Some(id),
+                    Some(first) if first == id => {}
+                    Some(first) => {
+                        return Err(format!(
+                            "line {number}: {ROLLOUT_GENERATION_ID_FIELD} {id:?} differs from {first:?}"
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -624,7 +728,25 @@ fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()
         .create(true)
         .truncate(true)
         .open(path)?;
-    let mut ordinal_state = items
+    let mut ordinal_state = ordinal_state_for_items(items)?;
+    let rollout_generation_id = Uuid::new_v4().to_string();
+    for item in items {
+        let ordinal = ordinal_state.current()?;
+        let generation_id =
+            matches!(item, RolloutItem::SessionMeta(_)).then_some(rollout_generation_id.as_str());
+        write_one_line(&mut file, item, ordinal, generation_id)?;
+        ordinal_state.advance();
+    }
+    file.flush()?;
+    Ok(())
+}
+
+/// The writer's ordinal plan for a full rewrite of `items`: from the first
+/// `SessionMeta`'s history mode / base / subagent start, legacy when there
+/// is none. Shared with the new-generation proof so both derive the same
+/// envelope.
+fn ordinal_state_for_items(items: &[RolloutItem]) -> std::io::Result<RolloutOrdinalState> {
+    items
         .iter()
         .find_map(|item| match item {
             RolloutItem::SessionMeta(meta) => Some(&meta.meta),
@@ -640,17 +762,7 @@ fn write_rollout_jsonl(path: &Path, items: &[RolloutItem]) -> std::io::Result<()
                     items.len(),
                 )
             },
-        )?;
-    let rollout_generation_id = Uuid::new_v4().to_string();
-    for item in items {
-        let ordinal = ordinal_state.current()?;
-        let generation_id =
-            matches!(item, RolloutItem::SessionMeta(_)).then_some(rollout_generation_id.as_str());
-        write_one_line(&mut file, item, ordinal, generation_id)?;
-        ordinal_state.advance();
-    }
-    file.flush()?;
-    Ok(())
+        )
 }
 
 fn write_one_line(
