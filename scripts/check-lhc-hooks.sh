@@ -14,6 +14,10 @@
 #   2a1. build the real codex CLI, run bare `codex exec`, and require a thread
 #        database containing the captured user and assistant messages plus a
 #        closed completed turn, with bounded process exit
+#   2a2. same binary, bare `codex exec` under sustained pressure must cross a
+#        mid-turn compact as turn parts (one turn id, sequential step stamps,
+#        intact tool pairs, durable parts seam, reduced next request, no
+#        continuation turn / forced-boundary marker)
 #   2b. cargo test -p codex-lhc-host --lib
 #   2c. cargo test -p codex-lhc-host --features test-util --test certification
 #   2d. cargo test -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
@@ -106,6 +110,24 @@ if cargo build -q -p codex-cli --manifest-path codex-rs/Cargo.toml \
 else
   echo "TRIPWIRE bare-exec: default LHC capture did not persist a complete turn:"
   cat /tmp/lhc-hook-bare-build.log /tmp/lhc-hook-bare-capture.log 2>/dev/null | tail -60
+  fail=1
+fi
+
+# ── Layer 2a2: bare-exec mid-turn parts crossing (turn parts, Story 5) ──
+# Same debug binary, deterministic local provider: one agentic turn under
+# sustained pressure must cross a mid-turn compact as parts — the SDK's exact
+# bootstrap/task/empty-successor turn lifecycle (task turn id unchanged),
+# real shell-tool path, sequential step stamps, intact tool pairs, a durable
+# parts seam, a reduced next request, and no continuation turn /
+# forced-boundary marker / continuation receipt.
+if [ -x codex-rs/target/debug/codex ] \
+    && scripts/check-lhc-midturn-parts.py \
+        --binary codex-rs/target/debug/codex \
+        >/tmp/lhc-hook-midturn-parts.log 2>&1; then
+  cat /tmp/lhc-hook-midturn-parts.log
+else
+  echo "TRIPWIRE midturn-parts: bare exec did not cross a mid-turn parts compact:"
+  tail -60 /tmp/lhc-hook-midturn-parts.log 2>/dev/null
   fail=1
 fi
 

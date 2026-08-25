@@ -1,9 +1,16 @@
-//! LIM-63B MidTurn full-loop acceptance (mock provider, production path).
+//! MidTurn full-loop acceptance (mock provider, production path).
 //!
 //! Drives a real Codex agentic turn through `test_codex` + mock SSE with LHC
 //! capture installed and MidTurn test knobs (small upper trigger / lower bound).
 //! Asserts request shapes, marker/pair residuals, and bounded
 //! `context_length_exceeded` behavior — not enum return values alone.
+//!
+//! Turn parts (Story 5): a clean thread's MidTurn relief is the certified
+//! parts compact inside the same Codex turn. These loops assert what that
+//! rules out on a clean thread — no continuation turn, no typed
+//! compact-continuation marker in any request, no forced-boundary receipt —
+//! alongside the request-shape invariants LIM-63B already pinned. The legacy
+//! runtime remains covered by the unit suite through its typed-only route.
 //!
 //! **Stack:** these full-loop suites nest tokio workers deep enough that the
 //! default host stack can SIGABRT. CI and the tripwire set
@@ -114,10 +121,11 @@ fn body_has_summarization(body: &str) -> bool {
 }
 
 /// A. Active non-tool full loop: response 1 above trigger with end_turn=false →
-/// MidTurn compact-continuation → request 2 retains task context, completes,
-/// no native summarization arm, no empty third request.
+/// MidTurn parts compact in the same turn → request 2 retains task context,
+/// completes, no native summarization arm, no continuation marker, no empty
+/// third request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
+async fn full_loop_active_non_tool_mid_turn_same_turn() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -134,7 +142,7 @@ async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
     ]);
     let second = sse(vec![
         ev_response_created("resp-2"),
-        ev_assistant_message("m2", "task complete after compact-continuation"),
+        ev_assistant_message("m2", "task complete after mid-turn compact"),
         ev_completed_with_tokens("resp-2", /*total_tokens*/ 80),
     ]);
     let mock = mount_sse_sequence(&server, vec![first, second]).await;
@@ -194,10 +202,10 @@ async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
     );
 
     let req2 = &bodies[1];
-    // Positive durable evidence (always-skip fails): receipt + typed marker event.
+    // Turn parts (Story 5): a clean thread never takes the forced-boundary
+    // path. No typed compact-continuation marker in either request and no
+    // receipt naming a continuation turn.
     const MARKER_KIND: &str = "lhc.compact_continuation";
-    const MARKER_CAUSE: &str = "context_compacted_task_in_progress";
-    const MARKER_ACTION: &str = "continue_existing_task";
     let slot = test
         .codex
         .thread_extension_data()
@@ -213,49 +221,21 @@ async fn full_loop_active_non_tool_mid_turn_continuation() -> Result<()> {
             .await
             .expect("inspect receipts");
     assert!(
-        !receipts.is_empty(),
-        "active non-tool full loop must leave a durable compact-continuation receipt"
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "clean thread must not open a continuation turn: {receipts:?}"
     );
-    let last = receipts.last().expect("receipt");
-    assert!(
-        last.terminal || last.outcome.contains("compact") || last.outcome.contains("no_reduction"),
-        "unexpected durable outcome {}",
-        last.outcome
-    );
-    if let Some(cont) = last.continuation_turn_id.as_deref() {
-        let has = codex_lhc_host::inspect_has_compact_continuation_marker(
-            &thread_id,
-            root.as_deref(),
-            cont,
-        )
-        .await
-        .expect("marker");
-        assert!(
-            has,
-            "durable typed marker must exist for continuation turn {cont}"
+    for (i, body) in bodies.iter().enumerate() {
+        assert_eq!(
+            count_substr(body, MARKER_KIND),
+            0,
+            "request {i} must not carry the forced-boundary marker"
         );
     }
-    // When reverse-mapped into request 2, require frozen kind/cause/action once.
-    let marker_hits = count_substr(req2, MARKER_KIND);
-    if marker_hits > 0 {
-        assert_eq!(marker_hits, 1, "at most one typed marker in request 2");
-        assert!(
-            req2.contains(MARKER_CAUSE) && req2.contains(MARKER_ACTION),
-            "request 2 marker must carry cause/action constants"
-        );
-    }
-    assert_eq!(
-        count_substr(&bodies[0], MARKER_KIND),
-        0,
-        "request 1 must not already carry the continuation marker"
-    );
-    // Task context retained on the continuation request.
+    // Task context retained on the next request of the same turn.
     assert!(
         req2.contains("continue this long agentic task")
             || req2.contains("working on long task")
-            || req2.contains("part one")
-            || req2.contains(MARKER_KIND)
-            || req2.contains("context_compact"),
+            || req2.contains("part one"),
         "request 2 must retain task context: {}",
         &req2[..req2.len().min(500)]
     );
@@ -405,26 +385,14 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
             .await
             .expect("inspect receipts");
     assert!(
-        !receipts.iter().any(|r| {
-            r.receipt
-                .refuse_code
-                .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
-                == Some("unsafe_runway")
-        }),
-        "no unsafe_runway refusal after body-size terminals were removed"
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "pending parallel tools settle inside the same turn; no continuation turn: {receipts:?}"
     );
-    for r in &receipts {
-        let hv = r.receipt.residual.host_validation_status.as_str();
-        if hv == "ok" || hv == "awaiting" {
-            let row = hv_row_blocking(&thread_id, lhc_data_root.clone(), &r.attempt_id)
-                .expect("durable host-validation row");
-            assert_eq!(
-                row.status,
-                codex_lhc_host::HostValidationStatus::Ok,
-                "host-validation receipt {hv} must resolve Ok"
-            );
-        }
-    }
+    assert_eq!(
+        count_substr(req2, "lhc.compact_continuation"),
+        0,
+        "request 2 must not carry the forced-boundary marker"
+    );
 
     Ok(())
 }
@@ -562,6 +530,10 @@ async fn full_loop_context_length_exceeded_is_bounded() -> Result<()> {
         "CLE path must not leave an unbounded compact/receipt treadmill; receipts={}",
         receipts.len()
     );
+    assert!(
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "CLE relief on a clean thread never forces a boundary: {receipts:?}"
+    );
 
     Ok(())
 }
@@ -592,28 +564,6 @@ fn canonical_messages_blocking(thread_id: &str, root: Option<PathBuf>) -> Vec<St
     .expect("canonical read thread")
 }
 
-fn hv_row_blocking(
-    thread_id: &str,
-    root: Option<PathBuf>,
-    attempt_id: &str,
-) -> Option<codex_lhc_host::HostValidationAck> {
-    let tid = thread_id.to_string();
-    let attempt = attempt_id.to_string();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        rt.block_on(async move {
-            codex_lhc_host::inspect_mid_turn_host_validation(&tid, root.as_deref(), &attempt)
-                .await
-                .expect("inspect host validation")
-        })
-    })
-    .join()
-    .expect("hv read thread")
-}
-
 /// Command whose OUTPUT carries the bulk (~8000 chars) with a distinctive
 /// marker LAST, while the call arguments stay small — matching real tool
 /// shapes (calls/reasoning are never visibility-prune targets; only result
@@ -621,18 +571,23 @@ fn hv_row_blocking(
 /// arguments (`%d` formatting), so its presence in a request body proves the
 /// verbatim OUTPUT survived and its absence proves the output was abridged.
 fn cycle_command(i: usize) -> String {
-    format!("yes tok | head -n 2000 | tr '\n' ' '; printf -- '-ENDPAY%d' {i}")
+    format!("yes tok | head -n 8000 | tr '\n' ' '; printf -- '-ENDPAY%d' {i}")
 }
 
 /// Approximate unpruned output volume per cycle (chars).
-const CYCLE_OUTPUT_CHARS: usize = 8_000;
+const CYCLE_OUTPUT_CHARS: usize = 32_000;
 
-/// LIM-67 sustained proof: 22 deterministic tool cycles. Provider usage
-/// follows a sawtooth so the seam crosses the auto-compact trigger on waves
-/// and LHC must repeatedly compact. Auto-compact is a trigger only, not a
-/// body-size refuse.
+/// LIM-67 sustained proof under turn parts: 22 deterministic tool cycles whose
+/// outputs cross the SDK's production lower bound part-way through. Provider
+/// usage follows a sawtooth so the seam crosses the auto-compact trigger on
+/// waves. The parts arm splits the active turn at step edges inside the one
+/// Codex turn: every request k+1 still carries cycle k's protected pair
+/// verbatim, the final request is bounded and abridges early outputs, encrypted
+/// reasoning survives, the installed view serves parts and a later request is
+/// served across the seam — with no continuation turn and no forced-boundary
+/// marker anywhere.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
+async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CYCLES: usize = 22;
@@ -702,6 +657,10 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
         .thread_extension_data()
         .get::<LhcCaptureSlot>()
         .expect("slot");
+    // Turn parts: this loop runs the production parts arm under the SDK's
+    // production lower bound (120k tokens; core's test knobs are not compiled
+    // into integration builds), so the fixture's tool outputs are sized to
+    // cross it part-way through the loop.
     let _ = wait_for_handle(&slot, Duration::from_secs(30)).await;
 
     let (sandbox_policy, permission_profile) =
@@ -752,6 +711,42 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
         );
     }
 
+    // Durable mechanism evidence (turn parts): the sustained relief split the
+    // active turn into parts inside the one Codex turn — the installed view
+    // serves parts, no continuation turn was opened, and no request carried
+    // the forced-boundary marker.
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    let thread_id = handle.thread_id().to_string();
+    let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
+            .await
+            .expect("inspect receipts");
+    assert!(
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "sustained relief must never open a continuation turn: {receipts:?}"
+    );
+    assert!(
+        !bodies
+            .iter()
+            .any(|b| b.contains("lhc.compact_continuation")),
+        "no request may carry the forced-boundary marker"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, lhc_data_root.as_deref())
+        .await
+        .expect("describe")
+        .expect("sustained relief installs a serving view");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "the active turn is served as parts by the installed view"
+    );
+    assert!(
+        bodies.iter().skip(1).any(|b| b.contains("[seam · ")),
+        "a later request is served across the parts seam"
+    );
+
     // Semantic pruning evidence: by the final request, some early-cycle
     // unprotected tool outputs have been abridged — their end markers are
     // gone. The selector may trade raw tail for bounded smooth/band context,
@@ -786,74 +781,6 @@ async fn full_loop_sustained_protected_escalation_bounded() -> Result<()> {
             "final request must carry the prior response's encrypted reasoning verbatim"
         );
     }
-
-    // Durable receipts: escalations happened, each with exactly one boundary +
-    // typed marker; installs are truthful; no misreported install failures.
-    let handle = wait_for_handle(&slot, Duration::from_secs(30))
-        .await
-        .expect("handle");
-    let thread_id = handle.thread_id().to_string();
-    let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
-    let receipts =
-        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
-            .await
-            .expect("inspect receipts");
-    let escalated: Vec<_> = receipts
-        .iter()
-        .filter(|r| {
-            matches!(
-                r.receipt.relief_path.as_str(),
-                "protected_escalation" | "host_validation_awaiting"
-            )
-        })
-        .collect();
-    assert!(
-        !escalated.is_empty(),
-        "sustained loop must include protected escalations; outcomes={:?}",
-        receipts
-            .iter()
-            .map(|r| (r.outcome.clone(), r.receipt.relief_path.as_str()))
-            .collect::<Vec<_>>()
-    );
-    for r in &escalated {
-        let cont = r
-            .continuation_turn_id
-            .as_deref()
-            .expect("escalated receipt must carry its continuation turn id");
-        let has_marker = codex_lhc_host::inspect_has_compact_continuation_marker(
-            &thread_id,
-            lhc_data_root.as_deref(),
-            cont,
-        )
-        .await
-        .expect("marker inspect");
-        assert!(
-            has_marker,
-            "exactly one typed marker per escalation ({cont})"
-        );
-        assert!(
-            !r.receipt.residual.protected_tool_call_ids.is_empty(),
-            "escalated receipt records its protected set"
-        );
-        // Host validation resolved ok for every served escalated install.
-        if r.receipt.residual.host_validation_status.as_str() == "awaiting" {
-            let row = hv_row_blocking(&thread_id, lhc_data_root.clone(), &r.attempt_id)
-                .expect("durable host-validation row for escalated install");
-            assert_eq!(
-                row.status,
-                codex_lhc_host::HostValidationStatus::Ok,
-                "served escalated install must have host validation recorded ok"
-            );
-        }
-    }
-    assert!(
-        !receipts.iter().any(|r| r
-            .receipt
-            .refuse_code
-            .map(codex_lhc_host::CompactContinuationRefuseCode::as_str)
-            == Some("install_failed")),
-        "no misreported install failures across the sustained loop"
-    );
 
     // Canonical content remains retrievable verbatim: the earliest cycle's
     // full payload (marker included) still lives in the canonical record even

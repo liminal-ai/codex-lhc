@@ -35,6 +35,8 @@ use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::LhcCompactResult;
 use codex_lhc_host::MaterializeInput;
 use codex_lhc_host::MidTurnCompactContinuationRequest;
+use codex_lhc_host::MidTurnPartsOutcome;
+use codex_lhc_host::MidTurnPartsRequest;
 use codex_lhc_host::WorkContinuation;
 use codex_lhc_host::WriterClaim;
 use codex_lhc_host::atomic_rewrite_rollout;
@@ -497,7 +499,7 @@ pub(crate) async fn try_run_lhc_compact_arm(
         && let Some(mid) = mid_turn
     {
         // Box to keep rustc query depth under the limit when nested under run_turn.
-        return Box::pin(try_run_mid_turn_compact_continuation(
+        return Box::pin(try_run_mid_turn_arm(
             sess,
             turn_context,
             initial_context_injection,
@@ -555,9 +557,224 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks(
     .await
 }
 
-/// LIM-63B MidTurn: certified compact-continuation at the settled post-sampling
-/// seam. LHC is the single writer; never silently falls open to native.
-async fn try_run_mid_turn_compact_continuation(
+/// Turn parts MidTurn arm (Story 5): at the settled post-sampling seam invoke
+/// the certified SDK `mid_turn_compact` — the ordinary bounded compact that
+/// splits the active turn into parts (or settles/compacts) with no synthetic
+/// boundary or continuation turn. The single AC-7.3 amendment is typed-only:
+/// **only** a typed `ForcedBoundaryThread` refusal routes an already-classified
+/// thread to the legacy compact-continuation path. Every other refusal, storage
+/// error, flush failure, or missing active turn preserves the current body and
+/// retries at a later eligible seam — it never falls open to native compaction
+/// and never asserts a false seam fact.
+async fn try_run_mid_turn_arm(
+    sess: &Arc<Session>,
+    turn_context: &TurnContext,
+    initial_context_injection: InitialContextInjection,
+    mid: MidTurnSeamFacts,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<LhcCompactAttempt> {
+    if cancellation_token.is_cancelled() {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "turn cancelled before MidTurn parts compact".into(),
+            next_provider_request_allowed: false,
+        });
+    }
+    if !sess.enabled(Feature::LhcCapture) {
+        return Ok(failed_attempt(
+            "Feature::LhcCapture off; native compact is disabled in this fork",
+        ));
+    }
+    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason:
+                "no LhcCaptureSlot at MidTurn; next provider request continues on the existing body"
+                    .into(),
+            next_provider_request_allowed: true,
+        });
+    };
+    let Some(handle) = slot.get() else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "LHC capture handle not ready at MidTurn; incomplete facts, no mutation".into(),
+            next_provider_request_allowed: true,
+        });
+    };
+    // Transport retries inside one outer sampling cycle never compact.
+    if mid.inside_transport_retry {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: "inside transport retry; stable view, no MidTurn compact".into(),
+        });
+    }
+    // AC-7.4: the host asserts `captureFlushed` only on a *successful* flush.
+    // A flush that does not complete is not a settled seam — keep the current
+    // body and retry, never assert a false fact.
+    if !handle.flush_within(MIDTURN_COMPACT_FLUSH_BOUND).await {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "capture flush did not complete at MidTurn seam; not a settled seam, retrying at the next one"
+                .into(),
+            next_provider_request_allowed: true,
+        });
+    }
+    // An unsettled stream (mailbox preempt / abandoned) is not a settled seam.
+    if !mid.model_response_complete {
+        return Ok(LhcCompactAttempt::MidTurnSkipped {
+            reason: "model response incomplete (preempted/abandoned stream); no MidTurn compact"
+                .into(),
+        });
+    }
+
+    let thread_id = handle.thread_id().to_string();
+    let root = handle.root().map(std::path::Path::to_path_buf);
+
+    // AC-7.4 (host side): the durable active turn must be exactly this Codex
+    // turn. `LhcTurnId` is the host identity; capture bound it to the SDK's
+    // durable turn name when that turn's opening prompt was committed. No
+    // current identity, or no binding yet (the open turn is not committed),
+    // keeps the current body without invoking compact; the adapter then
+    // compares the bound id with `host_metadata.active_turn.turn_id` exactly.
+    let Some(host_turn_id) = turn_context
+        .extension_data
+        .get::<codex_lhc_host::LhcTurnId>()
+        .map(|id| id.0.clone())
+    else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: "no current host turn identity (LhcTurnId) at the MidTurn seam; keeping current body"
+                .into(),
+            next_provider_request_allowed: true,
+        });
+    };
+    let Some(active_turn_id) = handle.durable_turn_id(&host_turn_id) else {
+        return Ok(LhcCompactAttempt::MidTurnBlocked {
+            reason: format!(
+                "durable turn for host turn {host_turn_id} not yet bound at the MidTurn seam; \
+                 keeping current body, retrying at a later seam"
+            ),
+            next_provider_request_allowed: true,
+        });
+    };
+
+    // Band percentages / lower target for the bounded walk (test override when set).
+    let compact = {
+        let configured =
+            compact_opts_with_band_percentages(configured_band_percentages(turn_context));
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            slot.mid_turn_test_compact().or(Some(configured))
+        }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            Some(configured)
+        }
+    };
+
+    let req = MidTurnPartsRequest {
+        thread_id: thread_id.clone(),
+        root: root.clone(),
+        active_turn_id,
+        compact,
+        created_at: None,
+    };
+    let outcome = match run_mid_turn_parts_on_thread(req, &mid.attempt_id, cancellation_token).await
+    {
+        Ok(o) => o,
+        Err(MidTurnPartsHopError::Cancelled(reason)) => {
+            // The turn is ending; nothing was invoked and no request follows.
+            return Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason,
+                next_provider_request_allowed: false,
+            });
+        }
+        Err(MidTurnPartsHopError::Failed(err)) => {
+            // Storage, worker, timeout, or panic: nothing durable changed (the
+            // SDK install is atomic). Keep the current body and retry at a
+            // later eligible seam — never a fall-open to native compaction and
+            // never the compact-continuation path.
+            warn!(%err, "LHC MidTurn parts compact failed; next provider request continues on the existing body");
+            return Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason: err,
+                next_provider_request_allowed: true,
+            });
+        }
+    };
+
+    match outcome {
+        MidTurnPartsOutcome::Installed(receipt) => {
+            // Reuse the existing atomic materialize / rollout-rewrite / in-memory
+            // install path. The SDK already installed the serving view (parts or
+            // whole); no continuation marker, no forced boundary. CompactMarker
+            // here is ordinary fork bookkeeping (the durable Compacted record).
+            let marker =
+                CompactMarker::from_receipt(&receipt, &thread_id, /*body*/ &[], "midturn");
+            let (_initial_context, world_state_baseline) =
+                build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
+            let reference_context_item = match &initial_context_injection {
+                InitialContextInjection::DoNotInject => None,
+                InitialContextInjection::BeforeLastUserMessage { .. } => {
+                    Some(turn_context.to_turn_context_item())
+                }
+            };
+            // The SDK install already happened; the host rewrite is the atomic
+            // completion and runs under a token that is never cancelled so a
+            // cancellation race cannot leave a split state.
+            let apply_token = CancellationToken::new();
+            Box::pin(install_lhc_compact_rewrite(
+                sess,
+                turn_context,
+                &slot,
+                thread_id,
+                root,
+                marker,
+                world_state_baseline,
+                reference_context_item,
+                /*manual*/ false,
+                /*host_validation*/ None,
+                &apply_token,
+            ))
+            .await
+        }
+        MidTurnPartsOutcome::ForcedBoundaryThread => {
+            // AC-7.3 (typed-only): this thread already took the forced-boundary
+            // path before the migration. Route it — and only it — through the
+            // legacy compact-continuation mechanism so it behaves exactly as
+            // before. A thread that ever served parts never reaches here (the
+            // SDK would not return this code), so once parts activated the old
+            // path cannot run.
+            Box::pin(run_mid_turn_forced_boundary_continuation(
+                sess,
+                turn_context,
+                initial_context_injection,
+                mid,
+                cancellation_token,
+            ))
+            .await
+        }
+        MidTurnPartsOutcome::ActiveTurnMismatch { expected, durable } => {
+            // AC-7.4: the durable active turn is not this Codex turn. Compact
+            // was not invoked; keep the current body, retry at a later seam.
+            Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason: format!(
+                    "durable active turn {} is not the current host turn's bound turn {expected}; \
+                     keeping current body",
+                    durable.as_deref().unwrap_or("<none>")
+                ),
+                next_provider_request_allowed: true,
+            })
+        }
+        MidTurnPartsOutcome::Refused { code, reason } => {
+            // Typed refusal at a truthful settled seam (not ForcedBoundaryThread):
+            // no mutation happened. Keep the current body; retry at a later seam.
+            // Never a license for native compaction.
+            Ok(LhcCompactAttempt::MidTurnBlocked {
+                reason: format!("mid-turn parts refused code={code} reason={reason}"),
+                next_provider_request_allowed: true,
+            })
+        }
+    }
+}
+
+/// Legacy compact-continuation MidTurn path (LIM-63B). Reached in Story 5 only
+/// for a thread the SDK typed as `ForcedBoundaryThread` (AC-7.3 coexistence).
+/// LHC is the single writer; never silently falls open to native.
+async fn run_mid_turn_forced_boundary_continuation(
     sess: &Arc<Session>,
     turn_context: &TurnContext,
     initial_context_injection: InitialContextInjection,
@@ -1040,6 +1257,19 @@ async fn try_run_mid_turn_compact_continuation(
                     marker_persisted = outcome.marker_persisted,
                     "LHC MidTurn compact-continuation installed serving view"
                 );
+                // AC-7.3/AC-7.4: the SDK opened the continuation turn for this
+                // host turn (no host prompt did). Re-bind so the exact identity
+                // check at the next seam names the durable turn now active and
+                // the thread keeps reaching its typed classification.
+                if let (Some(host_turn_id), Some(cont)) = (
+                    turn_context
+                        .extension_data
+                        .get::<codex_lhc_host::LhcTurnId>()
+                        .map(|id| id.0.clone()),
+                    outcome.continuation_turn_id.as_deref(),
+                ) {
+                    handle.rebind_turn(&host_turn_id, cont);
+                }
                 return Ok(LhcCompactAttempt::Installed { body, marker });
             }
             other => {
@@ -1386,6 +1616,86 @@ async fn run_mid_turn_on_thread(
             r
         }
         Err(_) => Err("lhc-midturn channel closed".into()),
+    }
+}
+
+/// Why the parts hop produced no outcome. Only `Cancelled` blocks the next
+/// provider request (the turn is ending); every `Failed` keeps the current
+/// body and retries at a later eligible seam.
+#[derive(Debug)]
+enum MidTurnPartsHopError {
+    Cancelled(String),
+    Failed(String),
+}
+
+/// Hop `run_mid_turn_parts_compact` onto a bounded current-thread runtime
+/// (SDK futures are `!Send`). The SDK install is atomic, so a cancellation
+/// during the section never leaves a split state; the worker is always joined.
+async fn run_mid_turn_parts_on_thread(
+    req: MidTurnPartsRequest,
+    attempt_id: &str,
+    turn_cancel: &CancellationToken,
+) -> Result<MidTurnPartsOutcome, MidTurnPartsHopError> {
+    if turn_cancel.is_cancelled() {
+        return Err(MidTurnPartsHopError::Cancelled(
+            "lhc-midturn-parts cancelled by turn abort before critical section".into(),
+        ));
+    }
+    run_mid_turn_parts_worker(req, attempt_id)
+        .await
+        .map_err(MidTurnPartsHopError::Failed)
+}
+
+async fn run_mid_turn_parts_worker(
+    req: MidTurnPartsRequest,
+    attempt_id: &str,
+) -> Result<MidTurnPartsOutcome, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let worker_timeout = midturn_worker_timeout();
+    // Same short prefix + attempt id as the legacy hop: "is *this* attempt's
+    // mutator still running?" stays answerable from /proc and the tests.
+    let join = std::thread::Builder::new()
+        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt_id}"))
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("runtime: {e}"))?;
+                rt.block_on(async move {
+                    let op = async {
+                        #[cfg(test)]
+                        if let Some(stall) = midturn_worker_stall() {
+                            tokio::time::sleep(stall).await;
+                        }
+                        codex_lhc_host::run_mid_turn_parts_compact(req).await
+                    };
+                    match tokio::time::timeout(worker_timeout, op).await {
+                        Ok(inner) => inner,
+                        Err(_) => Err(format!(
+                            "lhc-midturn-parts worker timed out after {}s (operation future dropped on worker)",
+                            worker_timeout.as_secs_f64()
+                        )),
+                    }
+                })
+            }));
+            let out = match result {
+                Ok(inner) => inner,
+                Err(_) => Err("lhc-midturn-parts thread panicked".into()),
+            };
+            let _ = tx.send(out);
+        })
+        .map_err(|e| format!("spawn lhc-midturn-parts thread: {e}"))?;
+    let worker_out = rx.await;
+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
+    match join_result {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err("lhc-midturn-parts thread panicked during join".into()),
+        Err(err) => return Err(format!("lhc-midturn-parts join task failed: {err}")),
+    }
+    match worker_out {
+        Ok(r) => r,
+        Err(_) => Err("lhc-midturn-parts channel closed".into()),
     }
 }
 

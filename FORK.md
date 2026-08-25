@@ -138,7 +138,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
-| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + LIM-63B MidTurn compact-continuation (one-writer, no native fall-open) | `0007-lhc-compact-arm` |
+| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + turn-parts MidTurn arm (Story 5: certified `mid_turn_compact` at the settled seam, exact active-turn identity, typed-only `ForcedBoundaryThread` route to the LIM-63B compact-continuation runtime; one-writer, no native fall-open) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
 | 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch) | (with 0007) |
 | 13b | `core/src/session/turn.rs` | turn parts F2: begin the provider request/response cycle before each outer sampling request so raw-item capture stamps `stepIndex` on assistant_text/assistant_thinking/tool_call/tool_result | (with 0007) |
@@ -321,6 +321,11 @@ Adapter absorbed two SDK shape additions without semantic change:
 `ViewCompactParams.newest_closed_protection` (left `None`, profile default) and
 `MessageRecord.step_index` in materialize test fixtures. `just fmt` reformats
 the vendored crate and two Python scripts; that churn was reverted (F12).
+
+Slices 2–3 of the same run: F2 step stamping (hook 13b, markers 52 → 53) and
+the turn-parts MidTurn arm with typed-only forced-boundary coexistence (see
+"Turn parts MidTurn"); patch `0007` regenerated for the fork-owned core files
+touched, tripwire layer 2a2 added.
 
 ### Drill run 2026-08-23 — exact stable `rust-v0.149.0`
 
@@ -627,8 +632,10 @@ request), **LHC is the single writer**. The certified SDK operation
   A later safe attempt supersedes.
 - Evidence: `mid_turn_protected_escalation_validates_installs_and_clears_reload_gate`,
   `mid_turn_host_validation_failed_blocks_send_and_gates_reload` (lib), and
-  the sustained `full_loop_sustained_protected_escalation_bounded` +
-  existing MidTurn loops (suite).
+  the legacy-runtime unit tests routed directly to
+  `run_mid_turn_forced_boundary_continuation` (Story 5: the arm reaches this
+  runtime only on the SDK's typed `ForcedBoundaryThread`; the suite loops now
+  pin the parts path — see "Turn parts MidTurn").
 
 Host obligations:
 
@@ -670,6 +677,55 @@ Host obligations:
 Implementation: `codex-lhc-host::compact_continuation` +
 `core/src/compact_lhc.rs` MidTurn arm; evidence in
 `compact_lhc_mid_turn_tests.rs`.
+
+## Turn parts MidTurn (Story 5, 2026-08-25)
+
+On a **clean thread** the MidTurn arm no longer forces a boundary. At the
+same settled post-sampling seam it invokes the certified SDK
+`thread_view::mid_turn_compact` — the ordinary bounded prepare → install
+compact behind the four-fact seam assertion (`modelResponseComplete`,
+`requestedToolsSettled`, `captureFlushed`, `beforeNextProviderRequest`, all
+asserted true and only when true) — which splits the active turn at step
+edges into parts inside the **same Codex turn**. The existing atomic
+materialize / rollout rewrite / in-memory install path then serves the view.
+No synthetic continuation turn, no forced-boundary marker.
+
+- **F2 step stamping** (`LhcStepIndex`, hook 13b): one zero-based cycle per
+  outer sampling request; transport retries inside `run_sampling_request`
+  never advance it; stamped only on `assistant_text` / `assistant_thinking` /
+  `tool_call` / `tool_result`; NULL = unknown, never split.
+- **Exact active-turn identity (AC-7.4 host side).** The SDK names durable
+  turns itself (`t{order}`), so capture binds the host `LhcTurnId` to the
+  durable turn the host turn's prompt opens (`BindTurn` at `on_turn_start`,
+  ordered ahead of the prompt; the intake's `Opened` transition — or the
+  adopted open turn when the prompt joins an empty one — completes the
+  binding). The arm compares that bound id **exactly** with
+  `host_metadata.active_turn.turn_id` before invoking compact. Missing
+  identity, missing binding, or mismatch keeps the current body, invokes
+  nothing, and retries at a later eligible seam. A forced-boundary
+  continuation re-binds the host turn to the SDK-opened continuation turn so
+  legacy threads keep reaching their typed classification.
+- **Truthful seam.** A capture flush that does not complete within its bound
+  is not a settled seam: keep the body, retry later — never assert a false
+  fact (supersedes the LIM-63B "warn and continue" behavior).
+- **Failure split.** Only cancellation/abort denies the next provider
+  request. Every other refusal, storage, worker, timeout, or panic failure
+  preserves the current body and allows progress to a later seam. Nothing but
+  the typed `ForcedBoundaryThread` reaches compact-continuation.
+- **Coexistence / exclusivity (AC-7.3, typed-only).** A thread the SDK types
+  `ForcedBoundaryThread` (any boundary row) keeps the LIM-63B runtime through
+  the ordinary arm, exactly as before. Once `parts_activated_at` exists the
+  legacy runtime never runs for that thread (the SDK refuses it typed even
+  when invoked directly). Both directions:
+  `mid_turn_forced_boundary_thread_keeps_legacy_runtime_through_arm`,
+  `mid_turn_parts_thread_never_runs_legacy_runtime`.
+- **Evidence:** `compact_lhc::mid_turn_tests` (parts, identity mismatch,
+  generic-failure retry, cancel blocks, flush seam), suite
+  `compact_lhc_mid_turn_loops` (same turn, no marker, sustained pressure
+  splits under the production 120k bound), `lhc_capture_e2e` step stamps,
+  certification `step_index_round_trips_on_four_kinds_and_null_elsewhere`,
+  and tripwire layer 2a2 (`scripts/check-lhc-midturn-parts.py`, bare exec).
+- Not in scope here: threshold/band tuning, Story 6.
 
 ## Turn abort / SIGINT capture (slice A + F-L3 live-cert)
 

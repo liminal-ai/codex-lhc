@@ -15,6 +15,7 @@ mod inference;
 mod install;
 mod mapping;
 mod materialize;
+mod mid_turn_parts;
 mod rollout_reconcile;
 mod rollout_swap;
 mod session;
@@ -141,6 +142,12 @@ pub use lhc::shared_tech::compact_continuation::PostMeasurementEstimate;
 pub use lhc::shared_tech::compact_continuation::ProviderUsageAuthority;
 pub use lhc::shared_tech::compact_continuation::WorkContinuation;
 pub use lhc::shared_tech::compact_continuation::WriterClaim;
+pub use mid_turn_parts::MidTurnPartsOutcome;
+pub use mid_turn_parts::MidTurnPartsRequest;
+pub use mid_turn_parts::SETTLED_MID_TURN_SEAM;
+pub use mid_turn_parts::inspect_installed_view;
+pub use mid_turn_parts::run_mid_turn_parts_compact;
+pub use mid_turn_parts::view_serves_parts;
 /// Return type of every [`InferenceCallbacks`] lane — lets hosts wrap the
 /// callbacks (counting, tracing, delaying) without a direct `lhc` path dep.
 pub type BoxInferenceFuture = lhc::shared_tech::derivation::BoxFuture<InferenceResult>;
@@ -148,6 +155,7 @@ pub use session::LhcSession;
 
 pub use capture::CAPTURE_QUEUE_CAP;
 pub use capture::CaptureHandle;
+pub use capture::TurnBinding;
 pub use capture::spawn_capture;
 pub use gating::lhc_root;
 pub use idempotency::OccurrenceTracker;

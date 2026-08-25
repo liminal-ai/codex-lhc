@@ -103,6 +103,12 @@ enum CaptureCmd {
     ProviderUsage {
         usage: TokenUsage,
     },
+    /// Host turn start (turn parts, AC-7.4 host side): bind the durable turn
+    /// the intake opens next to this host turn id. Ordered ahead of that
+    /// turn's prompt on the same queue.
+    BindTurn {
+        host_turn_id: String,
+    },
     /// Model and/or thinking-level change (from ConfigContributor).
     ModelOrThinkingChange {
         previous_model: String,
@@ -160,6 +166,94 @@ struct CaptureShared {
     dropped: Arc<AtomicU64>,
     /// Latched when a drop occurs or capture is permanently disabled.
     degraded: Arc<AtomicBool>,
+    /// Durable turn bound to the current host turn (published by the worker).
+    turn_binding: Arc<std::sync::Mutex<Option<TurnBinding>>>,
+}
+
+/// Durable identity of the LHC turn opened under one host turn (turn parts,
+/// AC-7.4 host side). The SDK names turns itself (`t{order}`); the host turn
+/// id (`LhcTurnId`) is bound to that name when the intake reports the turn
+/// opened, so the settled seam can compare the durable active turn with the
+/// host's current turn identity exactly rather than by presence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnBinding {
+    pub host_turn_id: String,
+    pub lhc_turn_id: String,
+}
+
+/// Worker-side binder: the host turn named by the latest `BindTurn` is bound
+/// to every durable turn the intake opens while it stays current (the turn's
+/// opening prompt; a later steer prompt re-binds to the newer open turn).
+struct TurnBinder {
+    host_turn_id: Option<String>,
+    published: Arc<std::sync::Mutex<Option<TurnBinding>>>,
+}
+
+impl TurnBinder {
+    /// Bind after one committed batch. A prompt normally opens a durable turn
+    /// (`Opened` transition). A prompt that joins an already-open empty turn —
+    /// the thread's initial turn, or any open turn without members — reports
+    /// no transition; then the open turn from the record is the bound one.
+    async fn observe(
+        &self,
+        session: &mut LhcSession,
+        events: &[MappedEvent],
+        batch: &lhc::intake_stream::BatchResult,
+    ) {
+        let Some(host_turn_id) = self.host_turn_id.as_ref() else {
+            return;
+        };
+        let opened = batch
+            .turn_transitions
+            .iter()
+            .rev()
+            .find(|transition| {
+                matches!(
+                    transition.action,
+                    lhc::intake_stream::TurnTransitionAction::Opened
+                )
+            })
+            .map(|transition| transition.turn_id.clone());
+        let lhc_turn_id = match opened {
+            Some(id) => id,
+            None => {
+                let prompted = events
+                    .iter()
+                    .any(|event| event.input.event_kind == "user_prompt");
+                if !prompted || self.bound_for(host_turn_id) {
+                    return;
+                }
+                match session.list_turns().await {
+                    Ok(turns) => match turns
+                        .into_iter()
+                        .find(|turn| matches!(turn.status, lhc::turns::TurnStatus::Open))
+                    {
+                        Some(turn) => turn.turn_id,
+                        None => return,
+                    },
+                    Err(err) => {
+                        warn!(%err, "LHC: could not resolve the open turn for host turn binding");
+                        return;
+                    }
+                }
+            }
+        };
+        *self
+            .published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TurnBinding {
+            host_turn_id: host_turn_id.clone(),
+            lhc_turn_id,
+        });
+    }
+
+    fn bound_for(&self, host_turn_id: &str) -> bool {
+        self.published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|binding| binding.host_turn_id == host_turn_id)
+    }
 }
 
 /// Handle to a per-thread capture worker (cheaply cloneable).
@@ -217,6 +311,57 @@ impl CaptureHandle {
                 self.latch_degraded("persist_closed");
             }
         }
+    }
+
+    /// Bind the durable turn the intake opens next to `host_turn_id` (turn
+    /// parts, AC-7.4 host side). Sent at host turn start, so it is ordered
+    /// ahead of that turn's prompt on the capture queue. A full or closed
+    /// queue degrades like any other lost command: the binding never lands
+    /// and the seam keeps the current body.
+    pub fn bind_turn(&self, host_turn_id: &str) {
+        if self.inner.degraded.load(Ordering::Relaxed) {
+            self.note_drop("degraded_refuse");
+            return;
+        }
+        match self.inner.tx.try_send(CaptureCmd::BindTurn {
+            host_turn_id: host_turn_id.to_string(),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.latch_degraded("bind_turn_full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.latch_degraded("bind_turn_closed");
+            }
+        }
+    }
+
+    /// Re-bind `host_turn_id` to a durable turn the host observed the SDK open
+    /// on its behalf (the forced-boundary continuation turn, AC-7.3). Keeps
+    /// the exact identity check truthful for a thread that keeps using the
+    /// legacy runtime, whose continuation turns no host prompt opens.
+    pub fn rebind_turn(&self, host_turn_id: &str, lhc_turn_id: &str) {
+        *self
+            .inner
+            .turn_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(TurnBinding {
+            host_turn_id: host_turn_id.to_string(),
+            lhc_turn_id: lhc_turn_id.to_string(),
+        });
+    }
+
+    /// The durable LHC turn id bound to `host_turn_id`, once capture has
+    /// committed that turn's opening prompt. `None` before then, or when the
+    /// current binding belongs to a different host turn.
+    pub fn durable_turn_id(&self, host_turn_id: &str) -> Option<String> {
+        self.inner
+            .turn_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|binding| binding.host_turn_id == host_turn_id)
+            .map(|binding| binding.lhc_turn_id.clone())
     }
 
     /// Latch degraded and try to record a self-describing truncation note (H6).
@@ -576,12 +721,14 @@ pub async fn spawn_capture_with_identity(
     let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_CAP);
     let dropped = Arc::new(AtomicU64::new(0));
     let degraded = Arc::new(AtomicBool::new(false));
+    let turn_binding = Arc::new(std::sync::Mutex::new(None));
     let shared = Arc::new(CaptureShared {
         thread_id: thread_id.to_string(),
         root: root.clone(),
         tx,
         dropped: Arc::clone(&dropped),
         degraded: Arc::clone(&degraded),
+        turn_binding: Arc::clone(&turn_binding),
     });
     let thread_id_owned = thread_id.to_string();
     let degraded_worker = Arc::clone(&degraded);
@@ -611,6 +758,7 @@ pub async fn spawn_capture_with_identity(
                         degraded_worker,
                         derivation,
                         initial_identity.unwrap_or_default(),
+                        turn_binding,
                     )
                     .await;
                 });
@@ -634,6 +782,7 @@ pub async fn spawn_capture_with_identity(
     Some(CaptureHandle { inner: shared })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker_loop(
     mut session: LhcSession,
     mut tracker: OccurrenceTracker,
@@ -642,9 +791,14 @@ async fn worker_loop(
     degraded: Arc<AtomicBool>,
     derivation: crate::inference::LateBoundCallbacks,
     mut live_identity: ModelIdentity,
+    turn_binding: Arc<std::sync::Mutex<Option<TurnBinding>>>,
 ) {
     #[cfg(any(test, feature = "test-util"))]
     let mut crash_after: Option<usize> = None;
+    let mut binder = TurnBinder {
+        host_turn_id: None,
+        published: turn_binding,
+    };
     // ModelOutput items from one sampling call arrive before
     // ResponseEvent::Completed (token usage). Buffer them so assistant_text
     // can carry providerUsage on the same event (schema v5 / D3) without
@@ -654,6 +808,9 @@ async fn worker_loop(
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
+            CaptureCmd::BindTurn { host_turn_id } => {
+                binder.host_turn_id = Some(host_turn_id);
+            }
             CaptureCmd::Persist {
                 item,
                 provenance,
@@ -671,6 +828,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -690,6 +848,7 @@ async fn worker_loop(
                     None,
                     step_index,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -710,6 +869,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     provider_usage.as_ref(),
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -733,6 +893,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -764,6 +925,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -809,6 +971,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -840,6 +1003,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -895,6 +1059,7 @@ async fn worker_loop(
                     &mut pending_model_output,
                     None,
                     &live_identity,
+                    &binder,
                     &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
@@ -927,6 +1092,7 @@ async fn worker_loop(
         &mut pending_model_output,
         None,
         &live_identity,
+        &binder,
         &mut durability,
         #[cfg(any(test, feature = "test-util"))]
         &mut crash_after,
@@ -935,6 +1101,7 @@ async fn worker_loop(
     close_capture_session(session, &derivation).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_pending_model_output(
     session: &mut LhcSession,
     tracker: &mut OccurrenceTracker,
@@ -943,6 +1110,7 @@ async fn flush_pending_model_output(
     pending: &mut Vec<(ResponseItem, RawItemProvenance, Option<i64>)>,
     provider_usage: Option<&Map<String, Value>>,
     identity: &ModelIdentity,
+    binder: &TurnBinder,
     durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
@@ -961,6 +1129,7 @@ async fn flush_pending_model_output(
             provider_usage,
             step_index,
             identity,
+            binder,
             durability,
             #[cfg(any(test, feature = "test-util"))]
             crash_after,
@@ -980,6 +1149,7 @@ async fn persist_item(
     provider_usage: Option<&Map<String, Value>>,
     step_index: Option<i64>,
     identity: &ModelIdentity,
+    binder: &TurnBinder,
     durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
@@ -1048,22 +1218,25 @@ async fn persist_item(
         );
         return Err("crash".into());
     }
-    if let Err(err) = submit_mapped(session, &events).await {
-        durability.failed = true;
-        warn!(thread_id = %thread_id, %err, "LHC: persist failed");
-        if session.capture_disabled {
-            degraded.store(true, Ordering::SeqCst);
-            error!(
-                thread_id = %thread_id,
-                "LHC: capture permanently disabled after repeated failures"
-            );
-            // Record a truncation note while still possible.
-            let note = map_runtime_note(
-                thread_id,
-                "LHC capture permanently disabled after repeated submit failures",
-                "disabled",
-            );
-            let _ = submit_mapped(session, &[note]).await;
+    match submit_mapped(session, &events).await {
+        Ok(batch) => binder.observe(session, &events, &batch).await,
+        Err(err) => {
+            durability.failed = true;
+            warn!(thread_id = %thread_id, %err, "LHC: persist failed");
+            if session.capture_disabled {
+                degraded.store(true, Ordering::SeqCst);
+                error!(
+                    thread_id = %thread_id,
+                    "LHC: capture permanently disabled after repeated failures"
+                );
+                // Record a truncation note while still possible.
+                let note = map_runtime_note(
+                    thread_id,
+                    "LHC capture permanently disabled after repeated submit failures",
+                    "disabled",
+                );
+                let _ = submit_mapped(session, &[note]).await;
+            }
         }
     }
     Ok(())

@@ -11,6 +11,7 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadStartInput;
+use codex_extension_api::TurnStartInput;
 use codex_features::Feature;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::ProviderUsageAuthority;
@@ -111,6 +112,30 @@ pub(super) async fn install_lhc_midturn(session: &mut Session, root: std::path::
     }
 }
 
+/// Drive the production turn-start lifecycle for `tc` (what `run_turn` does
+/// before recording the prompt): `LhcTurnId` lands in the turn store and
+/// capture binds the durable turn the next prompt opens to it (AC-7.4).
+pub(super) async fn start_host_turn(
+    session: &Session,
+    tc: &crate::session::turn_context::TurnContext,
+) {
+    let collaboration_mode = tc.collaboration_mode();
+    let token_usage_at_start = TokenUsage::default();
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: tc.sub_id.as_str(),
+                collaboration_mode: &collaboration_mode,
+                token_usage_at_turn_start: &token_usage_at_start,
+                started_at: None,
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: tc.extension_data.as_ref(),
+            })
+            .await;
+    }
+}
+
 pub(super) async fn seed_turns(
     session: &Session,
     tc: &crate::session::turn_context::TurnContext,
@@ -118,6 +143,7 @@ pub(super) async fn seed_turns(
 ) {
     let pad = "x".repeat(800);
     for i in 0..n {
+        start_host_turn(session, tc).await;
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
@@ -557,10 +583,12 @@ async fn mid_turn_feature_off_stops_without_native_fallback() {
 /// (G9) and the degraded recheck (G10) no longer stop anything — the MidTurn
 /// path now behaves like the ordinary path (G33/G34).
 ///
-/// Supersedes `mid_turn_blocked_capture_flush_stops_without_hanging_or_native`,
-/// which asserted `MidTurnBlocked(false)` as intended behavior.
+/// Story 5 (turn parts, AC-7.4): supersedes the LIM-63B behavior in which a
+/// wedged capture worker warned and compact continued. The parts seam asserts
+/// `captureFlushed` truthfully, so an incomplete flush keeps the current body
+/// and retries at a later seam — bounded, never a hang, never native.
 #[tokio::test]
-async fn mid_turn_blocked_capture_flush_warns_and_compact_continues() {
+async fn mid_turn_blocked_capture_flush_is_not_a_settled_seam() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let (mut session, tc) = make_session_and_context().await;
@@ -625,10 +653,26 @@ async fn mid_turn_blocked_capture_flush_warns_and_compact_continues() {
         elapsed < Duration::from_secs(30),
         "flush bound must keep the seam bounded; took {elapsed:?}"
     );
-    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
-        panic!("wedged capture worker must not stop compact, got {attempt:?}");
-    };
-    assert!(!body.is_empty(), "installed body must be non-empty");
+    // AC-7.4 (host side): `captureFlushed` is asserted only on a successful
+    // flush. A flush that does not complete is not a settled seam — the host
+    // keeps its current body, invokes nothing, and retries at a later
+    // eligible seam. It never asserts a false fact and never denies progress.
+    match &attempt {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(
+                reason.contains("flush"),
+                "blocked on the flush fact: {reason}"
+            );
+            assert!(
+                *next_provider_request_allowed,
+                "an unsettled seam retries later; it never strands the turn"
+            );
+        }
+        other => panic!("unsettled flush must keep the current body, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1066,10 +1110,19 @@ async fn mid_turn_cancel_joins_worker_no_detached_mutator() {
     .await
     .expect("arm");
     match attempt {
-        LhcCompactAttempt::MidTurnBlocked { reason, .. } => {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
             assert!(
                 reason.contains("cancel") || reason.contains("critical section"),
                 "{reason}"
+            );
+            // Cancellation is the one failure that denies the next provider
+            // request: the turn is ending. Every other failure retries later.
+            assert!(
+                !next_provider_request_allowed,
+                "cancellation must block the next provider request"
             );
         }
         other => panic!("expected blocked on cancel, got {other:?}"),
@@ -1535,6 +1588,9 @@ async fn mid_turn_stalled_worker_hits_bounded_timeout_and_joins() {
 
 /// A (unit/production-arm): active non-tool branch installs a certified view
 /// with exactly one continuation marker when above the test trigger.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
     let dir = tempdir().unwrap();
@@ -1556,19 +1612,17 @@ async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
     handle.flush().await;
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "resp-active-full-1",
             true,
             epoch,
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -1663,20 +1717,18 @@ async fn mid_turn_active_non_tool_installs_single_marker_and_boundary() {
     // Always-skip would leave zero receipts / no marker / no install — proven above.
     assert!(
         !matches!(
-            try_run_lhc_compact_arm(
+            super::run_mid_turn_forced_boundary_continuation(
                 &sess,
                 &tc,
                 InitialContextInjection::DoNotInject,
-                /*manual*/ false,
-                CompactionPhase::MidTurn,
-                Some(mid_facts(
+                mid_facts(
                     "resp-active-full-2",
                     true,
                     decision_epoch(&sess),
                     Vec::new(),
                     Some(sample_usage(5_000)),
-                )),
-                &CancellationToken::new(),
+                ),
+                &CancellationToken::new()
             )
             .await
             .expect("second arm"),
@@ -2147,6 +2199,9 @@ async fn mid_turn_reload_resume_equivalence_both_branches() {
 
 /// D: degraded derivations install a structurally valid view; invalid
 /// candidate/install leaves prior view byte-identical and obeys the receipt.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 #[serial]
 async fn mid_turn_degraded_and_invalid_install_host_paths() {
@@ -2173,19 +2228,17 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
         inject_response_usage(&session, &tc, 5_000).await;
         handle.flush().await;
         let sess = Arc::new(session);
-        let attempt = try_run_lhc_compact_arm(
+        let attempt = super::run_mid_turn_forced_boundary_continuation(
             &sess,
             &tc,
             InitialContextInjection::DoNotInject,
-            /*manual*/ false,
-            CompactionPhase::MidTurn,
-            Some(mid_facts(
+            mid_facts(
                 "degraded-1",
                 true,
                 decision_epoch(&sess),
                 Vec::new(),
                 Some(sample_usage(5_000)),
-            )),
+            ),
             &CancellationToken::new(),
         )
         .await
@@ -2235,19 +2288,17 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
         handle.flush().await;
         let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
         let sess = Arc::new(session);
-        let attempt = try_run_lhc_compact_arm(
+        let attempt = super::run_mid_turn_forced_boundary_continuation(
             &sess,
             &tc,
             InitialContextInjection::DoNotInject,
-            /*manual*/ false,
-            CompactionPhase::MidTurn,
-            Some(mid_facts(
+            mid_facts(
                 "invalid-install-1",
                 true,
                 decision_epoch(&sess),
                 Vec::new(),
                 Some(sample_usage(5_000)),
-            )),
+            ),
             &CancellationToken::new(),
         )
         .await
@@ -2301,19 +2352,17 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
         handle.flush().await;
         let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
         let sess = Arc::new(session);
-        let attempt = try_run_lhc_compact_arm(
+        let attempt = super::run_mid_turn_forced_boundary_continuation(
             &sess,
             &tc,
             InitialContextInjection::DoNotInject,
-            /*manual*/ false,
-            CompactionPhase::MidTurn,
-            Some(mid_facts(
+            mid_facts(
                 "invalid-candidate-1",
                 true,
                 decision_epoch(&sess),
                 Vec::new(),
                 Some(sample_usage(5_000)),
-            )),
+            ),
             &CancellationToken::new(),
         )
         .await
@@ -2334,6 +2383,9 @@ async fn mid_turn_degraded_and_invalid_install_host_paths() {
 /// E (unit residual): when MidTurn is blocked after a context-pressure seam,
 /// the residual must refuse native fall-open (one-writer). Full mock-provider
 /// loop coverage lives in suite `compact_lhc_mid_turn_loops`.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 async fn mid_turn_context_pressure_residual_refuses_native_race() {
     let dir = tempdir().unwrap();
@@ -2360,23 +2412,17 @@ async fn mid_turn_context_pressure_residual_refuses_native_race() {
     handle.flush().await;
     let history_before: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
     let sess = Arc::new(session);
-    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
-    let mut client = inert_model_client_session();
-    let result = run_auto_compact(
+    let result = super::run_mid_turn_forced_boundary_continuation(
         &sess,
-        step,
-        /*fallback*/ None,
-        &mut client,
+        &tc,
         InitialContextInjection::DoNotInject,
-        CompactionReason::ContextLimit,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "ctx-exceeded-1",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(9_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await;
@@ -2389,7 +2435,13 @@ async fn mid_turn_context_pressure_residual_refuses_native_race() {
         "context-pressure MidTurn residual must not pollute host history"
     );
     match result {
-        Ok(()) => {}
+        Ok(attempt) => assert!(
+            matches!(
+                attempt,
+                LhcCompactAttempt::MidTurnBlocked { .. } | LhcCompactAttempt::MidTurnSkipped { .. }
+            ),
+            "forced install failure must leave a residual, never install or fall open: {attempt:?}"
+        ),
         Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {}
         Err(err) => {
             let msg = err.to_string();
@@ -2405,6 +2457,9 @@ async fn mid_turn_context_pressure_residual_refuses_native_race() {
 
 /// B1: install failure leaves failed_repairable; next seam re-enters same
 /// attempt_id and repairs/installs rather than permanent wedge.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 #[serial]
 async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
@@ -2432,19 +2487,17 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
     let epoch = decision_epoch(&sess);
     let attempt_id = "b1-repair-1";
 
-    let failed = try_run_lhc_compact_arm(
+    let failed = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             attempt_id,
             true,
             epoch,
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2471,19 +2524,17 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
 
     // Fresh response id must not be used when durable owner exists — arm
     // re-enters with owner attempt. Use a different fresh id to prove resume.
-    let repaired = try_run_lhc_compact_arm(
+    let repaired = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "fresh-should-not-win",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2526,6 +2577,9 @@ async fn mid_turn_install_failure_repairs_same_attempt_on_next_seam() {
 /// residual (intent row + held writer, no pending boundary). Live seam cannot
 /// recreate the response-scoped toolCallId; recovery loads stored identity and
 /// re-enters without attempt_conflict.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 #[serial]
 async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
@@ -2587,19 +2641,17 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
     let crash_attempt_id = "preserve-claim-only-crash";
-    let crashed = try_run_lhc_compact_arm(
+    let crashed = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             crash_attempt_id,
             true,
             epoch,
             vec![tool_x.into()],
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2652,19 +2704,17 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
 
     // Clear fault hook; next live seam has different continuation (no tool X).
     slot.set_mid_turn_test_hooks(None);
-    let repaired = try_run_lhc_compact_arm(
+    let repaired = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "live-seam-no-X",
             true,
             decision_epoch(&sess),
             Vec::new(), // live ActiveNonTool — different kind
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2700,19 +2750,17 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
 
     // Later fresh seam uses a fresh attempt id normally (no permanent wedge).
     slot.set_mid_turn_test_hooks(None);
-    let fresh = try_run_lhc_compact_arm(
+    let fresh = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "fresh-after-claim-only",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2727,6 +2775,9 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
 /// a claim-only owner with no attempt-intent row (the shape a crash or partial
 /// write leaves) — must not block sampling. The arm warns and proceeds with a
 /// fresh attempt; the runtime CAS is what prevents a double write.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 #[serial]
 async fn mid_turn_recovery_inspect_failure_proceeds_with_fresh_attempt() {
@@ -2765,19 +2816,17 @@ async fn mid_turn_recovery_inspect_failure_proceeds_with_fresh_attempt() {
     );
 
     let sess = Arc::new(session);
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "fresh-after-unreadable-inspect",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2799,6 +2848,9 @@ async fn mid_turn_recovery_inspect_failure_proceeds_with_fresh_attempt() {
 /// R5 (CX-S2): a writer claim owned by another attempt id is a stale row from
 /// a dead process — Codex is a single writer per thread. The arm re-probes once
 /// and then reclaims; it never holds the session hostage to the dead owner.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 #[serial]
 async fn mid_turn_stale_writer_claim_is_reclaimed_not_blocked() {
@@ -2825,19 +2877,17 @@ async fn mid_turn_stale_writer_claim_is_reclaimed_not_blocked() {
     handle.flush().await;
 
     let sess = Arc::new(session);
-    let crashed = try_run_lhc_compact_arm(
+    let crashed = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "conflict-boundary-owner",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -2859,19 +2909,17 @@ async fn mid_turn_stale_writer_claim_is_reclaimed_not_blocked() {
     .expect("seed foreign writer claim");
 
     slot.set_mid_turn_test_hooks(None);
-    let after_conflict = try_run_lhc_compact_arm(
+    let after_conflict = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "reclaiming-attempt",
             true,
             decision_epoch(&sess),
             Vec::new(),
             Some(sample_usage(5_000)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -3113,6 +3161,9 @@ pub(super) async fn seed_escalation_history(
 /// host runway; core escalates through one protected boundary, the host
 /// validates the exact materialized body, records `ok`, and the reload gate
 /// stays clear.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate() {
     let dir = tempdir().unwrap();
@@ -3138,19 +3189,17 @@ async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate
 
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "resp-esc-ok-1",
             true,
             epoch,
             vec![protected_id.into()],
             Some(sample_usage(4_800)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -3215,6 +3264,9 @@ async fn mid_turn_protected_escalation_validates_installs_and_clears_reload_gate
 /// attempt's view is the one being served (carrying the degradation reason),
 /// the reload gate stays clear because the session did compact, and the same
 /// attempt still replays idempotently (no second boundary or marker).
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_clear() {
     let dir = tempdir().unwrap();
@@ -3248,13 +3300,11 @@ async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_cl
         vec![protected_id.into()],
         Some(sample_usage(4_800)),
     );
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid.clone()),
+        mid.clone(),
         &CancellationToken::new(),
     )
     .await
@@ -3320,13 +3370,11 @@ async fn mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_cl
     let receipts_before = receipts.len();
 
     // Replay the same attempt: terminal replay, no second boundary/marker.
-    let replay = try_run_lhc_compact_arm(
+    let replay = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid),
+        mid,
         &CancellationToken::new(),
     )
     .await
@@ -3425,6 +3473,9 @@ async fn mid_turn_host_validation_failure_strict_compact_completes_turn() {
 /// LIM-69 Slice D, under R10/R11: a degraded install never raises a reload
 /// block in the first place, and a later standalone compact still installs a
 /// newer view over it.
+/// Story 5: pins the legacy compact-continuation runtime directly. The arm
+/// routes a thread here only on the SDK's typed `ForcedBoundaryThread`
+/// (exclusivity tests); a clean thread takes the parts path instead.
 #[tokio::test]
 async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() {
     let dir = tempdir().unwrap();
@@ -3452,19 +3503,17 @@ async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() 
     let root_path = handle.root().map(std::path::Path::to_path_buf);
     let sess = Arc::new(session);
     let epoch = decision_epoch(&sess);
-    let blocked = try_run_lhc_compact_arm(
+    let blocked = super::run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "resp-esc-view-1",
             true,
             epoch,
             vec!["call-prot-view".into()],
             Some(sample_usage(4_800)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -3520,5 +3569,514 @@ async fn degraded_install_leaves_reload_clear_and_standalone_compact_installs() 
     assert!(
         hv.reason.unwrap_or_default().contains("proceeded degraded"),
         "the degraded attempt is still recorded as degraded"
+    );
+}
+
+/// AC-7.4 (host side): the durable active turn must be exactly the turn bound
+/// to the current Codex turn identity. A second writer opens a newer durable
+/// turn that this host turn never bound; the production arm reads
+/// `host_metadata.active_turn.turn_id`, finds it differs, and must keep the
+/// current body without invoking compact — and without any fallback to the
+/// compact-continuation path. Progress to a later seam stays allowed.
+#[tokio::test]
+async fn mid_turn_parts_mismatched_durable_turn_cannot_compact() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 10).await;
+    inject_response_usage(&session, &tc, 2_000).await;
+    handle.flush().await;
+    let bound = handle
+        .durable_turn_id(&tc.sub_id)
+        .expect("capture bound the seeded open turn to this host turn");
+
+    // Another writer opens a newer durable turn under no host binding.
+    let other = codex_lhc_host::spawn_capture(
+        handle.thread_id(),
+        None,
+        Some(root.clone()),
+        codex_lhc_host::LateBoundCallbacks::new(),
+    )
+    .await
+    .expect("second writer");
+    other.persist(
+        &ResponseItem::Message {
+            id: None,
+            role: "user".into(),
+            content: vec![ContentItem::InputText {
+                text: "drift prompt from another writer".into(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+        codex_extension_api::RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    other.flush().await;
+    assert_eq!(
+        handle.durable_turn_id(&tc.sub_id).as_deref(),
+        Some(bound.as_str()),
+        "the host binding is unchanged by a foreign writer"
+    );
+
+    let sess = Arc::new(session);
+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let epoch = decision_epoch(&sess);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "identity-1",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(2_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    match attempt {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(
+                reason.contains("is not the current host turn's bound turn"),
+                "must refuse on durable identity mismatch: {reason}"
+            );
+            assert!(
+                reason.contains(&bound),
+                "reason names the bound turn {bound}: {reason}"
+            );
+            assert!(
+                next_provider_request_allowed,
+                "identity mismatch keeps the body and retries at a later seam"
+            );
+        }
+        other => panic!("mismatched durable turn must not compact, got {other:?}"),
+    }
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(history_before, history_after, "current body preserved");
+    let receipts = codex_lhc_host::inspect_compact_continuation_receipts(
+        handle.thread_id(),
+        Some(root.as_path()),
+    )
+    .await
+    .expect("inspect receipts");
+    assert!(
+        receipts.is_empty(),
+        "identity mismatch must never route to compact-continuation"
+    );
+}
+
+/// Failure split at the parts hop: a generic (non-cancellation) failure keeps
+/// the current body and allows the next provider request, so compact retries
+/// at a later eligible seam — it never denies progress, never falls open to
+/// native compaction, and never routes to compact-continuation. (The
+/// cancellation half is `mid_turn_cancel_joins_worker_no_detached_mutator`.)
+#[tokio::test]
+async fn mid_turn_parts_generic_failure_keeps_body_and_allows_next_seam() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 10).await;
+    inject_response_usage(&session, &tc, 2_000).await;
+    handle.flush().await;
+    assert!(
+        handle.durable_turn_id(&tc.sub_id).is_some(),
+        "identity is bound; the failure under test is the hop, not identity"
+    );
+
+    // Storage failure inside the hop: the thread file is gone before the SDK
+    // entry runs. Capture's open connection keeps working (flush succeeds).
+    let path = codex_lhc_host::thread_sqlite_path(handle.thread_id(), Some(root.as_path()))
+        .expect("thread path");
+    std::fs::remove_file(&path).expect("remove thread file");
+
+    let sess = Arc::new(session);
+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    let epoch = decision_epoch(&sess);
+    let attempt = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "generic-fail-1",
+            true,
+            epoch,
+            Vec::new(),
+            Some(sample_usage(2_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    match attempt {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(
+                reason.contains("thread file missing"),
+                "generic hop failure surfaces its cause: {reason}"
+            );
+            assert!(
+                next_provider_request_allowed,
+                "generic failure must allow the next provider request (retry at a later seam)"
+            );
+        }
+        other => panic!("generic failure must block mutation only, got {other:?}"),
+    }
+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
+    assert_eq!(history_before, history_after, "current body preserved");
+    assert_eq!(
+        midturn_workers_for_attempt("generic-fail-1"),
+        0,
+        "no detached parts worker remains"
+    );
+}
+
+/// Seed an active (open) turn with `steps` complete provider cycles through
+/// the production recording seam: each cycle begins with `LhcStepIndex`
+/// (what `run_turn` does before each sampling request) and records an
+/// assistant message plus a paired tool call/result, so capture stamps the
+/// host step index and the turn is splittable (turn parts, F2).
+pub(super) async fn seed_stepped_active_turn(
+    session: &Session,
+    tc: &crate::session::turn_context::TurnContext,
+    steps: usize,
+) {
+    let pad = "y".repeat(800);
+    start_host_turn(session, tc).await;
+    session
+        .record_user_prompt_and_emit_turn_item(
+            tc,
+            &[text_input(&format!("long agentic prompt {pad}"))],
+            None,
+            PersistContext::TurnStart,
+        )
+        .await;
+    for k in 0..steps {
+        codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
+        let call_id = format!("call-step-{k}");
+        session
+            .record_conversation_items_with_provenance(
+                tc,
+                &[
+                    ResponseItem::Message {
+                        id: None,
+                        role: "assistant".into(),
+                        content: vec![ContentItem::OutputText {
+                            text: format!("step {k} progress {pad}"),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                    ResponseItem::FunctionCall {
+                        id: None,
+                        namespace: None,
+                        name: "shell".into(),
+                        arguments: format!("{{\"command\":\"echo step {k}\"}}"),
+                        call_id: call_id.clone(),
+                        encrypted_function_args: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                ],
+                codex_extension_api::RawItemProvenance::ModelOutput,
+            )
+            .await;
+        session
+            .record_conversation_items(
+                tc,
+                &[ResponseItem::FunctionCallOutput {
+                    id: None,
+                    call_id,
+                    output: FunctionCallOutputPayload::from_text(format!("step {k} output {pad}")),
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            )
+            .await;
+    }
+}
+
+/// AC-7.3 exclusivity, forced-boundary direction: a thread that already took
+/// the forced-boundary path keeps using the legacy compact-continuation
+/// runtime through the ordinary arm, and only because the SDK types it
+/// `ForcedBoundaryThread`. The host re-binds its turn identity to the
+/// SDK-opened continuation turn so the exact identity check stays truthful,
+/// and such a thread is never served parts.
+#[tokio::test]
+async fn mid_turn_forced_boundary_thread_keeps_legacy_runtime_through_arm() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 12).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let sess = Arc::new(session);
+
+    // Classify the thread: one forced boundary before the migration.
+    let seeded = super::run_mid_turn_forced_boundary_continuation(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        mid_facts(
+            "fb-seed",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        ),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("legacy arm");
+    assert!(
+        matches!(seeded, LhcCompactAttempt::Installed { .. }),
+        "seeding forced boundary must install, got {seeded:?}"
+    );
+    let receipts_before =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    let cont = receipts_before
+        .last()
+        .and_then(|r| r.continuation_turn_id.clone())
+        .expect("forced boundary opened a continuation turn");
+    assert_eq!(
+        handle.durable_turn_id(&tc.sub_id).as_deref(),
+        Some(cont.as_str()),
+        "host identity re-bound to the SDK-opened continuation turn"
+    );
+
+    // Ordinary arm at the next seam: still the legacy runtime, never parts.
+    seed_turns(&sess, &tc, 6).await;
+    inject_response_usage(&sess, &tc, 5_000).await;
+    handle.flush().await;
+    let again = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "fb-arm",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    assert!(
+        !matches!(again, LhcCompactAttempt::Unavailable { .. }),
+        "never falls open to native: {again:?}"
+    );
+    let receipts_after =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts_after.len() > receipts_before.len(),
+        "forced-boundary thread must take the legacy runtime through the arm; receipts {} -> {} ({again:?})",
+        receipts_before.len(),
+        receipts_after.len()
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
+        .await
+        .expect("describe")
+        .expect("installed view");
+    assert!(
+        !codex_lhc_host::view_serves_parts(&view),
+        "a forced-boundary thread is never served parts"
+    );
+}
+
+/// AC-7.2b / AC-7.3 exclusivity, parts direction: a clean thread under
+/// pressure is split into parts by the ordinary arm inside the same Codex
+/// turn (no continuation turn, no forced boundary), and once parts activated
+/// the legacy runtime never runs for it — not through the arm at later seams,
+/// and not even when invoked directly.
+#[tokio::test]
+async fn mid_turn_parts_thread_never_runs_legacy_runtime() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_midturn(&mut session, root.clone()).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_turns(&session, &tc, 4).await;
+    seed_stepped_active_turn(&session, &tc, 6).await;
+    inject_response_usage(&session, &tc, 5_000).await;
+    handle.flush().await;
+    let thread_id = handle.thread_id().to_string();
+    let sess = Arc::new(session);
+
+    let first = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "parts-1",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    assert!(
+        matches!(first, LhcCompactAttempt::Installed { .. }),
+        "clean thread under pressure installs parts, got {first:?}"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
+        .await
+        .expect("describe")
+        .expect("installed view");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "the active turn is served as parts: {view:?}"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.is_empty(),
+        "parts install leaves no compact-continuation receipt"
+    );
+
+    // Later seam in the same Codex turn: parts again, never the old path.
+    for _ in 0..3 {
+        codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
+        sess.record_conversation_items_with_provenance(
+            &tc,
+            &[ResponseItem::Message {
+                id: None,
+                role: "assistant".into(),
+                content: vec![ContentItem::OutputText {
+                    text: format!("more progress {}", "z".repeat(800)),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            }],
+            codex_extension_api::RawItemProvenance::ModelOutput,
+        )
+        .await;
+    }
+    inject_response_usage(&sess, &tc, 5_000).await;
+    handle.flush().await;
+    let second = try_run_lhc_compact_arm(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        /*manual*/ false,
+        CompactionPhase::MidTurn,
+        Some(mid_facts(
+            "parts-2",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        )),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("arm");
+    assert!(
+        !matches!(second, LhcCompactAttempt::Unavailable { .. }),
+        "never falls open to native: {second:?}"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "once parts activated the arm never runs the legacy runtime: {receipts:?}"
+    );
+
+    // Even a direct legacy invocation is refused typed by the SDK on a parts
+    // thread: no install, no continuation turn.
+    let legacy = super::run_mid_turn_forced_boundary_continuation(
+        &sess,
+        &tc,
+        InitialContextInjection::DoNotInject,
+        mid_facts(
+            "parts-legacy",
+            true,
+            decision_epoch(&sess),
+            Vec::new(),
+            Some(sample_usage(5_000)),
+        ),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("legacy arm");
+    assert!(
+        !matches!(legacy, LhcCompactAttempt::Installed { .. }),
+        "legacy runtime must not install on a parts thread: {legacy:?}"
+    );
+    let receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, Some(root.as_path()))
+            .await
+            .expect("receipts");
+    assert!(
+        receipts.iter().all(|r| r.continuation_turn_id.is_none()),
+        "no continuation turn ever opens on a parts thread: {receipts:?}"
+    );
+    let view = codex_lhc_host::inspect_installed_view(&thread_id, Some(root.as_path()))
+        .await
+        .expect("describe")
+        .expect("installed view");
+    assert!(
+        codex_lhc_host::view_serves_parts(&view),
+        "the parts view stands after the refused legacy call"
     );
 }

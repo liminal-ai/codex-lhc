@@ -126,6 +126,9 @@ enum PendingCmd {
         reason: String,
         facts: TurnEndFacts,
     },
+    BindTurn {
+        host_turn_id: String,
+    },
 }
 
 /// Cap on **superseded** (historical) derived provenance retained across
@@ -652,6 +655,9 @@ impl LhcCaptureSlot {
                 } => {
                     handle.turn_end(&turn_id, &reason, facts);
                 }
+                PendingCmd::BindTurn { host_turn_id } => {
+                    handle.bind_turn(&host_turn_id);
+                }
             }
         }
     }
@@ -1100,6 +1106,17 @@ impl<C: Send + Sync + 'static> TurnLifecycleContributor for LhcExtension<C> {
             input
                 .turn_store
                 .insert(LhcTurnId(input.turn_id.to_string()));
+            // Turn parts (AC-7.4 host side): bind the durable turn this host
+            // turn's prompt opens to the host identity, so the settled seam can
+            // compare `host_metadata.active_turn.turn_id` with it exactly.
+            let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
+                return;
+            };
+            if let Some(handle) = slot.buffer_or_handle(PendingCmd::BindTurn {
+                host_turn_id: input.turn_id.to_string(),
+            }) {
+                handle.bind_turn(input.turn_id);
+            }
         })
     }
 
