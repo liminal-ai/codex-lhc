@@ -23,15 +23,18 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`9d4d182`** (`9d4d18247942f35b356f28bdc4288f0e631a6da9`) —
-  accepted public Rust LHC source on `origin/main` (2026-08-23): bounded metadata-first Smart
-  Compact is the default; `LHC_COMPACT_ALGORITHM=legacy` still selects the
-  eager full-read path; skipped compact-continuation records keep their wire
-  casing. Default compact no longer reads every live message and closed-chunk
-  fallback before selecting. The pin is publicly reachable from `origin/main`
-  at this exact identity. It descends
-  `f4de85c` (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67
-  contract 2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
+  Current pin: **`713b38d`** (`713b38d9eb8497b48023977cec2d84df9568bd58`) —
+  accepted Rust turn-parts source (Story 4, 2026-08-25): schema v12 host step
+  index on messages, host metadata surface, `mid_turn_compact` entry with the
+  four-fact seam assertion and per-thread mechanism exclusivity (typed
+  `forced_boundary_thread` / `compact_continuation_parts_thread` refusals),
+  walk split/settle/parts, newest-closed protection. The commit is local-only
+  on `feature/turn-parts` at `/srv/work/long-horizon-context` until that
+  campaign publishes; the tripwire pin-drift check warns until it lands on
+  `origin/main`. It descends `9d4d182` (bounded metadata-first Smart Compact;
+  `LHC_COMPACT_ALGORITHM=legacy` still selects the eager path), `f4de85c`
+  (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67 contract
+  2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
   (LIM-63 / 63A), and retrieval `7062814` / `dd251ec`. The tripwire requires a
   clean tree at the pin and full mid-turn / full-loop layers.
   A dirty submodule working tree fails the tripwire (F12) — layer 0 at
@@ -300,6 +303,22 @@ terminal failure.
 5. `./scripts/check-lhc-hooks.sh` — all layers green before push.
 6. Commit with tripwire output summarized in the body; push to origin only.
 
+### Drill run 2026-08-25 — exact stable `rust-v0.149.1` (turn parts, Story 5)
+
+Merged annotated tag `rust-v0.149.1` (peeled `ff29a44391`) onto product base
+`a25a81a8d7` (workspace `0.149.0`). Two content conflicts: `Cargo.toml` (take
+`0.149.1`, keep the LHC workspace member) and `features/src/lib.rs` (keep
+`Feature::LhcCapture` default-on, take upstream `CompactionImageBudget`).
+`core/config.schema.json` and `core/src/session/tests.rs` auto-merged and were
+re-verified (`just write-config-schema`). `patches/lhc/BASE` advanced to
+`ff29a44391`; all seven patches regenerated (drift-only deltas). `Cargo.lock`
+regenerated. Vendored SDK advanced `9d4d182` → **`713b38d`** (accepted Rust
+turn-parts source; local-only, obtained from `/srv/work/long-horizon-context`).
+Adapter absorbed two SDK shape additions without semantic change:
+`ViewCompactParams.newest_closed_protection` (left `None`, profile default) and
+`MessageRecord.step_index` in materialize test fixtures. `just fmt` reformats
+the vendored crate and two Python scripts; that churn was reverted (F12).
+
 ### Drill run 2026-08-23 — exact stable `rust-v0.149.0`
 
 Merged tag `rust-v0.149.0` (`758ef40f50`) onto accepted local baseline
@@ -409,7 +428,7 @@ also corrected to the actual certified `7062814` gitlink.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `3aae5d885b`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `ff29a44391`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing

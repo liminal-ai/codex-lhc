@@ -109,6 +109,7 @@ impl LhcBandPercentages {
                     detailed: Some(self.detailed),
                     brief: Some(self.brief),
                 }),
+                newest_closed_protection: None,
             }),
             signal: None,
             compact_point_upper_bound: None,

@@ -234,6 +234,7 @@ fn msg(
         recorded_at: "2026-07-01T12:00:00.000Z".into(),
         turn_id: turn_id.into(),
         provider_usage,
+        step_index: None,
         derivations: None,
         deleted: None,
     }
@@ -258,6 +259,7 @@ fn msg_tool_result(
         recorded_at: "2026-07-01T12:00:00.000Z".into(),
         turn_id: turn_id.into(),
         provider_usage: None,
+        step_index: None,
         derivations: None,
         deleted: None,
     }
@@ -1106,6 +1108,7 @@ fn h2_token_count_emits_after_last_part_regardless_of_kind() {
             recorded_at: "2026-07-01T12:00:00.000Z".into(),
             turn_id: "t1".into(),
             provider_usage: Some(usage(77)),
+            step_index: None,
             derivations: None,
             deleted: None,
         },

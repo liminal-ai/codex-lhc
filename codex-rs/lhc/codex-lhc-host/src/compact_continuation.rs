@@ -672,6 +672,7 @@ pub fn compact_opts_with_band_percentages(
                 detailed: Some(percentages.detailed),
                 brief: Some(percentages.brief),
             }),
+            newest_closed_protection: None,
         }),
     }
 }

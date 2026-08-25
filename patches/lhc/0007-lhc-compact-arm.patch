@@ -13968,7 +13968,7 @@ index c0b0407967..e86b833dbb 100644
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index 4233e5f94d..d8174e5b1e 100644
+index 5e19607498..85e690b1b2 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
 @@ -5972,6 +5972,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {

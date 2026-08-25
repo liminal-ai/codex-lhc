@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 3a7ba720ef..b692ef595d 100644
+index d9084d3a05..d10cb4c364 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -646,6 +646,9 @@
+@@ -649,6 +649,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,7 @@ index 3a7ba720ef..b692ef595d 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -1645,9 +1648,81 @@
+@@ -1648,9 +1651,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -94,7 +94,7 @@ index 3a7ba720ef..b692ef595d 100644
      "MarketplaceConfig": {
        "additionalProperties": false,
        "properties": {
-@@ -5543,6 +5618,9 @@
+@@ -5549,6 +5624,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -104,7 +104,7 @@ index 3a7ba720ef..b692ef595d 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -5849,6 +5927,22 @@
+@@ -5855,6 +5933,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -128,7 +128,7 @@ index 3a7ba720ef..b692ef595d 100644
        "allOf": [
          {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index 71abcb1bd9..11af833341 100644
+index fefc441886..1db51249f4 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
 @@ -301,6 +301,9 @@ pub enum Feature {
@@ -138,10 +138,10 @@ index 71abcb1bd9..11af833341 100644
 +    /// Enable LHC long-horizon capture (parallel SQLite record; product default on).
 +    // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
 +    LhcCapture,
+     /// Include retained images in the remote compaction context budget.
+     CompactionImageBudget,
      /// Retain client-authored developer messages across compacted context windows.
-     RetainClientDeveloperMessages,
-     /// Use Agent Identity for ChatGPT-authenticated sessions.
-@@ -1529,6 +1532,13 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1531,6 +1534,13 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },
@@ -153,5 +153,5 @@ index 71abcb1bd9..11af833341 100644
 +        default_enabled: true,
 +    },
      FeatureSpec {
-         id: Feature::RetainClientDeveloperMessages,
-         key: "retain_client_developer_messages",
+         id: Feature::CompactionImageBudget,
+         key: "compaction_image_budget",
