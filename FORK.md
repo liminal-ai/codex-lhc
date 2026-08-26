@@ -23,13 +23,17 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`713b38d`** (`713b38d9eb8497b48023977cec2d84df9568bd58`) —
-  accepted Rust turn-parts source (Story 4, 2026-08-25): schema v12 host step
+  Current pin: **`13573a1`** (`13573a16759582ec77efb00b2c8fe11cf20c43ba`) —
+  accepted Rust turn-parts post-close-tail repair (2026-08-26), directly over
+  `713b38d`: schema v12 host step
   index on messages, host metadata surface, `mid_turn_compact` entry with the
   four-fact seam assertion and per-thread mechanism exclusivity (typed
   `forced_boundary_thread` / `compact_continuation_parts_thread` refusals),
-  walk split/settle/parts, newest-closed protection. The commit is public on
-  LHC `origin/main`. It descends `9d4d182` (bounded selector default;
+  walk split/settle/parts, newest-closed protection, and retention of a split
+  closed turn's parts, compact point, and nonempty Full suffix while a newer
+  turn remains below the Full budget. Once newer pressure fills that budget,
+  the old turn settles whole before the newer active turn splits, preserving
+  the one-unsettled-turn invariant. It descends `9d4d182` (bounded selector default;
   `LHC_COMPACT_ALGORITHM=legacy` still selects the legacy eager selector),
   `f4de85c` (compact-continuation UTC timestamps / CX-S5), `2cb04a5` (LIM-67
   contract 2.0.0 protected pending-tool escalation), `6232317` / `98826c1`
@@ -780,10 +784,19 @@ No synthetic continuation turn, no forced-boundary marker.
   when invoked directly). Both directions:
   `mid_turn_forced_boundary_thread_keeps_legacy_runtime_through_arm`,
   `mid_turn_parts_thread_never_runs_legacy_runtime`.
+- **Post-close Full-tail retention.** Closing a split turn does not collapse
+  it while the next user turn is still small. A compact at the next settled
+  seam keeps the prior parts and compact point byte-stable, keeps the prior
+  nonempty verbatim suffix in Full before the new prompt, and serves no whole
+  duplicate. Later pressure settles that old turn atomically before the new
+  active turn becomes the sole split turn. Schema remains 12; no migration or
+  host-source change is involved.
 - **Evidence:** `compact_lhc::mid_turn_tests` (parts, identity mismatch,
   generic-failure retry, host-apply retry, cancel blocks, flush seam), suite
   `compact_lhc_mid_turn_loops` (same turn, no marker, in-run steer, sustained
-  pressure splits under the production 120k bound), `lhc_capture_e2e` step stamps,
+  pressure splits under the production 120k bound, closes, preserves its exact
+  late Full suffix through a real small next Codex turn, then settles before
+  that newer turn splits), `lhc_capture_e2e` step stamps,
   certification `step_index_round_trips_on_four_kinds_and_null_elsewhere`,
   and tripwire layer 2a2 (`scripts/check-lhc-midturn-parts.py`, bare exec).
 - Not in scope here: threshold/band tuning, Story 6.

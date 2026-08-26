@@ -591,6 +591,7 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     const CYCLES: usize = 22;
+    const LATER_CYCLES: usize = 18;
     // Slice C counts serialized JSON with o200k, not chars/4. 80k still
     // triggers at the wave seams while leaving room for the accurate estimate.
     const SCOPE_LIMIT: i64 = 80_000;
@@ -598,6 +599,8 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     /// limit (post-relief responses drop back down, as a real provider would
     /// after the request shrank).
     const WAVE_SEAMS: [usize; 3] = [7, 14, 21];
+    const LATER_WAVE_SEAMS: [usize; 3] = [6, 12, 17];
+    const NEXT_PROMPT: &str = "continue with a small follow-up, then keep working";
 
     let server = start_mock_server().await;
     let lhc_root = TempDir::new()?;
@@ -630,6 +633,43 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
         ev_response_created("resp-sus-final"),
         ev_assistant_message("m-sus-final", "sustained task complete"),
         ev_completed_with_tokens("resp-sus-final", 300),
+    ]));
+    let tiny_args = json!({
+        "command": "printf NEXT-TINY-COMPLETE",
+        "timeout_ms": 10_000,
+    })
+    .to_string();
+    responses.push(sse(vec![
+        ev_response_created("resp-next-tiny"),
+        ev_function_call("call-next-tiny", "shell_command", &tiny_args),
+        ev_completed_with_tokens("resp-next-tiny", 78_400),
+    ]));
+    for i in 0..LATER_CYCLES {
+        let usage: i64 = if LATER_WAVE_SEAMS.contains(&i) {
+            78_400
+        } else {
+            40_000
+        };
+        let args = json!({
+            "command": cycle_command(100 + i),
+            "timeout_ms": 10_000,
+        })
+        .to_string();
+        responses.push(sse(vec![
+            ev_response_created(&format!("resp-next-{i}")),
+            ev_reasoning_item(
+                &format!("rsn-next-{i}"),
+                &["follow-up plan"],
+                &[&format!("follow-up reasoning cycle {i}")],
+            ),
+            ev_function_call(&format!("call-next-{i}"), "shell_command", &args),
+            ev_completed_with_tokens(&format!("resp-next-{i}"), usage),
+        ]));
+    }
+    responses.push(sse(vec![
+        ev_response_created("resp-next-final"),
+        ev_assistant_message("m-next-final", "follow-up task complete"),
+        ev_completed_with_tokens("resp-next-final", 300),
     ]));
     let mock = mount_sse_sequence(&server, responses).await;
 
@@ -665,7 +705,8 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
 
     let (sandbox_policy, permission_profile) =
         turn_permission_fields(PermissionProfile::Disabled, cwd_path.as_path());
-    test.codex
+    let started = test
+        .codex
         .start_or_steer_turn(
             TurnInputRequest::user_input(vec![UserInput::Text {
                 text: "run the sustained tool loop".into(),
@@ -682,6 +723,12 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
             ),
         )
         .await?;
+    let codex_protocol::turn_input::TurnInputSubmission::Started {
+        turn_id: first_host_turn_id,
+    } = started
+    else {
+        panic!("first submission must start a turn, got {started:?}");
+    };
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let bodies = request_bodies(&mock);
@@ -718,8 +765,12 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("handle");
+    handle.flush().await;
     let thread_id = handle.thread_id().to_string();
     let lhc_data_root = handle.root().map(std::path::Path::to_path_buf);
+    let first_turn_id = handle
+        .durable_turn_id(&first_host_turn_id)
+        .expect("first host turn must be bound to its durable turn");
     let receipts =
         codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
             .await
@@ -741,6 +792,20 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     assert!(
         codex_lhc_host::view_serves_parts(&view),
         "the active turn is served as parts by the installed view"
+    );
+    let split_compact_point = view.compact_point;
+    let split_parts: Vec<_> = view
+        .arrangement
+        .iter()
+        .filter(|entry| entry.part.is_some())
+        .cloned()
+        .collect();
+    assert!(
+        !split_parts.is_empty()
+            && split_parts
+                .iter()
+                .all(|entry| entry.subject_id == first_turn_id),
+        "the first turn must be the sole unsettled turn: {view:?}"
     );
     assert!(
         bodies.iter().skip(1).any(|b| b.contains("[seam · ")),
@@ -789,6 +854,240 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
     assert!(
         canonical.iter().any(|m| m.contains("-ENDPAY0")),
         "canonical record must retain the earliest tool output verbatim"
+    );
+
+    // Close → next user turn (burn-in stage 2): start a genuine second Codex
+    // turn, let one tiny tool step settle, and inspect the provider request
+    // produced after the next compact. The prior closed turn must remain the
+    // sole unsettled turn until newer Full-tail messages fill the budget.
+    let next_started = test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: NEXT_PROMPT.into(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let codex_protocol::turn_input::TurnInputSubmission::Started {
+        turn_id: next_host_turn_id,
+    } = next_started
+    else {
+        panic!("follow-up submission must start a new turn, got {next_started:?}");
+    };
+    wait_for_event(
+        &test.codex,
+        |ev| matches!(ev, EventMsg::ExecCommandBegin(event) if event.call_id == "call-next-0"),
+    )
+    .await;
+    handle.flush().await;
+    let next_turn_id = handle
+        .durable_turn_id(&next_host_turn_id)
+        .expect("follow-up host turn must be bound to its durable turn");
+    assert_ne!(first_turn_id, next_turn_id, "a genuine new turn must open");
+
+    let post_close_bodies = request_bodies(&mock);
+    let post_close_request = &post_close_bodies[CYCLES + 2];
+    let complete_old_suffix = format!("{}-ENDPAY21", "tok ".repeat(8000));
+    assert_eq!(
+        count_substr(post_close_request, &complete_old_suffix),
+        1,
+        "the first turn's complete nonempty late suffix must survive exactly once"
+    );
+    let suffix_at = post_close_request
+        .find(&complete_old_suffix)
+        .expect("complete old suffix in post-close request");
+    let next_prompt_at = post_close_request
+        .find(NEXT_PROMPT)
+        .expect("new prompt in post-close request");
+    assert!(
+        suffix_at < next_prompt_at,
+        "the old turn's Full suffix must precede the new prompt"
+    );
+    assert_eq!(
+        count_substr(post_close_request, NEXT_PROMPT),
+        1,
+        "the new prompt must have exactly one served copy"
+    );
+    let post_close_view =
+        codex_lhc_host::inspect_installed_view(&thread_id, lhc_data_root.as_deref())
+            .await
+            .expect("describe post-close view")
+            .expect("post-close compact installs a view");
+    assert_eq!(
+        post_close_view.compact_point, split_compact_point,
+        "the closed transition turn keeps its installed compact point"
+    );
+    assert_eq!(
+        post_close_view
+            .arrangement
+            .iter()
+            .filter(|entry| entry.part.is_some())
+            .cloned()
+            .collect::<Vec<_>>(),
+        split_parts,
+        "the closed transition turn keeps its installed parts"
+    );
+    assert!(
+        post_close_view.gaps.is_empty()
+            && post_close_view
+                .arrangement
+                .iter()
+                .all(|entry| !entry.degraded),
+        "post-close view must have no gap or degraded coverage: {post_close_view:?}"
+    );
+    assert!(
+        post_close_view
+            .arrangement
+            .iter()
+            .filter(|entry| entry.subject_id == first_turn_id)
+            .all(|entry| entry.part.is_some()),
+        "the old split turn must not also appear as a whole entry"
+    );
+    let post_close_bands: Vec<String> = post_close_view
+        .bands
+        .iter()
+        .map(|band| {
+            serde_json::to_value(&band.band)
+                .expect("band json")
+                .as_str()
+                .unwrap()
+                .into()
+        })
+        .collect();
+    let gradient = ["brief", "detailed", "smooth"];
+    assert!(
+        post_close_bands.windows(2).all(|pair| {
+            gradient
+                .iter()
+                .position(|band| *band == pair[0].as_str())
+                .unwrap()
+                < gradient
+                    .iter()
+                    .position(|band| *band == pair[1].as_str())
+                    .unwrap()
+        }),
+        "bands must remain in brief → detailed → smooth order: {post_close_bands:?}"
+    );
+
+    // Once later Full-tail pressure reaches the settlement threshold, the
+    // walk settles the old turn whole before it splits the active turn. The
+    // resulting installed view proves the ordering atomically: old whole,
+    // new parts, exactly one unsettled turn.
+    wait_for_event(
+        &test.codex,
+        |ev| matches!(ev, EventMsg::ExecCommandBegin(event) if event.call_id == "call-next-13"),
+    )
+    .await;
+    handle.flush().await;
+    let settled_view = codex_lhc_host::inspect_installed_view(&thread_id, lhc_data_root.as_deref())
+        .await
+        .expect("describe settled view")
+        .expect("later compact installs a settled view");
+    let settled_old: Vec<_> = settled_view
+        .arrangement
+        .iter()
+        .filter(|entry| entry.subject_id == first_turn_id)
+        .collect();
+    assert_eq!(
+        settled_old.len(),
+        1,
+        "the old turn settles atomically whole"
+    );
+    assert_eq!(
+        serde_json::to_value(&settled_old[0].band)?,
+        json!("smooth"),
+        "the old turn's settled construction belongs in Smooth"
+    );
+    assert!(
+        !settled_old[0].degraded && settled_view.gaps.is_empty(),
+        "settlement must preserve complete clean coverage"
+    );
+    let mut settled_unsettled: Vec<String> = settled_view
+        .arrangement
+        .iter()
+        .filter(|entry| entry.part.is_some())
+        .map(|entry| entry.subject_id.clone())
+        .collect();
+    settled_unsettled.sort();
+    settled_unsettled.dedup();
+    assert_eq!(
+        settled_unsettled,
+        vec![next_turn_id.clone()],
+        "the old turn settles before the follow-up turn becomes the sole unsettled turn"
+    );
+
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    handle.flush().await;
+    let final_view = codex_lhc_host::inspect_installed_view(&thread_id, lhc_data_root.as_deref())
+        .await
+        .expect("describe final view")
+        .expect("later pressure installs a follow-up parts view");
+    let mut final_unsettled: Vec<String> = final_view
+        .arrangement
+        .iter()
+        .filter(|entry| entry.part.is_some())
+        .map(|entry| entry.subject_id.clone())
+        .collect();
+    final_unsettled.sort();
+    final_unsettled.dedup();
+    assert_eq!(
+        final_unsettled,
+        vec![next_turn_id.clone()],
+        "the follow-up turn must become the sole unsettled turn"
+    );
+    let final_old: Vec<_> = final_view
+        .arrangement
+        .iter()
+        .filter(|entry| entry.subject_id == first_turn_id)
+        .collect();
+    assert_eq!(
+        final_old.len(),
+        1,
+        "the settled old turn must have one whole construction"
+    );
+    assert!(
+        final_old[0].part.is_none() && !final_old[0].degraded,
+        "the old turn remains whole and nondegraded after later progress"
+    );
+    assert!(
+        final_view.gaps.is_empty() && final_view.arrangement.iter().all(|entry| !entry.degraded),
+        "later progress must retain gap-free, nondegraded coverage: {final_view:?}"
+    );
+    assert!(
+        final_view.compact_point > settled_view.compact_point,
+        "later pressure must advance the follow-up split point"
+    );
+
+    let all_bodies = request_bodies(&mock);
+    assert_eq!(
+        all_bodies.len(),
+        CYCLES + LATER_CYCLES + 3,
+        "both real turns must make the expected bounded provider progress"
+    );
+    assert!(
+        all_bodies
+            .last()
+            .is_some_and(|body| body.contains("-ENDPAY117") && body.contains(NEXT_PROMPT)),
+        "the final request must prove later follow-up progress"
+    );
+    assert!(
+        !all_bodies.iter().any(|body| body_has_summarization(body)),
+        "no native compact path may run across either turn"
+    );
+    assert!(
+        !all_bodies
+            .iter()
+            .any(|body| body.contains("lhc.compact_continuation")),
+        "no forced-boundary marker may appear across either turn"
+    );
+    let final_receipts =
+        codex_lhc_host::inspect_compact_continuation_receipts(&thread_id, lhc_data_root.as_deref())
+            .await
+            .expect("inspect final receipts");
+    assert!(
+        final_receipts
+            .iter()
+            .all(|receipt| receipt.continuation_turn_id.is_none()),
+        "neither turn may open a continuation turn: {final_receipts:?}"
     );
 
     Ok(())
