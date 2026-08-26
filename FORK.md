@@ -329,6 +329,16 @@ the turn-parts MidTurn arm with typed-only forced-boundary coexistence (see
 "Turn parts MidTurn"); patch `0007` regenerated for the fork-owned core files
 touched, tripwire layer 2a2 added.
 
+### Release preparation 2026-08-26 — `v0.149.2`
+
+The unpushed release candidate aligns the workspace and release identity at
+`0.149.2` and pins the exact accepted SDK `13573a16759582ec77efb00b2c8fe11cf20c43ba`.
+It packages the post-close Full-tail repair described under "Turn parts
+MidTurn" without changing host behavior, release machinery, archive layout,
+installer behavior, platform matrix, or thresholds. Thread schema remains 12
+with no new migration. Provider-pressure crossing remains unestablished; no
+new provider crossing is claimed.
+
 ### Drill run 2026-08-23 — exact stable `rust-v0.149.0`
 
 Merged tag `rust-v0.149.0` (`758ef40f50`) onto accepted local baseline

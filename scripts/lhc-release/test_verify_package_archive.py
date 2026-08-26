@@ -10,7 +10,7 @@ from pathlib import Path
 from verify_package_archive import PLATFORMS, verify
 
 
-SDK = "713b38d9eb8497b48023977cec2d84df9568bd58"
+SDK = "13573a16759582ec77efb00b2c8fe11cf20c43ba"
 
 
 def fixture(root: Path, platform: str) -> Path:
@@ -34,7 +34,7 @@ def fixture(root: Path, platform: str) -> Path:
         path.write_bytes(b"fixture")
     metadata = {
         "layoutVersion": 1,
-        "version": "0.149.1",
+        "version": "0.149.2",
         "target": target,
         "variant": "codex",
         "entrypoint": f"bin/codex{suffix}",
@@ -75,7 +75,7 @@ class PackageContractTests(unittest.TestCase):
         )
         for platform in PLATFORMS:
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
-                verify(fixture(Path(tmp), platform), platform, "0.149.1", SDK)
+                verify(fixture(Path(tmp), platform), platform, "0.149.2", SDK)
 
     def test_missing_linux_zsh_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -87,7 +87,7 @@ class PackageContractTests(unittest.TestCase):
                 for path in package.rglob("*"):
                     output.add(path, arcname=path.relative_to(package), recursive=False)
             with self.assertRaisesRegex(ValueError, "zsh"):
-                verify(archive, "linux-x86_64", "0.149.1", SDK)
+                verify(archive, "linux-x86_64", "0.149.2", SDK)
 
 
 if __name__ == "__main__":

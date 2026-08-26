@@ -10,7 +10,7 @@ from verify_public_release import validate_public_state
 from verify_public_release import verify_downloaded_assets
 
 
-VERSION = "0.149.1"
+VERSION = "0.149.2"
 SOURCE = "a" * 40
 
 

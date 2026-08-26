@@ -16,7 +16,7 @@ SCRIPT = ROOT / "scripts/lhc-release/make_manifest.py"
 SHA_A = "a" * 40
 SHA_B = "b" * 40
 SHA_C = "c" * 40
-ALIGNED_VERSION = "0.149.1"
+ALIGNED_VERSION = "0.149.2"
 
 
 def write_archive(dist: Path, version: str, platform: str, kind: str) -> Path:

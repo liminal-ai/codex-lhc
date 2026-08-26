@@ -27,7 +27,7 @@ sh install.sh
 To install a specific release:
 
 ```bash
-sh install.sh --version 0.149.1
+sh install.sh --version 0.149.2
 ```
 
 Supported release targets are Linux x86-64/ARM64 and Apple Silicon macOS.
@@ -44,7 +44,7 @@ Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/downlo
 To install a specific release:
 
 ```powershell
-.\install.ps1 -Version 0.149.1
+.\install.ps1 -Version 0.149.2
 ```
 
 The installer selects the Windows x86-64 or ARM64 package from the process
@@ -98,10 +98,12 @@ official OpenAI builds without LHC.
 
 ## Upgrade and compatibility
 
-The current `v0.149.1` release advances LHC thread schema from 11 to 12.
+The current `v0.149.2` release retains LHC thread schema 12; it introduces no
+new migration.
 
-> **One-way migration:** opening schema-11 state with `v0.149.1` migrates it to
-> schema 12. After migration, downgrade to `v0.149.0` is unsupported.
+> **One-way migration:** opening schema-11 state with `v0.149.1` or newer
+> migrates it to schema 12. After migration, downgrade to `v0.149.0` is
+> unsupported.
 
 The bounded selector is the default. To run the legacy eager selector on Linux
 or macOS:

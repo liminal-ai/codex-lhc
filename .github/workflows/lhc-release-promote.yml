@@ -6,7 +6,7 @@ on:
       version:
         description: "Release version"
         required: true
-        default: "0.149.1"
+        default: "0.149.2"
         type: string
       candidate_run_id:
         description: "Successful five-platform candidate workflow run id"
@@ -81,7 +81,7 @@ jobs:
           assert manifest["release"] == os.environ["VERSION"]
           assert manifest["sourceCommit"] == os.environ["SOURCE_SHA"]
           assert manifest["buildRunId"] == os.environ["CANDIDATE_RUN_ID"]
-          assert manifest["lhcSdkCommit"] == "713b38d9eb8497b48023977cec2d84df9568bd58"
+          assert manifest["lhcSdkCommit"] == "13573a16759582ec77efb00b2c8fe11cf20c43ba"
           assert manifest["compactAlgorithmDefault"] == "bounded-selector"
           assert manifest["compactAlgorithmRollback"] == {
               "environment": "LHC_COMPACT_ALGORITHM", "value": "legacy",
