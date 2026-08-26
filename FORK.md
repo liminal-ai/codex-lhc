@@ -23,11 +23,13 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`13573a1`** (`13573a16759582ec77efb00b2c8fe11cf20c43ba`) —
-  accepted Rust turn-parts post-close-tail repair (2026-08-26), directly over
-  `713b38d`: schema v12 host step
-  index on messages, host metadata surface, `mid_turn_compact` entry with the
-  four-fact seam assertion and per-thread mechanism exclusivity (typed
+  Current pin: **`b408f89`** (`b408f89712cbbb525dbfc2f7b2c51ab3133c4f45`) —
+  accepted final SDK identity delta (2026-08-26), directly over `13573a1`.
+  The final delta changes only TypeScript scheduler files; its
+  `packages/lhc-rs` tree is byte-identical to the parent. The inherited Rust
+  turn-parts post-close-tail repair is directly over `713b38d`: schema v12
+  host step index on messages, host metadata surface, `mid_turn_compact` entry
+  with the four-fact seam assertion and per-thread mechanism exclusivity (typed
   `forced_boundary_thread` / `compact_continuation_parts_thread` refusals),
   walk split/settle/parts, newest-closed protection, and retention of a split
   closed turn's parts, compact point, and nonempty Full suffix while a newer
@@ -332,12 +334,13 @@ touched, tripwire layer 2a2 added.
 ### Release preparation 2026-08-26 — `v0.149.2`
 
 The unpushed release candidate aligns the workspace and release identity at
-`0.149.2` and pins the exact accepted SDK `13573a16759582ec77efb00b2c8fe11cf20c43ba`.
-It packages the post-close Full-tail repair described under "Turn parts
-MidTurn" without changing host behavior, release machinery, archive layout,
-installer behavior, platform matrix, or thresholds. Thread schema remains 12
-with no new migration. Provider-pressure crossing remains unestablished; no
-new provider crossing is claimed.
+`0.149.2` and pins the exact accepted SDK `b408f89712cbbb525dbfc2f7b2c51ab3133c4f45`.
+The final SDK delta is TS-only, and its `packages/lhc-rs` tree is unchanged
+from parent `13573a1`. It packages the inherited post-close Full-tail repair
+described under "Turn parts MidTurn" without changing host behavior, release
+machinery, archive layout, installer behavior, platform matrix, or thresholds.
+Thread schema remains 12 with no new migration. Provider-pressure crossing
+remains unestablished; no new provider crossing is claimed.
 
 ### Drill run 2026-08-23 — exact stable `rust-v0.149.0`
 

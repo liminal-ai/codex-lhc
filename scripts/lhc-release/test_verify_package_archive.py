@@ -10,7 +10,7 @@ from pathlib import Path
 from verify_package_archive import PLATFORMS, verify
 
 
-SDK = "13573a16759582ec77efb00b2c8fe11cf20c43ba"
+SDK = "b408f89712cbbb525dbfc2f7b2c51ab3133c4f45"
 
 
 def fixture(root: Path, platform: str) -> Path:

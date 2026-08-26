@@ -37,7 +37,7 @@ class PackageLayoutTest(unittest.TestCase):
             )
             provenance = LhcProvenance(
                 repository="https://github.com/liminal-ai/long-horizon-context",
-                sdk_commit="13573a16759582ec77efb00b2c8fe11cf20c43ba",
+                sdk_commit="b408f89712cbbb525dbfc2f7b2c51ab3133c4f45",
                 thread_schema=12,
             )
 
@@ -64,7 +64,7 @@ class PackageLayoutTest(unittest.TestCase):
                 metadata["lhc"],
                 {
                     "repository": "https://github.com/liminal-ai/long-horizon-context",
-                    "sdkCommit": "13573a16759582ec77efb00b2c8fe11cf20c43ba",
+                    "sdkCommit": "b408f89712cbbb525dbfc2f7b2c51ab3133c4f45",
                     "threadSchema": 12,
                 },
             )
