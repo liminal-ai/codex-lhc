@@ -1460,7 +1460,7 @@ fn law6_function_result_with_image_shaped_body_stays_function_output() {
         tail.iter().any(|r| matches!(
             r,
             ResponseItem::FunctionCallOutput { call_id, output, .. }
-                if call_id == "fc_trap"
+                if call_id.as_deref() == Some("fc_trap")
                     && matches!(&output.body, FunctionCallOutputBody::Text(t) if t == body)
         )),
         "must stay FunctionCallOutput, not ImageGenerationCall: {tail:?}"
@@ -1915,7 +1915,7 @@ fn banded_thread_with_tool_heavy_tail_preserves_native_kinds() {
     assert!(tail.iter().any(|r| matches!(
         r,
         ResponseItem::FunctionCallOutput { call_id, output, .. }
-            if call_id == "fc_1"
+            if call_id.as_deref() == Some("fc_1")
                 && matches!(&output.body, FunctionCallOutputBody::Text(t) if t == "fn main() {}")
                 && output.success == Some(true)
     )));
@@ -2190,7 +2190,7 @@ fn reverse_maps_local_shell_and_web_search_payloads() {
         tail.iter().any(|r| matches!(
             r,
             ResponseItem::FunctionCallOutput { call_id, output, .. }
-                if call_id == "shell-1"
+                if call_id.as_deref() == Some("shell-1")
                     && matches!(&output.body, FunctionCallOutputBody::Text(t) if t == "hi\n")
                     && output.success == Some(true)
         )),

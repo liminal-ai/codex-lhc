@@ -190,7 +190,9 @@ fn all_variant_fixtures() -> Vec<(&'static str, ResponseItem, RawItemProvenance)
             "function_call_output",
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "fc_1".into(),
+                call_id: Some("fc_1".into()),
+                name: None,
+                namespace: None,
                 output: FunctionCallOutputPayload::from_text("fn main() {}".into()),
                 internal_chat_message_metadata_passthrough: None,
             },
@@ -1486,7 +1488,9 @@ async fn f2_step_index_stamped_on_step_bearing_kinds_only() {
     handle.persist(
         &ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-0".into(),
+            call_id: Some("call-0".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload::from_text("file contents".into()),
             internal_chat_message_metadata_passthrough: None,
         },

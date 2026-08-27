@@ -95,8 +95,8 @@ pub fn client_call_id(item: &ResponseItem) -> Option<String> {
 
 pub fn output_call_id(item: &ResponseItem) -> Option<String> {
     match item {
-        ResponseItem::FunctionCallOutput { call_id, .. }
-        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::FunctionCallOutput { call_id, .. } => call_id.clone(),
+        ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
         ResponseItem::ToolSearchOutput {
             call_id: Some(call_id),
             ..
@@ -924,7 +924,9 @@ mod tests {
     fn output(id: &str, body: &str) -> ResponseItem {
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: id.into(),
+            call_id: Some(id.into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text(body.into()),
                 success: Some(true),

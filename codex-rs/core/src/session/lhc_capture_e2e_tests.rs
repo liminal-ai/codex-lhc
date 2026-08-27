@@ -1102,7 +1102,9 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     };
     let output = |call_id: &str| ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: call_id.into(),
+        call_id: Some(call_id.into()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload::from_text(format!("out-{call_id}")),
         internal_chat_message_metadata_passthrough: None,
     };

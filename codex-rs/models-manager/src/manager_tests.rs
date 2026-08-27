@@ -576,6 +576,7 @@ c2ln",
         agent_identity: None,
         personal_access_token: None,
         bedrock_api_key: None,
+        bedrock_access_keys: None,
     };
     std::fs::create_dir_all(codex_home).expect("codex home should be created");
     std::fs::write(
@@ -734,8 +735,10 @@ async fn get_model_info_applies_long_context_override_to_bundled_gpt_5_6_models(
         codex_home.path().to_path_buf(),
         TestModelsEndpoint::new(Vec::new()),
     );
+    // Codex-LHC ships a 1.05M capability ceiling on the bundled GPT-5.6 models
+    // (FORK.md "LC Adaptive Service Tier"), so the override clamps there.
     let config = ModelsManagerConfig {
-        model_context_window: Some(1_000_000),
+        model_context_window: Some(2_000_000),
         ..Default::default()
     };
 
@@ -744,7 +747,7 @@ async fn get_model_info_applies_long_context_override_to_bundled_gpt_5_6_models(
         let mut expected = manager
             .get_model_info(slug, &ModelsManagerConfig::default())
             .await;
-        expected.context_window = Some(872_000);
+        expected.context_window = Some(1_050_000);
 
         assert_eq!(model_info, expected);
     }

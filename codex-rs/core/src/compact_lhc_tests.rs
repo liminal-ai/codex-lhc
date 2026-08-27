@@ -842,6 +842,7 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
         SessionSource::Exec,
         "test_originator".to_string(),
         /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -1037,6 +1038,7 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
             SessionSource::Exec,
             "test_originator".to_string(),
             /*model_verbosity*/ None,
+            /*content_item_kinds_enabled*/ false,
             /*enable_request_compression*/ false,
             /*include_timing_metrics*/ false,
             /*beta_features_header*/ None,
@@ -2851,7 +2853,9 @@ async fn queue_loss_imports_missing_tool_and_reasoning() {
         },
         ResponseItem::FunctionCallOutput {
             id: Some(ResponseItemId::from_server("fco-import-1".into())),
-            call_id: call_id.into(),
+            call_id: Some(call_id.into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("import-tool-result-ok".into()),
                 success: Some(true),
@@ -2892,7 +2896,7 @@ async fn queue_loss_imports_missing_tool_and_reasoning() {
         _ => false,
     });
     let has_result_id = installed.iter().any(|item| match item {
-        ResponseItem::FunctionCallOutput { call_id: c, .. } => c == call_id,
+        ResponseItem::FunctionCallOutput { call_id: c, .. } => c.as_deref() == Some(call_id),
         _ => false,
     });
     // Live tail may retain tool pairs; bands may fold them. Either way install
@@ -3478,7 +3482,9 @@ fn degraded_drops_keep_rollout_and_installed_body_identical() {
     fn output(id: &str) -> ResponseItem {
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: id.into(),
+            call_id: Some(id.into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("out".into()),
                 success: Some(true),

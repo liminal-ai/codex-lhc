@@ -1985,7 +1985,9 @@ mod tests {
         };
         let result = ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-1".into(),
+            call_id: Some("call-1".into()),
+            name: None,
+            namespace: None,
             output: codex_protocol::models::FunctionCallOutputPayload {
                 body: codex_protocol::models::FunctionCallOutputBody::Text("ok".into()),
                 success: Some(true),

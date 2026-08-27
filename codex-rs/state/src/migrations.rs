@@ -117,6 +117,74 @@ WHERE version = ?
     Ok(())
 }
 
+/// The fork's rollout generation identity migration first shipped as thread
+/// history version 5; upstream later added its own versions 5 and 6, so the
+/// fork migration now lives at version 7. Relabel a legacy version-5 row that
+/// carries the generation-ID checksum as version 7 so upstream's 5 and 6 apply
+/// beneath it instead of failing the checksum comparison.
+pub(crate) async fn repair_legacy_rollout_generation_migration_version(
+    pool: &SqlitePool,
+    migrator: &Migrator,
+) -> anyhow::Result<()> {
+    let Some(generation_migration) = migrator
+        .migrations
+        .iter()
+        .find(|migration| migration.version == 7)
+    else {
+        return Ok(());
+    };
+    let migrations_table_exists = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !migrations_table_exists {
+        return Ok(());
+    }
+
+    let legacy_generation_needs_repair = sqlx::query_scalar::<_, i64>(
+        r#"
+SELECT 1
+FROM _sqlx_migrations
+WHERE version = ?
+  AND checksum = ?
+  AND NOT EXISTS (
+      SELECT 1 FROM _sqlx_migrations WHERE version = ?
+  )
+        "#,
+    )
+    .bind(5_i64)
+    .bind(generation_migration.checksum.as_ref())
+    .bind(generation_migration.version)
+    .fetch_optional(pool)
+    .await?
+    .is_some();
+    if !legacy_generation_needs_repair {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+UPDATE _sqlx_migrations
+SET version = ?, description = ?
+WHERE version = ?
+  AND checksum = ?
+  AND NOT EXISTS (
+      SELECT 1 FROM _sqlx_migrations WHERE version = ?
+  )
+        "#,
+    )
+    .bind(generation_migration.version)
+    .bind(generation_migration.description.as_ref())
+    .bind(5_i64)
+    .bind(generation_migration.checksum.as_ref())
+    .bind(generation_migration.version)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "migrations_tests.rs"]
 mod tests;

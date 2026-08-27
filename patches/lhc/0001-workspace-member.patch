@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 098613a587..1150380915 100644
+index 74a45554ab..a5e8c68bae 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -71,6 +71,8 @@ members = [
+@@ -73,6 +73,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,11 +11,7 @@ index 098613a587..1150380915 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -140,2 +142,2 @@ resolver = "2"
--version = "0.149.1"
-+version = "0.149.2"
- # Track the edition for all workspace crates in one place. Individual
-@@ -210,6 +212,8 @@ codex-hooks = { path = "hooks" }
+@@ -215,6 +217,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }

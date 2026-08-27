@@ -1627,7 +1627,9 @@ fn reverse_tool_result(
     } else {
         ResponseItem::FunctionCallOutput {
             id,
-            call_id,
+            call_id: non_empty_opt(&call_id),
+            name: None,
+            namespace: None,
             output: payload,
             internal_chat_message_metadata_passthrough: None,
         }

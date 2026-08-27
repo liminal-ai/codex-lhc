@@ -1,8 +1,8 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index d51ee6597e..97b3aed6c5 100644
+index a0ab68f560..6af73dfe05 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
-@@ -15,6 +15,7 @@ use crate::ExtensionMetrics;
+@@ -16,6 +16,7 @@ mod approval_review;
  mod context;
  mod mcp;
  mod prompt;
@@ -10,7 +10,7 @@ index d51ee6597e..97b3aed6c5 100644
  mod skill_invocation;
  mod thread_lifecycle;
  mod tool_lifecycle;
-@@ -29,6 +30,9 @@ pub use mcp::SelectedPluginIdentity;
+@@ -33,6 +34,9 @@ pub use mcp::SelectedPluginIdentity;
  pub use mcp::SelectedPluginSnapshot;
  pub use prompt::PromptFragment;
  pub use prompt::PromptSlot;
@@ -134,10 +134,10 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index 54c329ae22..5ada23cf97 100644
+index a166fdd31d..7624fecb2b 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
-@@ -45,6 +45,9 @@ pub use contributors::McpServerContributor;
+@@ -52,6 +52,9 @@ pub use contributors::McpServerContributor;
  pub use contributors::PreviousWorldStateSection;
  pub use contributors::PromptFragment;
  pub use contributors::PromptSlot;
@@ -148,10 +148,10 @@ index 54c329ae22..5ada23cf97 100644
  pub use contributors::SelectedPluginIdentity;
  pub use contributors::SelectedPluginSnapshot;
 diff --git a/codex-rs/ext/extension-api/src/registry.rs b/codex-rs/ext/extension-api/src/registry.rs
-index be4670cbba..7e886ba4c4 100644
+index eec5b9f0a7..fb15f7957d 100644
 --- a/codex-rs/ext/extension-api/src/registry.rs
 +++ b/codex-rs/ext/extension-api/src/registry.rs
-@@ -10,6 +10,7 @@ use crate::ExtensionEventSink;
+@@ -13,6 +13,7 @@ use crate::ExtensionEventSink;
  use crate::ExtensionMetrics;
  use crate::McpServerContributor;
  use crate::NoopExtensionEventSink;
@@ -159,7 +159,7 @@ index be4670cbba..7e886ba4c4 100644
  use crate::SkillInvocationContributor;
  use crate::ThreadLifecycleContributor;
  use crate::TokenUsageContributor;
-@@ -41,6 +42,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
+@@ -44,6 +45,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
                  tool_contributors: Vec::new(),
                  tool_lifecycle_contributors: Vec::new(),
                  turn_item_contributors: Vec::new(),
@@ -167,7 +167,7 @@ index be4670cbba..7e886ba4c4 100644
              },
          }
      }
-@@ -134,6 +136,12 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
+@@ -137,6 +139,12 @@ impl<C: Sync> ExtensionRegistryBuilder<C> {
          self.registry.turn_item_contributors.push(contributor);
      }
  
@@ -180,7 +180,7 @@ index be4670cbba..7e886ba4c4 100644
      /// Finishes construction and returns the immutable registry.
      pub fn build(self) -> ExtensionRegistry<C> {
          self.registry
-@@ -154,6 +162,8 @@ pub struct ExtensionRegistry<C: Sync> {
+@@ -157,6 +165,8 @@ pub struct ExtensionRegistry<C: Sync> {
      tool_contributors: Vec<Arc<dyn ToolContributor>>,
      tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
      turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
@@ -189,7 +189,7 @@ index be4670cbba..7e886ba4c4 100644
      approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
  }
  
-@@ -243,6 +253,12 @@ impl<C: Sync> ExtensionRegistry<C> {
+@@ -259,6 +269,12 @@ impl<C: Sync> ExtensionRegistry<C> {
      pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
          &self.turn_item_contributors
      }
@@ -203,7 +203,7 @@ index be4670cbba..7e886ba4c4 100644
  
  /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 7ac890183e..a6930f83c9 100644
+index 2e856ffedd..fb804e9118 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
 @@ -1366,6 +1366,7 @@ impl GoalExtensionHarness {

@@ -540,6 +540,7 @@ async fn lhc_band_shape_eval_live() {
         SessionSource::Exec,
         "lhc-band-shape-eval".to_string(),
         config.model_verbosity,
+        /*content_item_kinds_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,

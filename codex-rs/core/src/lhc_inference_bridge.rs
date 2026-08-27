@@ -528,6 +528,7 @@ mod tests {
             SessionSource::Exec,
             "test_originator".to_string(),
             /*model_verbosity*/ None,
+            /*content_item_kinds_enabled*/ false,
             /*enable_request_compression*/ false,
             /*include_timing_metrics*/ false,
             /*beta_features_header*/ None,

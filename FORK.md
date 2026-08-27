@@ -168,7 +168,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 32 | `cli/Cargo.toml`, `cli/tests/version.rs` | inherits the mapped upstream workspace version reported by `codex --version`, with fork regression coverage | `0001-workspace-member` (test only; manifest restored to upstream) |
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
-| 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,thread_history_migrations/0005_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals | `0007-lhc-compact-arm` |
+| 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,src/sqlite.rs,thread_history_migrations/0007_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals; the fork migration is version 7 (it shipped as 5 before upstream 0.150 added its own 5/6) and a legacy version-5 row is relabelled at open by `repair_legacy_rollout_generation_migration_version` | `0007-lhc-compact-arm` |
 | 36 | `app-server-daemon/{README.md,src/lib.rs,src/managed_install.rs,src/managed_install_tests.rs,src/update_loop.rs,src/update_loop_tests.rs}` | managed CLI/app-server version parsing and same-version restart coherence use the workspace version; isolated remote-control homes seed fork bytes and never download stock Codex | `0001-workspace-member` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
@@ -309,6 +309,59 @@ terminal failure.
    sync**, not cleanup after it.
 5. `./scripts/check-lhc-hooks.sh` — all layers green before push.
 6. Commit with tripwire output summarized in the body; push to origin only.
+
+### Drill run 2026-08-27 — exact stable `rust-v0.150.1` (LIM-132)
+
+Merged annotated tag `rust-v0.150.1` (tag object `0eb410ad0d`, peeled commit
+`9085439396`) onto product base `673df1bf08` (workspace `0.149.2`, public tag
+`v0.149.2`) with a real two-parent `--no-ff` merge; the second parent is the
+peeled commit. `rust-v0.149.1` is not an ancestor of `rust-v0.150.1`
+(release branches); merge-base `2584e88cad`, 208 upstream commits.
+
+Twelve conflicts. Content: `Cargo.toml` (take `0.150.1`, keep the LHC
+workspace member); `features/src/lib.rs` (keep `Feature::LhcCapture`);
+`models.json` (keep fork windows `370000/1050000/350000` on gpt-5.6-*, take
+upstream `model_specialty`); `core/src/tasks/mod.rs` (upstream
+`run_turn_interrupt_hooks` on interrupt + fork abort timing into
+`emit_turn_abort_lifecycle`); `core/src/tasks/compact.rs` and
+`core/src/session/turn.rs` (strict LHC manual/auto ladders kept; upstream
+`Session::responses_metadata` taken with the F2 `begin_cycle` seam after it);
+`core/src/session/mod.rs` (upstream memory-pollution check on unpaired
+outputs + fork provenance fan-out); `thread_history_materialization.rs`
+(upstream `is_inherited_subagent_history` computed from the fork's rollout
+`head`); `state/src/migrations_tests.rs` (both tests kept). Add/add or content
+conflicts where the 0.149.1 release-branch image-budget backport met upstream
+main (`compact_remote_v2_images.rs`, `compact_remote_v2_image_budget_tests.rs`,
+`core/tests/suite/compact_remote.rs`) were taken from upstream verbatim — the
+fork side was byte-identical to the `rust-v0.149.1` tag.
+
+**Thread-history migration renumber.** Upstream 0.150 added
+`0005_thread_realtime_items.sql` and `0006_thread_turn_ends.sql`; the fork's
+`0005_rollout_generation_id.sql` moved to version **7** (same SQL, same
+checksum). Existing fork databases carry the generation-ID migration as
+version 5, which would fail upstream's version-5 checksum comparison, so
+`repair_legacy_rollout_generation_migration_version` (mirroring upstream's
+version-38/39 recency repair) relabels that row to 7 before the thread-history
+migrator runs and upstream 5/6 apply beneath it. Pinned by
+`repairs_rollout_generation_migration_that_was_applied_as_version_5`.
+
+Adapter absorbed upstream API changes without semantic change:
+`ResponseItem::FunctionCallOutput.call_id` is now `Option<String>` with new
+`name`/`namespace` fields (unpaired named outputs). Capture maps a `None`
+call id to a synthetic id exactly as `ToolSearchCall` already does; the
+closed `tool_result` payload has no slot for `name`/`namespace`, so they are
+not carried (recorded gap — no in-process producer emits such items today) and
+materialize emits `name: None, namespace: None`. `ToolOutput::log_preview`
+became `log_output`; `ToolCall` gained `source` (test fixtures);
+`RolloutItem::RealtimeItem` joined the fork's rollout-head scan.
+
+Release identity: `lhc-release/VERSION` and the release-helper alignment
+test moved `0.149.2` → `0.150.1` so `check_version_identity` stays aligned
+with the merged workspace; release notes, workflow defaults, and any
+`0.150.2` identity remain with the release story. `patches/lhc/BASE` advanced
+to `9085439396`; all seven patches regenerated. `Cargo.lock` regenerated
+(the auto-merge left it inconsistent). Vendored SDK pin unchanged at
+`b408f89`.
 
 ### Drill run 2026-08-25 — exact stable `rust-v0.149.1` (turn parts, Story 5)
 
@@ -451,7 +504,7 @@ also corrected to the actual certified `7062814` gitlink.
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 
 The whole series is a diff from **one upstream base**, recorded in
-`patches/lhc/BASE` (currently `ff29a44391`; it was `322d5b96cf`, the last
+`patches/lhc/BASE` (currently `9085439396`; it was `322d5b96cf`, the last
 upstream commit before Chunk 0, until the first real sync advanced it — see
 Sync drill step 4). Each fork-owned file appears in **exactly one** patch. Tripwire
 layer 4 runs this drill on every invocation and fails if it stops reproducing

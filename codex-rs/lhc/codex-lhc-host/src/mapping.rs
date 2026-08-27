@@ -281,11 +281,25 @@ pub fn map_item(
             call_id,
             output,
             id: _,
+            name: _,
+            namespace: _,
             internal_chat_message_metadata_passthrough: _,
         } => {
+            // An unpaired named output (`call_id: None`) takes a synthetic id
+            // like ToolSearchCall; the closed tool_result payload has no slot
+            // for `name`/`namespace`, so they are not carried (gap).
+            let tool_call_id = call_id
+                .clone()
+                .unwrap_or_else(|| format!("synthetic:{digest}"));
             let (content, is_error) = function_output_content(output);
             vec![tool_result_event(
-                thread_id, sid, &digest, occ, call_id, &content, is_error,
+                thread_id,
+                sid,
+                &digest,
+                occ,
+                &tool_call_id,
+                &content,
+                is_error,
             )]
         }
         ResponseItem::CustomToolCall {

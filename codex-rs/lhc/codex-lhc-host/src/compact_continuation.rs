@@ -162,10 +162,11 @@ pub fn work_continuation_for_mid_turn(
     let result_ids: std::collections::HashSet<String> = history_items
         .iter()
         .filter_map(|item| match item {
-            ResponseItem::FunctionCallOutput { call_id, .. }
-            | ResponseItem::CustomToolCallOutput { call_id, .. }
-                if !call_id.is_empty() =>
-            {
+            ResponseItem::FunctionCallOutput {
+                call_id: Some(call_id),
+                ..
+            } if !call_id.is_empty() => Some(call_id.clone()),
+            ResponseItem::CustomToolCallOutput { call_id, .. } if !call_id.is_empty() => {
                 Some(call_id.clone())
             }
             // ToolSearch is client-correlated when present; scan its output type.
@@ -1114,7 +1115,9 @@ mod tests {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "call-b".into(),
+                call_id: Some("call-b".into()),
+                name: None,
+                namespace: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text("b".into()),
                     success: Some(true),
@@ -1123,7 +1126,9 @@ mod tests {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "call-a".into(),
+                call_id: Some("call-a".into()),
+                name: None,
+                namespace: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text("a".into()),
                     success: Some(true),
@@ -1303,7 +1308,9 @@ mod tests {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "old-call".into(),
+                call_id: Some("old-call".into()),
+                name: None,
+                namespace: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text("old".into()),
                     success: Some(true),
@@ -1321,7 +1328,9 @@ mod tests {
             },
             ResponseItem::FunctionCallOutput {
                 id: None,
-                call_id: "new-call".into(),
+                call_id: Some("new-call".into()),
+                name: None,
+                namespace: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text("new".into()),
                     success: Some(true),

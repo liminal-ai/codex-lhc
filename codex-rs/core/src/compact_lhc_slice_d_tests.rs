@@ -1036,7 +1036,9 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
                 },
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "fc_adv".into(),
+                    call_id: Some("fc_adv".into()),
+                    name: None,
+                    namespace: None,
                     output: FunctionCallOutputPayload::from_text(oversized.clone()),
                     internal_chat_message_metadata_passthrough: None,
                 },

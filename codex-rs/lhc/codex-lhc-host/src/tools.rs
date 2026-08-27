@@ -499,7 +499,7 @@ impl TextToolOutput {
 }
 
 impl ToolOutput for TextToolOutput {
-    fn log_preview(&self) -> String {
+    fn log_output(&self) -> String {
         const MAX: usize = 200;
         if self.text.len() <= MAX {
             self.text.clone()
@@ -559,6 +559,7 @@ mod tests {
             model: "test-model".into(),
             codex_turn_metadata: None,
             truncation_policy: TruncationPolicy::Bytes(64 * 1024),
+            source: codex_extension_api::ToolCallSource::Direct,
             conversation_history: Default::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
             environments: Vec::new(),

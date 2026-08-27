@@ -253,7 +253,9 @@ fn parallel_tool_ids_form_complete_sorted_protected_set() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "z-call".into(),
+            call_id: Some("z-call".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("z".into()),
                 success: Some(true),
@@ -262,7 +264,9 @@ fn parallel_tool_ids_form_complete_sorted_protected_set() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "a-call".into(),
+            call_id: Some("a-call".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("a".into()),
                 success: Some(true),
@@ -301,7 +305,9 @@ fn response_scoped_ids_ignore_older_history_tool_calls() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "aaa-old".into(),
+            call_id: Some("aaa-old".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("old".into()),
                 success: Some(true),
@@ -319,7 +325,9 @@ fn response_scoped_ids_ignore_older_history_tool_calls() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "zzz-new".into(),
+            call_id: Some("zzz-new".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("new".into()),
                 success: Some(true),
@@ -779,7 +787,9 @@ async fn mid_turn_pending_tool_branch_preserves_pair_shape() {
                 },
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "call-tool-z".into(),
+                    call_id: Some("call-tool-z".into()),
+                    name: None,
+                    namespace: None,
                     output: FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text("z".into()),
                         success: Some(true),
@@ -788,7 +798,9 @@ async fn mid_turn_pending_tool_branch_preserves_pair_shape() {
                 },
                 ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id: "call-tool-a".into(),
+                    call_id: Some("call-tool-a".into()),
+                    name: None,
+                    namespace: None,
                     output: FunctionCallOutputPayload {
                         body: FunctionCallOutputBody::Text("a".into()),
                         success: Some(true),
@@ -1347,6 +1359,7 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
         SessionSource::Exec,
         "test_originator".to_string(),
         /*model_verbosity*/ None,
+        /*content_item_kinds_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
@@ -1801,7 +1814,9 @@ async fn mid_turn_pending_parallel_tools_preserve_reasoning_and_pairs() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-tool-z".into(),
+            call_id: Some("call-tool-z".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("z-out".into()),
                 success: Some(true),
@@ -1810,7 +1825,9 @@ async fn mid_turn_pending_parallel_tools_preserve_reasoning_and_pairs() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: "call-tool-a".into(),
+            call_id: Some("call-tool-a".into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("a-out".into()),
                 success: Some(true),
@@ -1891,13 +1908,13 @@ async fn mid_turn_pending_parallel_tools_preserve_reasoning_and_pairs() {
     let out_z = pair_source.iter().find_map(|i| match i {
         ResponseItem::FunctionCallOutput {
             call_id, output, ..
-        } if call_id == "call-tool-z" => Some(format!("{:?}", output.body)),
+        } if call_id.as_deref() == Some("call-tool-z") => Some(format!("{:?}", output.body)),
         _ => None,
     });
     let out_a = pair_source.iter().find_map(|i| match i {
         ResponseItem::FunctionCallOutput {
             call_id, output, ..
-        } if call_id == "call-tool-a" => Some(format!("{:?}", output.body)),
+        } if call_id.as_deref() == Some("call-tool-a") => Some(format!("{:?}", output.body)),
         _ => None,
     });
     assert!(
@@ -2085,7 +2102,9 @@ async fn mid_turn_reload_resume_equivalence_both_branches() {
                     },
                     ResponseItem::FunctionCallOutput {
                         id: None,
-                        call_id: "call-reload-b".into(),
+                        call_id: Some("call-reload-b".into()),
+                        name: None,
+                        namespace: None,
                         output: FunctionCallOutputPayload {
                             body: FunctionCallOutputBody::Text("b".into()),
                             success: Some(true),
@@ -2094,7 +2113,9 @@ async fn mid_turn_reload_resume_equivalence_both_branches() {
                     },
                     ResponseItem::FunctionCallOutput {
                         id: None,
-                        call_id: "call-reload-a".into(),
+                        call_id: Some("call-reload-a".into()),
+                        name: None,
+                        namespace: None,
                         output: FunctionCallOutputPayload {
                             body: FunctionCallOutputBody::Text("a".into()),
                             success: Some(true),
@@ -2623,7 +2644,9 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
         },
         ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: tool_x.into(),
+            call_id: Some(tool_x.into()),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("x-out".into()),
                 success: Some(true),
@@ -3126,7 +3149,9 @@ pub(super) async fn seed_escalation_history(
         });
         items.push(ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: format!("call-old-{i}"),
+            call_id: Some(format!("call-old-{i}")),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text(format!("{}-OLD{i}", "tok ".repeat(1_200))),
                 success: Some(true),
@@ -3145,7 +3170,9 @@ pub(super) async fn seed_escalation_history(
     });
     items.push(ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: protected_id.into(),
+        call_id: Some(protected_id.into()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(format!("{}-PROTECTED", "tok ".repeat(400))),
             success: Some(true),
@@ -3818,7 +3845,9 @@ pub(super) async fn seed_stepped_active_turn(
                 tc,
                 &[ResponseItem::FunctionCallOutput {
                     id: None,
-                    call_id,
+                    call_id: Some(call_id),
+                    name: None,
+                    namespace: None,
                     output: FunctionCallOutputPayload::from_text(format!("step {k} output {pad}")),
                     internal_chat_message_metadata_passthrough: None,
                 }],

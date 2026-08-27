@@ -651,7 +651,9 @@ async fn seed_oversized_protected_pair(
         });
         items.push(ResponseItem::FunctionCallOutput {
             id: None,
-            call_id: format!("canary-old-{i}"),
+            call_id: Some(format!("canary-old-{i}")),
+            name: None,
+            namespace: None,
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text(format!("{}-OLD{i}", "tok ".repeat(1_200))),
                 success: Some(true),
@@ -670,7 +672,9 @@ async fn seed_oversized_protected_pair(
     });
     items.push(ResponseItem::FunctionCallOutput {
         id: None,
-        call_id: protected_id.into(),
+        call_id: Some(protected_id.into()),
+        name: None,
+        namespace: None,
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(format!("{}-PROTECTED", "tok ".repeat(9_000))),
             success: Some(true),

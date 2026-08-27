@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index 21855dffca..93bce10ab4 100644
+index 929eab5392..82eb671b19 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
-@@ -127,6 +127,28 @@ where
+@@ -131,6 +131,28 @@ where
                  .enabled(codex_features::Feature::SkillSearch),
          },
      );
@@ -31,7 +31,7 @@ index 21855dffca..93bce10ab4 100644
      Arc::new(builder.build())
  }
  
-@@ -336,6 +358,135 @@ mod tests {
+@@ -358,6 +380,135 @@ mod tests {
  
      use super::*;
  
@@ -100,7 +100,7 @@ index 21855dffca..93bce10ab4 100644
 +                executor_skill_provider,
 +                git_attribution_base_url: config.chatgpt_base_url.clone(),
 +                http_client_factory: config.http_client_factory(),
-+                queue_store: None,
++                queue_service: None,
 +            },
 +        );
 +

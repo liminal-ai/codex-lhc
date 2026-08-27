@@ -256,13 +256,13 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
     let root = lhc_root.path().to_path_buf();
 
     let shell_args_z = json!({
-        "command": "echo z-out",
-        "timeout_ms": 2000,
+        "cmd": "echo z-out",
+        "yield_time_ms": 2000,
     })
     .to_string();
     let shell_args_a = json!({
-        "command": "echo a-out",
-        "timeout_ms": 2000,
+        "cmd": "echo a-out",
+        "yield_time_ms": 2000,
     })
     .to_string();
 
@@ -273,8 +273,8 @@ async fn full_loop_pending_parallel_tools_mid_turn() -> Result<()> {
             &["plan both tools"],
             &["reasoning body for parallel tools"],
         ),
-        ev_function_call("call-loop-z", "shell_command", &shell_args_z),
-        ev_function_call("call-loop-a", "shell_command", &shell_args_a),
+        ev_function_call("call-loop-z", "exec_command", &shell_args_z),
+        ev_function_call("call-loop-a", "exec_command", &shell_args_a),
         ev_completed_with_tokens("resp-tool-1", /*total_tokens*/ 2_500),
     ]);
     let second = sse(vec![
@@ -614,8 +614,8 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
             40_000
         };
         let args = json!({
-            "command": cycle_command(i),
-            "timeout_ms": 10_000,
+            "cmd": cycle_command(i),
+            "yield_time_ms": 10_000,
         })
         .to_string();
         responses.push(sse(vec![
@@ -625,7 +625,7 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
                 &["sustained plan"],
                 &[&format!("reasoning cycle {i}")],
             ),
-            ev_function_call(&format!("call-sus-{i}"), "shell_command", &args),
+            ev_function_call(&format!("call-sus-{i}"), "exec_command", &args),
             ev_completed_with_tokens(&format!("resp-sus-{i}"), usage),
         ]));
     }
@@ -635,13 +635,13 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
         ev_completed_with_tokens("resp-sus-final", 300),
     ]));
     let tiny_args = json!({
-        "command": "printf NEXT-TINY-COMPLETE",
-        "timeout_ms": 10_000,
+        "cmd": "printf NEXT-TINY-COMPLETE",
+        "yield_time_ms": 10_000,
     })
     .to_string();
     responses.push(sse(vec![
         ev_response_created("resp-next-tiny"),
-        ev_function_call("call-next-tiny", "shell_command", &tiny_args),
+        ev_function_call("call-next-tiny", "exec_command", &tiny_args),
         ev_completed_with_tokens("resp-next-tiny", 78_400),
     ]));
     for i in 0..LATER_CYCLES {
@@ -651,8 +651,8 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
             40_000
         };
         let args = json!({
-            "command": cycle_command(100 + i),
-            "timeout_ms": 10_000,
+            "cmd": cycle_command(100 + i),
+            "yield_time_ms": 10_000,
         })
         .to_string();
         responses.push(sse(vec![
@@ -662,7 +662,7 @@ async fn full_loop_sustained_pressure_parts_bounded() -> Result<()> {
                 &["follow-up plan"],
                 &[&format!("follow-up reasoning cycle {i}")],
             ),
-            ev_function_call(&format!("call-next-{i}"), "shell_command", &args),
+            ev_function_call(&format!("call-next-{i}"), "exec_command", &args),
             ev_completed_with_tokens(&format!("resp-next-{i}"), usage),
         ]));
     }
@@ -1165,13 +1165,13 @@ async fn full_loop_in_run_steer_stays_in_task_turn() -> Result<()> {
     // Cycle 0: a tool call that holds the turn open long enough to steer it,
     // below the trigger so no relief runs before the steer is drained.
     let shell_args = json!({
-        "command": "sleep 1; echo steer-window-open",
-        "timeout_ms": 10_000,
+        "cmd": "sleep 1; echo steer-window-open",
+        "yield_time_ms": 10_000,
     })
     .to_string();
     let mut responses = vec![sse(vec![
         ev_response_created("resp-steer-0"),
-        ev_function_call("call-steer-window", "shell_command", &shell_args),
+        ev_function_call("call-steer-window", "exec_command", &shell_args),
         ev_completed_with_tokens("resp-steer-0", /*total_tokens*/ 300),
     ])];
     // Cycles 1..=N answer the drained steer and keep the task going under
@@ -1183,8 +1183,8 @@ async fn full_loop_in_run_steer_stays_in_task_turn() -> Result<()> {
             40_000
         };
         let args = json!({
-            "command": cycle_command(i),
-            "timeout_ms": 10_000,
+            "cmd": cycle_command(i),
+            "yield_time_ms": 10_000,
         })
         .to_string();
         responses.push(sse(vec![
@@ -1193,7 +1193,7 @@ async fn full_loop_in_run_steer_stays_in_task_turn() -> Result<()> {
                 &format!("m-steer-{i}"),
                 &format!("continuing with the steered direction, cycle {i}"),
             ),
-            ev_function_call(&format!("call-steer-{i}"), "shell_command", &args),
+            ev_function_call(&format!("call-steer-{i}"), "exec_command", &args),
             ev_completed_with_tokens(&format!("resp-steer-{i}"), usage),
         ]));
     }
