@@ -45,6 +45,7 @@ use codex_otel::TURN_TOKEN_USAGE_METRIC;
 use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::TokenUsage;
@@ -218,6 +219,22 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
             let _ = (session, ctx);
         }
     }
+}
+
+/// The single terminal outcome a Turn reports (LIM-134).
+///
+/// [`Session::on_task_finished`] is the only place this is decided, and exactly
+/// one of the three lifecycle contributor paths fires for it.
+enum TurnTerminal {
+    /// Successful completion — `on_turn_stop`.
+    Stop,
+    /// Cancellation / interrupt — `on_turn_abort`.
+    Abort(TurnAbortReason),
+    /// Hard failure — `on_turn_error` (already emitted), never also stop.
+    ///
+    /// Carries the exact protocol error so the terminal result is failed even
+    /// when the error did not latch `TurnContext::terminal_error`.
+    Error(ErrorEvent),
 }
 
 pub(crate) trait AnySessionTask: Send + Sync + 'static {
@@ -597,10 +614,13 @@ impl Session {
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
-        let (last_agent_message, abort_reason) = match task_result {
-            Ok(last_agent_message) => (last_agent_message, None),
+        // LIM-134: the finalizer owns the terminal choice. Exactly one
+        // contributor path fires per Turn — stop, abort, or error — and tasks
+        // never emit one themselves.
+        let (last_agent_message, terminal) = match task_result {
+            Ok(last_agent_message) => (last_agent_message, TurnTerminal::Stop),
             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
-                (None, Some(TurnAbortReason::Interrupted))
+                (None, TurnTerminal::Abort(TurnAbortReason::Interrupted))
             }
             Err(err) => {
                 warn!(%err, "session task returned an unexpected error");
@@ -610,12 +630,10 @@ impl Session {
                 )
                 .await;
                 self.track_turn_codex_error(turn_context.as_ref(), &err);
-                self.send_event(
-                    turn_context.as_ref(),
-                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
-                )
-                .await;
-                (None, None)
+                let error_event = err.to_error_event(/*message_prefix*/ None);
+                self.send_event(turn_context.as_ref(), EventMsg::Error(error_event.clone()))
+                    .await;
+                (None, TurnTerminal::Error(error_event))
             }
         };
         turn_context
@@ -799,55 +817,76 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile,
             });
-        let idle_cause = if matches!(
-            abort_reason.as_ref(),
-            Some(TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited)
-        ) {
-            ThreadIdleCause::Interrupted
-        } else if abort_reason.is_none() && turn_context.terminal_error.lock().await.is_some() {
-            ThreadIdleCause::Failed
-        } else {
-            ThreadIdleCause::Completed
-        };
-        let event = if let Some(reason) = abort_reason {
-            if reason == TurnAbortReason::Interrupted {
-                run_turn_interrupt_hooks(self, &turn_context).await;
+        let idle_cause = match &terminal {
+            TurnTerminal::Abort(TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited) => {
+                ThreadIdleCause::Interrupted
             }
-            self.emit_turn_abort_lifecycle(
-                reason.clone(),
-                turn_context.extension_data.as_ref(),
-                started_at,
-                completed_at,
-            )
-            .await;
-            EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: Some(turn_context.sub_id.clone()),
-                reason,
-                started_at,
-                completed_at,
-                duration_ms,
-            })
-        } else {
-            let time_to_first_token_ms = turn_context
-                .turn_timing_state
-                .time_to_first_token_ms()
+            TurnTerminal::Abort(_) => ThreadIdleCause::Completed,
+            // A hard failure is failed regardless of whether the error latched
+            // `terminal_error` on its way out.
+            TurnTerminal::Error(_) => ThreadIdleCause::Failed,
+            TurnTerminal::Stop => {
+                if turn_context.terminal_error.lock().await.is_some() {
+                    ThreadIdleCause::Failed
+                } else {
+                    ThreadIdleCause::Completed
+                }
+            }
+        };
+        let event = match terminal {
+            TurnTerminal::Abort(reason) => {
+                if reason == TurnAbortReason::Interrupted {
+                    run_turn_interrupt_hooks(self, &turn_context).await;
+                }
+                self.emit_turn_abort_lifecycle(
+                    reason.clone(),
+                    turn_context.extension_data.as_ref(),
+                    started_at,
+                    completed_at,
+                )
                 .await;
-            let error = turn_context.terminal_error.lock().await.clone();
-            self.emit_turn_stop_lifecycle(
-                turn_context.extension_data.as_ref(),
-                started_at,
-                completed_at,
-            )
-            .await;
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_context.sub_id.clone(),
-                last_agent_message,
-                error,
-                started_at,
-                completed_at,
-                duration_ms,
-                time_to_first_token_ms,
-            })
+                EventMsg::TurnAborted(TurnAbortedEvent {
+                    turn_id: Some(turn_context.sub_id.clone()),
+                    reason,
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                })
+            }
+            // LIM-134: the error contributor already fired for this Turn, so
+            // the stop contributor must NOT fire too. The protocol close-out
+            // still rides `TurnComplete`, which carries the exact hard error
+            // and maps to a failed app-server result.
+            terminal @ (TurnTerminal::Stop | TurnTerminal::Error(_)) => {
+                let time_to_first_token_ms = turn_context
+                    .turn_timing_state
+                    .time_to_first_token_ms()
+                    .await;
+                let latched = turn_context.terminal_error.lock().await.clone();
+                let error = match &terminal {
+                    TurnTerminal::Error(error_event) => {
+                        Some(latched.unwrap_or_else(|| error_event.clone()))
+                    }
+                    _ => latched,
+                };
+                if matches!(terminal, TurnTerminal::Stop) {
+                    self.emit_turn_stop_lifecycle(
+                        turn_context.extension_data.as_ref(),
+                        started_at,
+                        completed_at,
+                    )
+                    .await;
+                }
+                EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id: turn_context.sub_id.clone(),
+                    last_agent_message,
+                    error,
+                    started_at,
+                    completed_at,
+                    duration_ms,
+                    time_to_first_token_ms,
+                })
+            }
         };
         self.send_event(turn_context.as_ref(), event).await;
         self.services

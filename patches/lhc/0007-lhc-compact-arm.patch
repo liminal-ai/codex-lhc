@@ -95,10 +95,10 @@ index 384af1d3cd..571ce25aca 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..1b94a2da2a
+index 0000000000..5931fef8ca
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,3088 @@
+@@ -0,0 +1,3157 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -126,6 +126,7 @@ index 0000000000..1b94a2da2a
 +use codex_analytics::CompactionTrigger;
 +use codex_features::Feature;
 +use codex_history::RolloutItem;
++use codex_lhc_host::CaptureState;
 +use codex_lhc_host::CompactBoundaryMeta;
 +use codex_lhc_host::CompactMarker;
 +use codex_lhc_host::DEFAULT_LOWER_TARGET_TOKENS;
@@ -198,6 +199,66 @@ index 0000000000..1b94a2da2a
 +const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
 +#[cfg(test)]
 +const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(2);
++
++/// LIM-134: how long a **required** PreTurn / Standalone strict compact waits
++/// for the asynchronous capture open before failing visibly.
++///
++/// Ordinary thread startup stays off the critical path; this bound is only
++/// consumed once strict compact is known to be required. Expiry is a hard
++/// visible compact failure — never `Ok(None)`, never native fallback.
++pub(crate) const STRICT_COMPACT_READINESS_BOUND: Duration = Duration::from_secs(60);
++
++/// Required strict compact waits for the capture slot to settle (LIM-134).
++///
++/// PreTurn / Standalone only: MidTurn keeps its distinct settled in-flight
++/// policy and never reaches this wait. Ready continues through the existing
++/// strict arm; `Failed`, `Stopped`, and bound expiry are hard visible compact
++/// failures that preserve the prior body and issue zero provider requests;
++/// turn cancellation aborts the turn without native fallback.
++async fn await_capture_ready_for_required_compact(
++    slot: &LhcCaptureSlot,
++    cancellation_token: &CancellationToken,
++) -> Result<codex_lhc_host::CaptureHandle, LhcCompactAttempt> {
++    match slot.state() {
++        CaptureState::Ready(handle) => return Ok(handle),
++        CaptureState::Failed(reason) => {
++            return Err(failed_attempt(format!("LHC capture open failed: {reason}")));
++        }
++        CaptureState::Stopped => {
++            return Err(failed_attempt(
++                "LHC capture has shut down; compact cannot run",
++            ));
++        }
++        CaptureState::Opening => {}
++    }
++    let bound = STRICT_COMPACT_READINESS_BOUND;
++    info!(
++        bound_ms = bound.as_millis() as u64,
++        "LHC capture is still opening; required strict compact waits for readiness"
++    );
++    let settled = tokio::select! {
++        biased;
++        () = cancellation_token.cancelled() => {
++            return Err(cancelled_attempt(
++                "turn cancelled while waiting for the LHC capture open",
++            ));
++        }
++        settled = slot.await_settled(bound) => settled,
++    };
++    match settled {
++        Some(CaptureState::Ready(handle)) => Ok(handle),
++        Some(CaptureState::Failed(reason)) => {
++            Err(failed_attempt(format!("LHC capture open failed: {reason}")))
++        }
++        Some(CaptureState::Stopped) => Err(failed_attempt(
++            "LHC capture has shut down; compact cannot run",
++        )),
++        Some(CaptureState::Opening) | None => Err(failed_attempt(format!(
++            "LHC capture did not open within {}s; compact cannot run",
++            bound.as_secs_f64()
++        ))),
++    }
++}
 +
 +fn configured_band_percentages(turn_context: &TurnContext) -> LhcBandPercentages {
 +    let percentages = turn_context.config.lhc_compact.percentages;
@@ -1906,8 +1967,12 @@ index 0000000000..1b94a2da2a
 +    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
 +        return Ok(failed_attempt("no LhcCaptureSlot (capture not opened)"));
 +    };
-+    let Some(handle) = slot.get() else {
-+        return Ok(failed_attempt("capture handle not ready"));
++    // LIM-134: strict compact is already known to be required here, so a slot
++    // that is still Opening is waited for (bounded, cancellation-aware) rather
++    // than declared not-ready.
++    let handle = match await_capture_ready_for_required_compact(&slot, cancellation_token).await {
++        Ok(handle) => handle,
++        Err(attempt) => return Ok(attempt),
 +    };
 +
 +    // Degraded capture is not a hard stop: flush what we can, then rely on
@@ -3187,6 +3252,10 @@ index 0000000000..1b94a2da2a
 +#[cfg(test)]
 +#[path = "compact_lhc_canary_tests.rs"]
 +mod canary_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_readiness_tests.rs"]
++mod readiness_tests;
 diff --git a/codex-rs/core/src/compact_lhc_canary_tests.rs b/codex-rs/core/src/compact_lhc_canary_tests.rs
 new file mode 100644
 index 0000000000..afac6c839d
@@ -8900,6 +8969,388 @@ index 0000000000..c31cb79bbb
 +            .await
 +            .expect("receipts");
 +    assert!(receipts.is_empty(), "still no compact-continuation receipt");
++}
+diff --git a/codex-rs/core/src/compact_lhc_readiness_tests.rs b/codex-rs/core/src/compact_lhc_readiness_tests.rs
+new file mode 100644
+index 0000000000..3afcfa11fe
+--- /dev/null
++++ b/codex-rs/core/src/compact_lhc_readiness_tests.rs
+@@ -0,0 +1,376 @@
++//! Required-compact readiness proofs (LIM-134).
++//!
++//! A PreTurn / Standalone strict compact that is already known to be required
++//! waits, bounded and cancellably, for the asynchronous capture open. Ready
++//! continues; `Failed`, `Stopped`, and bound expiry are hard visible failures
++//! that preserve the prior body and issue zero provider requests; cancellation
++//! aborts the turn. MidTurn keeps its own settled in-flight policy.
++//!
++//! The slot is held `Opening` by `install_with_root_held_open`, and the wait is
++//! shown to actually block by advancing the **paused tokio clock** — virtual,
++//! exact, and free of wall-clock cost. Timeouts appear only as deadlock
++//! ceilings. There is no process-global bound override, so parallel tests
++//! cannot observe each other.
++
++use std::sync::Arc;
++use std::time::Duration;
++
++use codex_analytics::CompactionPhase;
++use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::ThreadStartInput;
++use codex_features::Feature;
++use codex_lhc_host::CaptureState;
++use codex_lhc_host::InferenceCallbacks;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::install_with_root_held_open;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::SessionSource;
++use codex_protocol::user_input::UserInput;
++use codex_thread_store::PersistContext;
++use tempfile::tempdir;
++use tokio_util::sync::CancellationToken;
++
++use super::LhcCompactAttempt;
++use super::STRICT_COMPACT_READINESS_BOUND;
++use super::try_run_lhc_compact_arm;
++use super::try_run_lhc_compact_arm_with_callbacks_and_cancel;
++use crate::compact::InitialContextInjection;
++use crate::session::session::Session;
++use crate::session::tests::make_session_and_context;
++use crate::session::turn_context::TurnContext;
++
++/// Deadlock ceiling only — never the evidence that ordering happened.
++const DEADLOCK_CEILING: Duration = Duration::from_secs(60);
++
++fn deterministic_callbacks() -> InferenceCallbacks {
++    codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic offline callbacks")
++}
++
++fn text_input(text: &str) -> UserInput {
++    UserInput::Text {
++        text: text.into(),
++        text_elements: Vec::new(),
++    }
++}
++
++/// Install LHC with the capture slot deliberately held in `Opening`.
++async fn install_held_open(session: &mut Session, root: std::path::PathBuf) -> Arc<LhcCaptureSlot> {
++    session
++        .set_feature_for_test(Feature::LhcCapture, true)
++        .expect("enable LhcCapture");
++    let mut builder = ExtensionRegistryBuilder::<crate::config::Config>::new();
++    install_with_root_held_open(&mut builder, |_c| true, root);
++    let registry = Arc::new(builder.build());
++    session.services.extensions = Arc::clone(&registry);
++    let config = session.get_config().await;
++    let environments = [];
++    let session_source = SessionSource::Exec;
++    for contributor in registry.thread_lifecycle_contributors() {
++        contributor
++            .on_thread_start(ThreadStartInput {
++                config: config.as_ref(),
++                session_source: &session_source,
++                persistent_thread_state_available: false,
++                environments: &environments,
++                mcp_resource_client: None,
++                extension_metrics: None,
++                session_store: &session.services.session_extension_data,
++                thread_store: &session.services.thread_extension_data,
++            })
++            .await;
++    }
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("held-open slot");
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "the held-open installer must leave the slot Opening"
++    );
++    slot
++}
++
++async fn seed_bandable(session: &Session, tc: &TurnContext, turns: usize) {
++    let pad = "p".repeat(2500);
++    for i in 0..turns {
++        session
++            .record_user_prompt_and_emit_turn_item(
++                tc,
++                &[text_input(&format!("user turn {i} readiness seed {pad}"))],
++                None,
++                PersistContext::TurnStart,
++            )
++            .await;
++        session
++            .record_conversation_items_with_provenance(
++                tc,
++                &[ResponseItem::Message {
++                    id: None,
++                    role: "assistant".into(),
++                    content: vec![ContentItem::OutputText {
++                        text: format!("assistant reply {i} readiness seed {pad}"),
++                    }],
++                    phase: None,
++                    internal_chat_message_metadata_passthrough: None,
++                }],
++                codex_extension_api::RawItemProvenance::ModelOutput,
++            )
++            .await;
++    }
++}
++
++async fn open_real_handle(
++    root: &std::path::Path,
++    thread_id: &str,
++) -> codex_lhc_host::CaptureHandle {
++    let derivation = codex_lhc_host::LateBoundCallbacks::new();
++    derivation.seed(deterministic_callbacks());
++    codex_lhc_host::spawn_capture(thread_id, None, Some(root.to_path_buf()), derivation)
++        .await
++        .expect("open capture")
++}
++
++/// Spawn the required strict-compact arm against a held-open slot.
++fn spawn_required_compact(
++    sess: Arc<Session>,
++    tc: Arc<TurnContext>,
++    cancel: CancellationToken,
++) -> tokio::task::JoinHandle<LhcCompactAttempt> {
++    tokio::spawn(async move {
++        try_run_lhc_compact_arm_with_callbacks_and_cancel(
++            &sess,
++            tc.as_ref(),
++            InitialContextInjection::DoNotInject,
++            /*manual*/ false,
++            deterministic_callbacks(),
++            &cancel,
++        )
++        .await
++        .expect("arm")
++    })
++}
++
++/// The production safety bound is exactly 60 seconds. A drift here changes how
++/// long a required compact can stall a turn, so it is pinned explicitly.
++#[test]
++fn production_readiness_bound_is_sixty_seconds() {
++    assert_eq!(STRICT_COMPACT_READINESS_BOUND, Duration::from_secs(60));
++}
++
++/// Held open: the required compact does not resolve while the slot is
++/// `Opening` — proved by advancing the virtual clock well inside the bound —
++/// and completes through the strict path only after Ready.
++#[tokio::test]
++async fn required_compact_waits_for_a_held_open_capture_then_proceeds() {
++    let dir = tempdir().unwrap();
++    let root = dir.path().join("lhc");
++    let (mut session, tc) = make_session_and_context().await;
++    let slot = install_held_open(&mut session, root.clone()).await;
++    seed_bandable(&session, &tc, 40).await;
++    let sess = Arc::new(session);
++    let tc = Arc::new(tc);
++
++    let arm = spawn_required_compact(Arc::clone(&sess), Arc::clone(&tc), CancellationToken::new());
++
++    tokio::time::pause();
++    tokio::time::advance(STRICT_COMPACT_READINESS_BOUND / 2).await;
++    assert!(
++        !arm.is_finished(),
++        "required compact must wait for the capture open, not declare it not-ready"
++    );
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "the slot is still Opening — the arm has nothing to proceed on"
++    );
++    // Real time again: the produce path below runs real workers and timers.
++    tokio::time::resume();
++
++    let thread_id = sess.thread_id.to_string();
++    let handle = open_real_handle(&root, &thread_id).await;
++    slot.set_derivation_callbacks(deterministic_callbacks());
++    assert!(
++        slot.publish_ready_for_test(handle),
++        "Ready must publish onto a slot that is still Opening"
++    );
++
++    let attempt = arm.await.expect("arm join");
++    assert!(
++        matches!(attempt, LhcCompactAttempt::Installed { .. }),
++        "the arm must proceed through the strict path once Ready lands: {attempt:?}"
++    );
++}
++
++/// A permanently failed open is a hard visible compact failure — never
++/// `Ok(None)`, never native fallback — and the prior body is preserved.
++#[tokio::test]
++async fn required_compact_hard_fails_when_the_open_failed() {
++    let dir = tempdir().unwrap();
++    let (mut session, tc) = make_session_and_context().await;
++    let slot = install_held_open(&mut session, dir.path().join("lhc")).await;
++    seed_bandable(&session, &tc, 4).await;
++    let before = session.clone_history().await.into_raw_items().len();
++    let sess = Arc::new(session);
++
++    slot.publish_failed_for_test(codex_lhc_host::CAPTURE_OPEN_FAILED);
++    let attempt = try_run_lhc_compact_arm_with_callbacks_and_cancel(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        deterministic_callbacks(),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++
++    assert!(
++        matches!(&attempt, LhcCompactAttempt::Failed { reason }
++            if reason.contains(codex_lhc_host::CAPTURE_OPEN_FAILED)),
++        "a failed open must surface as a hard compact failure: {attempt:?}"
++    );
++    assert_eq!(
++        sess.clone_history().await.into_raw_items().len(),
++        before,
++        "a hard failure preserves the prior body"
++    );
++}
++
++/// A stopped capture is likewise a hard visible failure, distinguishable from
++/// "still opening".
++#[tokio::test]
++async fn required_compact_hard_fails_when_the_capture_stopped() {
++    let dir = tempdir().unwrap();
++    let (mut session, tc) = make_session_and_context().await;
++    let slot = install_held_open(&mut session, dir.path().join("lhc")).await;
++    seed_bandable(&session, &tc, 4).await;
++    let sess = Arc::new(session);
++
++    slot.publish_stopped_for_test();
++    let attempt = try_run_lhc_compact_arm_with_callbacks_and_cancel(
++        &sess,
++        &tc,
++        InitialContextInjection::DoNotInject,
++        /*manual*/ false,
++        deterministic_callbacks(),
++        &CancellationToken::new(),
++    )
++    .await
++    .expect("arm");
++
++    assert!(
++        matches!(&attempt, LhcCompactAttempt::Failed { reason } if reason.contains("shut down")),
++        "a stopped capture must surface as a hard compact failure: {attempt:?}"
++    );
++}
++
++/// Bound expiry is a hard visible failure too. The full production 60s bound is
++/// exercised in virtual time, so the proof is exact and costs no wall clock.
++#[tokio::test]
++async fn required_compact_hard_fails_when_the_readiness_bound_expires() {
++    let dir = tempdir().unwrap();
++    let (mut session, tc) = make_session_and_context().await;
++    let slot = install_held_open(&mut session, dir.path().join("lhc")).await;
++    seed_bandable(&session, &tc, 4).await;
++    let before = session.clone_history().await.into_raw_items().len();
++    let sess = Arc::new(session);
++    let tc = Arc::new(tc);
++
++    let arm = spawn_required_compact(Arc::clone(&sess), Arc::clone(&tc), CancellationToken::new());
++
++    tokio::time::pause();
++    tokio::time::advance(STRICT_COMPACT_READINESS_BOUND / 2).await;
++    assert!(!arm.is_finished(), "the arm must still be waiting");
++    tokio::time::advance(STRICT_COMPACT_READINESS_BOUND).await;
++    let attempt = arm.await.expect("arm join");
++    tokio::time::resume();
++
++    assert!(
++        matches!(&attempt, LhcCompactAttempt::Failed { reason } if reason.contains("did not open")),
++        "readiness-bound expiry must be a hard compact failure: {attempt:?}"
++    );
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "expiry is the compact's decision; it does not mutate the slot"
++    );
++    assert_eq!(
++        sess.clone_history().await.into_raw_items().len(),
++        before,
++        "expiry preserves the prior body"
++    );
++}
++
++/// Turn cancellation during the readiness wait aborts the turn. It is not
++/// permission for native compaction and not a silent success.
++#[tokio::test]
++async fn required_compact_aborts_the_turn_when_cancelled_while_waiting() {
++    let dir = tempdir().unwrap();
++    let (mut session, tc) = make_session_and_context().await;
++    let _slot = install_held_open(&mut session, dir.path().join("lhc")).await;
++    seed_bandable(&session, &tc, 4).await;
++    let sess = Arc::new(session);
++    let tc = Arc::new(tc);
++    let cancel = CancellationToken::new();
++
++    let arm = spawn_required_compact(Arc::clone(&sess), Arc::clone(&tc), cancel.clone());
++
++    tokio::time::pause();
++    tokio::time::advance(STRICT_COMPACT_READINESS_BOUND / 2).await;
++    assert!(!arm.is_finished(), "the arm must still be waiting");
++    cancel.cancel();
++    let attempt = arm.await.expect("arm join");
++    tokio::time::resume();
++
++    assert!(
++        matches!(&attempt, LhcCompactAttempt::Cancelled { reason } if reason.contains("cancelled")),
++        "cancellation during the readiness wait must abort the turn: {attempt:?}"
++    );
++}
++
++/// MidTurn must not inherit the readiness wait. It takes its own settled
++/// in-flight policy — named in the returned reason — and returns immediately
++/// rather than consuming the PreTurn bound.
++#[tokio::test]
++async fn mid_turn_does_not_inherit_the_readiness_wait() {
++    let dir = tempdir().unwrap();
++    let (mut session, tc) = make_session_and_context().await;
++    let _slot = install_held_open(&mut session, dir.path().join("lhc")).await;
++    *session
++        .services
++        .lhc_test_inference
++        .lock()
++        .expect("lhc_test_inference lock") = Some(deterministic_callbacks());
++    let sess = Arc::new(session);
++
++    let mid = super::MidTurnSeamFacts {
++        attempt_id: "resp-midturn-readiness".into(),
++        response_token_usage: None,
++        response_tool_call_ids: Vec::new(),
++        total_needs_follow_up: true,
++        input_epoch_at_decision: 0,
++        inside_transport_retry: false,
++        model_response_complete: true,
++    };
++    let attempt = tokio::time::timeout(
++        DEADLOCK_CEILING,
++        try_run_lhc_compact_arm(
++            &sess,
++            &tc,
++            InitialContextInjection::DoNotInject,
++            /*manual*/ false,
++            CompactionPhase::MidTurn,
++            Some(mid),
++            &CancellationToken::new(),
++        ),
++    )
++    .await
++    .expect("MidTurn must not park on the PreTurn readiness wait")
++    .expect("arm");
++
++    assert!(
++        matches!(&attempt, LhcCompactAttempt::MidTurnBlocked { reason, .. }
++            if reason.contains("not ready at MidTurn")),
++        "MidTurn keeps its own settled in-flight policy: {attempt:?}"
++    );
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
@@ -16576,7 +17027,7 @@ index 30b27e78d0..81e6ee97cc 100644
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
              &config.code_mode,
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 850166360d..b7274341ec 100644
+index 850166360d..291af9f191 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -7,9 +7,6 @@ use crate::client::ModelClientSession;
@@ -16605,7 +17056,173 @@ index 850166360d..b7274341ec 100644
  use codex_protocol::ResponseItemId;
  use codex_protocol::config_types::AutoCompactTokenLimitScope;
  use codex_protocol::config_types::ModeKind;
-@@ -380,6 +375,11 @@ pub(crate) async fn run_turn(
+@@ -93,8 +88,6 @@ use codex_protocol::models::ResponseInputItem;
+ use codex_protocol::models::ResponseItem;
+ use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+ use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
+-use codex_protocol::protocol::CodexErrorInfo;
+-use codex_protocol::protocol::ErrorEvent;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::InternalSessionSource;
+ use codex_protocol::protocol::PlanDeltaEvent;
+@@ -130,7 +123,6 @@ use tokio_util::sync::CancellationToken;
+ use tracing::Instrument;
+ use tracing::error;
+ use tracing::field;
+-use tracing::info;
+ use tracing::instrument;
+ use tracing::trace;
+ use tracing::trace_span;
+@@ -168,6 +160,10 @@ pub(crate) async fn run_turn(
+     // new user message are recorded. Estimate pending incoming items (context
+     // diffs/full reinjection + user input) and trigger compaction preemptively
+     // when they would push the thread over the compaction threshold.
++    // LIM-134: once Codex has accepted this Turn input, the native rollout must
++    // contain it exactly once on every exit before the first provider request.
++    // `input_recorded` is the per-run ownership guard for that.
++    let mut input_recorded = false;
+     if let Err(err) = run_pre_sampling_compact(
+         &sess,
+         &turn_context,
+@@ -176,19 +172,20 @@ pub(crate) async fn run_turn(
+     )
+     .await
+     {
+-        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+-            run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+-                .await;
+-            return Err(err);
+-        }
+-        if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
+-            return Err(err);
++        record_turn_input_once(
++            &sess,
++            &turn_context,
++            &input,
++            &mut input_recorded,
++            PersistContext::Standard,
++        )
++        .await;
++        if !matches!(err.details(), CodexErrorDetails::TurnAborted) {
++            error!("Failed to run pre-sampling compact");
+         }
+-        let error = err.to_codex_protocol_error();
+-        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+-            .await;
+-        error!("Failed to run pre-sampling compact");
+-        return Ok(None);
++        // LIM-134: hard failures are returned, not laundered into `Ok(None)`.
++        // The task finalizer owns the single terminal lifecycle contributor.
++        return Err(err);
+     }
+ 
+     let user_input = turn_user_input(&input);
+@@ -199,8 +196,14 @@ pub(crate) async fn run_turn(
+         {
+             Ok(requirements) => requirements,
+             Err(err) => {
+-                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+-                    .await;
++                record_turn_input_once(
++                    &sess,
++                    &turn_context,
++                    &input,
++                    &mut input_recorded,
++                    PersistContext::Standard,
++                )
++                .await;
+                 return Err(err.into());
+             }
+         };
+@@ -215,12 +218,17 @@ pub(crate) async fn run_turn(
+         .await
+     {
+         Ok(step_context) => step_context,
+-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+-            run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
+-                .await;
++        Err(err) => {
++            record_turn_input_once(
++                &sess,
++                &turn_context,
++                &input,
++                &mut input_recorded,
++                PersistContext::Standard,
++            )
++            .await;
+             return Err(err);
+         }
+-        Err(err) => return Err(err),
+     };
+     // Keep the exact model-visible state used by this turn and its inline compactions.
+     let (world_state, display_roots) = tokio::join!(
+@@ -247,7 +255,20 @@ pub(crate) async fn run_turn(
+             }
+         },
+     );
+-    let mut world_state = world_state?;
++    let mut world_state = match world_state {
++        Ok(world_state) => world_state,
++        Err(err) => {
++            record_turn_input_once(
++                &sess,
++                &turn_context,
++                &input,
++                &mut input_recorded,
++                PersistContext::Standard,
++            )
++            .await;
++            return Err(err);
++        }
++    };
+ 
+     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
+         &sess,
+@@ -258,14 +279,41 @@ pub(crate) async fn run_turn(
+     )
+     .await
+     else {
+-        return Ok(None);
++        // `build_skills_and_plugins` only yields `None` when a turn-input
++        // contributor was cancelled, so this is an abort — not a quiet
++        // successful stop (LIM-134).
++        record_turn_input_once(
++            &sess,
++            &turn_context,
++            &input,
++            &mut input_recorded,
++            PersistContext::Standard,
++        )
++        .await;
++        return Err(CodexErr::TurnAborted);
+     };
+ 
+     if run_pending_session_start_hooks(&sess, &turn_context).await {
++        record_turn_input_once(
++            &sess,
++            &turn_context,
++            &input,
++            &mut input_recorded,
++            PersistContext::Standard,
++        )
++        .await;
+         return Ok(None);
+     }
+     let mut can_drain_pending_input = input.is_empty();
+-    if run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::TurnStart).await {
++    if record_turn_input_once(
++        &sess,
++        &turn_context,
++        &input,
++        &mut input_recorded,
++        PersistContext::TurnStart,
++    )
++    .await
++    {
+         return Ok(None);
+     }
+ 
+@@ -380,6 +428,11 @@ pub(crate) async fn run_turn(
              let responses_metadata = sess
                  .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
                  .await;
@@ -16617,7 +17234,7 @@ index 850166360d..b7274341ec 100644
              run_sampling_request(
                  Arc::clone(&sess),
                  Arc::clone(&step_context),
-@@ -398,6 +398,10 @@ pub(crate) async fn run_turn(
+@@ -398,6 +451,10 @@ pub(crate) async fn run_turn(
                  let SamplingRequestResult {
                      needs_follow_up: model_needs_follow_up,
                      last_agent_message: sampling_request_last_agent_message,
@@ -16628,7 +17245,7 @@ index 850166360d..b7274341ec 100644
                  } = sampling_request_output;
                  if model_needs_follow_up {
                      sess.input_queue
-@@ -422,6 +426,7 @@ pub(crate) async fn run_turn(
+@@ -422,6 +479,7 @@ pub(crate) async fn run_turn(
                  }
                  .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                  .await;
@@ -16636,7 +17253,7 @@ index 850166360d..b7274341ec 100644
                  let needs_follow_up = model_needs_follow_up || has_pending_input;
                  let token_limit_reached = token_status.token_limit_reached;
  
-@@ -470,6 +475,27 @@ pub(crate) async fn run_turn(
+@@ -470,6 +528,27 @@ pub(crate) async fn run_turn(
  
                  // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                  if should_roll_over {
@@ -16664,7 +17281,7 @@ index 850166360d..b7274341ec 100644
                      if let Err(err) = run_auto_compact(
                          &sess,
                          Arc::clone(&step_context),
-@@ -481,6 +507,8 @@ pub(crate) async fn run_turn(
+@@ -481,16 +560,14 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -16673,7 +17290,91 @@ index 850166360d..b7274341ec 100644
                      )
                      .await
                      {
-@@ -1047,6 +1075,8 @@ async fn run_pre_sampling_compact(
+-                        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
+-                            return Err(err);
+-                        }
+-                        let error = err.to_codex_protocol_error();
+-                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+-                            .await;
+-                        return Ok(None);
++                        // LIM-134: hard MidTurn compact failure is a failure.
++                        // The task finalizer owns the terminal lifecycle.
++                        return Err(err);
+                     }
+                     if run_pending_session_start_hooks(&sess, &turn_context).await {
+                         return Ok(None);
+@@ -562,38 +639,10 @@ pub(crate) async fn run_turn(
+                 }
+                 continue;
+             }
+-            Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+-                return Err(err);
+-            }
+-            Err(codex_error)
+-                if matches!(
+-                    codex_error.details(),
+-                    CodexErrorDetails::InvalidImageRequest()
+-                ) =>
+-            {
+-                sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
+-                let error = CodexErrorInfo::BadRequest;
+-                sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+-                    .await;
+-                let event = EventMsg::Error(ErrorEvent {
+-                    message: "Invalid image in your last message. Please remove it and try again."
+-                        .to_string(),
+-                    codex_error_info: Some(error),
+-                });
+-                sess.send_event(&turn_context, event).await;
+-                break;
+-            }
+-            Err(e) => {
+-                info!("Turn error: {e:#}");
+-                let error = e.to_codex_protocol_error();
+-                sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+-                    .await;
+-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
+-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
+-                sess.send_event(&turn_context, event).await;
+-                // let the user continue the conversation
+-                break;
+-            }
++            // LIM-134: sampling failures return Err so the task finalizer is
++            // the sole terminal contributor (`TurnTerminal::Error` emits one
++            // Error event + TurnComplete). In-loop emit+Ok would also fire stop.
++            Err(err) => return Err(err),
+         }
+     }
+ 
+@@ -654,6 +703,27 @@ pub(crate) async fn run_hooks_and_record_inputs(
+     blocked_input && !accepted_user_input
+ }
+ 
++/// LIM-134: run the accepted-input hook/record path at most once per
++/// `run_turn`, whichever exit reaches it first.
++///
++/// This is the native `run_hooks_and_record_inputs` path — no LHC per-prompt
++/// commit protocol, no durable acknowledgment, no second prompt record. Hook
++/// semantics are untouched: input a hook rejects before acceptance is still not
++/// recorded as accepted work.
++async fn record_turn_input_once(
++    sess: &Arc<Session>,
++    turn_context: &Arc<TurnContext>,
++    input: &[TurnInput],
++    recorded: &mut bool,
++    persist_context: PersistContext,
++) -> bool {
++    if *recorded {
++        return false;
++    }
++    *recorded = true;
++    run_hooks_and_record_inputs(sess, turn_context, input, persist_context).await
++}
++
+ fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
+     input
+         .iter()
+@@ -1047,6 +1117,8 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -16682,7 +17383,7 @@ index 850166360d..b7274341ec 100644
          )
          .await?;
      }
-@@ -1129,6 +1159,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1129,6 +1201,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -16691,7 +17392,7 @@ index 850166360d..b7274341ec 100644
          )
          .await?;
          return Ok(());
-@@ -1177,6 +1209,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1177,6 +1251,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -16700,7 +17401,7 @@ index 850166360d..b7274341ec 100644
          )
          .await?;
      }
-@@ -1188,86 +1222,45 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1188,86 +1264,45 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -16818,7 +17519,7 @@ index 850166360d..b7274341ec 100644
  }
  
  pub(super) fn collect_explicit_app_ids_from_skill_items(
-@@ -1587,6 +1580,17 @@ pub(crate) async fn built_tools(
+@@ -1587,6 +1622,17 @@ pub(crate) async fn built_tools(
  struct SamplingRequestResult {
      needs_follow_up: bool,
      last_agent_message: Option<String>,
@@ -16836,7 +17537,7 @@ index 850166360d..b7274341ec 100644
  }
  
  /// Ephemeral per-response state for streaming a single proposed plan.
-@@ -2220,14 +2224,26 @@ async fn try_run_sampling_request(
+@@ -2220,14 +2266,26 @@ async fn try_run_sampling_request(
          .features
          .enabled(Feature::ConcurrentReasoningSummaries)
          && turn_context.provider.info().is_openai();
@@ -16868,7 +17569,7 @@ index 850166360d..b7274341ec 100644
              responses_metadata,
              &inference_trace,
          )
-@@ -2247,12 +2263,9 @@ async fn try_run_sampling_request(
+@@ -2247,12 +2305,9 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
      const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
      let mut analytics_tool_call_ids = Vec::new();
@@ -16884,7 +17585,7 @@ index 850166360d..b7274341ec 100644
      let plan_mode = turn_context.mode == ModeKind::Plan;
      let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
      let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
-@@ -2308,7 +2321,8 @@ async fn try_run_sampling_request(
+@@ -2308,7 +2363,8 @@ async fn try_run_sampling_request(
              ResponseEvent::OutputItemDone(mut item) => {
                  assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                  if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -16894,7 +17595,7 @@ index 850166360d..b7274341ec 100644
                          ResponseItem::FunctionCall { call_id, .. }
                          | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                          ResponseItem::ToolSearchCall { call_id, .. }
-@@ -2319,10 +2333,35 @@ async fn try_run_sampling_request(
+@@ -2319,10 +2375,35 @@ async fn try_run_sampling_request(
                          }
                          _ => None,
                      };
@@ -16931,7 +17632,7 @@ index 850166360d..b7274341ec 100644
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                      && let Ok(Some(event)) = consumer.finish()
                  {
-@@ -2413,6 +2452,10 @@ async fn try_run_sampling_request(
+@@ -2413,6 +2494,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
@@ -16942,7 +17643,7 @@ index 850166360d..b7274341ec 100644
                      });
                  }
              }
-@@ -2574,7 +2617,7 @@ async fn try_run_sampling_request(
+@@ -2574,7 +2659,7 @@ async fn try_run_sampling_request(
                  sess.send_event(
                      &turn_context,
                      EventMsg::RawResponseCompleted(RawResponseCompletedEvent {
@@ -16951,7 +17652,7 @@ index 850166360d..b7274341ec 100644
                          token_usage: token_usage.clone(),
                      }),
                  )
-@@ -2593,6 +2636,10 @@ async fn try_run_sampling_request(
+@@ -2593,6 +2678,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
@@ -17231,10 +17932,41 @@ index cde3fc7d72..4f2f485273 100644
                      thread_store: &self.services.thread_extension_data,
                      turn_store,
 diff --git a/codex-rs/core/src/tasks/mod.rs b/codex-rs/core/src/tasks/mod.rs
-index f8fae7e986..e98bd5d026 100644
+index f8fae7e986..8574e0b268 100644
 --- a/codex-rs/core/src/tasks/mod.rs
 +++ b/codex-rs/core/src/tasks/mod.rs
-@@ -501,12 +501,13 @@ impl Session {
+@@ -45,6 +45,7 @@ use codex_otel::TURN_TOKEN_USAGE_METRIC;
+ use codex_otel::TURN_TOOL_CALL_METRIC;
+ use codex_otel::TURN_UNIFIED_EXEC_RUNNING_PROCESSES_METRIC;
+ use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::ErrorEvent;
+ use codex_protocol::protocol::EventMsg;
+ use codex_protocol::protocol::MultiAgentVersion;
+ use codex_protocol::protocol::TokenUsage;
+@@ -220,6 +221,22 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
+     }
+ }
+ 
++/// The single terminal outcome a Turn reports (LIM-134).
++///
++/// [`Session::on_task_finished`] is the only place this is decided, and exactly
++/// one of the three lifecycle contributor paths fires for it.
++enum TurnTerminal {
++    /// Successful completion — `on_turn_stop`.
++    Stop,
++    /// Cancellation / interrupt — `on_turn_abort`.
++    Abort(TurnAbortReason),
++    /// Hard failure — `on_turn_error` (already emitted), never also stop.
++    ///
++    /// Carries the exact protocol error so the terminal result is failed even
++    /// when the error did not latch `TurnContext::terminal_error`.
++    Error(ErrorEvent),
++}
++
+ pub(crate) trait AnySessionTask: Send + Sync + 'static {
+     fn kind(&self) -> TaskKind;
+ 
+@@ -501,12 +518,13 @@ impl Session {
          let mut aborted_turn = false;
          let mut active_turn_to_clear = None;
          let mut turn_context = None;
@@ -17249,7 +17981,7 @@ index f8fae7e986..e98bd5d026 100644
              }
              if aborted_turn {
                  active_turn_to_clear = Some(active_turn);
-@@ -514,8 +515,16 @@ impl Session {
+@@ -514,8 +532,16 @@ impl Session {
          }
  
          if let Some(turn_context) = turn_context.as_deref() {
@@ -17268,7 +18000,7 @@ index f8fae7e986..e98bd5d026 100644
          }
          if let Some(active_turn) = active_turn_to_clear {
              // Let interrupted tasks observe cancellation before dropping pending approvals, or an
-@@ -556,12 +565,21 @@ impl Session {
+@@ -556,12 +582,21 @@ impl Session {
  
          let task = active_turn.task.take();
          let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
@@ -17295,38 +18027,156 @@ index f8fae7e986..e98bd5d026 100644
          }
          // Let interrupted tasks observe cancellation before dropping pending approvals, or an
          // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-@@ -795,8 +813,13 @@ impl Session {
-             if reason == TurnAbortReason::Interrupted {
-                 run_turn_interrupt_hooks(self, &turn_context).await;
+@@ -579,10 +614,13 @@ impl Session {
+         turn_context: Arc<TurnContext>,
+         task_result: SessionTaskResult,
+     ) {
+-        let (last_agent_message, abort_reason) = match task_result {
+-            Ok(last_agent_message) => (last_agent_message, None),
++        // LIM-134: the finalizer owns the terminal choice. Exactly one
++        // contributor path fires per Turn — stop, abort, or error — and tasks
++        // never emit one themselves.
++        let (last_agent_message, terminal) = match task_result {
++            Ok(last_agent_message) => (last_agent_message, TurnTerminal::Stop),
+             Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
+-                (None, Some(TurnAbortReason::Interrupted))
++                (None, TurnTerminal::Abort(TurnAbortReason::Interrupted))
+             }
+             Err(err) => {
+                 warn!(%err, "session task returned an unexpected error");
+@@ -592,12 +630,10 @@ impl Session {
+                 )
+                 .await;
+                 self.track_turn_codex_error(turn_context.as_ref(), &err);
+-                self.send_event(
+-                    turn_context.as_ref(),
+-                    EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+-                )
+-                .await;
+-                (None, None)
++                let error_event = err.to_error_event(/*message_prefix*/ None);
++                self.send_event(turn_context.as_ref(), EventMsg::Error(error_event.clone()))
++                    .await;
++                (None, TurnTerminal::Error(error_event))
+             }
+         };
+         turn_context
+@@ -781,46 +817,76 @@ impl Session {
+                 turn_id: turn_context.sub_id.clone(),
+                 profile,
+             });
+-        let idle_cause = if matches!(
+-            abort_reason.as_ref(),
+-            Some(TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited)
+-        ) {
+-            ThreadIdleCause::Interrupted
+-        } else if abort_reason.is_none() && turn_context.terminal_error.lock().await.is_some() {
+-            ThreadIdleCause::Failed
+-        } else {
+-            ThreadIdleCause::Completed
+-        };
+-        let event = if let Some(reason) = abort_reason {
+-            if reason == TurnAbortReason::Interrupted {
+-                run_turn_interrupt_hooks(self, &turn_context).await;
++        let idle_cause = match &terminal {
++            TurnTerminal::Abort(TurnAbortReason::Interrupted | TurnAbortReason::BudgetLimited) => {
++                ThreadIdleCause::Interrupted
              }
 -            self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
 -                .await;
-+            self.emit_turn_abort_lifecycle(
-+                reason.clone(),
-+                turn_context.extension_data.as_ref(),
-+                started_at,
-+                completed_at,
-+            )
-+            .await;
-             EventMsg::TurnAborted(TurnAbortedEvent {
-                 turn_id: Some(turn_context.sub_id.clone()),
-                 reason,
-@@ -810,8 +833,12 @@ impl Session {
-                 .time_to_first_token_ms()
-                 .await;
-             let error = turn_context.terminal_error.lock().await.clone();
--            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
+-            EventMsg::TurnAborted(TurnAbortedEvent {
+-                turn_id: Some(turn_context.sub_id.clone()),
+-                reason,
+-                started_at,
+-                completed_at,
+-                duration_ms,
+-            })
+-        } else {
+-            let time_to_first_token_ms = turn_context
+-                .turn_timing_state
+-                .time_to_first_token_ms()
 -                .await;
-+            self.emit_turn_stop_lifecycle(
-+                turn_context.extension_data.as_ref(),
-+                started_at,
-+                completed_at,
-+            )
-+            .await;
-             EventMsg::TurnComplete(TurnCompleteEvent {
-                 turn_id: turn_context.sub_id.clone(),
-                 last_agent_message,
-@@ -886,10 +913,22 @@ impl Session {
+-            let error = turn_context.terminal_error.lock().await.clone();
+-            self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
++            TurnTerminal::Abort(_) => ThreadIdleCause::Completed,
++            // A hard failure is failed regardless of whether the error latched
++            // `terminal_error` on its way out.
++            TurnTerminal::Error(_) => ThreadIdleCause::Failed,
++            TurnTerminal::Stop => {
++                if turn_context.terminal_error.lock().await.is_some() {
++                    ThreadIdleCause::Failed
++                } else {
++                    ThreadIdleCause::Completed
++                }
++            }
++        };
++        let event = match terminal {
++            TurnTerminal::Abort(reason) => {
++                if reason == TurnAbortReason::Interrupted {
++                    run_turn_interrupt_hooks(self, &turn_context).await;
++                }
++                self.emit_turn_abort_lifecycle(
++                    reason.clone(),
++                    turn_context.extension_data.as_ref(),
++                    started_at,
++                    completed_at,
++                )
+                 .await;
+-            EventMsg::TurnComplete(TurnCompleteEvent {
+-                turn_id: turn_context.sub_id.clone(),
+-                last_agent_message,
+-                error,
+-                started_at,
+-                completed_at,
+-                duration_ms,
+-                time_to_first_token_ms,
+-            })
++                EventMsg::TurnAborted(TurnAbortedEvent {
++                    turn_id: Some(turn_context.sub_id.clone()),
++                    reason,
++                    started_at,
++                    completed_at,
++                    duration_ms,
++                })
++            }
++            // LIM-134: the error contributor already fired for this Turn, so
++            // the stop contributor must NOT fire too. The protocol close-out
++            // still rides `TurnComplete`, which carries the exact hard error
++            // and maps to a failed app-server result.
++            terminal @ (TurnTerminal::Stop | TurnTerminal::Error(_)) => {
++                let time_to_first_token_ms = turn_context
++                    .turn_timing_state
++                    .time_to_first_token_ms()
++                    .await;
++                let latched = turn_context.terminal_error.lock().await.clone();
++                let error = match &terminal {
++                    TurnTerminal::Error(error_event) => {
++                        Some(latched.unwrap_or_else(|| error_event.clone()))
++                    }
++                    _ => latched,
++                };
++                if matches!(terminal, TurnTerminal::Stop) {
++                    self.emit_turn_stop_lifecycle(
++                        turn_context.extension_data.as_ref(),
++                        started_at,
++                        completed_at,
++                    )
++                    .await;
++                }
++                EventMsg::TurnComplete(TurnCompleteEvent {
++                    turn_id: turn_context.sub_id.clone(),
++                    last_agent_message,
++                    error,
++                    started_at,
++                    completed_at,
++                    duration_ms,
++                    time_to_first_token_ms,
++                })
++            }
+         };
+         self.send_event(turn_context.as_ref(), event).await;
+         self.services
+@@ -886,10 +952,22 @@ impl Session {
              .await
      }
  
@@ -17351,7 +18201,7 @@ index f8fae7e986..e98bd5d026 100644
          }
  
          trace!(task_kind = ?task.kind, sub_id, "aborting running task");
-@@ -983,6 +1022,7 @@ impl Session {
+@@ -983,6 +1061,7 @@ impl Session {
          if let Err(err) = self.flush_rollout().await {
              warn!("failed to flush rollout after emitting terminal turn event: {err}");
          }
@@ -19976,8 +20826,720 @@ index 1e88b17147..1db68d46bb 100644
  async fn resumed_thread_runs_resume_then_compact_session_start_hooks() -> Result<()> {
      skip_if_no_network!(Ok(()));
  
+diff --git a/codex-rs/core/tests/suite/lhc_preturn_readiness.rs b/codex-rs/core/tests/suite/lhc_preturn_readiness.rs
+new file mode 100644
+index 0000000000..9f8ad3ddf4
+--- /dev/null
++++ b/codex-rs/core/tests/suite/lhc_preturn_readiness.rs
+@@ -0,0 +1,706 @@
++//! LIM-134 production-path proofs (mapped).
++//!
++//! Natural gpt-5.6-sol 350K resumed PreTurn: wait-entry is the lifecycle
++//! watch receiver-count increment, not `Opening` or elapsed time.
++
++use std::path::Path;
++use std::path::PathBuf;
++use std::sync::Arc;
++use std::sync::Mutex;
++use std::time::Duration;
++
++use anyhow::Result;
++use codex_core::TurnInputRequest;
++use codex_core::config::Config;
++use codex_extension_api::ExtensionFuture;
++use codex_extension_api::ExtensionRegistryBuilder;
++use codex_extension_api::TurnAbortInput;
++use codex_extension_api::TurnErrorInput;
++use codex_extension_api::TurnLifecycleContributor;
++use codex_extension_api::TurnStopInput;
++use codex_features::Feature;
++use codex_history::RolloutItem;
++use codex_history::RolloutLine;
++use codex_lhc_host::CAPTURE_OPEN_FAILED;
++use codex_lhc_host::CaptureState;
++use codex_lhc_host::LateBoundCallbacks;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::install_with_root;
++use codex_lhc_host::install_with_root_held_open;
++use codex_lhc_host::lhc_inference_callbacks;
++use codex_lhc_host::spawn_capture;
++use codex_model_provider_info::ModelProviderInfo;
++use codex_model_provider_info::built_in_model_providers;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::ResponseItem;
++use codex_protocol::protocol::EventMsg;
++use codex_protocol::protocol::Op;
++use codex_protocol::user_input::UserInput;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_completed_with_tokens;
++use core_test_support::responses::mount_sse_once_match;
++use core_test_support::responses::sse;
++use core_test_support::responses::sse_failed;
++use core_test_support::responses::start_mock_server;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::TestCodex;
++use core_test_support::test_codex::test_codex;
++use core_test_support::wait_for_event_with_timeout;
++use pretty_assertions::assert_eq;
++use tempfile::TempDir;
++use tokio::time::timeout;
++use wiremock::MockServer;
++
++const MODEL: &str = "gpt-5.6-sol";
++const OVER_LIMIT_TOKENS: i64 = 351_000;
++const SEED_PROMPT: &str = "LIM134_SEED_OVER_LIMIT";
++const NEW_PROMPT: &str = "LIM134_RESUMED_USER_PROMPT";
++const NO_TOOL_PROMPT: &str = "LIM134_NO_TOOL_PROMPT";
++const WAITER_CEILING: Duration = Duration::from_secs(15);
++const TURN_CEILING: Duration = Duration::from_secs(45);
++
++fn non_openai_model_provider(server: &MockServer) -> ModelProviderInfo {
++    let mut provider = built_in_model_providers(/* openai_base_url */ None)["openai"].clone();
++    provider.base_url = Some(format!("{}/v1", server.uri()));
++    provider.name = "MockProvider".into();
++    provider.supports_websockets = false;
++    provider.stream_max_retries = Some(0);
++    provider.request_max_retries = Some(0);
++    provider
++}
++
++fn lhc_ready(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root(&mut builder, |_c| true, root);
++    Arc::new(builder.build())
++}
++
++fn lhc_held_open(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root_held_open(&mut builder, |_c| true, root);
++    Arc::new(builder.build())
++}
++
++/// Records which turn-terminal contributor methods fired (LIM-134 F2).
++struct TerminalRecorder {
++    calls: Mutex<Vec<&'static str>>,
++}
++
++impl TerminalRecorder {
++    fn new() -> Arc<Self> {
++        Arc::new(Self {
++            calls: Mutex::new(Vec::new()),
++        })
++    }
++
++    fn snapshot(&self) -> Vec<&'static str> {
++        self.calls
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .clone()
++    }
++}
++
++impl TurnLifecycleContributor for TerminalRecorder {
++    fn on_turn_stop<'a>(&'a self, input: TurnStopInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            let _ = input;
++            self.calls
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .push("stop");
++        })
++    }
++
++    fn on_turn_abort<'a>(&'a self, input: TurnAbortInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            let _ = input;
++            self.calls
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .push("abort");
++        })
++    }
++
++    fn on_turn_error<'a>(&'a self, input: TurnErrorInput<'a>) -> ExtensionFuture<'a, ()> {
++        Box::pin(async move {
++            let _ = input;
++            self.calls
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .push("error");
++        })
++    }
++}
++
++fn lhc_ready_with_recorder(
++    root: PathBuf,
++    recorder: Arc<TerminalRecorder>,
++) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root(&mut builder, |_c| true, root);
++    builder.turn_lifecycle_contributor(recorder);
++    Arc::new(builder.build())
++}
++
++fn lhc_held_open_with_recorder(
++    root: PathBuf,
++    recorder: Arc<TerminalRecorder>,
++) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root_held_open(&mut builder, |_c| true, root);
++    builder.turn_lifecycle_contributor(recorder);
++    Arc::new(builder.build())
++}
++
++fn assert_exactly_one_terminal(calls: &[&str], expected: &str) {
++    assert_eq!(
++        calls,
++        &[expected],
++        "exactly one of stop/abort/error must fire; expected {expected}"
++    );
++}
++
++fn apply_gpt56_lhc_config(config: &mut Config, model_provider: ModelProviderInfo) {
++    config.model_provider = model_provider;
++    let _ = config.features.enable(Feature::LhcCapture);
++    let _ = config.features.disable(Feature::TokenBudget);
++}
++
++fn user_turn(text: &str) -> TurnInputRequest {
++    TurnInputRequest::user_input(vec![UserInput::Text {
++        text: text.into(),
++        text_elements: Vec::new(),
++    }])
++}
++
++fn prompt_body_match(prompt: &'static str) -> impl wiremock::Match + Send + Sync + 'static {
++    move |req: &wiremock::Request| {
++        let body = std::str::from_utf8(&req.body).unwrap_or("");
++        body.contains(prompt)
++    }
++}
++
++fn native_prompt_count(rollout: &Path, needle: &str) -> usize {
++    let Ok(text) = std::fs::read_to_string(rollout) else {
++        return 0;
++    };
++    text.lines()
++        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
++        .filter(|line| match &line.item {
++            RolloutItem::ResponseItem(envelope) => match &envelope.item {
++                ResponseItem::Message { role, content, .. } if role == "user" => content
++                    .iter()
++                    .any(|item| matches!(item, ContentItem::InputText { text } if text == needle)),
++                _ => false,
++            },
++            _ => false,
++        })
++        .count()
++}
++
++fn is_responses_post(req: &wiremock::Request) -> bool {
++    req.method == "POST" && req.url.path().contains("/responses")
++}
++
++fn request_has_prompt(req: &wiremock::Request, prompt: &str) -> bool {
++    std::str::from_utf8(&req.body).is_ok_and(|body| body.contains(prompt))
++}
++
++async fn responses_posts(server: &MockServer) -> Vec<wiremock::Request> {
++    server
++        .received_requests()
++        .await
++        .unwrap_or_default()
++        .into_iter()
++        .filter(is_responses_post)
++        .collect()
++}
++
++fn prompt_bearing_count(posts: &[wiremock::Request], prompt: &str) -> usize {
++    posts
++        .iter()
++        .filter(|req| request_has_prompt(req, prompt))
++        .count()
++}
++
++struct Terminal {
++    errors: usize,
++    completes: usize,
++    complete_has_error: bool,
++    aborts: usize,
++}
++
++async fn wait_terminal(codex: &codex_core::CodexThread) -> Terminal {
++    let mut terminal = Terminal {
++        errors: 0,
++        completes: 0,
++        complete_has_error: false,
++        aborts: 0,
++    };
++    let mut shutdown_submitted = false;
++    loop {
++        let ev = timeout(TURN_CEILING, codex.next_event())
++            .await
++            .expect("timeout waiting for terminal or shutdown")
++            .expect("event stream ended");
++        match &ev.msg {
++            EventMsg::Error(_) => terminal.errors += 1,
++            EventMsg::TurnComplete(complete) => {
++                terminal.completes += 1;
++                terminal.complete_has_error = complete.error.is_some();
++            }
++            EventMsg::TurnAborted(_) => terminal.aborts += 1,
++            EventMsg::ShutdownComplete => return terminal,
++            _ => {}
++        }
++        if !shutdown_submitted
++            && matches!(ev.msg, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
++        {
++            shutdown_submitted = true;
++            codex
++                .submit(Op::Shutdown)
++                .await
++                .expect("submit shutdown after first terminal");
++        }
++    }
++}
++
++async fn wait_for_waiter_increment(slot: &LhcCaptureSlot, baseline: usize) {
++    timeout(WAITER_CEILING, async {
++        loop {
++            if slot.readiness_waiter_count_for_test() == baseline + 1 {
++                return;
++            }
++            tokio::task::yield_now().await;
++        }
++    })
++    .await
++    .expect("deadlock ceiling: required compact did not subscribe");
++}
++
++async fn seed_over_limit_thread(server: &MockServer, lhc_root: PathBuf) -> Result<TestCodex> {
++    let _seed = mount_sse_once_match(
++        server,
++        prompt_body_match(SEED_PROMPT),
++        sse(vec![
++            ev_assistant_message("seed-msg", "seed reply"),
++            ev_completed_with_tokens("seed-resp", OVER_LIMIT_TOKENS),
++        ]),
++    )
++    .await;
++    let model_provider = non_openai_model_provider(server);
++    let mut builder = test_codex()
++        .with_model(MODEL)
++        .with_extensions(lhc_ready(lhc_root))
++        .with_config(move |config| apply_gpt56_lhc_config(config, model_provider));
++    let seed = builder.build(server).await?;
++    seed.codex
++        .start_or_steer_turn(user_turn(SEED_PROMPT))
++        .await?;
++    wait_for_event_with_timeout(
++        &seed.codex,
++        |ev| matches!(ev, EventMsg::TurnComplete(_)),
++        TURN_CEILING,
++    )
++    .await;
++    Ok(seed)
++}
++
++async fn resume_held_open(
++    server: &MockServer,
++    seed: &TestCodex,
++    lhc_root: PathBuf,
++) -> Result<TestCodex> {
++    resume_with_extensions(server, seed, lhc_held_open(lhc_root)).await
++}
++
++async fn resume_with_extensions(
++    server: &MockServer,
++    seed: &TestCodex,
++    extensions: Arc<codex_extension_api::ExtensionRegistry<Config>>,
++) -> Result<TestCodex> {
++    let model_provider = non_openai_model_provider(server);
++    let mut builder = test_codex()
++        .with_model(MODEL)
++        .with_extensions(extensions)
++        .with_config(move |config| apply_gpt56_lhc_config(config, model_provider));
++    builder.restart(server, seed).await
++}
++
++fn slot_of(test: &TestCodex) -> Arc<LhcCaptureSlot> {
++    test.codex
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("LhcCaptureSlot")
++}
++
++async fn prove_wait_entry(test: &TestCodex, server: &MockServer) -> Arc<LhcCaptureSlot> {
++    let slot = slot_of(test);
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "held-open installer must leave the slot Opening before submit"
++    );
++    let baseline = slot.readiness_waiter_count_for_test();
++    let posts_before = responses_posts(server).await.len();
++    test.codex
++        .start_or_steer_turn(user_turn(NEW_PROMPT))
++        .await
++        .expect("submit resumed turn");
++    wait_for_event_with_timeout(
++        &test.codex,
++        |ev| matches!(ev, EventMsg::TurnStarted(_)),
++        TURN_CEILING,
++    )
++    .await;
++    wait_for_waiter_increment(&slot, baseline).await;
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "waiter armed while still Opening"
++    );
++    let posts = responses_posts(server).await;
++    assert_eq!(
++        posts.len(),
++        posts_before,
++        "no provider request of any kind before Ready"
++    );
++    assert_eq!(prompt_bearing_count(&posts, NEW_PROMPT), 0);
++    slot
++}
++
++/// Arm the required-compact waiter. XOR tests use this instead of
++/// [`prove_wait_entry`] so they do not depend on the zero-request snapshot.
++async fn arm_held_open_waiter(test: &TestCodex) -> Arc<LhcCaptureSlot> {
++    let slot = slot_of(test);
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "held-open installer must leave the slot Opening before submit"
++    );
++    let baseline = slot.readiness_waiter_count_for_test();
++    test.codex
++        .start_or_steer_turn(user_turn(NEW_PROMPT))
++        .await
++        .expect("submit resumed turn");
++    wait_for_event_with_timeout(
++        &test.codex,
++        |ev| matches!(ev, EventMsg::TurnStarted(_)),
++        TURN_CEILING,
++    )
++    .await;
++    wait_for_waiter_increment(&slot, baseline).await;
++    assert!(
++        matches!(slot.state(), CaptureState::Opening),
++        "waiter armed while still Opening"
++    );
++    slot
++}
++
++async fn publish_ready(test: &TestCodex, slot: &LhcCaptureSlot, root: PathBuf) {
++    let thread_id = test.session_configured.thread_id.to_string();
++    let derivation = LateBoundCallbacks::new();
++    derivation.seed(lhc_inference_callbacks(false).expect("deterministic callbacks"));
++    let handle = spawn_capture(&thread_id, None, Some(root), derivation)
++        .await
++        .expect("open capture for Ready");
++    assert!(
++        slot.publish_ready_for_test(handle),
++        "Ready must publish onto Opening"
++    );
++}
++
++fn rollout_of(test: &TestCodex) -> PathBuf {
++    test.session_configured
++        .rollout_path
++        .clone()
++        .expect("rollout path")
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn natural_350k_resumed_ready_orders_one_prompt_bearing_agent_request() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let root = lhc_root.path().to_path_buf();
++    let seed = seed_over_limit_thread(&server, root.clone()).await?;
++    let resumed = resume_held_open(&server, &seed, root.clone()).await?;
++    let _agent = mount_sse_once_match(
++        &server,
++        prompt_body_match(NEW_PROMPT),
++        sse(vec![
++            ev_assistant_message("follow-msg", "follow reply"),
++            ev_completed("follow-resp"),
++        ]),
++    )
++    .await;
++
++    let slot = prove_wait_entry(&resumed, &server).await;
++    publish_ready(&resumed, &slot, root).await;
++    let terminal = wait_terminal(&resumed.codex).await;
++    let posts = responses_posts(&server).await;
++
++    assert_eq!(terminal.errors, 0);
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(!terminal.complete_has_error);
++    assert_eq!(prompt_bearing_count(&posts, NEW_PROMPT), 1);
++    assert_eq!(native_prompt_count(&rollout_of(&resumed), NEW_PROMPT), 1);
++    Ok(())
++}
++
++#[derive(Clone, Copy)]
++enum PreDispatch {
++    Failed,
++    Stopped,
++    Interrupt,
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn pre_dispatch_failed_stopped_interrupt_after_waiter_proof() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    for row in [
++        PreDispatch::Failed,
++        PreDispatch::Stopped,
++        PreDispatch::Interrupt,
++    ] {
++        let server = start_mock_server().await;
++        let lhc_root = TempDir::new()?;
++        let root = lhc_root.path().to_path_buf();
++        let seed = seed_over_limit_thread(&server, root.clone()).await?;
++        let resumed = resume_held_open(&server, &seed, root).await?;
++        let slot = prove_wait_entry(&resumed, &server).await;
++        let posts_at_wait = responses_posts(&server).await.len();
++        match row {
++            PreDispatch::Failed => {
++                assert!(slot.publish_failed_for_test(CAPTURE_OPEN_FAILED));
++            }
++            PreDispatch::Stopped => slot.publish_stopped_for_test(),
++            PreDispatch::Interrupt => {
++                resumed.codex.submit(Op::Interrupt).await?;
++            }
++        }
++        let terminal = wait_terminal(&resumed.codex).await;
++        let posts = responses_posts(&server).await;
++        assert_eq!(
++            posts.len(),
++            posts_at_wait,
++            "pre-dispatch must not issue provider requests"
++        );
++        assert_eq!(prompt_bearing_count(&posts, NEW_PROMPT), 0);
++        assert_eq!(native_prompt_count(&rollout_of(&resumed), NEW_PROMPT), 1);
++        match row {
++            PreDispatch::Failed | PreDispatch::Stopped => {
++                assert_eq!(terminal.aborts, 0);
++                assert_eq!(terminal.completes, 1);
++                assert!(terminal.complete_has_error);
++                assert_eq!(terminal.errors, 1);
++            }
++            PreDispatch::Interrupt => {
++                assert_eq!(terminal.errors, 0);
++                assert_eq!(terminal.aborts, 1);
++                assert_eq!(terminal.completes, 0);
++            }
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn post_dispatch_prompt_bearing_agent_failure() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let root = lhc_root.path().to_path_buf();
++    let seed = seed_over_limit_thread(&server, root.clone()).await?;
++    let resumed = resume_held_open(&server, &seed, root.clone()).await?;
++    let _agent = mount_sse_once_match(
++        &server,
++        prompt_body_match(NEW_PROMPT),
++        sse_failed("agent-fail", "server_error", "forced agent failure"),
++    )
++    .await;
++
++    let slot = prove_wait_entry(&resumed, &server).await;
++    let posts_at_wait = responses_posts(&server).await.len();
++    publish_ready(&resumed, &slot, root).await;
++    let terminal = wait_terminal(&resumed.codex).await;
++    let posts = responses_posts(&server).await;
++
++    assert!(
++        posts.len() > posts_at_wait,
++        "post-dispatch failure must not claim zero provider requests"
++    );
++    assert_eq!(prompt_bearing_count(&posts, NEW_PROMPT), 1);
++    assert_eq!(native_prompt_count(&rollout_of(&resumed), NEW_PROMPT), 1);
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(terminal.complete_has_error);
++    assert_eq!(terminal.errors, 1);
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn no_tool_success_is_one_provider_request() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let _agent = mount_sse_once_match(
++        &server,
++        prompt_body_match(NO_TOOL_PROMPT),
++        sse(vec![
++            ev_assistant_message("ok-msg", "ok reply"),
++            ev_completed("ok-resp"),
++        ]),
++    )
++    .await;
++    let model_provider = non_openai_model_provider(&server);
++    let mut builder = test_codex()
++        .with_model(MODEL)
++        .with_extensions(lhc_ready(lhc_root.path().to_path_buf()))
++        .with_config(move |config| apply_gpt56_lhc_config(config, model_provider));
++    let test = builder.build(&server).await?;
++    test.codex
++        .start_or_steer_turn(user_turn(NO_TOOL_PROMPT))
++        .await?;
++    let terminal = wait_terminal(&test.codex).await;
++    let posts = responses_posts(&server).await;
++
++    assert_eq!(posts.len(), 1);
++    assert_eq!(prompt_bearing_count(&posts, NO_TOOL_PROMPT), 1);
++    assert_eq!(native_prompt_count(&rollout_of(&test), NO_TOOL_PROMPT), 1);
++    assert_eq!(terminal.errors, 0);
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(!terminal.complete_has_error);
++    Ok(())
++}
++
++// ---------------------------------------------------------------------------
++// LIM-134 F2: contributor-level exactly-one terminal
++// ---------------------------------------------------------------------------
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn contributor_xor_normal_success_fires_only_stop() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let recorder = TerminalRecorder::new();
++    let _agent = mount_sse_once_match(
++        &server,
++        prompt_body_match(NO_TOOL_PROMPT),
++        sse(vec![
++            ev_assistant_message("ok-msg", "ok reply"),
++            ev_completed("ok-resp"),
++        ]),
++    )
++    .await;
++    let model_provider = non_openai_model_provider(&server);
++    let mut builder = test_codex()
++        .with_model(MODEL)
++        .with_extensions(lhc_ready_with_recorder(
++            lhc_root.path().to_path_buf(),
++            Arc::clone(&recorder),
++        ))
++        .with_config(move |config| apply_gpt56_lhc_config(config, model_provider));
++    let test = builder.build(&server).await?;
++    test.codex
++        .start_or_steer_turn(user_turn(NO_TOOL_PROMPT))
++        .await?;
++    let terminal = wait_terminal(&test.codex).await;
++    assert_eq!(terminal.errors, 0);
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(!terminal.complete_has_error);
++    assert_exactly_one_terminal(&recorder.snapshot(), "stop");
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn contributor_xor_pre_dispatch_required_compact_failure_fires_only_error() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let root = lhc_root.path().to_path_buf();
++    let recorder = TerminalRecorder::new();
++    let seed = seed_over_limit_thread(&server, root.clone()).await?;
++    let resumed = resume_with_extensions(
++        &server,
++        &seed,
++        lhc_held_open_with_recorder(root, Arc::clone(&recorder)),
++    )
++    .await?;
++    let slot = arm_held_open_waiter(&resumed).await;
++    assert!(slot.publish_failed_for_test(CAPTURE_OPEN_FAILED));
++    let terminal = wait_terminal(&resumed.codex).await;
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(terminal.complete_has_error);
++    assert_eq!(terminal.errors, 1);
++    assert_exactly_one_terminal(&recorder.snapshot(), "error");
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn contributor_xor_post_dispatch_sampling_failure_fires_only_error() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let recorder = TerminalRecorder::new();
++    let _agent = mount_sse_once_match(
++        &server,
++        prompt_body_match(NO_TOOL_PROMPT),
++        sse_failed("agent-fail", "server_error", "forced agent failure"),
++    )
++    .await;
++    let model_provider = non_openai_model_provider(&server);
++    let mut builder = test_codex()
++        .with_model(MODEL)
++        .with_extensions(lhc_ready_with_recorder(
++            lhc_root.path().to_path_buf(),
++            Arc::clone(&recorder),
++        ))
++        .with_config(move |config| apply_gpt56_lhc_config(config, model_provider));
++    let test = builder.build(&server).await?;
++    test.codex
++        .start_or_steer_turn(user_turn(NO_TOOL_PROMPT))
++        .await?;
++    let terminal = wait_terminal(&test.codex).await;
++    assert_eq!(terminal.aborts, 0);
++    assert_eq!(terminal.completes, 1);
++    assert!(terminal.complete_has_error);
++    assert_eq!(terminal.errors, 1);
++    assert_exactly_one_terminal(&recorder.snapshot(), "error");
++    Ok(())
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn contributor_xor_interrupt_fires_only_abort() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++
++    let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
++    let root = lhc_root.path().to_path_buf();
++    let recorder = TerminalRecorder::new();
++    let seed = seed_over_limit_thread(&server, root.clone()).await?;
++    let resumed = resume_with_extensions(
++        &server,
++        &seed,
++        lhc_held_open_with_recorder(root, Arc::clone(&recorder)),
++    )
++    .await?;
++    let _slot = arm_held_open_waiter(&resumed).await;
++    resumed.codex.submit(Op::Interrupt).await?;
++    let terminal = wait_terminal(&resumed.codex).await;
++    assert_eq!(terminal.errors, 0);
++    assert_eq!(terminal.aborts, 1);
++    assert_eq!(terminal.completes, 0);
++    assert_exactly_one_terminal(&recorder.snapshot(), "abort");
++    Ok(())
++}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 47c1b598cf..942499a9b7 100644
+index 47c1b598cf..9714755c58 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
 @@ -55,6 +55,7 @@ mod code_mode_elicitation;
@@ -19988,6 +21550,14 @@ index 47c1b598cf..942499a9b7 100644
  mod compact_remote;
  mod compact_remote_parity;
  mod compact_resume_fork;
+@@ -88,6 +89,7 @@ mod injected_models_cache;
+ mod interrupt_hooks;
+ mod items;
+ mod json_result;
++mod lhc_preturn_readiness;
+ mod live_cli;
+ mod mcp_auth_elicitation;
+ mod mcp_auth_refresh;
 diff --git a/codex-rs/core/tests/suite/model_switching.rs b/codex-rs/core/tests/suite/model_switching.rs
 index e5232fe736..e8ce80e83c 100644
 --- a/codex-rs/core/tests/suite/model_switching.rs
@@ -20250,6 +21820,646 @@ index a0a2312e93..e20fb77f06 100644
 +#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture reads window ids from native compact / follow-up /responses headers; LHC window identity is successful_lhc_compact_advances_auto_compact_window plus slice_c_window_continuity_across_two_rewrites"]
  async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork() -> Result<()> {
      skip_if_no_network!(Ok(()));
+ 
+diff --git a/codex-rs/exec/src/event_processor_with_human_output_tests.rs b/codex-rs/exec/src/event_processor_with_human_output_tests.rs
+index 22a6a3cb45..f3c49311ca 100644
+--- a/codex-rs/exec/src/event_processor_with_human_output_tests.rs
++++ b/codex-rs/exec/src/event_processor_with_human_output_tests.rs
+@@ -477,6 +477,57 @@ fn turn_failed_clears_stale_final_message() {
+     assert!(!processor.emit_final_message_on_shutdown);
+ }
+ 
++/// Reclassified empty-result shape: Failed + error. Suppresses any stale
++/// final message and takes the error-reporting Failed arm.
++#[test]
++fn reclassified_failed_turn_suppresses_final_message_and_reports_error() {
++    let mut processor = EventProcessorWithHumanOutput {
++        bold: Style::new(),
++        cyan: Style::new(),
++        dimmed: Style::new(),
++        green: Style::new(),
++        italic: Style::new(),
++        magenta: Style::new(),
++        red: Style::new(),
++        yellow: Style::new(),
++        show_agent_reasoning: true,
++        show_raw_agent_reasoning: false,
++        last_message_path: None,
++        final_message: Some("stale answer".to_string()),
++        final_message_rendered: true,
++        emit_final_message_on_shutdown: true,
++        last_total_token_usage: None,
++    };
++
++    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
++        codex_app_server_protocol::TurnCompletedNotification {
++            thread_id: "thread-1".to_string(),
++            turn: Turn {
++                id: "turn-1".to_string(),
++                items_view: codex_app_server_protocol::TurnItemsView::Full,
++                items: Vec::new(),
++                status: TurnStatus::Failed,
++                error: Some(codex_app_server_protocol::TurnError {
++                    message: "Turn completed without producing an agent message.".to_string(),
++                    additional_details: None,
++                    codex_error_info: None,
++                }),
++                started_at: None,
++                completed_at: Some(0),
++                duration_ms: None,
++            },
++        },
++    ));
++
++    assert_eq!(
++        status,
++        crate::event_processor::CodexStatus::InitiateShutdown
++    );
++    assert_eq!(processor.final_message, None);
++    assert!(!processor.final_message_rendered);
++    assert!(!processor.emit_final_message_on_shutdown);
++}
++
+ #[test]
+ fn turn_interrupted_clears_stale_final_message() {
+     let mut processor = EventProcessorWithHumanOutput {
+diff --git a/codex-rs/exec/src/lib.rs b/codex-rs/exec/src/lib.rs
+index f0b573e3eb..3f418b2446 100644
+--- a/codex-rs/exec/src/lib.rs
++++ b/codex-rs/exec/src/lib.rs
+@@ -951,6 +951,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+         }
+     });
+ 
++    let mut answer_evidence =
++        DirectTurnAnswerEvidence::new(expects_agent_message(&initial_operation));
+     let task_id = match initial_operation {
+         InitialOperation::ForkOnly => {
+             request_shutdown(&client, &mut request_ids, &primary_thread_id_for_span)
+@@ -1073,30 +1075,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+             }
+             InProcessServerEvent::ServerNotification(notification) => {
+                 let mut notification = *notification;
+-                if let ServerNotification::Error(payload) = &notification {
+-                    if payload.thread_id == primary_thread_id_for_requests
+-                        && payload.turn_id == task_id
+-                        && !payload.will_retry
+-                    {
+-                        error_seen = true;
+-                    }
+-                } else if let ServerNotification::TurnCompleted(payload) = &notification
+-                    && payload.thread_id == primary_thread_id_for_requests
+-                    && payload.turn.id == task_id
+-                    && matches!(
+-                        payload.turn.status,
+-                        codex_app_server_protocol::TurnStatus::Failed
+-                            | codex_app_server_protocol::TurnStatus::Interrupted
+-                    )
+-                {
+-                    error_seen = true;
+-                }
+-
+-                if should_process_notification(
++                let process = should_process_notification(
+                     &notification,
+                     &primary_thread_id_for_requests,
+                     &task_id,
+-                ) {
++                );
++                if process {
++                    // Streamed evidence is scoped to this thread + turn by
++                    // `should_process_notification`.
++                    answer_evidence.observe(&notification);
+                     maybe_backfill_turn_completed_items(
+                         config.ephemeral,
+                         &client,
+@@ -1104,7 +1091,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
+                         &mut notification,
+                     )
+                     .await;
++                    // LIM-134: decide empty-result truth after backfill and
++                    // before the exit status and either output mode read it.
++                    answer_evidence.reclassify_empty_result(&mut notification);
++                }
++                if notification_sets_error_seen(
++                    &notification,
++                    &primary_thread_id_for_requests,
++                    &task_id,
++                ) {
++                    error_seen = true;
++                }
+ 
++                if process {
+                     match event_processor.process_server_notification(notification) {
+                         CodexStatus::Running => {}
+                         CodexStatus::InitiateShutdown => {
+@@ -1463,6 +1462,127 @@ fn should_process_notification(
+     }
+ }
+ 
++/// Whether exec dispatched substantive direct user work for this run.
++///
++/// LIM-134: only such a run promises an answer. Every substantive `UserTurn`
++/// input counts — images and other non-text inputs are work too. Review and
++/// fork-only operations, and truly blank/no-op input, are never reclassified.
++fn expects_agent_message(initial_operation: &InitialOperation) -> bool {
++    let InitialOperation::UserTurn { items, .. } = initial_operation else {
++        return false;
++    };
++    items.iter().any(|item| match item {
++        UserInput::Text { text, .. } => !text.trim().is_empty(),
++        // Any non-text input (image, mention, …) is substantive work.
++        _ => true,
++    })
++}
++
++/// Whether a thread item is nonblank answer evidence for a completed turn.
++///
++/// Matches both processors' final-message fallback: a nonblank `AgentMessage`
++/// or a nonblank `Plan` counts. Empty or whitespace-only text does not.
++fn is_nonblank_agent_message(item: &AppServerThreadItem) -> bool {
++    match item {
++        AppServerThreadItem::AgentMessage { text, .. } | AppServerThreadItem::Plan { text, .. } => {
++            !text.trim().is_empty()
++        }
++        _ => false,
++    }
++}
++
++/// Decision boundary for `std::process::exit(1)` after the event loop.
++///
++/// A non-retryable error notification, or a Failed/Interrupted turn
++/// completion, for this thread and turn. Callers still own the actual exit.
++fn notification_sets_error_seen(
++    notification: &ServerNotification,
++    thread_id: &str,
++    turn_id: &str,
++) -> bool {
++    match notification {
++        ServerNotification::Error(payload) => {
++            payload.thread_id == thread_id && payload.turn_id == turn_id && !payload.will_retry
++        }
++        ServerNotification::TurnCompleted(payload) => {
++            payload.thread_id == thread_id
++                && payload.turn.id == turn_id
++                && matches!(
++                    payload.turn.status,
++                    codex_app_server_protocol::TurnStatus::Failed
++                        | codex_app_server_protocol::TurnStatus::Interrupted
++                )
++        }
++        _ => false,
++    }
++}
++
++/// Records whether the current Turn has produced a nonblank agent message,
++/// from either streamed item notifications or completion items (LIM-134).
++///
++/// Streamed evidence matters because in-process completion can arrive with
++/// empty `turn.items` and no backfill (ephemeral threads). Only the current
++/// Turn counts — a stale prior-Turn message never satisfies this.
++#[derive(Default)]
++struct DirectTurnAnswerEvidence {
++    expected: bool,
++    streamed: bool,
++}
++
++impl DirectTurnAnswerEvidence {
++    fn new(expected: bool) -> Self {
++        Self {
++            expected,
++            streamed: false,
++        }
++    }
++
++    /// Observe a notification scoped to the current thread and Turn.
++    fn observe(&mut self, notification: &ServerNotification) {
++        if let ServerNotification::ItemCompleted(payload) = notification
++            && is_nonblank_agent_message(&payload.item)
++        {
++            self.streamed = true;
++        }
++    }
++
++    /// LIM-134: one local semantic check shared by the human and JSONL
++    /// dispatch.
++    ///
++    /// After [`maybe_backfill_turn_completed_items`] has had its chance to
++    /// recover dropped nonterminal notifications, a *completed* turn that
++    /// answered a substantive direct prompt must have produced a nonblank
++    /// current-Turn agent message — streamed or in the completion items. When
++    /// it did not, the turn is reclassified as failed before either output mode
++    /// sees it, so neither can report a successful empty result.
++    fn reclassify_empty_result(&self, notification: &mut ServerNotification) {
++        if !self.expected {
++            return;
++        }
++        let ServerNotification::TurnCompleted(payload) = notification else {
++            return;
++        };
++        if payload.turn.status != codex_app_server_protocol::TurnStatus::Completed {
++            return;
++        }
++        if self.streamed || payload.turn.items.iter().any(is_nonblank_agent_message) {
++            return;
++        }
++        warn!(
++            turn_id = %payload.turn.id,
++            "turn completed without an agent message for a substantive prompt; reporting failure"
++        );
++        payload.turn.status = codex_app_server_protocol::TurnStatus::Failed;
++        payload.turn.items.clear();
++        payload.turn.items_view = codex_app_server_protocol::TurnItemsView::NotLoaded;
++        payload.turn.error = Some(codex_app_server_protocol::TurnError {
++            message: "Turn completed without producing an agent message.".to_string(),
++            codex_error_info: None,
++            additional_details: None,
++        });
++    }
++}
++
+ async fn maybe_backfill_turn_completed_items(
+     thread_ephemeral: bool,
+     client: &InProcessAppServerClient,
+diff --git a/codex-rs/exec/src/lib_tests.rs b/codex-rs/exec/src/lib_tests.rs
+index 050b586a5c..4cf497c5d0 100644
+--- a/codex-rs/exec/src/lib_tests.rs
++++ b/codex-rs/exec/src/lib_tests.rs
+@@ -861,3 +861,305 @@ fn sample_thread_start_response() -> ThreadStartResponse {
+         multi_agent_mode: Default::default(),
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// LIM-134: exec direct-prompt empty-result truth
++// ---------------------------------------------------------------------------
++
++fn completed_turn(items: Vec<AppServerThreadItem>) -> ServerNotification {
++    ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
++        thread_id: "thread-1".to_string(),
++        turn: codex_app_server_protocol::Turn {
++            id: "turn-1".to_string(),
++            items_view: codex_app_server_protocol::TurnItemsView::Full,
++            items,
++            status: codex_app_server_protocol::TurnStatus::Completed,
++            error: None,
++            started_at: None,
++            completed_at: Some(0),
++            duration_ms: None,
++        },
++    })
++}
++
++fn agent_message(id: &str, text: &str) -> AppServerThreadItem {
++    AppServerThreadItem::AgentMessage {
++        id: id.to_string(),
++        text: text.to_string(),
++        phase: None,
++        memory_citation: None,
++        delivery: None,
++    }
++}
++
++fn streamed_agent_message(turn_id: &str, text: &str) -> ServerNotification {
++    ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
++        item: agent_message("msg-streamed", text),
++        thread_id: "thread-1".to_string(),
++        turn_id: turn_id.to_string(),
++        completed_at_ms: 0,
++    })
++}
++
++fn turn_status(notification: &ServerNotification) -> codex_app_server_protocol::TurnStatus {
++    let ServerNotification::TurnCompleted(payload) = notification else {
++        panic!("expected a turn completion");
++    };
++    payload.turn.status.clone()
++}
++
++fn user_turn(items: Vec<UserInput>) -> InitialOperation {
++    InitialOperation::UserTurn {
++        items,
++        output_schema: None,
++    }
++}
++
++fn text(text: &str) -> UserInput {
++    UserInput::Text {
++        text: text.to_string(),
++        text_elements: Vec::new(),
++    }
++}
++
++/// Every substantive direct input promises an answer, including non-text
++/// inputs. Blank text and non-`UserTurn` operations do not.
++#[test]
++fn expects_agent_message_covers_substantive_direct_input_only() {
++    assert!(expects_agent_message(&user_turn(vec![text(
++        "do the thing"
++    )])));
++    assert!(
++        expects_agent_message(&user_turn(vec![
++            UserInput::LocalImage {
++                path: std::path::PathBuf::from("/tmp/shot.png"),
++                detail: None,
++            },
++            text("   "),
++        ])),
++        "an image with a blank caption is still work"
++    );
++    assert!(!expects_agent_message(&user_turn(vec![text("   \n\t ")])));
++    assert!(!expects_agent_message(&user_turn(Vec::new())));
++    assert!(!expects_agent_message(&InitialOperation::ForkOnly));
++}
++
++/// Absent, blank, and whitespace-only completions are not successful results
++/// for a substantive direct prompt.
++#[test]
++fn completed_turn_without_an_agent_message_is_reclassified_as_failed() {
++    let cases: Vec<(&str, Vec<AppServerThreadItem>)> = vec![
++        ("absent", Vec::new()),
++        ("empty", vec![agent_message("msg-1", "")]),
++        ("whitespace", vec![agent_message("msg-1", "  \n\t ")]),
++    ];
++    for (label, items) in cases {
++        let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++        let mut notification = completed_turn(items);
++        evidence.reclassify_empty_result(&mut notification);
++        assert_eq!(
++            turn_status(&notification),
++            codex_app_server_protocol::TurnStatus::Failed,
++            "{label} must not report a successful empty result"
++        );
++        let ServerNotification::TurnCompleted(payload) = &notification else {
++            unreachable!()
++        };
++        assert!(
++            payload.turn.error.is_some(),
++            "{label} must carry a failure diagnostic"
++        );
++        assert!(
++            payload.turn.items.is_empty(),
++            "{label} must not carry a fabricated answer"
++        );
++    }
++}
++
++/// A completed turn whose only substantive output is a nonblank Plan is
++/// answer evidence (LIM-134 F5) — matching both processors' Plan fallback.
++#[test]
++fn completed_turn_with_a_nonblank_plan_is_not_reclassified_as_failed() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    let mut notification = completed_turn(vec![AppServerThreadItem::Plan {
++        id: "plan-1".to_string(),
++        text: "a nonblank plan counts as answer evidence".to_string(),
++    }]);
++    evidence.reclassify_empty_result(&mut notification);
++    assert_eq!(
++        turn_status(&notification),
++        codex_app_server_protocol::TurnStatus::Completed,
++        "plan only must not be reclassified as failed"
++    );
++}
++
++/// A backfilled nonblank current-Turn agent message remains a success.
++#[test]
++fn backfilled_agent_message_remains_a_successful_result() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    let mut notification = completed_turn(vec![agent_message("msg-1", "the answer")]);
++    evidence.reclassify_empty_result(&mut notification);
++    assert_eq!(
++        turn_status(&notification),
++        codex_app_server_protocol::TurnStatus::Completed
++    );
++}
++
++/// A valid answer that streamed while completion items stayed empty (the
++/// ephemeral / no-backfill shape) is still a success.
++#[test]
++fn streamed_agent_message_remains_a_successful_result_without_backfill() {
++    let mut evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    evidence.observe(&streamed_agent_message("turn-1", "the answer"));
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++    assert_eq!(
++        turn_status(&notification),
++        codex_app_server_protocol::TurnStatus::Completed,
++        "streamed evidence must not be discarded when completion items are empty"
++    );
++}
++
++/// A blank streamed message is not evidence of an answer.
++#[test]
++fn blank_streamed_agent_message_is_not_evidence() {
++    let mut evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    evidence.observe(&streamed_agent_message("turn-1", "   "));
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++    assert_eq!(
++        turn_status(&notification),
++        codex_app_server_protocol::TurnStatus::Failed
++    );
++}
++
++/// Operations that never promised an answer — Review, fork-only, blank input —
++/// are never reclassified.
++#[test]
++fn operations_without_a_substantive_prompt_are_never_reclassified() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ false);
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++    assert_eq!(
++        turn_status(&notification),
++        codex_app_server_protocol::TurnStatus::Completed
++    );
++}
++
++/// Already-failed and interrupted completions keep their own status.
++#[test]
++fn non_completed_turn_status_is_left_alone() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    for status in [
++        codex_app_server_protocol::TurnStatus::Failed,
++        codex_app_server_protocol::TurnStatus::Interrupted,
++        codex_app_server_protocol::TurnStatus::InProgress,
++    ] {
++        let mut notification = completed_turn(Vec::new());
++        if let ServerNotification::TurnCompleted(payload) = &mut notification {
++            payload.turn.status = status.clone();
++        }
++        evidence.reclassify_empty_result(&mut notification);
++        assert_eq!(turn_status(&notification), status);
++    }
++}
++
++/// LIM-134 F4: reclassified empty completion is consumed by the JSONL
++/// processor as `turn.failed`, never `turn.completed`.
++#[test]
++fn reclassified_empty_result_jsonl_emits_turn_failed() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++
++    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
++    let collected = processor.collect_thread_events(notification);
++    assert_eq!(collected.status, CodexStatus::InitiateShutdown);
++    assert!(
++        collected
++            .events
++            .iter()
++            .any(|event| matches!(event, ThreadEvent::TurnFailed(_))),
++        "JSONL must emit TurnFailed: {:?}",
++        collected.events
++    );
++    assert!(
++        collected
++            .events
++            .iter()
++            .all(|event| !matches!(event, ThreadEvent::TurnCompleted(_))),
++        "JSONL must not emit TurnCompleted for a reclassified empty result: {:?}",
++        collected.events
++    );
++    let failed = collected
++        .events
++        .iter()
++        .find(|event| matches!(event, ThreadEvent::TurnFailed(_)))
++        .expect("TurnFailed present");
++    let json = serde_json::to_value(failed).expect("serialize thread event");
++    assert_eq!(json["type"], "turn.failed");
++}
++
++/// LIM-134 F4: the human processor suppresses the last-message file and
++/// takes the Failed arm (which reports the error) rather than completing.
++#[tokio::test]
++async fn reclassified_empty_result_human_suppresses_final_message() {
++    let codex_home = tempdir().expect("create temp codex home");
++    let cwd = tempdir().expect("create temp cwd");
++    let config = ConfigBuilder::default()
++        .codex_home(codex_home.path().to_path_buf())
++        .fallback_cwd(Some(cwd.path().to_path_buf()))
++        .build()
++        .await
++        .expect("build config");
++    let output_dir = tempdir().expect("create temp output dir");
++    let last_message_path = output_dir.path().join("last-message.txt");
++    std::fs::write(&last_message_path, "keep existing contents").expect("seed last message");
++
++    let mut processor = EventProcessorWithHumanOutput::create_with_ansi(
++        /*with_ansi*/ false,
++        &config,
++        Some(last_message_path.clone()),
++    );
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++
++    let status = crate::event_processor::EventProcessor::process_server_notification(
++        &mut processor,
++        notification,
++    );
++    assert_eq!(status, CodexStatus::InitiateShutdown);
++    crate::event_processor::EventProcessor::print_final_output(&mut processor);
++    assert_eq!(
++        std::fs::read_to_string(&last_message_path).expect("read last message"),
++        "keep existing contents",
++        "Failed completion must not write a fabricated/stale final message"
++    );
++}
++
++/// LIM-134 F4(c): the error_seen decision that leads to `std::process::exit(1)`.
++///
++/// Limitation: the `exit(1)` call itself is not executed here — it lives in
++/// the process event loop and would terminate the test process. This asserts
++/// the production decision boundary used immediately before that exit.
++#[test]
++fn reclassified_empty_result_sets_the_nonzero_exit_decision() {
++    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
++    let mut notification = completed_turn(Vec::new());
++    evidence.reclassify_empty_result(&mut notification);
++    assert!(
++        notification_sets_error_seen(&notification, "thread-1", "turn-1"),
++        "a reclassified Failed turn must set error_seen for this thread/turn"
++    );
++    assert!(
++        !notification_sets_error_seen(&notification, "other-thread", "turn-1"),
++        "error_seen is scoped to the primary thread"
++    );
++
++    let success = completed_turn(vec![agent_message("msg-1", "the answer")]);
++    assert!(
++        !notification_sets_error_seen(&success, "thread-1", "turn-1"),
++        "a successful completion must not set error_seen"
++    );
++}
+diff --git a/codex-rs/exec/tests/suite/apply_patch.rs b/codex-rs/exec/tests/suite/apply_patch.rs
+index 8376b2e765..cf6a302d7f 100644
+--- a/codex-rs/exec/tests/suite/apply_patch.rs
++++ b/codex-rs/exec/tests/suite/apply_patch.rs
+@@ -4,6 +4,7 @@ use anyhow::Context;
+ use assert_cmd::prelude::*;
+ use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
+ use core_test_support::responses::ev_apply_patch_custom_tool_call;
++use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::mount_sse_sequence;
+ use core_test_support::responses::sse;
+@@ -73,7 +74,10 @@ async fn test_apply_patch_tool() -> anyhow::Result<()> {
+             ev_apply_patch_custom_tool_call("request_1", update_patch),
+             ev_completed("request_1"),
+         ]),
+-        sse(vec![ev_completed("request_2")]),
++        sse(vec![
++            ev_assistant_message("request_2", "done"),
++            ev_completed("request_2"),
++        ]),
+     ];
+     let server = start_mock_server().await;
+     mount_sse_sequence(&server, response_streams).await;
+@@ -123,7 +127,10 @@ async fn test_apply_patch_freeform_tool() -> anyhow::Result<()> {
+             ev_apply_patch_custom_tool_call("request_1", freeform_update_patch),
+             ev_completed("request_1"),
+         ]),
+-        sse(vec![ev_completed("request_2")]),
++        sse(vec![
++            ev_assistant_message("request_2", "done"),
++            ev_completed("request_2"),
++        ]),
+     ];
+     let server = start_mock_server().await;
+     mount_sse_sequence(&server, response_streams).await;
+@@ -238,7 +245,10 @@ async fn shutdown_flushes_completed_turn_and_file_diff() -> anyhow::Result<()> {
+                 ),
+                 ev_completed("request_0"),
+             ]),
+-            sse(vec![ev_completed("request_1")]),
++            sse(vec![
++                ev_assistant_message("request_1", "done"),
++                ev_completed("request_1"),
++            ]),
+         ],
+     )
+     .await;
+diff --git a/codex-rs/exec/tests/suite/auth_env.rs b/codex-rs/exec/tests/suite/auth_env.rs
+index 179f40fbd4..df1c074b0a 100644
+--- a/codex-rs/exec/tests/suite/auth_env.rs
++++ b/codex-rs/exec/tests/suite/auth_env.rs
+@@ -1,4 +1,5 @@
+ #![allow(clippy::unwrap_used)]
++use core_test_support::responses::ev_assistant_message;
+ use core_test_support::responses::ev_completed;
+ use core_test_support::responses::mount_sse_once_match;
+ use core_test_support::responses::sse;
+@@ -15,7 +16,10 @@ async fn exec_uses_codex_api_key_env_var() -> anyhow::Result<()> {
+     mount_sse_once_match(
+         &server,
+         header("Authorization", "Bearer dummy"),
+-        sse(vec![ev_completed("request_0")]),
++        sse(vec![
++            ev_assistant_message("request_0", "done"),
++            ev_completed("request_0"),
++        ]),
+     )
+     .await;
  
 diff --git a/codex-rs/history/src/lib.rs b/codex-rs/history/src/lib.rs
 index 6e15c01bc8..adab8d3799 100644

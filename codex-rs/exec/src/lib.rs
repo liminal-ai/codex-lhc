@@ -951,6 +951,8 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     });
 
+    let mut answer_evidence =
+        DirectTurnAnswerEvidence::new(expects_agent_message(&initial_operation));
     let task_id = match initial_operation {
         InitialOperation::ForkOnly => {
             request_shutdown(&client, &mut request_ids, &primary_thread_id_for_span)
@@ -1073,30 +1075,15 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             }
             InProcessServerEvent::ServerNotification(notification) => {
                 let mut notification = *notification;
-                if let ServerNotification::Error(payload) = &notification {
-                    if payload.thread_id == primary_thread_id_for_requests
-                        && payload.turn_id == task_id
-                        && !payload.will_retry
-                    {
-                        error_seen = true;
-                    }
-                } else if let ServerNotification::TurnCompleted(payload) = &notification
-                    && payload.thread_id == primary_thread_id_for_requests
-                    && payload.turn.id == task_id
-                    && matches!(
-                        payload.turn.status,
-                        codex_app_server_protocol::TurnStatus::Failed
-                            | codex_app_server_protocol::TurnStatus::Interrupted
-                    )
-                {
-                    error_seen = true;
-                }
-
-                if should_process_notification(
+                let process = should_process_notification(
                     &notification,
                     &primary_thread_id_for_requests,
                     &task_id,
-                ) {
+                );
+                if process {
+                    // Streamed evidence is scoped to this thread + turn by
+                    // `should_process_notification`.
+                    answer_evidence.observe(&notification);
                     maybe_backfill_turn_completed_items(
                         config.ephemeral,
                         &client,
@@ -1104,7 +1091,19 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                         &mut notification,
                     )
                     .await;
+                    // LIM-134: decide empty-result truth after backfill and
+                    // before the exit status and either output mode read it.
+                    answer_evidence.reclassify_empty_result(&mut notification);
+                }
+                if notification_sets_error_seen(
+                    &notification,
+                    &primary_thread_id_for_requests,
+                    &task_id,
+                ) {
+                    error_seen = true;
+                }
 
+                if process {
                     match event_processor.process_server_notification(notification) {
                         CodexStatus::Running => {}
                         CodexStatus::InitiateShutdown => {
@@ -1460,6 +1459,127 @@ fn should_process_notification(
             notification.thread_id == thread_id && notification.turn.id == turn_id
         }
         _ => false,
+    }
+}
+
+/// Whether exec dispatched substantive direct user work for this run.
+///
+/// LIM-134: only such a run promises an answer. Every substantive `UserTurn`
+/// input counts — images and other non-text inputs are work too. Review and
+/// fork-only operations, and truly blank/no-op input, are never reclassified.
+fn expects_agent_message(initial_operation: &InitialOperation) -> bool {
+    let InitialOperation::UserTurn { items, .. } = initial_operation else {
+        return false;
+    };
+    items.iter().any(|item| match item {
+        UserInput::Text { text, .. } => !text.trim().is_empty(),
+        // Any non-text input (image, mention, …) is substantive work.
+        _ => true,
+    })
+}
+
+/// Whether a thread item is nonblank answer evidence for a completed turn.
+///
+/// Matches both processors' final-message fallback: a nonblank `AgentMessage`
+/// or a nonblank `Plan` counts. Empty or whitespace-only text does not.
+fn is_nonblank_agent_message(item: &AppServerThreadItem) -> bool {
+    match item {
+        AppServerThreadItem::AgentMessage { text, .. } | AppServerThreadItem::Plan { text, .. } => {
+            !text.trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// Decision boundary for `std::process::exit(1)` after the event loop.
+///
+/// A non-retryable error notification, or a Failed/Interrupted turn
+/// completion, for this thread and turn. Callers still own the actual exit.
+fn notification_sets_error_seen(
+    notification: &ServerNotification,
+    thread_id: &str,
+    turn_id: &str,
+) -> bool {
+    match notification {
+        ServerNotification::Error(payload) => {
+            payload.thread_id == thread_id && payload.turn_id == turn_id && !payload.will_retry
+        }
+        ServerNotification::TurnCompleted(payload) => {
+            payload.thread_id == thread_id
+                && payload.turn.id == turn_id
+                && matches!(
+                    payload.turn.status,
+                    codex_app_server_protocol::TurnStatus::Failed
+                        | codex_app_server_protocol::TurnStatus::Interrupted
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Records whether the current Turn has produced a nonblank agent message,
+/// from either streamed item notifications or completion items (LIM-134).
+///
+/// Streamed evidence matters because in-process completion can arrive with
+/// empty `turn.items` and no backfill (ephemeral threads). Only the current
+/// Turn counts — a stale prior-Turn message never satisfies this.
+#[derive(Default)]
+struct DirectTurnAnswerEvidence {
+    expected: bool,
+    streamed: bool,
+}
+
+impl DirectTurnAnswerEvidence {
+    fn new(expected: bool) -> Self {
+        Self {
+            expected,
+            streamed: false,
+        }
+    }
+
+    /// Observe a notification scoped to the current thread and Turn.
+    fn observe(&mut self, notification: &ServerNotification) {
+        if let ServerNotification::ItemCompleted(payload) = notification
+            && is_nonblank_agent_message(&payload.item)
+        {
+            self.streamed = true;
+        }
+    }
+
+    /// LIM-134: one local semantic check shared by the human and JSONL
+    /// dispatch.
+    ///
+    /// After [`maybe_backfill_turn_completed_items`] has had its chance to
+    /// recover dropped nonterminal notifications, a *completed* turn that
+    /// answered a substantive direct prompt must have produced a nonblank
+    /// current-Turn agent message — streamed or in the completion items. When
+    /// it did not, the turn is reclassified as failed before either output mode
+    /// sees it, so neither can report a successful empty result.
+    fn reclassify_empty_result(&self, notification: &mut ServerNotification) {
+        if !self.expected {
+            return;
+        }
+        let ServerNotification::TurnCompleted(payload) = notification else {
+            return;
+        };
+        if payload.turn.status != codex_app_server_protocol::TurnStatus::Completed {
+            return;
+        }
+        if self.streamed || payload.turn.items.iter().any(is_nonblank_agent_message) {
+            return;
+        }
+        warn!(
+            turn_id = %payload.turn.id,
+            "turn completed without an agent message for a substantive prompt; reporting failure"
+        );
+        payload.turn.status = codex_app_server_protocol::TurnStatus::Failed;
+        payload.turn.items.clear();
+        payload.turn.items_view = codex_app_server_protocol::TurnItemsView::NotLoaded;
+        payload.turn.error = Some(codex_app_server_protocol::TurnError {
+            message: "Turn completed without producing an agent message.".to_string(),
+            codex_error_info: None,
+            additional_details: None,
+        });
     }
 }
 

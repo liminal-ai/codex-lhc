@@ -477,6 +477,57 @@ fn turn_failed_clears_stale_final_message() {
     assert!(!processor.emit_final_message_on_shutdown);
 }
 
+/// Reclassified empty-result shape: Failed + error. Suppresses any stale
+/// final message and takes the error-reporting Failed arm.
+#[test]
+fn reclassified_failed_turn_suppresses_final_message_and_reports_error() {
+    let mut processor = EventProcessorWithHumanOutput {
+        bold: Style::new(),
+        cyan: Style::new(),
+        dimmed: Style::new(),
+        green: Style::new(),
+        italic: Style::new(),
+        magenta: Style::new(),
+        red: Style::new(),
+        yellow: Style::new(),
+        show_agent_reasoning: true,
+        show_raw_agent_reasoning: false,
+        last_message_path: None,
+        final_message: Some("stale answer".to_string()),
+        final_message_rendered: true,
+        emit_final_message_on_shutdown: true,
+        last_total_token_usage: None,
+    };
+
+    let status = processor.process_server_notification(ServerNotification::TurnCompleted(
+        codex_app_server_protocol::TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: TurnStatus::Failed,
+                error: Some(codex_app_server_protocol::TurnError {
+                    message: "Turn completed without producing an agent message.".to_string(),
+                    additional_details: None,
+                    codex_error_info: None,
+                }),
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
+            },
+        },
+    ));
+
+    assert_eq!(
+        status,
+        crate::event_processor::CodexStatus::InitiateShutdown
+    );
+    assert_eq!(processor.final_message, None);
+    assert!(!processor.final_message_rendered);
+    assert!(!processor.emit_final_message_on_shutdown);
+}
+
 #[test]
 fn turn_interrupted_clears_stale_final_message() {
     let mut processor = EventProcessorWithHumanOutput {

@@ -89,6 +89,7 @@ mod injected_models_cache;
 mod interrupt_hooks;
 mod items;
 mod json_result;
+mod lhc_preturn_readiness;
 mod live_cli;
 mod mcp_auth_elicitation;
 mod mcp_auth_refresh;

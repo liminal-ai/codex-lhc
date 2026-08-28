@@ -88,8 +88,6 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
-use codex_protocol::protocol::CodexErrorInfo;
-use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::PlanDeltaEvent;
@@ -125,7 +123,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::error;
 use tracing::field;
-use tracing::info;
 use tracing::instrument;
 use tracing::trace;
 use tracing::trace_span;
@@ -163,6 +160,10 @@ pub(crate) async fn run_turn(
     // new user message are recorded. Estimate pending incoming items (context
     // diffs/full reinjection + user input) and trigger compaction preemptively
     // when they would push the thread over the compaction threshold.
+    // LIM-134: once Codex has accepted this Turn input, the native rollout must
+    // contain it exactly once on every exit before the first provider request.
+    // `input_recorded` is the per-run ownership guard for that.
+    let mut input_recorded = false;
     if let Err(err) = run_pre_sampling_compact(
         &sess,
         &turn_context,
@@ -171,19 +172,20 @@ pub(crate) async fn run_turn(
     )
     .await
     {
-        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-            run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                .await;
-            return Err(err);
+        record_turn_input_once(
+            &sess,
+            &turn_context,
+            &input,
+            &mut input_recorded,
+            PersistContext::Standard,
+        )
+        .await;
+        if !matches!(err.details(), CodexErrorDetails::TurnAborted) {
+            error!("Failed to run pre-sampling compact");
         }
-        if matches!(err.details(), CodexErrorDetails::ToolCollision(_)) {
-            return Err(err);
-        }
-        let error = err.to_codex_protocol_error();
-        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-            .await;
-        error!("Failed to run pre-sampling compact");
-        return Ok(None);
+        // LIM-134: hard failures are returned, not laundered into `Ok(None)`.
+        // The task finalizer owns the single terminal lifecycle contributor.
+        return Err(err);
     }
 
     let user_input = turn_user_input(&input);
@@ -194,8 +196,14 @@ pub(crate) async fn run_turn(
         {
             Ok(requirements) => requirements,
             Err(err) => {
-                run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                    .await;
+                record_turn_input_once(
+                    &sess,
+                    &turn_context,
+                    &input,
+                    &mut input_recorded,
+                    PersistContext::Standard,
+                )
+                .await;
                 return Err(err.into());
             }
         };
@@ -210,12 +218,17 @@ pub(crate) async fn run_turn(
         .await
     {
         Ok(step_context) => step_context,
-        Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
-            run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::Standard)
-                .await;
+        Err(err) => {
+            record_turn_input_once(
+                &sess,
+                &turn_context,
+                &input,
+                &mut input_recorded,
+                PersistContext::Standard,
+            )
+            .await;
             return Err(err);
         }
-        Err(err) => return Err(err),
     };
     // Keep the exact model-visible state used by this turn and its inline compactions.
     let (world_state, display_roots) = tokio::join!(
@@ -242,7 +255,20 @@ pub(crate) async fn run_turn(
             }
         },
     );
-    let mut world_state = world_state?;
+    let mut world_state = match world_state {
+        Ok(world_state) => world_state,
+        Err(err) => {
+            record_turn_input_once(
+                &sess,
+                &turn_context,
+                &input,
+                &mut input_recorded,
+                PersistContext::Standard,
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
         &sess,
@@ -253,14 +279,41 @@ pub(crate) async fn run_turn(
     )
     .await
     else {
-        return Ok(None);
+        // `build_skills_and_plugins` only yields `None` when a turn-input
+        // contributor was cancelled, so this is an abort — not a quiet
+        // successful stop (LIM-134).
+        record_turn_input_once(
+            &sess,
+            &turn_context,
+            &input,
+            &mut input_recorded,
+            PersistContext::Standard,
+        )
+        .await;
+        return Err(CodexErr::TurnAborted);
     };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
+        record_turn_input_once(
+            &sess,
+            &turn_context,
+            &input,
+            &mut input_recorded,
+            PersistContext::Standard,
+        )
+        .await;
         return Ok(None);
     }
     let mut can_drain_pending_input = input.is_empty();
-    if run_hooks_and_record_inputs(&sess, &turn_context, &input, PersistContext::TurnStart).await {
+    if record_turn_input_once(
+        &sess,
+        &turn_context,
+        &input,
+        &mut input_recorded,
+        PersistContext::TurnStart,
+    )
+    .await
+    {
         return Ok(None);
     }
 
@@ -512,13 +565,9 @@ pub(crate) async fn run_turn(
                     )
                     .await
                     {
-                        if matches!(err.details(), CodexErrorDetails::TurnAborted) {
-                            return Err(err);
-                        }
-                        let error = err.to_codex_protocol_error();
-                        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                            .await;
-                        return Ok(None);
+                        // LIM-134: hard MidTurn compact failure is a failure.
+                        // The task finalizer owns the terminal lifecycle.
+                        return Err(err);
                     }
                     if run_pending_session_start_hooks(&sess, &turn_context).await {
                         return Ok(None);
@@ -590,38 +639,10 @@ pub(crate) async fn run_turn(
                 }
                 continue;
             }
-            Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
-                return Err(err);
-            }
-            Err(codex_error)
-                if matches!(
-                    codex_error.details(),
-                    CodexErrorDetails::InvalidImageRequest()
-                ) =>
-            {
-                sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
-                let error = CodexErrorInfo::BadRequest;
-                sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                    .await;
-                let event = EventMsg::Error(ErrorEvent {
-                    message: "Invalid image in your last message. Please remove it and try again."
-                        .to_string(),
-                    codex_error_info: Some(error),
-                });
-                sess.send_event(&turn_context, event).await;
-                break;
-            }
-            Err(e) => {
-                info!("Turn error: {e:#}");
-                let error = e.to_codex_protocol_error();
-                sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                    .await;
-                sess.track_turn_codex_error(turn_context.as_ref(), &e);
-                let event = EventMsg::Error(e.to_error_event(/*message_prefix*/ None));
-                sess.send_event(&turn_context, event).await;
-                // let the user continue the conversation
-                break;
-            }
+            // LIM-134: sampling failures return Err so the task finalizer is
+            // the sole terminal contributor (`TurnTerminal::Error` emits one
+            // Error event + TurnComplete). In-loop emit+Ok would also fire stop.
+            Err(err) => return Err(err),
         }
     }
 
@@ -680,6 +701,27 @@ pub(crate) async fn run_hooks_and_record_inputs(
         }
     }
     blocked_input && !accepted_user_input
+}
+
+/// LIM-134: run the accepted-input hook/record path at most once per
+/// `run_turn`, whichever exit reaches it first.
+///
+/// This is the native `run_hooks_and_record_inputs` path — no LHC per-prompt
+/// commit protocol, no durable acknowledgment, no second prompt record. Hook
+/// semantics are untouched: input a hook rejects before acceptance is still not
+/// recorded as accepted work.
+async fn record_turn_input_once(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+    recorded: &mut bool,
+    persist_context: PersistContext,
+) -> bool {
+    if *recorded {
+        return false;
+    }
+    *recorded = true;
+    run_hooks_and_record_inputs(sess, turn_context, input, persist_context).await
 }
 
 fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {

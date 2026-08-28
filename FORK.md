@@ -139,16 +139,16 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 3 | `features/src/lib.rs` | `Feature::LhcCapture` (product default ON) | `0003-feature-flag` |
 | 4 | `core/src/session/mod.rs` | provenance-carrying record path + `send_raw_response_items` fan-out + e2e module | `0004-session-raw-item-hook` |
 | 4a | `ext/extension-api/src/contributors/turn_lifecycle.rs` | turn start/stop/abort inputs carry optional host `started_at`/`completed_at` (schema v5 timing) | (with 0002) |
-| 4b | `core/src/tasks/lifecycle.rs` + `tasks/mod.rs` | pass host turn timestamps into turn lifecycle emitters; abort path returns timing from `handle_task_abort` | (with 0007) |
+| 4b | `core/src/tasks/lifecycle.rs` + `tasks/mod.rs` | pass host turn timestamps into turn lifecycle emitters; abort path returns timing from `handle_task_abort`; LIM-134 centralizes terminal contributor selection so exactly one of stop, abort, or error fires | (with 0007) |
 | 5 | `app-server/Cargo.toml` | `codex-lhc-host` dependency | `0005-app-server-dep` |
 | 6 | `app-server/src/extensions.rs` | `codex_lhc_host::install(...)` (cwd + host seam) | `0006-app-server-install` |
 | 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0007` |
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
-| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + turn-parts MidTurn arm (Story 5: certified `mid_turn_compact` at the settled seam, exact active-turn identity, typed-only `ForcedBoundaryThread` route to the LIM-63B compact-continuation runtime; one-writer, no native fall-open) | `0007-lhc-compact-arm` |
+| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + turn-parts MidTurn arm (Story 5: certified `mid_turn_compact` at the settled seam, exact active-turn identity, typed-only `ForcedBoundaryThread` route to the LIM-63B compact-continuation runtime; one-writer, no native fall-open); LIM-134 required PreTurn/Standalone compact awaits capture Ready/Failed/Stopped (bounded, cancellable) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
-| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch) | (with 0007) |
+| 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch); LIM-134 compact over prior native history before recording the new prompt and records accepted input exactly once | (with 0007) |
 | 13b | `core/src/session/turn.rs` | turn parts F2: begin the provider request/response cycle before each outer sampling request so raw-item capture stamps `stepIndex` on assistant_text/assistant_thinking/tool_call/tool_result | (with 0007) |
 | 13a | `core/src/session/input_queue.rs` | monotonic pending-input epoch for MidTurn input-epoch gate (steer/mailbox enqueue) | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated); `derivation_prompt` pins `base_instructions` empty — never `..Default::default()` (P1) | (with 0007) |
@@ -174,6 +174,11 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |
 | 35 | `history/src/lib.rs`, `rollout/src/lib.rs`, `state/{src/migrations.rs,src/migrations_tests.rs,src/sqlite.rs,thread_history_migrations/0007_rollout_generation_id.sql}`, `thread-store/{Cargo.toml,src/local/mod.rs,src/local/rollout_migration.rs,src/local/rollout_migration_tests.rs,src/local/thread_history.rs,src/local/thread_history_generation.rs,src/local/thread_history_materialization.rs,src/local/thread_history_materialization_tests.rs}`, `lhc/codex-lhc-host/{Cargo.toml,src/rollout_swap.rs,src/rollout_swap_tests.rs}` | Paginated projection self-heals after an LHC rollout generation swap using a persisted durable generation identity, including equal-boundary replacements and lifted subagent ordinals; the fork migration is version 7 (it shipped as 5 before upstream 0.150 added its own 5/6) and a legacy version-5 row is relabelled at open by `repair_legacy_rollout_generation_migration_version` | `0007-lhc-compact-arm` |
 | 36 | `app-server-daemon/{README.md,src/lib.rs,src/managed_install.rs,src/managed_install_tests.rs,src/update_loop.rs,src/update_loop_tests.rs}` | managed CLI/app-server version parsing and same-version restart coherence use the workspace version; isolated remote-control homes seed fork bytes and never download stock Codex | `0001-workspace-member` |
+| 37 | `core/src/compact_lhc_readiness_tests.rs` | LIM-134 required-compact readiness unit proofs (virtual-time wait, cancellation, Failed/Stopped/bound expiry); no sentinel | `0007-lhc-compact-arm` |
+| 38 | `core/tests/suite/lhc_preturn_readiness.rs` | LIM-134 production-path PreTurn proofs (natural 350K resumed ready, pre/post-dispatch failure, no-tool one-request success); no sentinel | `0007-lhc-compact-arm` |
+| 39 | `exec/src/lib.rs` | LIM-134 empty-result truth: a completed nonblank prompt with no nonblank AgentMessage or Plan fails in human and JSONL paths; no sentinel | `0007-lhc-compact-arm` |
+| 40 | `exec/src/{lib_tests.rs,event_processor_with_human_output_tests.rs}` | LIM-134 exec human/JSONL/backfill empty-result proofs (processor-level and reclassify units); no sentinel | `0007-lhc-compact-arm` |
+| 41 | `exec/tests/suite/{apply_patch.rs,auth_env.rs}` | LIM-134 F6: fixtures gain a minimal assistant message so completed turns satisfy empty-result truth; no sentinel | `0007-lhc-compact-arm` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
@@ -182,7 +187,10 @@ policy and is covered by 0001. Row 32 records the upstream-aligned runtime
 version policy; its regression test is covered by 0001 while the CLI manifest
 itself no longer carries a fork delta. Fork-owned and not sentinel-bearing is a
 legitimate combination; fork-owned and *not in any patch* is not. Row 26 is the
-same pattern (impl details under a sentinel-bearing LiveThread API).
+same pattern (impl details under a sentinel-bearing LiveThread API). Rows 37-40
+are the LIM-134 non-sentinel set (readiness/preturn proofs and exec empty-result
+truth), row 41 its fixture repairs; LIM-134 added no `LHC-HOOK` marker. Host capture-lifecycle sources stay
+under `codex-rs/lhc/` and are outside the patch series.
 
 Expected markers: **53** (`EXPECTED_HOOKS` in the tripwire script).
 Was 52 before turn parts Story 5 (+1 for the F2 provider-cycle begin seam in
@@ -366,6 +374,27 @@ with the merged workspace; release notes, workflow defaults, and any
 to `9085439396`; all seven patches regenerated. `Cargo.lock` regenerated
 (the auto-merge left it inconsistent). Vendored SDK pin unchanged at
 `b408f89`.
+
+### LIM-134 — PreTurn readiness, prompt preservation, lifecycle, and exec truth (2026-08-28)
+
+Landed on the LIM-142 descendant of `rust-v0.150.1`. A resumed Turn that
+requires PreTurn compact waits for capture `Ready`/`Failed`/`Stopped`
+(bounded, cancellable); native prompt is recorded exactly once; terminal
+contributor selection emits exactly one of stop, abort, or error; exec
+human/JSONL paths fail a completed nonblank prompt with no nonblank
+`AgentMessage`. Patch `0007` was regenerated at `BASE` `9085439396` to cover
+four newly fork-owned non-host files (`core/src/compact_lhc_readiness_tests.rs`,
+`core/tests/suite/lhc_preturn_readiness.rs`, `exec/src/lib.rs`,
+`exec/src/lib_tests.rs`, `exec/src/event_processor_with_human_output_tests.rs`). Host
+capture-lifecycle sources remain under
+`codex-rs/lhc/` (not patched). No new `LHC-HOOK` sentinel; `EXPECTED_HOOKS`
+stays 53. Patches 0001–0006 are byte-identical to the LIM-132 series.
+
+Known delta (accepted 2026-08-28): post-dispatch sampling errors now return
+`Err` so the task finalizer is the sole terminal contributor; the
+`InvalidImageRequest` arm's custom "Invalid image in your last message..."
+message + `BadRequest` info is replaced by the generic finalizer error event.
+Restoring the custom message is future cosmetic scope, not LIM-134 rework.
 
 ### Drill run 2026-08-25 — exact stable `rust-v0.149.1` (turn parts, Story 5)
 

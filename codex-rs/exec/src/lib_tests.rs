@@ -861,3 +861,305 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         multi_agent_mode: Default::default(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// LIM-134: exec direct-prompt empty-result truth
+// ---------------------------------------------------------------------------
+
+fn completed_turn(items: Vec<AppServerThreadItem>) -> ServerNotification {
+    ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
+        thread_id: "thread-1".to_string(),
+        turn: codex_app_server_protocol::Turn {
+            id: "turn-1".to_string(),
+            items_view: codex_app_server_protocol::TurnItemsView::Full,
+            items,
+            status: codex_app_server_protocol::TurnStatus::Completed,
+            error: None,
+            started_at: None,
+            completed_at: Some(0),
+            duration_ms: None,
+        },
+    })
+}
+
+fn agent_message(id: &str, text: &str) -> AppServerThreadItem {
+    AppServerThreadItem::AgentMessage {
+        id: id.to_string(),
+        text: text.to_string(),
+        phase: None,
+        memory_citation: None,
+        delivery: None,
+    }
+}
+
+fn streamed_agent_message(turn_id: &str, text: &str) -> ServerNotification {
+    ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+        item: agent_message("msg-streamed", text),
+        thread_id: "thread-1".to_string(),
+        turn_id: turn_id.to_string(),
+        completed_at_ms: 0,
+    })
+}
+
+fn turn_status(notification: &ServerNotification) -> codex_app_server_protocol::TurnStatus {
+    let ServerNotification::TurnCompleted(payload) = notification else {
+        panic!("expected a turn completion");
+    };
+    payload.turn.status.clone()
+}
+
+fn user_turn(items: Vec<UserInput>) -> InitialOperation {
+    InitialOperation::UserTurn {
+        items,
+        output_schema: None,
+    }
+}
+
+fn text(text: &str) -> UserInput {
+    UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }
+}
+
+/// Every substantive direct input promises an answer, including non-text
+/// inputs. Blank text and non-`UserTurn` operations do not.
+#[test]
+fn expects_agent_message_covers_substantive_direct_input_only() {
+    assert!(expects_agent_message(&user_turn(vec![text(
+        "do the thing"
+    )])));
+    assert!(
+        expects_agent_message(&user_turn(vec![
+            UserInput::LocalImage {
+                path: std::path::PathBuf::from("/tmp/shot.png"),
+                detail: None,
+            },
+            text("   "),
+        ])),
+        "an image with a blank caption is still work"
+    );
+    assert!(!expects_agent_message(&user_turn(vec![text("   \n\t ")])));
+    assert!(!expects_agent_message(&user_turn(Vec::new())));
+    assert!(!expects_agent_message(&InitialOperation::ForkOnly));
+}
+
+/// Absent, blank, and whitespace-only completions are not successful results
+/// for a substantive direct prompt.
+#[test]
+fn completed_turn_without_an_agent_message_is_reclassified_as_failed() {
+    let cases: Vec<(&str, Vec<AppServerThreadItem>)> = vec![
+        ("absent", Vec::new()),
+        ("empty", vec![agent_message("msg-1", "")]),
+        ("whitespace", vec![agent_message("msg-1", "  \n\t ")]),
+    ];
+    for (label, items) in cases {
+        let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+        let mut notification = completed_turn(items);
+        evidence.reclassify_empty_result(&mut notification);
+        assert_eq!(
+            turn_status(&notification),
+            codex_app_server_protocol::TurnStatus::Failed,
+            "{label} must not report a successful empty result"
+        );
+        let ServerNotification::TurnCompleted(payload) = &notification else {
+            unreachable!()
+        };
+        assert!(
+            payload.turn.error.is_some(),
+            "{label} must carry a failure diagnostic"
+        );
+        assert!(
+            payload.turn.items.is_empty(),
+            "{label} must not carry a fabricated answer"
+        );
+    }
+}
+
+/// A completed turn whose only substantive output is a nonblank Plan is
+/// answer evidence (LIM-134 F5) — matching both processors' Plan fallback.
+#[test]
+fn completed_turn_with_a_nonblank_plan_is_not_reclassified_as_failed() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    let mut notification = completed_turn(vec![AppServerThreadItem::Plan {
+        id: "plan-1".to_string(),
+        text: "a nonblank plan counts as answer evidence".to_string(),
+    }]);
+    evidence.reclassify_empty_result(&mut notification);
+    assert_eq!(
+        turn_status(&notification),
+        codex_app_server_protocol::TurnStatus::Completed,
+        "plan only must not be reclassified as failed"
+    );
+}
+
+/// A backfilled nonblank current-Turn agent message remains a success.
+#[test]
+fn backfilled_agent_message_remains_a_successful_result() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    let mut notification = completed_turn(vec![agent_message("msg-1", "the answer")]);
+    evidence.reclassify_empty_result(&mut notification);
+    assert_eq!(
+        turn_status(&notification),
+        codex_app_server_protocol::TurnStatus::Completed
+    );
+}
+
+/// A valid answer that streamed while completion items stayed empty (the
+/// ephemeral / no-backfill shape) is still a success.
+#[test]
+fn streamed_agent_message_remains_a_successful_result_without_backfill() {
+    let mut evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    evidence.observe(&streamed_agent_message("turn-1", "the answer"));
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+    assert_eq!(
+        turn_status(&notification),
+        codex_app_server_protocol::TurnStatus::Completed,
+        "streamed evidence must not be discarded when completion items are empty"
+    );
+}
+
+/// A blank streamed message is not evidence of an answer.
+#[test]
+fn blank_streamed_agent_message_is_not_evidence() {
+    let mut evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    evidence.observe(&streamed_agent_message("turn-1", "   "));
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+    assert_eq!(
+        turn_status(&notification),
+        codex_app_server_protocol::TurnStatus::Failed
+    );
+}
+
+/// Operations that never promised an answer — Review, fork-only, blank input —
+/// are never reclassified.
+#[test]
+fn operations_without_a_substantive_prompt_are_never_reclassified() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ false);
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+    assert_eq!(
+        turn_status(&notification),
+        codex_app_server_protocol::TurnStatus::Completed
+    );
+}
+
+/// Already-failed and interrupted completions keep their own status.
+#[test]
+fn non_completed_turn_status_is_left_alone() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    for status in [
+        codex_app_server_protocol::TurnStatus::Failed,
+        codex_app_server_protocol::TurnStatus::Interrupted,
+        codex_app_server_protocol::TurnStatus::InProgress,
+    ] {
+        let mut notification = completed_turn(Vec::new());
+        if let ServerNotification::TurnCompleted(payload) = &mut notification {
+            payload.turn.status = status.clone();
+        }
+        evidence.reclassify_empty_result(&mut notification);
+        assert_eq!(turn_status(&notification), status);
+    }
+}
+
+/// LIM-134 F4: reclassified empty completion is consumed by the JSONL
+/// processor as `turn.failed`, never `turn.completed`.
+#[test]
+fn reclassified_empty_result_jsonl_emits_turn_failed() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+    let collected = processor.collect_thread_events(notification);
+    assert_eq!(collected.status, CodexStatus::InitiateShutdown);
+    assert!(
+        collected
+            .events
+            .iter()
+            .any(|event| matches!(event, ThreadEvent::TurnFailed(_))),
+        "JSONL must emit TurnFailed: {:?}",
+        collected.events
+    );
+    assert!(
+        collected
+            .events
+            .iter()
+            .all(|event| !matches!(event, ThreadEvent::TurnCompleted(_))),
+        "JSONL must not emit TurnCompleted for a reclassified empty result: {:?}",
+        collected.events
+    );
+    let failed = collected
+        .events
+        .iter()
+        .find(|event| matches!(event, ThreadEvent::TurnFailed(_)))
+        .expect("TurnFailed present");
+    let json = serde_json::to_value(failed).expect("serialize thread event");
+    assert_eq!(json["type"], "turn.failed");
+}
+
+/// LIM-134 F4: the human processor suppresses the last-message file and
+/// takes the Failed arm (which reports the error) rather than completing.
+#[tokio::test]
+async fn reclassified_empty_result_human_suppresses_final_message() {
+    let codex_home = tempdir().expect("create temp codex home");
+    let cwd = tempdir().expect("create temp cwd");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(cwd.path().to_path_buf()))
+        .build()
+        .await
+        .expect("build config");
+    let output_dir = tempdir().expect("create temp output dir");
+    let last_message_path = output_dir.path().join("last-message.txt");
+    std::fs::write(&last_message_path, "keep existing contents").expect("seed last message");
+
+    let mut processor = EventProcessorWithHumanOutput::create_with_ansi(
+        /*with_ansi*/ false,
+        &config,
+        Some(last_message_path.clone()),
+    );
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+
+    let status = crate::event_processor::EventProcessor::process_server_notification(
+        &mut processor,
+        notification,
+    );
+    assert_eq!(status, CodexStatus::InitiateShutdown);
+    crate::event_processor::EventProcessor::print_final_output(&mut processor);
+    assert_eq!(
+        std::fs::read_to_string(&last_message_path).expect("read last message"),
+        "keep existing contents",
+        "Failed completion must not write a fabricated/stale final message"
+    );
+}
+
+/// LIM-134 F4(c): the error_seen decision that leads to `std::process::exit(1)`.
+///
+/// Limitation: the `exit(1)` call itself is not executed here — it lives in
+/// the process event loop and would terminate the test process. This asserts
+/// the production decision boundary used immediately before that exit.
+#[test]
+fn reclassified_empty_result_sets_the_nonzero_exit_decision() {
+    let evidence = DirectTurnAnswerEvidence::new(/*expected*/ true);
+    let mut notification = completed_turn(Vec::new());
+    evidence.reclassify_empty_result(&mut notification);
+    assert!(
+        notification_sets_error_seen(&notification, "thread-1", "turn-1"),
+        "a reclassified Failed turn must set error_seen for this thread/turn"
+    );
+    assert!(
+        !notification_sets_error_seen(&notification, "other-thread", "turn-1"),
+        "error_seen is scoped to the primary thread"
+    );
+
+    let success = completed_turn(vec![agent_message("msg-1", "the answer")]);
+    assert!(
+        !notification_sets_error_seen(&success, "thread-1", "turn-1"),
+        "a successful completion must not set error_seen"
+    );
+}

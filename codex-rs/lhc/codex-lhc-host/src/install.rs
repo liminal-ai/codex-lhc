@@ -137,6 +137,54 @@ enum PendingCmd {
 /// write-backs (H3). Current-body ids/digests are **never** capped (L3).
 pub const SESSION_DERIVED_CAP: usize = 512;
 
+/// The capture slot's whole lifecycle, in one watchable value (LIM-134).
+///
+/// Every transition that can end a readiness wait is published through the
+/// slot's `watch` channel, so waiters cannot miss one. `Opening` is the only
+/// non-terminal state; `Failed` and `Stopped` are terminal and suppress any
+/// later `Ready` publication from the dedicated open thread.
+///
+/// There is deliberately no persistence here: this is process-local runtime
+/// state, not a durable readiness record.
+#[derive(Clone)]
+pub enum CaptureState {
+    /// No handle published yet — the asynchronous open is in flight (or has
+    /// not been scheduled).
+    Opening,
+    /// The background open published a live handle.
+    Ready(CaptureHandle),
+    /// The background open failed permanently. The reason is stable and
+    /// visible to compact / retrieval callers.
+    Failed(String),
+    /// Thread stop ran, or the shutdown bound expired while still `Opening`.
+    Stopped,
+}
+
+impl CaptureState {
+    /// Whether the slot has left `Opening` (a readiness wait may end).
+    fn is_settled(&self) -> bool {
+        !matches!(self, Self::Opening)
+    }
+}
+
+impl std::fmt::Debug for CaptureState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opening => f.write_str("Opening"),
+            // CaptureHandle is not Debug; the thread id is the useful fact.
+            Self::Ready(handle) => write!(f, "Ready({})", handle.thread_id()),
+            Self::Failed(reason) => write!(f, "Failed({reason})"),
+            Self::Stopped => f.write_str("Stopped"),
+        }
+    }
+}
+
+/// Stable visible reasons published with [`CaptureState::Failed`].
+pub const CAPTURE_OPEN_RUNTIME_UNAVAILABLE: &str = "capture open runtime unavailable";
+pub const CAPTURE_OPEN_FAILED: &str = "capture open failed";
+pub const CAPTURE_OPEN_THREAD_UNAVAILABLE: &str = "capture open thread unavailable";
+pub const CAPTURE_OPEN_ABANDONED: &str = "capture open abandoned before settling";
+
 /// Why resolving a live retrieval thread from the capture slot failed.
 ///
 /// Validation failures never reach this path — they refuse before any SDK
@@ -171,14 +219,16 @@ pub struct LiveRetrievalThread {
 /// Per-thread capture slot: handle is filled asynchronously after start.
 /// Items arriving before open are buffered and flushed when the handle lands.
 pub struct LhcCaptureSlot {
-    handle: Mutex<Option<CaptureHandle>>,
+    /// The one coherent, watchable lifecycle (LIM-134). Replaces the former
+    /// `handle` / `opening` / `open_failed` / `stopped` spread, which allowed
+    /// a required compact to observe "no handle" and allowed a late `Ready`
+    /// publication after stop.
+    state: tokio::sync::watch::Sender<CaptureState>,
     pending: Mutex<VecDeque<PendingCmd>>,
     pending_overflow: AtomicBool,
     pending_dropped: AtomicU64,
-    opening: AtomicBool,
-    open_failed: AtomicBool,
-    /// Set when `on_thread_stop` begins — retrieval must refuse after this.
-    stopped: AtomicBool,
+    /// One-shot guard so `schedule_open` spawns at most one open thread.
+    open_scheduled: AtomicBool,
     /// Pinned provenance for the **current** installed body (+ durable reseed).
     /// Never subject to [`SESSION_DERIVED_CAP`] eviction (L3).
     pinned_ids: Mutex<HashSet<String>>,
@@ -227,13 +277,11 @@ impl LhcCaptureSlot {
     /// `on_thread_start`.
     pub(crate) fn new() -> Self {
         Self {
-            handle: Mutex::new(None),
+            state: tokio::sync::watch::Sender::new(CaptureState::Opening),
             pending: Mutex::new(VecDeque::new()),
             pending_overflow: AtomicBool::new(false),
             pending_dropped: AtomicU64::new(0),
-            opening: AtomicBool::new(false),
-            open_failed: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
+            open_scheduled: AtomicBool::new(false),
             pinned_ids: Mutex::new(HashSet::new()),
             pinned_digests: Mutex::new(HashSet::new()),
             superseded_ids: Mutex::new(HashSet::new()),
@@ -400,9 +448,152 @@ impl LhcCaptureSlot {
             .load(Ordering::SeqCst)
     }
 
-    /// Mark the slot stopped (thread stop). Retrieval tools refuse after this.
-    pub(crate) fn mark_stopped(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
+    /// Current lifecycle state (LIM-134).
+    pub fn state(&self) -> CaptureState {
+        self.state.borrow().clone()
+    }
+
+    /// Publish `Ready` — **only** from `Opening`. Returns false when the slot
+    /// already left `Opening` (stop won the race), in which case the caller
+    /// must neither replay nor use the handle.
+    fn publish_ready(&self, handle: CaptureHandle) -> bool {
+        let mut published = false;
+        self.state.send_if_modified(|state| {
+            if state.is_settled() {
+                return false;
+            }
+            *state = CaptureState::Ready(handle.clone());
+            published = true;
+            true
+        });
+        published
+    }
+
+    /// Publish `Failed(reason)` — only from `Opening`.
+    fn publish_failed(&self, reason: impl Into<String>) -> bool {
+        let reason = reason.into();
+        let mut published = false;
+        self.state.send_if_modified(|state| {
+            if state.is_settled() {
+                return false;
+            }
+            *state = CaptureState::Failed(reason.clone());
+            published = true;
+            true
+        });
+        published
+    }
+
+    /// Publish `Stopped` from any state. Idempotent; always leaves the slot
+    /// terminal so a later `Ready` publication is suppressed.
+    fn publish_stopped(&self) {
+        self.state.send_if_modified(|state| {
+            if matches!(state, CaptureState::Stopped) {
+                return false;
+            }
+            *state = CaptureState::Stopped;
+            true
+        });
+    }
+
+    /// Transition to `Stopped` and drop the pre-open buffer exactly once with
+    /// one loud warning. Taken under the pending lock so a concurrent
+    /// `set_and_flush` cannot slip a replay past the transition.
+    fn stop_and_drop_pending(&self) -> usize {
+        let dropped = {
+            let mut q = self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.publish_stopped();
+            std::mem::take(&mut *q).len()
+        };
+        if dropped > 0 {
+            error!(
+                dropped,
+                telemetry_event = "lhc.capture_open_abandoned_at_stop",
+                "LHC: capture open did not complete before thread stop; dropping buffered pre-open commands"
+            );
+        }
+        dropped
+    }
+
+    /// Wait until the slot leaves `Opening`, or `bound` expires.
+    ///
+    /// The subscribe happens here, before the first read of the value, and the
+    /// state rides a `watch` channel — so a transition published either side of
+    /// the subscribe still ends the wait.
+    pub async fn await_settled(&self, bound: std::time::Duration) -> Option<CaptureState> {
+        self.wait_settled(self.state.subscribe(), bound).await
+    }
+
+    /// Subscribe now, wait later. Tests use this to make "the waiter cannot
+    /// miss the transition" structural rather than a scheduling race.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn subscribe_lifecycle(&self) -> tokio::sync::watch::Receiver<CaptureState> {
+        self.state.subscribe()
+    }
+
+    async fn wait_settled(
+        &self,
+        mut rx: tokio::sync::watch::Receiver<CaptureState>,
+        bound: std::time::Duration,
+    ) -> Option<CaptureState> {
+        tokio::time::timeout(bound, async move {
+            loop {
+                {
+                    let state = rx.borrow_and_update().clone();
+                    if state.is_settled() {
+                        return state;
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    // Slot dropped out from under the waiter; nothing can open.
+                    return CaptureState::Stopped;
+                }
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Wait on a receiver taken earlier via [`Self::subscribe_lifecycle`].
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) async fn await_settled_on(
+        &self,
+        rx: tokio::sync::watch::Receiver<CaptureState>,
+        bound: std::time::Duration,
+    ) -> Option<CaptureState> {
+        self.wait_settled(rx, bound).await
+    }
+
+    /// Test-only: live receiver count on the existing lifecycle watch.
+    ///
+    /// Production [`Self::await_settled`] subscribes before waiting. An
+    /// increase of one after `TurnStarted` is structural proof that waiter
+    /// armed. No extra field or channel.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn readiness_waiter_count_for_test(&self) -> usize {
+        self.state.receiver_count()
+    }
+
+    /// Test-only: publish `Ready` (with the ordered pre-open replay) exactly
+    /// as the background open thread would. Returns whether it published.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn publish_ready_for_test(&self, handle: CaptureHandle) -> bool {
+        self.set_and_flush(handle)
+    }
+
+    /// Test-only: publish a permanent open failure.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn publish_failed_for_test(&self, reason: &str) -> bool {
+        self.publish_failed(reason)
+    }
+
+    /// Test-only: publish the terminal stopped state.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn publish_stopped_for_test(&self) {
+        self.publish_stopped();
     }
 
     /// Resolve the live capture thread for retrieval tools.
@@ -411,14 +602,11 @@ impl LhcCaptureSlot {
     /// published handle's thread id / root. Callers open via
     /// [`crate::session::thread_file_path`] + `ThreadRef::file_path`.
     pub fn resolve_for_retrieval(&self) -> Result<LiveRetrievalThread, RetrievalLifecycleError> {
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(RetrievalLifecycleError::Shutdown);
-        }
-        if self.open_failed.load(Ordering::SeqCst) {
-            return Err(RetrievalLifecycleError::OpenFailed);
-        }
-        let Some(handle) = self.get() else {
-            return Err(RetrievalLifecycleError::NotOpen);
+        let handle = match self.state() {
+            CaptureState::Ready(handle) => handle,
+            CaptureState::Opening => return Err(RetrievalLifecycleError::NotOpen),
+            CaptureState::Failed(_) => return Err(RetrievalLifecycleError::OpenFailed),
+            CaptureState::Stopped => return Err(RetrievalLifecycleError::Shutdown),
         };
         let root = handle
             .root()
@@ -448,10 +636,10 @@ impl LhcCaptureSlot {
 
     /// Current capture handle, if the background open has completed.
     pub fn get(&self) -> Option<CaptureHandle> {
-        self.handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        match self.state() {
+            CaptureState::Ready(handle) => Some(handle),
+            CaptureState::Opening | CaptureState::Failed(_) | CaptureState::Stopped => None,
+        }
     }
 
     /// Record derived provenance after write-back (H1/L3). Previous current
@@ -579,8 +767,13 @@ impl LhcCaptureSlot {
     /// next pass), and the handle publishes under the SAME pending lock that
     /// `buffer_or_handle` re-checks it under — so no command can slip into a
     /// drained queue after the final pass, and no direct send can overtake a
-    /// buffered one. Lock order (pending → handle) matches `buffer_or_handle`.
-    fn set_and_flush(&self, handle: CaptureHandle) {
+    /// buffered one. Lock order (pending → state) matches `buffer_or_handle`.
+    ///
+    /// LIM-134: every pass re-reads the lifecycle under the pending lock. Once
+    /// the slot has left `Opening` (thread stop abandoned this open), neither
+    /// publication nor further replay happens and the caller learns so.
+    /// Returns whether `Ready` was published.
+    fn set_and_flush(&self, handle: CaptureHandle) -> bool {
         // Overflow latches degraded BEFORE any replay (first drain pass
         // rechecks under the lock): if commands were dropped — possibly an
         // identity update — replaying survivors could tag output with stale
@@ -592,6 +785,9 @@ impl LhcCaptureSlot {
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.state.borrow().is_settled() {
+                    return false;
+                }
                 // Recheck under the drain lock every pass: a producer can
                 // overflow DURING replay, after the entry check — the handle
                 // must never publish healthy over dropped commands.
@@ -604,17 +800,16 @@ impl LhcCaptureSlot {
                     // Final pass: publish while still holding the pending
                     // lock — concurrent buffer_or_handle callers block on
                     // this lock, then see the handle on their re-check.
-                    *self
-                        .handle
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = publishable.take();
-                    break;
+                    let Some(live) = publishable.take() else {
+                        return false;
+                    };
+                    return self.publish_ready(live);
                 }
                 std::mem::take(&mut *q)
             };
             // Present until the final (empty-queue) pass publishes it.
             let Some(live) = publishable.as_ref() else {
-                break;
+                return false;
             };
             self.replay(live, pending);
         }
@@ -670,28 +865,25 @@ impl LhcCaptureSlot {
     }
 
     /// Buffer a command if the handle is not yet ready. Returns:
-    /// - `Ok(Some(handle))` if ready
-    /// - `Ok(None)` if buffered (or open failed / overflow)
+    /// - `Some(handle)` if ready
+    /// - `None` if buffered (or terminal / overflow)
     /// - does not block
     fn buffer_or_handle(&self, cmd: PendingCmd) -> Option<CaptureHandle> {
-        if let Some(h) = self.get() {
-            return Some(h);
-        }
-        if self.open_failed.load(Ordering::Relaxed) {
-            return None;
+        match self.state() {
+            CaptureState::Ready(handle) => return Some(handle),
+            // Terminal: nothing will ever replay this buffer.
+            CaptureState::Failed(_) | CaptureState::Stopped => return None,
+            CaptureState::Opening => {}
         }
         let mut q = self
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Re-check under lock — handle may have landed.
-        if let Some(h) = self
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
-            return Some(h);
+        // Re-check under lock — the lifecycle may have moved.
+        match self.state() {
+            CaptureState::Ready(handle) => return Some(handle),
+            CaptureState::Failed(_) | CaptureState::Stopped => return None,
+            CaptureState::Opening => {}
         }
         if q.len() >= PRE_OPEN_CAP {
             self.pending_overflow.store(true, Ordering::SeqCst);
@@ -790,6 +982,8 @@ pub fn install_with_provider_label<C>(
         thinking_level_label: Arc::new(thinking_level_label),
         cwd: Arc::new(cwd),
         root_override: None,
+        hold_open: false,
+        open_thread_fault: None,
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
@@ -820,6 +1014,68 @@ pub fn install_with_root<C>(
     );
 }
 
+/// Test helper: install with a forced root but leave the capture slot in
+/// `Opening` — no background open is scheduled (LIM-134).
+///
+/// Readiness proofs drive the transition themselves via
+/// [`LhcCaptureSlot::publish_ready_for_test`] and friends, so "held open" is a
+/// barrier the test controls rather than a race against real SQLite.
+#[cfg(any(test, feature = "test-util"))]
+pub fn install_with_root_held_open<C>(
+    registry: &mut ExtensionRegistryBuilder<C>,
+    lhc_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+    root: PathBuf,
+) where
+    C: Send + Sync + 'static,
+{
+    let extension = Arc::new(LhcExtension {
+        enabled: Arc::new(lhc_enabled),
+        model_label: Arc::new(|_c| "unknown".into()),
+        provider_label: Arc::new(|_c| "openai".to_string()),
+        thinking_level_label: Arc::new(|_c| "none".into()),
+        cwd: Arc::new(|_c| None),
+        root_override: Some(root),
+        hold_open: true,
+        open_thread_fault: None,
+    });
+    registry.thread_lifecycle_contributor(extension.clone());
+    registry.turn_lifecycle_contributor(extension.clone());
+    registry.token_usage_contributor(extension.clone());
+    registry.raw_item_contributor(extension.clone());
+    registry.config_contributor(extension.clone());
+    registry.tool_contributor(extension);
+}
+
+/// Test helper: install with a forced root and a fault injected into the
+/// dedicated open thread, so the production scheduling path — not a direct
+/// `publish_failed` call — is what terminalizes the slot (LIM-134).
+#[cfg(any(test, feature = "test-util"))]
+pub fn install_with_root_and_open_fault<C>(
+    registry: &mut ExtensionRegistryBuilder<C>,
+    lhc_enabled: impl Fn(&C) -> bool + Send + Sync + 'static,
+    root: PathBuf,
+    fault: OpenThreadFault,
+) where
+    C: Send + Sync + 'static,
+{
+    let extension = Arc::new(LhcExtension {
+        enabled: Arc::new(lhc_enabled),
+        model_label: Arc::new(|_c| "unknown".into()),
+        provider_label: Arc::new(|_c| "openai".to_string()),
+        thinking_level_label: Arc::new(|_c| "none".into()),
+        cwd: Arc::new(|_c| None),
+        root_override: Some(root),
+        hold_open: false,
+        open_thread_fault: Some(fault),
+    });
+    registry.thread_lifecycle_contributor(extension.clone());
+    registry.turn_lifecycle_contributor(extension.clone());
+    registry.token_usage_contributor(extension.clone());
+    registry.raw_item_contributor(extension.clone());
+    registry.config_contributor(extension.clone());
+    registry.tool_contributor(extension);
+}
+
 /// Test helper with custom model/thinking extractors.
 #[cfg(any(test, feature = "test-util"))]
 pub fn install_with_root_and_labels<C>(
@@ -839,6 +1095,8 @@ pub fn install_with_root_and_labels<C>(
         thinking_level_label: Arc::new(thinking_level_label),
         cwd: Arc::new(cwd),
         root_override: Some(root),
+        hold_open: false,
+        open_thread_fault: None,
     });
     registry.thread_lifecycle_contributor(extension.clone());
     registry.turn_lifecycle_contributor(extension.clone());
@@ -855,6 +1113,12 @@ struct LhcExtension<C> {
     thinking_level_label: Arc<dyn Fn(&C) -> String + Send + Sync>,
     cwd: Arc<dyn Fn(&C) -> Option<String> + Send + Sync>,
     root_override: Option<PathBuf>,
+    /// Test-only (LIM-134): insert the slot but never schedule the open, so a
+    /// readiness proof owns the `Opening` → settled transition.
+    hold_open: bool,
+    /// Test-only (LIM-134): fault injected into the dedicated open thread.
+    /// Production is always `None` (the seam type is uninhabited).
+    open_thread_fault: Option<OpenThreadFaultSeam>,
 }
 
 impl<C: Sync> LhcExtension<C> {
@@ -863,54 +1127,167 @@ impl<C: Sync> LhcExtension<C> {
     }
 }
 
+/// Terminalizes the dedicated open thread (LIM-134).
+///
+/// Every exit of the open closure must leave the slot settled, or a readiness
+/// waiter parks forever. Explicit `Ready` / `Failed` disarm this guard; any
+/// other exit — an unwind, or a future early `return` that forgets to publish —
+/// drops it armed and publishes `Failed`. `publish_failed` only transitions
+/// from `Opening`, so a slot already `Stopped` (or `Ready`) is left alone.
+struct OpenCompletionGuard {
+    slot: Arc<LhcCaptureSlot>,
+    thread_id: String,
+    armed: bool,
+}
+
+impl OpenCompletionGuard {
+    fn new(slot: Arc<LhcCaptureSlot>, thread_id: String) -> Self {
+        Self {
+            slot,
+            thread_id,
+            armed: true,
+        }
+    }
+
+    /// Call only after Ready / Failed / Stopped has actually been handled.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OpenCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.slot.publish_failed(CAPTURE_OPEN_ABANDONED) {
+            error!(
+                thread_id = %self.thread_id,
+                telemetry_event = "lhc.capture_open_abandoned",
+                "LHC: capture open thread exited without settling the slot"
+            );
+        }
+    }
+}
+
+/// Test-only fault injection for the dedicated open thread (LIM-134).
+///
+/// The injection points are the OS-facing calls only; everything downstream —
+/// the spawn-error branch and [`OpenCompletionGuard`] — is production code.
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenThreadFault {
+    /// The native thread spawn fails.
+    SpawnFailed,
+    /// The open thread unwinds before settling the slot.
+    PanicBeforeSettle,
+}
+
+/// Spawn the dedicated open thread. The single seam a test can fail.
+fn spawn_open_thread(
+    name: String,
+    #[allow(unused_variables)] fault: Option<OpenThreadFaultSeam>,
+    body: impl FnOnce() + Send + 'static,
+) -> std::io::Result<()> {
+    #[cfg(any(test, feature = "test-util"))]
+    if fault == Some(OpenThreadFault::SpawnFailed) {
+        return Err(std::io::Error::other("injected open-thread spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name(name)
+        .spawn(body)
+        .map(|_| ())
+}
+
+#[cfg(any(test, feature = "test-util"))]
+type OpenThreadFaultSeam = OpenThreadFault;
+/// Production carries no fault seam; the parameter collapses to a unit value.
+#[cfg(not(any(test, feature = "test-util")))]
+type OpenThreadFaultSeam = std::convert::Infallible;
+
 /// Schedule a background open; never blocks the caller on SQLite (F17).
+///
+/// LIM-134: every exit terminalizes the slot. A failed native spawn publishes
+/// `Failed` on the caller's thread; anything that leaves the open closure
+/// without publishing is caught by [`OpenCompletionGuard`].
 fn schedule_open(
     slot: Arc<LhcCaptureSlot>,
     thread_id: String,
     cwd: Option<String>,
     root: PathBuf,
     initial_identity: Option<ModelIdentity>,
+    fault: Option<OpenThreadFaultSeam>,
 ) {
     if slot
-        .opening
+        .open_scheduled
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
         return;
     }
     let derivation = slot.derivation_callbacks.clone();
-    let _ = std::thread::Builder::new()
-        .name(format!("lhc-open-{thread_id}"))
-        .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(err) => {
-                    error!(?err, "LHC: open runtime failed");
-                    slot.open_failed.store(true, Ordering::SeqCst);
-                    return;
-                }
-            };
-            let handle = rt.block_on(spawn_capture_with_identity(
-                &thread_id,
-                cwd.as_deref(),
-                Some(root),
-                derivation,
-                initial_identity,
-            ));
-            match handle {
-                Some(h) => {
-                    slot.set_and_flush(h);
+    let slot_for_spawn = Arc::clone(&slot);
+    let thread_id_for_spawn = thread_id.clone();
+    let spawned = spawn_open_thread(format!("lhc-open-{thread_id}"), fault, move || {
+        let mut guard = OpenCompletionGuard::new(Arc::clone(&slot), thread_id.clone());
+        #[cfg(any(test, feature = "test-util"))]
+        if fault == Some(OpenThreadFault::PanicBeforeSettle) {
+            panic!("injected open-thread panic before settlement");
+        }
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(err) => {
+                error!(?err, "LHC: open runtime failed");
+                slot.publish_failed(CAPTURE_OPEN_RUNTIME_UNAVAILABLE);
+                guard.disarm();
+                return;
+            }
+        };
+        let handle = rt.block_on(spawn_capture_with_identity(
+            &thread_id,
+            cwd.as_deref(),
+            Some(root),
+            derivation,
+            initial_identity,
+        ));
+        match handle {
+            Some(h) => {
+                if slot.set_and_flush(h.clone()) {
                     debug!(thread_id = %thread_id, "LHC: capture opened (async) + pre-open buffer flushed");
-                }
-                None => {
-                    slot.open_failed.store(true, Ordering::SeqCst);
-                    error!(thread_id = %thread_id, "LHC: failed to open capture");
+                    guard.disarm();
+                } else {
+                    // LIM-134: the slot went terminal (thread stop) while
+                    // this inline SQLite open was still running. Do not
+                    // publish and do not replay; close what we opened.
+                    warn!(
+                        thread_id = %thread_id,
+                        "LHC: capture open completed after the slot was stopped; discarding handle"
+                    );
+                    // The slot is already terminal, so the guard would be a
+                    // no-op; disarm to keep "handled" explicit.
+                    guard.disarm();
+                    rt.block_on(h.shutdown_bounded(CAPTURE_SHUTDOWN_BOUND));
                 }
             }
-        });
+            None => {
+                slot.publish_failed(CAPTURE_OPEN_FAILED);
+                guard.disarm();
+                error!(thread_id = %thread_id, "LHC: failed to open capture");
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        error!(
+            thread_id = %thread_id_for_spawn,
+            ?err,
+            telemetry_event = "lhc.capture_open_thread_unavailable",
+            "LHC: failed to spawn the capture open thread"
+        );
+        slot_for_spawn.publish_failed(CAPTURE_OPEN_THREAD_UNAVAILABLE);
+    }
 }
 
 #[cfg(not(test))]
@@ -1022,8 +1399,19 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
             let model = (self.model_label)(input.config);
             let provider = (self.provider_label)(input.config);
             let identity = ModelIdentity::new(provider, model, ModelIdentity::RESPONSES_API);
+            if self.hold_open {
+                debug!(thread_id = %thread_id, "LHC: capture slot held Opening (test)");
+                return;
+            }
             // Fire-and-forget open — Session construction continues immediately.
-            schedule_open(slot, thread_id, cwd, root, Some(identity));
+            schedule_open(
+                slot,
+                thread_id,
+                cwd,
+                root,
+                Some(identity),
+                self.open_thread_fault,
+            );
         })
     }
 
@@ -1047,14 +1435,41 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
             if let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() {
-                // Refuse retrieval before the worker teardown so tools cannot
-                // race a half-shutdown channel/session.
-                slot.mark_stopped();
-                if let Some(handle) = slot.get() {
-                    shutdown_capture_send(handle).await;
-                }
+                // LIM-134: an open that is still in flight gets the existing
+                // shutdown bound to land. If it does, its ordered pre-open
+                // replay has already run (Ready publishes only after the
+                // final drain pass) and we run the normal bounded shutdown.
+                let settled = slot.await_settled(CAPTURE_SHUTDOWN_BOUND).await;
+                apply_thread_stop(&slot, settled).await;
             }
         })
+    }
+}
+
+/// Apply thread-stop to a settled (or timed-out) capture slot.
+///
+/// `None` is bound expiry: re-read the slot, because a `Ready` that landed
+/// inside the timeout window must still take the Ready path (flush already
+/// ran at publish; the handle still needs a bounded shutdown). Stomping a
+/// live Ready with `stop_and_drop_pending` would skip that shutdown.
+async fn apply_thread_stop(slot: &LhcCaptureSlot, settled: Option<CaptureState>) {
+    let state = match settled {
+        Some(state) => state,
+        None => slot.state(),
+    };
+    match state {
+        CaptureState::Ready(handle) => {
+            // Refuse retrieval before the worker teardown so tools
+            // cannot race a half-shutdown channel/session.
+            slot.publish_stopped();
+            shutdown_capture_send(handle).await;
+        }
+        CaptureState::Failed(_) | CaptureState::Stopped => {
+            slot.publish_stopped();
+        }
+        CaptureState::Opening => {
+            slot.stop_and_drop_pending();
+        }
     }
 }
 
@@ -1323,18 +1738,9 @@ pub async fn wait_for_handle(
     slot: &LhcCaptureSlot,
     timeout: std::time::Duration,
 ) -> Option<CaptureHandle> {
-    let start = std::time::Instant::now();
-    loop {
-        if let Some(h) = slot.get() {
-            return Some(h);
-        }
-        if slot.open_failed.load(Ordering::Relaxed) {
-            return None;
-        }
-        if start.elapsed() > timeout {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    match slot.await_settled(timeout).await? {
+        CaptureState::Ready(handle) => Some(handle),
+        CaptureState::Opening | CaptureState::Failed(_) | CaptureState::Stopped => None,
     }
 }
 
@@ -1620,3 +2026,7 @@ mod install_pre_open_tests;
 #[cfg(test)]
 #[path = "install_shutdown_tests.rs"]
 mod install_shutdown_tests;
+
+#[cfg(test)]
+#[path = "install_lifecycle_tests.rs"]
+mod install_lifecycle_tests;

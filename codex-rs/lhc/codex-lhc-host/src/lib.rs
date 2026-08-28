@@ -167,6 +167,11 @@ pub use idempotency::model_change_key;
 pub use idempotency::seed_occurrence_from_keys;
 pub use idempotency::thinking_level_change_key;
 pub use idempotency::turn_end_key;
+pub use install::CAPTURE_OPEN_ABANDONED;
+pub use install::CAPTURE_OPEN_FAILED;
+pub use install::CAPTURE_OPEN_RUNTIME_UNAVAILABLE;
+pub use install::CAPTURE_OPEN_THREAD_UNAVAILABLE;
+pub use install::CaptureState;
 pub use install::LhcCaptureSlot;
 pub use install::LhcStepIndex;
 pub use install::LhcTurnId;
@@ -259,9 +264,15 @@ pub use lhc::sdk::init_lhc;
 #[cfg(any(test, feature = "test-util"))]
 pub use gating::env_lock;
 #[cfg(any(test, feature = "test-util"))]
+pub use install::OpenThreadFault;
+#[cfg(any(test, feature = "test-util"))]
 pub use install::install_with_root;
 #[cfg(any(test, feature = "test-util"))]
 pub use install::install_with_root_and_labels;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::install_with_root_and_open_fault;
+#[cfg(any(test, feature = "test-util"))]
+pub use install::install_with_root_held_open;
 #[cfg(any(test, feature = "test-util"))]
 pub use install::wait_for_handle;
 

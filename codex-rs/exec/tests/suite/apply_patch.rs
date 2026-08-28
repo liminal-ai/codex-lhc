@@ -4,6 +4,7 @@ use anyhow::Context;
 use assert_cmd::prelude::*;
 use codex_apply_patch::CODEX_CORE_APPLY_PATCH_ARG1;
 use core_test_support::responses::ev_apply_patch_custom_tool_call;
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -73,7 +74,10 @@ async fn test_apply_patch_tool() -> anyhow::Result<()> {
             ev_apply_patch_custom_tool_call("request_1", update_patch),
             ev_completed("request_1"),
         ]),
-        sse(vec![ev_completed("request_2")]),
+        sse(vec![
+            ev_assistant_message("request_2", "done"),
+            ev_completed("request_2"),
+        ]),
     ];
     let server = start_mock_server().await;
     mount_sse_sequence(&server, response_streams).await;
@@ -123,7 +127,10 @@ async fn test_apply_patch_freeform_tool() -> anyhow::Result<()> {
             ev_apply_patch_custom_tool_call("request_1", freeform_update_patch),
             ev_completed("request_1"),
         ]),
-        sse(vec![ev_completed("request_2")]),
+        sse(vec![
+            ev_assistant_message("request_2", "done"),
+            ev_completed("request_2"),
+        ]),
     ];
     let server = start_mock_server().await;
     mount_sse_sequence(&server, response_streams).await;
@@ -238,7 +245,10 @@ async fn shutdown_flushes_completed_turn_and_file_diff() -> anyhow::Result<()> {
                 ),
                 ev_completed("request_0"),
             ]),
-            sse(vec![ev_completed("request_1")]),
+            sse(vec![
+                ev_assistant_message("request_1", "done"),
+                ev_completed("request_1"),
+            ]),
         ],
     )
     .await;

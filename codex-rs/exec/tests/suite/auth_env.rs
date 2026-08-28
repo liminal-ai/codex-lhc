@@ -1,4 +1,5 @@
 #![allow(clippy::unwrap_used)]
+use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
@@ -15,7 +16,10 @@ async fn exec_uses_codex_api_key_env_var() -> anyhow::Result<()> {
     mount_sse_once_match(
         &server,
         header("Authorization", "Bearer dummy"),
-        sse(vec![ev_completed("request_0")]),
+        sse(vec![
+            ev_assistant_message("request_0", "done"),
+            ev_completed("request_0"),
+        ]),
     )
     .await;
 

@@ -25,6 +25,7 @@ use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionTrigger;
 use codex_features::Feature;
 use codex_history::RolloutItem;
+use codex_lhc_host::CaptureState;
 use codex_lhc_host::CompactBoundaryMeta;
 use codex_lhc_host::CompactMarker;
 use codex_lhc_host::DEFAULT_LOWER_TARGET_TOKENS;
@@ -97,6 +98,66 @@ const COMPACT_FLUSH_BOUND: Duration = Duration::from_millis(200);
 const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(2);
+
+/// LIM-134: how long a **required** PreTurn / Standalone strict compact waits
+/// for the asynchronous capture open before failing visibly.
+///
+/// Ordinary thread startup stays off the critical path; this bound is only
+/// consumed once strict compact is known to be required. Expiry is a hard
+/// visible compact failure — never `Ok(None)`, never native fallback.
+pub(crate) const STRICT_COMPACT_READINESS_BOUND: Duration = Duration::from_secs(60);
+
+/// Required strict compact waits for the capture slot to settle (LIM-134).
+///
+/// PreTurn / Standalone only: MidTurn keeps its distinct settled in-flight
+/// policy and never reaches this wait. Ready continues through the existing
+/// strict arm; `Failed`, `Stopped`, and bound expiry are hard visible compact
+/// failures that preserve the prior body and issue zero provider requests;
+/// turn cancellation aborts the turn without native fallback.
+async fn await_capture_ready_for_required_compact(
+    slot: &LhcCaptureSlot,
+    cancellation_token: &CancellationToken,
+) -> Result<codex_lhc_host::CaptureHandle, LhcCompactAttempt> {
+    match slot.state() {
+        CaptureState::Ready(handle) => return Ok(handle),
+        CaptureState::Failed(reason) => {
+            return Err(failed_attempt(format!("LHC capture open failed: {reason}")));
+        }
+        CaptureState::Stopped => {
+            return Err(failed_attempt(
+                "LHC capture has shut down; compact cannot run",
+            ));
+        }
+        CaptureState::Opening => {}
+    }
+    let bound = STRICT_COMPACT_READINESS_BOUND;
+    info!(
+        bound_ms = bound.as_millis() as u64,
+        "LHC capture is still opening; required strict compact waits for readiness"
+    );
+    let settled = tokio::select! {
+        biased;
+        () = cancellation_token.cancelled() => {
+            return Err(cancelled_attempt(
+                "turn cancelled while waiting for the LHC capture open",
+            ));
+        }
+        settled = slot.await_settled(bound) => settled,
+    };
+    match settled {
+        Some(CaptureState::Ready(handle)) => Ok(handle),
+        Some(CaptureState::Failed(reason)) => {
+            Err(failed_attempt(format!("LHC capture open failed: {reason}")))
+        }
+        Some(CaptureState::Stopped) => Err(failed_attempt(
+            "LHC capture has shut down; compact cannot run",
+        )),
+        Some(CaptureState::Opening) | None => Err(failed_attempt(format!(
+            "LHC capture did not open within {}s; compact cannot run",
+            bound.as_secs_f64()
+        ))),
+    }
+}
 
 fn configured_band_percentages(turn_context: &TurnContext) -> LhcBandPercentages {
     let percentages = turn_context.config.lhc_compact.percentages;
@@ -1805,8 +1866,12 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
         return Ok(failed_attempt("no LhcCaptureSlot (capture not opened)"));
     };
-    let Some(handle) = slot.get() else {
-        return Ok(failed_attempt("capture handle not ready"));
+    // LIM-134: strict compact is already known to be required here, so a slot
+    // that is still Opening is waited for (bounded, cancellation-aware) rather
+    // than declared not-ready.
+    let handle = match await_capture_ready_for_required_compact(&slot, cancellation_token).await {
+        Ok(handle) => handle,
+        Err(attempt) => return Ok(attempt),
     };
 
     // Degraded capture is not a hard stop: flush what we can, then rely on
@@ -3086,3 +3151,7 @@ mod mid_turn_tests;
 #[cfg(test)]
 #[path = "compact_lhc_canary_tests.rs"]
 mod canary_tests;
+
+#[cfg(test)]
+#[path = "compact_lhc_readiness_tests.rs"]
+mod readiness_tests;
