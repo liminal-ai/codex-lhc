@@ -9,6 +9,8 @@
 #       Checked at start AND end so fmt-churn / accidental vendor edits cannot
 #       slip through after later layers run.
 #   1.  grep count of LHC-HOOK sentinels in core vs EXPECTED_HOOKS below
+#   1b. scripts/check-lhc-compact-ignores.sh — exact reviewed native-routing
+#       ignore allowlist (LIM-142); drift fails
 #   2a. cargo check -p codex-core -p codex-app-server -p codex-extension-api
 #       (the crates that *carry* the hooks — not just the adapter)
 #   2a1. build the real codex CLI, run bare `codex exec`, and require a thread
@@ -84,6 +86,13 @@ if [ "$found" -ne "$EXPECTED_HOOKS" ]; then
   fail=1
 else
   echo "ok sentinel: $found/$EXPECTED_HOOKS LHC-HOOK markers"
+fi
+
+# ── Layer 1b: exact native-routing ignore allowlist (LIM-142) ─────────
+if scripts/check-lhc-compact-ignores.sh; then
+  :
+else
+  fail=1
 fi
 
 # ── Layer 2a: compile the crates that carry hooks ─────────────────────

@@ -1,0 +1,142 @@
+# Reviewed native-routing ignore allowlist (LIM-142).
+#
+# Codex-LHC routes every compact entry point through
+# `compact_lhc::run_strict_lhc_compact`. Upstream's native TokenBudget /
+# remote / local compaction implementation is retained for upstream parity,
+# but the upstream *integration* tests whose owned assertion is that a normal
+# entry point issues native local, remote `/responses/compact`, or TokenBudget
+# compaction have a false premise here. Those tests — and only those — carry
+#
+#     #[ignore = "codex-lhc LIM-142 strict-lhc-routing: <reason>"]
+#
+# and are listed below. `scripts/check-lhc-compact-ignores.sh` fails on any
+# drift between this file and the tree, so the exclusion cannot grow silently.
+#
+# Classification (source-level, not failure membership):
+#   1. Strict-LHC supported behavior stays ACTIVE. Where an old native fixture
+#      still named a supported invariant (hooks, pending input, resume/fork,
+#      current-time, window, budgets), an active LHC test owns that invariant
+#      and the old test is listed only because its remaining premise is the
+#      native compact request itself.
+#   2. Route-independent native helper/unit coverage stays ACTIVE
+#      (`compact::tests`, `compact_remote` metadata/v2 unit tests, skip-path
+#      pre-sampling tests, already-ported suite routing proofs).
+#   3. False-premise native-routing integration coverage — this list.
+#
+# Adding a line here is a reviewed change: it must be a test whose owned
+# assertion is native routing, never a way to silence a real regression.
+#
+# One entry per ignored test function (parameterized cases share their fn).
+# count: 112
+codex-rs/core/tests/suite/client.rs::response_item_ids_are_sent_for_all_remote_v2_compaction_requests
+codex-rs/core/tests/suite/compact.rs::auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events
+codex-rs/core/tests/suite/compact.rs::auto_compact_body_after_prefix_counts_growth_after_compaction
+codex-rs/core/tests/suite/compact.rs::auto_compact_body_after_prefix_ignores_starting_window_prefix
+codex-rs/core/tests/suite/compact.rs::auto_compact_body_after_prefix_still_caps_at_context_window
+codex-rs/core/tests/suite/compact.rs::auto_compact_clamps_config_limit_to_context_window
+codex-rs/core/tests/suite/compact.rs::auto_compact_counts_encrypted_reasoning_before_last_user
+codex-rs/core/tests/suite/compact.rs::auto_compact_emits_context_compaction_items
+codex-rs/core/tests/suite/compact.rs::auto_compact_persists_rollout_entries
+codex-rs/core/tests/suite/compact.rs::auto_compact_runs_after_resume_when_token_usage_is_over_limit
+codex-rs/core/tests/suite/compact.rs::auto_compact_runs_when_reasoning_header_clears_between_turns
+codex-rs/core/tests/suite/compact.rs::auto_compact_starts_after_turn_started
+codex-rs/core/tests/suite/compact.rs::body_after_prefix_model_switch_budget_compacts_with_next_model
+codex-rs/core/tests/suite/compact.rs::compact_hooks_respect_matchers_and_post_runs_after_compaction
+codex-rs/core/tests/suite/compact.rs::manual_compact_emits_api_and_local_token_usage_events
+codex-rs/core/tests/suite/compact.rs::manual_compact_emits_context_compaction_items
+codex-rs/core/tests/suite/compact.rs::manual_compact_retries_after_context_window_error
+codex-rs/core/tests/suite/compact.rs::manual_compact_twice_preserves_latest_user_messages
+codex-rs/core/tests/suite/compact.rs::manual_compact_uses_custom_prompt
+codex-rs/core/tests/suite/compact.rs::manual_compaction_keeps_the_creation_time_global_instructions
+codex-rs/core/tests/suite/compact.rs::manual_pre_compact_block_decision_does_not_block_compaction
+codex-rs/core/tests/suite/compact.rs::mid_turn_compaction_keeps_the_creation_time_global_instructions
+codex-rs/core/tests/suite/compact.rs::multiple_auto_compact_per_task_runs_after_token_limit_hit
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_from_retired_previous_model_after_rename
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_when_previous_model_is_not_found
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_recovers_comp_hash_after_resume
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_runs_on_switch_to_smaller_context_model
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_runs_when_comp_hash_changes
+codex-rs/core/tests/suite/compact.rs::pre_sampling_legacy_remote_compact_falls_back_after_previous_model_invalid_request
+codex-rs/core/tests/suite/compact.rs::remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation
+codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_manual_compact_without_previous_user_messages
+codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_mid_turn_continuation_compaction
+codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction_context_window_exceeded
+codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction_including_incoming_user_message
+codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
+codex-rs/core/tests/suite/compact.rs::summarize_context_three_requests_and_instructions
+codex-rs/core/tests/suite/compact_remote.rs::amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint
+codex-rs/core/tests/suite/compact_remote.rs::amazon_bedrock_manual_compaction_uses_v2_responses_endpoint
+codex-rs/core/tests/suite/compact_remote.rs::auto_remote_compact_failure_stops_agent_loop
+codex-rs/core/tests/suite/compact_remote.rs::auto_remote_compact_trims_function_call_history_to_fit_context_window
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_and_resume_refresh_stale_developer_instructions
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_does_not_charge_inline_audio_payload_as_text
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_filters_deferred_dynamic_tools
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_refreshes_stale_developer_instructions_without_resume
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_replaces_history_for_followups
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_rewrites_multiple_trailing_function_call_outputs
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_runs_automatically
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_trim_estimate_uses_session_base_instructions
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_trims_function_call_history_to_fit_context_window
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_trims_tool_search_output_to_empty_tools_array
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_uses_agent_identity_assertion
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_accepts_additional_output_items_before_compaction
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_charges_retained_images_to_token_budget
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_retains_metadata_from_resumed_history
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_retains_only_client_developer_messages_when_enabled
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_retries_failures_with_stream_retry_budget
+codex-rs/core/tests/suite/compact_remote.rs::remote_compact_v2_reuses_compaction_trigger_for_followups
+codex-rs/core/tests/suite/compact_remote.rs::remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cache_key
+codex-rs/core/tests/suite/compact_remote.rs::remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache_key
+codex-rs/core/tests/suite/compact_remote.rs::remote_manual_compact_emits_context_compaction_items
+codex-rs/core/tests/suite/compact_remote.rs::remote_manual_compact_failure_emits_task_error_event
+codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v1_sends_turn_state_over_http
+codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v2_sends_turn_state_over_http
+codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v2_sends_turn_state_over_websocket
+codex-rs/core/tests/suite/compact_remote.rs::remote_pre_turn_compact_response_seeds_turn_state
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_manual_compact_restates_realtime_start
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_manual_compact_without_previous_user_messages
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjects_above_last_summary
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinjects_context
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_mid_turn_continuation_compaction
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_pre_turn_compaction_context_window_exceeded
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start
+codex-rs/core/tests/suite/compact_remote.rs::snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model_switch
+codex-rs/core/tests/suite/compact_remote_parity.rs::remote_compaction_parity_manual_hooks
+codex-rs/core/tests/suite/compact_remote_parity.rs::remote_compaction_parity_manual_transcripts
+codex-rs/core/tests/suite/compact_remote_parity.rs::remote_compaction_parity_mid_turn_auto
+codex-rs/core/tests/suite/compact_remote_parity.rs::remote_compaction_parity_pre_turn_auto
+codex-rs/core/tests/suite/compact_remote_parity.rs::remote_compaction_parity_v2_api_key_sends_service_tier_upgrade
+codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_after_second_compaction_preserves_history
+codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_and_fork_preserve_model_history_view
+codex-rs/core/tests/suite/compact_resume_fork.rs::snapshot_rollback_past_compaction_replays_append_only_history
+codex-rs/core/tests/suite/current_time_reminder.rs::current_time_reminder_is_refreshed_after_compaction
+codex-rs/core/tests/suite/hooks.rs::compact_session_start_hook_records_additional_context_for_next_turn
+codex-rs/core/tests/suite/hooks.rs::mid_turn_auto_compact_session_start_hook_stop_blocks_continuation
+codex-rs/core/tests/suite/hooks.rs::mid_turn_auto_compact_session_start_hooks_run_before_each_continuation
+codex-rs/core/tests/suite/hooks.rs::resumed_thread_runs_resume_then_compact_session_start_hooks
+codex-rs/core/tests/suite/pending_input.rs::steered_user_input_follows_compact_when_only_the_steer_needs_follow_up
+codex-rs/core/tests/suite/pending_input.rs::steered_user_input_waits_for_model_continuation_after_mid_turn_compact
+codex-rs/core/tests/suite/pending_input.rs::steered_user_input_waits_when_tool_output_triggers_compact_before_next_request
+codex-rs/core/tests/suite/remote_env.rs::deferred_executor_compaction_preserves_then_updates_environment_once
+codex-rs/core/tests/suite/responses_lite.rs::responses_lite_compact_request_uses_lite_transport_contract
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_overload_without_retry_after_exhausts_request_retries
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_rate_limit_message_uses_server_advised_retry_delay
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_rate_limit_message_without_retry_after_uses_server_advised_delay
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_stream_failure_uses_local_backoff_despite_retry_after
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_stream_failure_without_retry_after_exhausts_stream_retries
+codex-rs/core/tests/suite/retry_after.rs::compact_v2_uses_local_backoff_despite_retry_after
+codex-rs/core/tests/suite/rollout_budget.rs::compaction_budget_exhaustion_fails_without_retry
+codex-rs/core/tests/suite/rollout_budget.rs::restates_the_current_remainder_after_compaction
+codex-rs/core/tests/suite/token_budget.rs::new_context_tool_skips_auto_compact_fallback
+codex-rs/core/tests/suite/token_budget.rs::token_budget_auto_compact_fallback_rolls_over_after_buffer
+codex-rs/core/tests/suite/token_budget.rs::token_budget_auto_compact_fallback_uses_buffer_until_new_context
+codex-rs/core/tests/suite/token_budget.rs::token_budget_compaction_runs_compact_hooks
+codex-rs/core/tests/suite/token_budget.rs::token_budget_context_uses_new_window_after_compaction
+codex-rs/core/tests/suite/token_budget.rs::token_budget_mid_turn_auto_compaction_resets_before_active_follow_up
+codex-rs/core/tests/suite/tools.rs::strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors
+codex-rs/core/tests/suite/window_headers.rs::window_id_advances_after_compact_persists_on_resume_and_resets_on_fork

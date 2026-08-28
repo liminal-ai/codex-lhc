@@ -2558,6 +2558,7 @@ fn environment_instructions_occurrences(request: &ResponsesRequest) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture interleaves a native compact summarization request with deferred-executor environment updates; environment injection itself is owned by non-compact remote_env tests, and LHC install does not issue that compact request"]
 async fn deferred_executor_compaction_preserves_then_updates_environment_once() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let server = start_mock_server().await;

@@ -961,6 +961,7 @@ async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> 
 #[test_case(false; "token_budget_only")]
 #[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native start_new_context_window dropping prior messages; LHC window advance is successful_lhc_compact_advances_auto_compact_window and does not use that native arm"]
 async fn token_budget_context_uses_new_window_after_compaction(
     retain_client_developer_messages: bool,
 ) -> Result<()> {
@@ -1083,6 +1084,7 @@ async fn token_budget_context_uses_new_window_after_compaction(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture runs PreCompact/PostCompact around TokenBudget native compact; live hooks are run_strict_lhc_compact (R15) plus successful_lhc_compact_queues_compact_session_start"]
 async fn token_budget_compaction_runs_compact_hooks() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1134,6 +1136,7 @@ async fn token_budget_compaction_runs_compact_hooks() -> Result<()> {
 #[test_case(false; "token_budget_only")]
 #[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native mid-turn compact resetting the window before follow-up; live MidTurn is LHC parts/continuation"]
 async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
     retain_client_developer_messages: bool,
 ) -> Result<()> {
@@ -1261,6 +1264,7 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback using the buffer until new_context"]
 async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1362,6 +1366,7 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback rollover after buffer"]
 async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1424,6 +1429,7 @@ async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback skipped by new_context; Feature::TokenBudget compact is not a live Codex-LHC route"]
 async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

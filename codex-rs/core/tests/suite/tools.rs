@@ -169,6 +169,7 @@ async fn strict_tool_collisions_fail_the_turn_before_sampling(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is error-message de-dupe when a native compact request fails alongside tool-collision errors"]
 async fn strict_tool_collisions_do_not_duplicate_unrelated_compaction_errors() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

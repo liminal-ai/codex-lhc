@@ -615,6 +615,7 @@ async fn synthetic_call_output_id_is_stable_across_resumes() -> anyhow::Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is that Op::Compact issues a remote /responses/compact request carrying response item ids; strict LHC never issues that request"]
 async fn response_item_ids_are_sent_for_all_remote_v2_compaction_requests() -> anyhow::Result<()> {
     let server = MockServer::start().await;
     let response_mock = mount_sse_sequence(

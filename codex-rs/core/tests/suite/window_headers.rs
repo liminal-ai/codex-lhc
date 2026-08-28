@@ -20,6 +20,7 @@ use pretty_assertions::assert_eq;
 use std::sync::Arc;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture reads window ids from native compact / follow-up /responses headers; LHC window identity is successful_lhc_compact_advances_auto_compact_window plus slice_c_window_continuity_across_two_rewrites"]
 async fn window_id_advances_after_compact_persists_on_resume_and_resets_on_fork() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

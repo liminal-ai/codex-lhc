@@ -504,6 +504,7 @@ fn format_labeled_requests_snapshot(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the three-request native local compact conversation (user, summarization, follow-up)"]
 async fn summarize_context_three_requests_and_instructions() {
     skip_if_no_network!();
 
@@ -750,6 +751,7 @@ async fn summarize_context_three_requests_and_instructions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture asserts a native compact request still happens after PreCompact stop; R15 on run_strict_lhc_compact is the live veto-removed policy"]
 async fn manual_pre_compact_block_decision_does_not_block_compaction() {
     skip_if_no_network!();
 
@@ -817,6 +819,7 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture waits on a native summarization request; PostCompact-after-install and matcher policy are owned by compact_lhc_strict_routing_tests plus run_strict_lhc_compact R15"]
 async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     skip_if_no_network!();
 
@@ -879,6 +882,7 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is that Op::Compact sends config.compact_prompt as a native summarization user message"]
 async fn manual_compact_uses_custom_prompt() {
     skip_if_no_network!();
 
@@ -967,6 +971,7 @@ async fn manual_compact_uses_custom_prompt() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenCount events from a native compact summarization request; Op::Compact never issues that request"]
 async fn manual_compact_emits_api_and_local_token_usage_events() {
     skip_if_no_network!();
 
@@ -1025,6 +1030,7 @@ async fn manual_compact_emits_api_and_local_token_usage_events() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ContextCompaction items after native compact succeeds; LHC install emission is compact_lhc_tests::installed_emits_one_context_compaction_started_and_completed"]
 async fn manual_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 
@@ -1096,6 +1102,7 @@ async fn manual_compact_emits_context_compaction_items() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is multiple native auto-compact summarization turns in one task"]
 async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     skip_if_no_network!();
 
@@ -1842,6 +1849,7 @@ async fn manual_op_compact_routes_to_strict_lhc_not_native() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ContextCompaction items after a native summarization turn; LHC install emission is compact_lhc_tests::installed_emits_one_context_compaction_started_and_completed"]
 async fn auto_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 
@@ -1922,6 +1930,7 @@ async fn auto_compact_emits_context_compaction_items() {
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact request ordering relative to TurnStarted; live auto compact is run_strict_lhc_compact"]
 async fn auto_compact_starts_after_turn_started() {
     skip_if_no_network!();
 
@@ -2006,6 +2015,7 @@ async fn auto_compact_starts_after_turn_started() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native summarization request on the first post-resume over-limit turn; routing is auto_compact_runs_after_token_limit_hit plus c1_resume_after_compact"]
 async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     skip_if_no_network!();
 
@@ -2109,6 +2119,7 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request on model downshift; live dispatch is run_auto_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     skip_if_no_network!();
 
@@ -2211,6 +2222,7 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request on comp_hash change; live dispatch is run_auto_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     skip_if_no_network!();
 
@@ -2298,6 +2310,7 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact fallback after rename, observed as a native compact request"]
 async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_rename() {
     skip_if_no_network!();
 
@@ -2439,6 +2452,7 @@ async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_renam
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact fallback when the model is missing"]
 async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
     skip_if_no_network!();
 
@@ -2579,6 +2593,7 @@ async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact retry/fallback issuing a native compact request"]
 async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift() {
     skip_if_no_network!();
 
@@ -2681,6 +2696,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is legacy remote /responses/compact fallback after previous-model invalid request"]
 async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_invalid_request() {
     skip_if_no_network!();
 
@@ -2787,6 +2803,7 @@ async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_inva
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact model identity on the previous-model compact request"]
 async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
     skip_if_no_network!();
 
@@ -2981,6 +2998,7 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact on model switch using the next model's native budget, observed as a summarization request"]
 async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     skip_if_no_network!();
 
@@ -3075,6 +3093,7 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request after resume+downshift; live path is maybe_run_previous_model_inline_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     skip_if_no_network!();
 
@@ -3196,6 +3215,7 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request after resume when comp_hash changes"]
 async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     skip_if_no_network!();
 
@@ -3456,6 +3476,7 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native append of Compacted rollout records after local compact; LHC rewrite persistence is slice_c_* / law-1 tests"]
 async fn auto_compact_persists_rollout_entries() {
     skip_if_no_network!();
 
@@ -3578,6 +3599,7 @@ async fn auto_compact_persists_rollout_entries() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is retry of a native summarization compact after a context-window error on /responses"]
 async fn manual_compact_retries_after_context_window_error() {
     skip_if_no_network!();
 
@@ -3748,6 +3770,7 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact replacement-history shape across two summarization turns; LHC multi-compact is production_many_compacts_marker_bounded_body_not_growing"]
 async fn manual_compact_twice_preserves_latest_user_messages() {
     skip_if_no_network!();
 
@@ -3981,6 +4004,7 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is multiple native TokenBudget/local auto-compact summarization turns interleaved with other events; production auto compact is run_strict_lhc_compact"]
 async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events() {
     skip_if_no_network!();
 
@@ -4090,6 +4114,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native mid-turn continuation compact /responses request snapshot"]
 async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     skip_if_no_network!();
 
@@ -4191,6 +4216,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native auto-compact clamp producing a native summarization request; the live auto ladder is run_strict_lhc_compact"]
 async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();
 
@@ -4251,6 +4277,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native body-after-prefix trigger math that then issues a native compact request; strict LHC does not take that arm"]
 async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
     skip_if_no_network!();
 
@@ -4320,6 +4347,7 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native body-after-prefix accounting after a native summarization compact; strict LHC does not issue that compact request"]
 async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
     skip_if_no_network!();
 
@@ -4423,6 +4451,7 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact still firing at the context-window cap via local summarization; strict LHC never issues that request"]
 async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
     skip_if_no_network!();
 
@@ -4482,6 +4511,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact trigger counting encrypted reasoning then issuing a summarization request"]
 async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     skip_if_no_network!();
 
@@ -4610,6 +4640,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact firing when the reasoning header clears, observed as a summarization request"]
 async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
     skip_if_no_network!();
 
@@ -4694,6 +4725,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once pre-turn compaction includes incoming user input.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot including the incoming user message"]
 async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_message() {
     skip_if_no_network!();
 
@@ -4804,6 +4836,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once pre-turn compaction context-overflow handling includes incoming
 // user input and emits richer oversized-input messaging.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot stripping a model switch"]
 async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch() {
     skip_if_no_network!();
 
@@ -4907,6 +4940,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot"]
 async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     skip_if_no_network!();
 
@@ -4988,6 +5022,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native manual compact /responses request snapshot"]
 async fn snapshot_request_shape_manual_compact_without_previous_user_messages() {
     skip_if_no_network!();
 
@@ -5046,6 +5081,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native fixture asserts instruction text on the compact summarization request; LHC compact does not issue that request, and instruction_sources remain session-owned across install"]
 async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up an initial turn, a manual compaction response, and a post-compaction turn.
     let server = responses::start_mock_server().await;
@@ -5125,6 +5161,7 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native fixture asserts instruction text on a native mid-turn compact request; live MidTurn is LHC parts/continuation, not native summarization"]
 async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up a turn that crosses the auto-compaction limit and a post-compaction response.
     let server = responses::start_mock_server().await;
@@ -5197,6 +5234,7 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 /responses/compact request and replacement history instruction bytes"]
 async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
 -> Result<()> {
     skip_if_no_network!(Ok(()));

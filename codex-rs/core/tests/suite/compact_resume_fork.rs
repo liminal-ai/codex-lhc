@@ -204,6 +204,7 @@ fn normalize_compact_prompts(requests: &mut [Value]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: compact an initial conversation, resume it, fork one turn back, and
 /// ensure the model-visible history matches expectations at each request.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact replacement-history view on resume/fork; LHC fork is c1_fork_full_history_after_compact_inherits_coherent_body"]
 async fn compact_resume_and_fork_preserve_model_history_view() {
     if network_disabled() {
         println!("Skipping test because network is disabled in this sandbox");
@@ -360,6 +361,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 /// Scenario: after the forked branch is compacted, resuming again should reuse
 /// the compacted history and only append the new user message.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native Compacted-append history across two summarization compacts then resume; LHC resume is c1_resume_after_compact_no_reingest_and_durable_provenance_survives"]
 async fn compact_resume_after_second_compaction_preserves_history() -> Result<()> {
     if network_disabled() {
         println!("Skipping test because network is disabled in this sandbox");
@@ -509,6 +511,7 @@ async fn compact_resume_after_second_compaction_preserves_history() -> Result<()
 /// Scenario: rolling back behind a pre-turn compaction should replay
 /// append-only history from the rollout file and keep earlier compacted
 /// history visible.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is rollback through native append-only Compacted records; LHC rewrite generations are slice_c / slice_d resume drills"]
 async fn snapshot_rollback_past_compaction_replays_append_only_history() -> Result<()> {
     if network_disabled() {
         println!("Skipping test because network is disabled in this sandbox");

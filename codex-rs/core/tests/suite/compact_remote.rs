@@ -458,6 +458,7 @@ fn assert_compact_request_omits_harness_metadata(request: &responses::ResponsesR
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is manual remote v2 /responses/compact against Bedrock"]
 async fn amazon_bedrock_manual_compaction_uses_v2_responses_endpoint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -528,6 +529,7 @@ async fn amazon_bedrock_manual_compaction_uses_v2_responses_endpoint() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact retaining metadata from resumed history on the compact request"]
 async fn remote_compact_v2_retains_metadata_from_resumed_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -594,6 +596,7 @@ async fn remote_compact_v2_retains_metadata_from_resumed_history() -> Result<()>
 #[test_case(false; "feature_disabled")]
 #[test_case(true; "feature_enabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact retained-developer-message policy on the compact request"]
 async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
     enabled: bool,
 ) -> Result<()> {
@@ -688,6 +691,7 @@ async fn remote_compact_v2_retains_only_client_developer_messages_when_enabled(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is automatic remote v2 /responses/compact against Bedrock"]
 async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -766,6 +770,7 @@ async fn amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact replacement history served on the next /responses request"]
 async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -993,6 +998,7 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is agent-identity headers on the remote compact request"]
 async fn remote_compact_uses_agent_identity_assertion() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1295,6 +1301,7 @@ async fn assert_remote_manual_compact_request_parity(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is API-auth headers on manual remote compact"]
 async fn remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cache_key()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -1312,6 +1319,7 @@ async fn remote_manual_compact_api_auth_omits_service_tier_and_reuses_prompt_cac
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ChatGPT-auth headers on manual remote compact"]
 async fn remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache_key() -> Result<()>
 {
     skip_if_no_network!(Ok(()));
@@ -1332,6 +1340,7 @@ async fn remote_manual_compact_chatgpt_auth_reuses_service_tier_and_prompt_cache
 #[test_case(Some(false); "disabled_preserves_images")]
 #[test_case(Some(true); "enabled_trims_images")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact image token charging on the compact request"]
 async fn remote_compact_v2_charges_retained_images_to_token_budget(
     image_budget_enabled: Option<bool>,
 ) -> Result<()> {
@@ -1473,6 +1482,7 @@ async fn remote_compact_v2_charges_retained_images_to_token_budget(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact trigger reuse on later compact requests"]
 async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1819,6 +1829,7 @@ async fn remote_compact_v2_reuses_compaction_trigger_for_followups() -> Result<(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is retry of remote v2 /responses/compact stream failures"]
 async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1925,6 +1936,7 @@ async fn remote_compact_v2_retries_failures_with_stream_retry_budget() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact accepting extra output items before /responses/compact"]
 async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2003,6 +2015,7 @@ async fn remote_compact_v2_accepts_additional_output_items_before_compaction() -
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact request tool filtering"]
 async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2093,6 +2106,7 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact token charging of inline audio on the compact request"]
 async fn remote_compact_does_not_charge_inline_audio_payload_as_text() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2207,6 +2221,7 @@ async fn remote_compact_does_not_charge_inline_audio_payload_as_text() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is automatic remote /responses/compact"]
 async fn remote_compact_runs_automatically() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2334,6 +2349,7 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact trim of function-call history to fit the window"]
 async fn remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2447,6 +2463,7 @@ async fn remote_compact_trims_function_call_history_to_fit_context_window() -> R
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact rewrite of trailing function-call outputs"]
 async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2555,6 +2572,7 @@ async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Re
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is automatic remote compact trim of function-call history on the compact request"]
 async fn auto_remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2686,6 +2704,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact trim of tool-search output"]
 async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2789,6 +2808,7 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is automatic remote compact failure after a /responses/compact request"]
 async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -2877,6 +2897,7 @@ async fn auto_remote_compact_failure_stops_agent_loop() -> Result<()> {
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact trim estimate using base instructions on the compact request"]
 async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3074,6 +3095,7 @@ async fn remote_compact_trim_estimate_uses_session_base_instructions() -> Result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ContextCompaction items after remote compact succeeds"]
 async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3149,6 +3171,7 @@ async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is task error after a failed remote compact request"]
 async fn remote_manual_compact_failure_emits_task_error_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3338,6 +3361,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote /responses/compact then resume refreshing developer instructions via native compact history"]
 async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3491,6 +3515,7 @@ async fn remote_compact_and_resume_refresh_stale_developer_instructions() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote compact replacement history refreshing developer instructions"]
 async fn remote_compact_refreshes_stale_developer_instructions_without_resume() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3578,6 +3603,7 @@ async fn remote_compact_refreshes_stale_developer_instructions_without_resume() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote pre-turn compact request snapshot restating realtime start"]
 async fn snapshot_request_shape_remote_pre_turn_compaction_restates_realtime_start() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3774,6 +3800,7 @@ async fn active_realtime_does_not_diff_changed_start_instructions_after_resume()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote manual compact /responses/compact request snapshot"]
 async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -3855,6 +3882,7 @@ async fn snapshot_request_shape_remote_manual_compact_restates_realtime_start() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote mid-turn compact request snapshot omitting realtime end"]
 async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_realtime_end()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -3951,6 +3979,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_does_not_restate_real
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once remote pre-turn compaction includes incoming user input.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote pre-turn compact request snapshot including the incoming user message"]
 async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_user_message()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -4045,6 +4074,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_including_incoming_us
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote pre-turn compact request snapshot stripping a model switch"]
 async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model_switch()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -4172,6 +4202,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_strips_incoming_model
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once remote pre-turn compaction context-overflow handling includes
 // incoming user input and emits richer oversized-input messaging.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote pre-turn compact request snapshot on context-window exceeded"]
 async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceeded() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4266,6 +4297,7 @@ async fn snapshot_request_shape_remote_pre_turn_compaction_context_window_exceed
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is pre-turn remote compact response seeding turn state"]
 async fn remote_pre_turn_compact_response_seeds_turn_state() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4333,6 +4365,7 @@ async fn remote_pre_turn_compact_response_seeds_turn_state() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is mid-turn remote v1 compact HTTP turn-state payload"]
 async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4410,6 +4443,7 @@ async fn remote_mid_turn_compact_v1_sends_turn_state_over_http() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is mid-turn remote v2 compact HTTP turn-state payload"]
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4499,6 +4533,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_http() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is mid-turn remote v2 compact websocket turn-state payload"]
 async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4591,6 +4626,7 @@ async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote mid-turn continuation compact request snapshot"]
 async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -4657,6 +4693,7 @@ async fn snapshot_request_shape_remote_mid_turn_continuation_compaction() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote mid-turn compact request snapshot for summary-only reinject"]
 async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinjects_context()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -4739,6 +4776,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_summary_only_reinject
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote mid-turn compact request snapshot for multi-summary reinject"]
 async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjects_above_last_summary()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -4841,6 +4879,7 @@ async fn snapshot_request_shape_remote_mid_turn_compaction_multi_summary_reinjec
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote manual compact /responses/compact request snapshot without previous user messages"]
 async fn snapshot_request_shape_remote_manual_compact_without_previous_user_messages() -> Result<()>
 {
     skip_if_no_network!(Ok(()));

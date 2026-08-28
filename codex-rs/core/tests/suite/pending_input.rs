@@ -1074,6 +1074,7 @@ async fn user_input_does_not_preempt_after_reasoning_item() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is steered input withheld from the native compact request and post-compact continuation; live in-run steer around MidTurn is full_loop_in_run_steer_stays_in_task_turn"]
 async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact() {
     let first_chunks = vec![
         chunk(ev_response_created("resp-1")),
@@ -1167,6 +1168,7 @@ async fn steered_user_input_waits_for_model_continuation_after_mid_turn_compact(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is steered input omitted from a native compact request then sent on the next /responses; live in-run steer around MidTurn is full_loop_in_run_steer_stays_in_task_turn"]
 async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 
@@ -1254,6 +1256,7 @@ async fn steered_user_input_follows_compact_when_only_the_steer_needs_follow_up(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is steered input withheld from a native compact request triggered by tool output; live MidTurn parts + steer is full_loop_in_run_steer_stays_in_task_turn"]
 async fn steered_user_input_waits_when_tool_output_triggers_compact_before_next_request() {
     let (gate_first_completed_tx, gate_first_completed_rx) = oneshot::channel();
 

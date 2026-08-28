@@ -3072,6 +3072,10 @@ pub(crate) async fn token_limit_reached(sess: &Session, turn_context: &TurnConte
 mod tests;
 
 #[cfg(test)]
+#[path = "compact_lhc_strict_routing_tests.rs"]
+mod strict_routing_tests;
+
+#[cfg(test)]
 #[path = "compact_lhc_slice_d_tests.rs"]
 mod slice_d_tests;
 

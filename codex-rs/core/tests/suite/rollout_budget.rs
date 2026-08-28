@@ -336,6 +336,7 @@ async fn exhausted_budget_fails_current_and_later_turns() -> Result<()> {
 #[test_case(false, true ; "local provider units")]
 #[test_case(true, false ; "remote v2 token usage")]
 #[test_case(true, true ; "remote v2 provider units")]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is rollout-budget exhaustion charged by a native compact model request (local or remote v2)"]
 async fn compaction_budget_exhaustion_fails_without_retry(
     remote_v2: bool,
     provider_units: bool,
@@ -407,6 +408,7 @@ async fn compaction_budget_exhaustion_fails_without_retry(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture places remainder after a native compact summary in the next /responses body; LHC install advances the window (successful_lhc_compact_advances_auto_compact_window) and does not emit that summary request"]
 async fn restates_the_current_remainder_after_compaction() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

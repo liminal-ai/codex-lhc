@@ -121,6 +121,7 @@ const FULL_MIX: &[Step] = &[
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is local-vs-remote native compact transcript parity via native compact requests"]
 async fn remote_compaction_parity_manual_transcripts() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -151,6 +152,7 @@ async fn remote_compaction_parity_manual_transcripts() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compact API-key service-tier header on the compact request"]
 async fn remote_compaction_parity_v2_api_key_sends_service_tier_upgrade() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -182,6 +184,7 @@ async fn remote_compaction_parity_v2_api_key_sends_service_tier_upgrade() -> Res
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is local-vs-remote native compact hook parity; neither native route is taken"]
 async fn remote_compaction_parity_manual_hooks() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -192,6 +195,7 @@ async fn remote_compaction_parity_manual_hooks() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is local-vs-remote native pre-turn auto compact parity"]
 async fn remote_compaction_parity_pre_turn_auto() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -202,6 +206,7 @@ async fn remote_compaction_parity_pre_turn_auto() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is local-vs-remote native mid-turn auto compact parity"]
 async fn remote_compaction_parity_mid_turn_auto() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

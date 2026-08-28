@@ -521,6 +521,7 @@ async fn assert_responses_lite_custom_provider_web_search(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the lite-transport header on a remote /responses/compact request"]
 async fn responses_lite_compact_request_uses_lite_transport_contract() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

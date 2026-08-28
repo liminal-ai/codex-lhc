@@ -70,8 +70,9 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
 /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
 /// initial context into the replacement history just above the last real user message.
-// LHC-HOOK: Clone required so auto-compact can try the LHC arm then fall through
-// to native arms with the same injection (Chunk 2b).
+// LHC-HOOK: Clone on the injection enum (Chunk 2b). Native compact arms remain
+// for upstream parity and still take this type by value; production dispatch
+// never clones it to fall through to those arms.
 #[derive(Clone)]
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage {
