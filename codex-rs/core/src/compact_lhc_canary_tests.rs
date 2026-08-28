@@ -1,14 +1,10 @@
-//! CX-S6 (LIM-106) certification canaries.
+//! CX-S6 (LIM-106) certification canaries, updated to Story 5 MidTurn law.
 //!
-//! End-to-end proof, on the integrated CX-S1..CX-S5 candidate, that the
-//! conditions the removed gates used to stop on now degrade and continue. Each
-//! canary drives the production seam (`try_run_lhc_compact_arm` at
-//! `CompactionPhase::MidTurn`) with one real fault and asserts the session
-//! ends up with a smaller, provider-legal body — never stranded.
-//!
-//! These are certification canaries, not unit coverage: behaviors already
-//! proven end-to-end by a prior story's test are cited in the CX-S6 coverage
-//! map instead of duplicated here.
+//! Each canary drives a production seam with one real fault. A clean thread's
+//! ordinary MidTurn arm is turn-parts (`try_run_lhc_compact_arm`); protected
+//! escalation, live-pair graft, host-body degrade, and validation ACK live on
+//! the typed compact-continuation runtime (`run_mid_turn_forced_boundary_continuation`)
+//! — the same split the mid-turn suite uses. Never native compact.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -38,6 +34,7 @@ use super::mid_turn_tests::install_lhc_midturn;
 use super::mid_turn_tests::mid_facts;
 use super::mid_turn_tests::sample_usage;
 use super::mid_turn_tests::seed_turns;
+use super::run_mid_turn_forced_boundary_continuation;
 use super::try_run_lhc_compact_arm;
 use crate::compact::InitialContextInjection;
 use crate::session::tests::make_session_and_context;
@@ -86,10 +83,13 @@ fn protected_items(body: &[ResponseItem], call_id: &str) -> (usize, usize) {
     (calls, outputs)
 }
 
-/// Canary (a) — R2/R14. Both capture faults the MidTurn path used to stop on,
-/// at once: derivations reported missing/failed *and* a capture worker that can
-/// never acknowledge the arm's flush. Capture feeds derivation quality, not
-/// compact capability; the seam stays bounded and the session gets a body.
+/// Canary (a) — Story 5 truthful seam (AC-7.4).
+///
+/// Derivations reported missing/failed *and* a capture worker that never
+/// acknowledges the arm's flush. An incomplete flush is not a settled seam:
+/// the ordinary MidTurn arm keeps the current body, allows the next seam,
+/// never asserts `captureFlushed`, and never falls open to native compact.
+/// Maps to `mid_turn_blocked_capture_flush_is_not_a_settled_seam`.
 #[tokio::test]
 #[serial]
 async fn canary_degraded_capture_plus_flush_timeout_still_yields_a_body() {
@@ -161,15 +161,35 @@ async fn canary_degraded_capture_plus_flush_timeout_still_yields_a_body() {
         "the flush bound keeps the seam bounded; took {elapsed:?}"
     );
 
-    let LhcCompactAttempt::Installed { body, .. } = &attempt else {
-        panic!("degraded capture + flush timeout must still install, got {attempt:?}");
-    };
-    assert!(!body.is_empty(), "installed body must be non-empty");
-    assert_provider_sendable(body);
+    // Story 5: a flush that does not complete is not a settled seam. The
+    // ordinary arm must not install, must not strand the turn, and must not
+    // fall open to native compact.
+    match &attempt {
+        LhcCompactAttempt::MidTurnBlocked {
+            reason,
+            next_provider_request_allowed,
+        } => {
+            assert!(
+                reason.contains("flush") && reason.contains("not a settled seam"),
+                "blocked on the flush fact: {reason}"
+            );
+            assert!(
+                *next_provider_request_allowed,
+                "an unsettled seam retries later; it never strands the turn"
+            );
+        }
+        other => panic!(
+            "incomplete capture flush must keep the current body and retry later, got {other:?}"
+        ),
+    }
     let history_after = sess.clone_history().await.raw_items().count();
+    assert_eq!(
+        history_after, history_before,
+        "unsettled flush preserves the current body: before={history_before} after={history_after}"
+    );
     assert!(
-        history_after < history_before,
-        "the session must end up smaller: before={history_before} after={history_after}"
+        !matches!(attempt, LhcCompactAttempt::Unavailable { .. }),
+        "never a license for native compact: {attempt:?}"
     );
 }
 
@@ -270,6 +290,11 @@ async fn canary_input_arriving_during_construction_does_not_suppress_install() {
 /// (ambiguous live cardinality), so the body carries the LHC-reconstructed
 /// pair instead: same call_id, same correlation, provider-specific fields
 /// missing. Degraded body, valid request, install proceeds.
+///
+/// Graft runs on the typed compact-continuation runtime (host_validation
+/// spec), the same path `mid_turn_protected_escalation_validates_installs_and_clears_reload_gate`
+/// pins. A parked worker would make the ordinary parts flush unsettled and
+/// cannot be used to prove a live-only graft.
 #[tokio::test]
 #[serial]
 async fn canary_unprovable_graft_installs_the_lhc_pair_not_the_exact_pair() {
@@ -305,39 +330,31 @@ async fn canary_unprovable_graft_installs_the_lhc_pair_not_the_exact_pair() {
     inject_response_usage(&session, &tc, 4_800).await;
     handle.flush().await;
 
-    // Ambiguity, live-side only: the capture worker is parked, so a second call
-    // for the protected id lands in the session's live history but never
-    // reaches canonical LHC. Tool correlation on the canonical thread stays
-    // provable (the SDK does not decline), while `graft_live_protected_pairs`
-    // can no longer prove which live call is the exact pair.
-    let release = handle.block_worker().await;
-    session
-        .record_conversation_items_with_provenance(
-            &tc,
-            &[custom_call(protected_id, Some("completed"))],
-            codex_extension_api::RawItemProvenance::ModelOutput,
-        )
-        .await;
+    // Live-side ambiguity after a truthful flush: a second call for the same
+    // id is injected into host history only (not captured). The worker is
+    // not parked, so the arm's flush still settles. SDK correlation stays
+    // proven from the captured pair; `graft_live_protected_pairs` sees two
+    // live calls and cannot prove the exact pair.
+    let mut live: Vec<_> = session.clone_history().await.raw_items().cloned().collect();
+    live.push(custom_call(protected_id, Some("completed")));
+    session.replace_history(live, None).await;
 
     let sess = Arc::new(session);
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "canary-degraded-graft",
             true,
             decision_epoch(&sess),
             vec![protected_id.into()],
             Some(sample_usage(4_800)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
     .expect("arm");
-    drop(release);
 
     let LhcCompactAttempt::Installed { body, .. } = &attempt else {
         panic!("an unprovable graft must degrade and install, got {attempt:?}");
@@ -541,6 +558,10 @@ async fn canary_dead_owner_writer_claim_is_reclaimed_and_compact_proceeds() {
 /// Canary (h) — R10/R24. Body validation reporting oversized content is a
 /// truncation instruction, not a refusal: the ladder cuts model-visible text,
 /// leaves a marker, and installs the smaller body.
+///
+/// Host-body validation is the typed compact-continuation path (LIM-67), the
+/// same runtime `mid_turn_host_validation_failure_degrades_installs_and_leaves_reload_clear`
+/// pins. A clean thread's parts arm does not run that ladder.
 #[tokio::test]
 #[serial]
 async fn canary_oversized_body_truncates_and_installs_instead_of_refusing() {
@@ -569,19 +590,17 @@ async fn canary_oversized_body_truncates_and_installs_instead_of_refusing() {
     handle.flush().await;
 
     let sess = Arc::new(session);
-    let attempt = try_run_lhc_compact_arm(
+    let attempt = run_mid_turn_forced_boundary_continuation(
         &sess,
         &tc,
         InitialContextInjection::DoNotInject,
-        /*manual*/ false,
-        CompactionPhase::MidTurn,
-        Some(mid_facts(
+        mid_facts(
             "canary-oversized-1",
             true,
             decision_epoch(&sess),
             vec![protected_id.into()],
             Some(sample_usage(4_800)),
-        )),
+        ),
         &CancellationToken::new(),
     )
     .await
@@ -699,6 +718,9 @@ async fn seed_oversized_protected_pair(
 /// the rollout from the installed LHC view (the prior oversized generation
 /// does not stay authoritative) and converges. The ordinary repair op remains
 /// available as optional bookkeeping recovery.
+///
+/// Host-validation ACK is the typed compact-continuation path. A clean
+/// thread's parts arm never writes that receipt (`host_validation: None`).
 #[tokio::test]
 #[serial]
 async fn canary_validation_ack_write_failure_warns_and_continues() {
@@ -727,19 +749,17 @@ async fn canary_validation_ack_write_failure_warns_and_continues() {
     let epoch = decision_epoch(&sess);
     let attempt = tokio::time::timeout(
         CANARY_BOUND,
-        try_run_lhc_compact_arm(
+        run_mid_turn_forced_boundary_continuation(
             &sess,
             &tc,
             InitialContextInjection::DoNotInject,
-            /*manual*/ false,
-            CompactionPhase::MidTurn,
-            Some(mid_facts(
+            mid_facts(
                 "canary-ack-write-fail",
                 true,
                 epoch,
                 vec![protected_id.into()],
                 Some(sample_usage(4_800)),
-            )),
+            ),
             &CancellationToken::new(),
         ),
     )
