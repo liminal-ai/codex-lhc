@@ -1145,3 +1145,168 @@ fn strict_new_generation_proof_requires_exact_envelope() {
         );
     }
 }
+
+// ── M2: prior-generation realtime eligibility ─────────────────────────────
+
+fn realtime_line(ordinal: u64, id: &str) -> String {
+    serde_json::to_string(&RolloutLine {
+        timestamp: "2026-01-01T00:00:00.000Z".into(),
+        ordinal: Some(ordinal),
+        item: RolloutItem::RealtimeItem(codex_protocol::realtime::RealtimeItem {
+            id: id.into(),
+            realtime_session_id: "rt-session".into(),
+            content: codex_protocol::realtime::RealtimeItemContent::RealtimeSessionStarted,
+        }),
+    })
+    .expect("encode realtime line")
+}
+
+fn session_meta_line(subagent_history_start_ordinal: Option<u64>) -> String {
+    serde_json::to_string(&RolloutLine {
+        timestamp: "2026-01-01T00:00:00.000Z".into(),
+        ordinal: Some(0),
+        item: RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                timestamp: "2026-01-01T00:00:00.000Z".into(),
+                history_mode: ThreadHistoryMode::Paginated,
+                subagent_history_start_ordinal,
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+    })
+    .expect("encode session meta line")
+}
+
+#[test]
+fn parse_prior_realtime_items_returns_every_row_in_order_without_a_boundary() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    let body = format!(
+        "{}\n{}\n{}\n{}\n",
+        session_meta_line(None),
+        realtime_line(1, "rt-a"),
+        realtime_line(2, "rt-b"),
+        realtime_line(3, "rt-c"),
+    );
+    std::fs::write(&path, body).unwrap();
+
+    let ids: Vec<String> = parse_prior_realtime_items(&path)
+        .expect("read realtime rows")
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(ids, vec!["rt-a", "rt-b", "rt-c"]);
+}
+
+#[test]
+fn parse_prior_realtime_items_excludes_inherited_subagent_rows() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    let body = format!(
+        "{}\n{}\n{}\n{}\n",
+        session_meta_line(Some(3)),
+        realtime_line(1, "rt-inherited-a"),
+        realtime_line(2, "rt-inherited-b"),
+        realtime_line(3, "rt-child"),
+    );
+    std::fs::write(&path, body).unwrap();
+
+    let ids: Vec<String> = parse_prior_realtime_items(&path)
+        .expect("read realtime rows")
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["rt-child"],
+        "rows below subagent_history_start_ordinal stay inherited history"
+    );
+}
+
+fn realtime_line_without_ordinal(id: &str) -> String {
+    let mut line = serde_json::to_value(RolloutLine {
+        timestamp: "2026-01-01T00:00:00.000Z".into(),
+        ordinal: None,
+        item: RolloutItem::RealtimeItem(codex_protocol::realtime::RealtimeItem {
+            id: id.into(),
+            realtime_session_id: "rt-session".into(),
+            content: codex_protocol::realtime::RealtimeItemContent::RealtimeSessionStarted,
+        }),
+    })
+    .expect("encode realtime line");
+    line.as_object_mut().expect("object").remove("ordinal");
+    serde_json::to_string(&line).expect("encode realtime line without ordinal")
+}
+
+#[test]
+fn parse_prior_realtime_items_rejects_unprovable_authority_input() {
+    struct Case {
+        name: &'static str,
+        body: String,
+        needle: &'static str,
+    }
+    let cases = [
+        Case {
+            name: "malformed JSON",
+            body: format!(
+                "{}\n{{not-json\n{}\n",
+                session_meta_line(None),
+                realtime_line(1, "rt-a")
+            ),
+            needle: "malformed JSON",
+        },
+        Case {
+            name: "malformed envelope",
+            body: format!(
+                "{}\n{{\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"ordinal\":1}}\n{}\n",
+                session_meta_line(None),
+                realtime_line(1, "rt-a")
+            ),
+            needle: "malformed rollout envelope",
+        },
+        Case {
+            name: "missing ordinal",
+            body: format!(
+                "{}\n{}\n{}\n",
+                session_meta_line(None),
+                realtime_line_without_ordinal("rt-legacy"),
+                realtime_line(1, "rt-a"),
+            ),
+            needle: "missing a paginated ordinal",
+        },
+        Case {
+            name: "missing SessionMeta",
+            body: format!("{}\n", realtime_line(1, "rt-a")),
+            needle: "without SessionMeta",
+        },
+        Case {
+            name: "ambiguous SessionMeta",
+            body: format!(
+                "{}\n{}\n{}\n",
+                session_meta_line(None),
+                session_meta_line(Some(3)),
+                realtime_line(3, "rt-child"),
+            ),
+            needle: "conflicting SessionMeta",
+        },
+    ];
+    for case in cases {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(&path, &case.body).unwrap();
+        let err = parse_prior_realtime_items(&path).expect_err(case.name);
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "{}: {err}",
+            case.name
+        );
+        assert!(
+            err.to_string().contains(case.needle),
+            "{}: expected {:?} in {err}",
+            case.name,
+            case.needle
+        );
+    }
+}

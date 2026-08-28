@@ -699,6 +699,91 @@ pub fn parse_rollout_items(path: &Path) -> std::io::Result<Vec<RolloutItem>> {
     Ok(items)
 }
 
+fn invalid_realtime_authority(message: impl Into<String>) -> IoError {
+    IoError::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+/// Read the prior generation's **eligible** paginated `RealtimeItem` rows in
+/// original rollout order (M2).
+///
+/// This is an **authority** read: the replacement generation may only be
+/// installed when the complete eligible set can be proven. Unlike
+/// [`parse_rollout_items`], a nonempty malformed JSON line, a malformed
+/// [`RolloutLine`] envelope, a `RealtimeItem` without a paginated ordinal, or
+/// realtime rows without enough [`RolloutItem::SessionMeta`] to apply the
+/// inherited-subagent boundary is [`std::io::ErrorKind::InvalidData`] — never
+/// a skip.
+///
+/// Eligible means non-inherited: at an ordinal at or after the session's
+/// `subagent_history_start_ordinal`, the same boundary the thread-history
+/// projector applies (`ordinal < start` → inherited subagent history, excluded
+/// from `thread_realtime_items`). Rows below it are the parent's copied prefix
+/// and must stay excluded from the replacement generation, so carrying them
+/// forward cannot promote them. `SessionMeta` with
+/// `subagent_history_start_ordinal: None` is a real "no inherited prefix";
+/// missing or conflicting `SessionMeta` is not.
+pub fn parse_prior_realtime_items(
+    path: &Path,
+) -> std::io::Result<Vec<codex_protocol::realtime::RealtimeItem>> {
+    use std::io::BufRead;
+    let file = File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut session_meta_boundary: Option<Option<u64>> = None;
+    let mut rows: Vec<(u64, codex_protocol::realtime::RealtimeItem)> = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let number = index + 1;
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|err| {
+            invalid_realtime_authority(format!("line {number}: malformed JSON: {err}"))
+        })?;
+        let rollout_line: RolloutLine = serde_json::from_value(value).map_err(|err| {
+            invalid_realtime_authority(format!("line {number}: malformed rollout envelope: {err}"))
+        })?;
+        match rollout_line.item {
+            RolloutItem::SessionMeta(meta) => {
+                let start = meta.meta.subagent_history_start_ordinal;
+                match session_meta_boundary {
+                    None => session_meta_boundary = Some(start),
+                    Some(existing) if existing == start => {}
+                    Some(_) => {
+                        return Err(invalid_realtime_authority(format!(
+                            "line {number}: conflicting SessionMeta \
+                             subagent_history_start_ordinal; cannot apply \
+                             inherited-subagent boundary"
+                        )));
+                    }
+                }
+            }
+            RolloutItem::RealtimeItem(item) => {
+                let Some(ordinal) = rollout_line.ordinal else {
+                    return Err(invalid_realtime_authority(format!(
+                        "line {number}: RealtimeItem is missing a paginated ordinal"
+                    )));
+                };
+                rows.push((ordinal, item));
+            }
+            _ => {}
+        }
+    }
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(start) = session_meta_boundary else {
+        return Err(invalid_realtime_authority(
+            "RealtimeItem rows present without SessionMeta; cannot apply \
+             inherited-subagent boundary",
+        ));
+    };
+    Ok(rows
+        .into_iter()
+        .filter(|(ordinal, _)| start.is_none_or(|boundary| *ordinal >= boundary))
+        .map(|(_, item)| item)
+        .collect())
+}
+
 /// RAII arm for a thread-scoped swap failpoint. Restores the previous value.
 #[cfg(any(test, feature = "test-util"))]
 pub struct SwapFailpointGuard {

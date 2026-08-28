@@ -2048,6 +2048,29 @@ async fn install_lhc_compact_rewrite(
         _ => Vec::new(),
     };
 
+    // M2: eligible non-inherited paginated realtime rows must survive this
+    // rewrite; they need the ordinal-bearing authority read, not the
+    // skip-tolerant item-only one. An unprovable set is a refusal: keep the
+    // prior body rather than installing a replacement that silently dropped
+    // rows the reader could not prove.
+    let prior_realtime_items = match rollout_path.as_ref() {
+        Some(path) if path.exists() => match codex_lhc_host::parse_prior_realtime_items(path) {
+            Ok(items) => items,
+            Err(err) => {
+                error!(
+                    %err,
+                    path = %path.display(),
+                    manual,
+                    "LHC compact refusing to install: prior rollout realtime rows cannot be proven"
+                );
+                return Ok(kept_prior_body_attempt(format!(
+                    "prior rollout realtime rows unreadable; prior body kept: {err}"
+                )));
+            }
+        },
+        _ => Vec::new(),
+    };
+
     let session_meta = prior_generation
         .iter()
         .find_map(|item| match item {
@@ -2079,6 +2102,7 @@ async fn install_lhc_compact_rewrite(
         messages: &surfaces.messages,
         turns: &surfaces.turns,
         prior_generation: &prior_generation,
+        prior_realtime_items: &prior_realtime_items,
         boundary: CompactBoundaryMeta {
             message: provisional_message,
             window_number,
@@ -2104,6 +2128,25 @@ async fn install_lhc_compact_rewrite(
 
     for note in &materialize_result.gap_notes {
         error!(%note, manual, "LHC materialize gap_note");
+    }
+
+    // M1: a captured item the rebuilt sequence cannot represent exactly is a
+    // visible refusal, not a degradation ladder input. Refuse before anything
+    // is installed: the session keeps the body it already holds (same
+    // disposition as R19) rather than serving a silently altered item.
+    if !materialize_result.refusals.is_empty() {
+        for refusal in &materialize_result.refusals {
+            error!(
+                %refusal,
+                manual,
+                "LHC compact refusing to install: materialization cannot represent a \
+                 captured item exactly"
+            );
+        }
+        return Ok(kept_prior_body_attempt(format!(
+            "materialization cannot represent captured items exactly; prior body kept: {}",
+            materialize_result.refusals.join("; ")
+        )));
     }
 
     // In-memory history = bands (replacement_history) + native tail — same as

@@ -95,10 +95,10 @@ index 384af1d3cd..571ce25aca 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..752b0b78ad
+index 0000000000..140a86ec6c
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,3041 @@
+@@ -0,0 +1,3084 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -2149,6 +2149,29 @@ index 0000000000..752b0b78ad
 +        _ => Vec::new(),
 +    };
 +
++    // M2: eligible non-inherited paginated realtime rows must survive this
++    // rewrite; they need the ordinal-bearing authority read, not the
++    // skip-tolerant item-only one. An unprovable set is a refusal: keep the
++    // prior body rather than installing a replacement that silently dropped
++    // rows the reader could not prove.
++    let prior_realtime_items = match rollout_path.as_ref() {
++        Some(path) if path.exists() => match codex_lhc_host::parse_prior_realtime_items(path) {
++            Ok(items) => items,
++            Err(err) => {
++                error!(
++                    %err,
++                    path = %path.display(),
++                    manual,
++                    "LHC compact refusing to install: prior rollout realtime rows cannot be proven"
++                );
++                return Ok(kept_prior_body_attempt(format!(
++                    "prior rollout realtime rows unreadable; prior body kept: {err}"
++                )));
++            }
++        },
++        _ => Vec::new(),
++    };
++
 +    let session_meta = prior_generation
 +        .iter()
 +        .find_map(|item| match item {
@@ -2180,6 +2203,7 @@ index 0000000000..752b0b78ad
 +        messages: &surfaces.messages,
 +        turns: &surfaces.turns,
 +        prior_generation: &prior_generation,
++        prior_realtime_items: &prior_realtime_items,
 +        boundary: CompactBoundaryMeta {
 +            message: provisional_message,
 +            window_number,
@@ -2205,6 +2229,25 @@ index 0000000000..752b0b78ad
 +
 +    for note in &materialize_result.gap_notes {
 +        error!(%note, manual, "LHC materialize gap_note");
++    }
++
++    // M1: a captured item the rebuilt sequence cannot represent exactly is a
++    // visible refusal, not a degradation ladder input. Refuse before anything
++    // is installed: the session keeps the body it already holds (same
++    // disposition as R19) rather than serving a silently altered item.
++    if !materialize_result.refusals.is_empty() {
++        for refusal in &materialize_result.refusals {
++            error!(
++                %refusal,
++                manual,
++                "LHC compact refusing to install: materialization cannot represent a \
++                 captured item exactly"
++            );
++        }
++        return Ok(kept_prior_body_attempt(format!(
++            "materialization cannot represent captured items exactly; prior body kept: {}",
++            materialize_result.refusals.join("; ")
++        )));
 +    }
 +
 +    // In-memory history = bands (replacement_history) + native tail — same as
@@ -8836,10 +8879,10 @@ index 0000000000..c31cb79bbb
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..dd96663962
+index 0000000000..8534d13b33
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1421 @@
+@@ -0,0 +1,1688 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -9220,6 +9263,7 @@ index 0000000000..dd96663962
 +        messages: &surfaces.messages,
 +        turns: &surfaces.turns,
 +        prior_generation: &[], // file gone — pure thread projection
++        prior_realtime_items: &[],
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
@@ -9974,6 +10018,7 @@ index 0000000000..dd96663962
 +        messages: &surfaces.messages,
 +        turns: &surfaces.turns,
 +        prior_generation: &prior,
++        prior_realtime_items: &[],
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
@@ -10196,6 +10241,7 @@ index 0000000000..dd96663962
 +            messages: &surfaces.messages,
 +            turns: &surfaces.turns,
 +            prior_generation: &prior,
++            prior_realtime_items: &[],
 +            boundary,
 +            world_state: None,
 +            turn_context: None,
@@ -10259,6 +10305,270 @@ index 0000000000..dd96663962
 +    assert!(
 +        response_items_structurally_equal(&got, &expected_newest_only),
 +        "newest boundary extract is the dual-format contract"
++    );
++}
++
++// ── M1: named unpaired FunctionCallOutput through the real compact arm ─────
++
++fn named_unpaired_output(body: codex_protocol::models::FunctionCallOutputBody) -> ResponseItem {
++    ResponseItem::FunctionCallOutput {
++        id: None,
++        call_id: None,
++        name: Some("notifications".to_string()),
++        namespace: Some("slack".to_string()),
++        output: FunctionCallOutputPayload {
++            body,
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn function_call_outputs(items: &[ResponseItem]) -> Vec<&ResponseItem> {
++    items
++        .iter()
++        .filter(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
++        .collect()
++}
++
++/// Provider-visible `FunctionCallOutput` shape: host-stamped chat passthrough
++/// is stripped before a non-OpenAI send and is not part of the contract this
++/// test proves. Assigned item identity is kept.
++fn provider_visible_function_call_output(item: &ResponseItem) -> ResponseItem {
++    let mut item = item.clone();
++    item.clear_internal_chat_message_metadata_passthrough();
++    item
++}
++
++/// Production path: a named unpaired `FunctionCallOutput` (`call_id: None`,
++/// nonempty name and namespace) recorded on a live session survives capture,
++/// the LHC compact generation rewrite, reopen/materialize, and the next
++/// provider request with its original absent call id, exact name / namespace /
++/// payload, and the host-assigned item identity — never a paired tool result
++/// with a synthetic call id.
++#[tokio::test]
++async fn slice_d_named_unpaired_function_output_survives_generation_rewrite() {
++    let _swap = hold_swap_clean();
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++
++    seed_conversation_bandable(&session, &tc, 80).await;
++    session
++        .record_conversation_items_with_provenance(
++            &tc,
++            &[named_unpaired_output(
++                codex_protocol::models::FunctionCallOutputBody::Text(
++                    "parent notification".to_string(),
++                ),
++            )],
++            codex_extension_api::RawItemProvenance::ModelOutput,
++        )
++        .await;
++    handle.flush().await;
++
++    let precompact = session.clone_history().await.into_raw_items();
++    let precompact_outputs = function_call_outputs(&precompact);
++    assert_eq!(precompact_outputs.len(), 1, "{precompact_outputs:?}");
++    let ResponseItem::FunctionCallOutput {
++        id: Some(precompact_id),
++        call_id: None,
++        name: Some(name),
++        namespace: Some(namespace),
++        output,
++        ..
++    } = precompact_outputs[0]
++    else {
++        panic!(
++            "host-recorded unpaired output must keep call_id: None with assigned item identity: {:?}",
++            precompact_outputs[0]
++        );
++    };
++    assert!(
++        precompact_id.is_prefixed(),
++        "host-assigned item identity is provider-visible: {precompact_id}"
++    );
++    assert_eq!(name, "notifications");
++    assert_eq!(namespace, "slack");
++    assert_eq!(output.success, Some(true));
++    assert!(matches!(
++        output.body,
++        codex_protocol::models::FunctionCallOutputBody::Text(ref text)
++            if text == "parent notification"
++    ));
++    let expected = provider_visible_function_call_output(precompact_outputs[0]);
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::Installed { body, .. } = attempt else {
++        panic!("expected an installed compact: {attempt:?}");
++    };
++
++    let installed = function_call_outputs(&body)
++        .into_iter()
++        .map(provider_visible_function_call_output)
++        .collect::<Vec<_>>();
++    assert_eq!(
++        installed,
++        vec![expected.clone()],
++        "installed body keeps the host-recorded unpaired output, including assigned item identity"
++    );
++
++    // Reopen: rebuild the next provider request from the rewritten generation.
++    // `FunctionCallOutputPayload.success` is in-memory metadata and is not on
++    // the function_call_output wire, so disk reopen deserializes it as None.
++    // Compare the provider-visible JSON (includes assigned id; omits success).
++    let items = parse_rollout_items(&rollout_path).expect("parse rewritten rollout");
++    let rebuilt = reconstruct_model_history(&items);
++    let reopened = function_call_outputs(&rebuilt)
++        .into_iter()
++        .map(provider_visible_function_call_output)
++        .collect::<Vec<_>>();
++    assert_eq!(
++        serde_json::to_value(&reopened).expect("serialize reopened outputs"),
++        serde_json::to_value(&installed).expect("serialize installed outputs"),
++        "reopen provider-visible JSON matches the installed host-recorded output, including assigned item identity"
++    );
++    assert_eq!(
++        serde_json::to_value(&reopened).expect("serialize reopened outputs"),
++        serde_json::to_value(std::slice::from_ref(&expected)).expect("serialize expected outputs"),
++        "reopen provider-visible JSON matches the precompact host-recorded output"
++    );
++    let rebuilt_json = serde_json::to_string(&rebuilt).expect("serialize rebuilt body");
++    assert!(
++        !rebuilt_json.contains("synthetic:"),
++        "no synthetic call id reaches the provider body: {rebuilt_json}"
++    );
++}
++
++/// Production path: a variant the closed LHC `tool_result` payload cannot carry
++/// exactly is refused before anything is installed — the session keeps the body
++/// it already holds and the rollout is not rewritten.
++#[tokio::test]
++async fn slice_d_unrepresentable_unpaired_output_refuses_before_install() {
++    let _swap = hold_swap_clean();
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++
++    seed_conversation_bandable(&session, &tc, 80).await;
++    session
++        .record_conversation_items_with_provenance(
++            &tc,
++            &[named_unpaired_output(
++                codex_protocol::models::FunctionCallOutputBody::ContentItems(vec![
++                    codex_protocol::models::FunctionCallOutputContentItem::InputText {
++                        text: "see attachment".to_string(),
++                    },
++                    codex_protocol::models::FunctionCallOutputContentItem::InputImage {
++                        image_url: "https://example.invalid/a.png".to_string(),
++                        detail: None,
++                    },
++                ]),
++            )],
++            codex_extension_api::RawItemProvenance::ModelOutput,
++        )
++        .await;
++    handle.flush().await;
++
++    let before = std::fs::read(&rollout_path).expect("read rollout before");
++    let history_before = session.clone_history().await.into_raw_items();
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::ContinuedWithoutCompact { reason } = attempt else {
++        panic!("expected a visible refusal, got: {attempt:?}");
++    };
++    assert!(
++        reason.contains("cannot represent captured items exactly")
++            && reason.contains("notifications"),
++        "refusal must name the cause: {reason}"
++    );
++    assert_eq!(
++        std::fs::read(&rollout_path).expect("read rollout after"),
++        before,
++        "no generation rewrite on refusal"
++    );
++    assert!(
++        response_items_structurally_equal(
++            &sess.clone_history().await.into_raw_items(),
++            &history_before
++        ),
++        "the session keeps the body it already held"
++    );
++}
++
++/// Q1: a malformed authority line means the complete eligible realtime set
++/// cannot be proven. Compact refuses before materialization or rewrite.
++#[tokio::test]
++async fn slice_d_unprovable_realtime_rows_refuse_before_install() {
++    let _swap = hold_swap_clean();
++    let dir = tempdir().unwrap();
++    let root = dir.path().to_path_buf();
++    let (mut session, tc) = make_session_and_context().await;
++    install_lhc_and_enable(&mut session, root.clone()).await;
++    let rollout_path = attach_rollout(&mut session).await;
++
++    let slot = session
++        .services
++        .thread_extension_data
++        .get::<LhcCaptureSlot>()
++        .expect("slot");
++    let handle = wait_for_handle(&slot, Duration::from_secs(5))
++        .await
++        .expect("handle");
++
++    seed_conversation_bandable(&session, &tc, 80).await;
++    handle.flush().await;
++    session.flush_rollout().await.expect("flush rollout");
++
++    let mut before = std::fs::read(&rollout_path).expect("read rollout before");
++    before.extend_from_slice(b"{not-json\n");
++    std::fs::write(&rollout_path, &before).expect("append malformed authority line");
++    let history_before = session.clone_history().await.into_raw_items();
++
++    let sess = Arc::new(session);
++    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
++    let LhcCompactAttempt::ContinuedWithoutCompact { reason } = attempt else {
++        panic!("expected a visible refusal, got: {attempt:?}");
++    };
++    assert!(
++        reason.contains("prior rollout realtime rows unreadable"),
++        "refusal must name the unprovable realtime set: {reason}"
++    );
++    assert_eq!(
++        std::fs::read(&rollout_path).expect("read rollout after"),
++        before,
++        "no generation rewrite on unprovable realtime authority"
++    );
++    assert!(
++        response_items_structurally_equal(
++            &sess.clone_history().await.into_raw_items(),
++            &history_before
++        ),
++        "the session keeps the body it already held"
 +    );
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
@@ -20306,10 +20616,10 @@ index a63ed7fcb1..467fce6a85 100644
  
  fn thread_store_io_error(err: std::io::Error) -> ThreadStoreError {
 diff --git a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
-index 4354e39244..cdd01757d4 100644
+index 4354e39244..1f13baa2d6 100644
 --- a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
 +++ b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
-@@ -1896,6 +1896,369 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
+@@ -1896,6 +1896,525 @@ async fn synchronized_catch_up_does_not_replay_old_rows() {
      assert_eq!(status, "sentinel");
  }
  
@@ -20549,6 +20859,162 @@ index 4354e39244..cdd01757d4 100644
 +    );
 +}
 +
++/// M2: an LHC generation rewrite carries the prior generation's eligible
++/// realtime rows forward. After the generation swap resets the projection, the
++/// rebuild must land those rows exactly once at the **replacement** ordinals —
++/// never pinned to the dead generation's ordinals — and a repeated rewrite must
++/// not duplicate or move them.
++#[tokio::test]
++async fn generation_rewrite_reprojects_carried_realtime_rows_exactly_once() {
++    let home = TempDir::new().expect("temp dir");
++    let store = projection_store(home.path()).await;
++    let thread_id = ThreadId::default();
++    create_paginated_thread(&store, thread_id).await;
++
++    let carried = vec![
++        realtime_session_started("rt-a", "realtime-session-1"),
++        realtime_session_started("rt-b", "realtime-session-2"),
++    ];
++    let mut dead_generation = generation_items(thread_id, "dead-turn-a", /*text_len*/ 16_384);
++    dead_generation.extend(generation_items(
++        thread_id,
++        "dead-turn-b",
++        /*text_len*/ 16_384,
++    ));
++    dead_generation.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
++    store
++        .append_items(AppendThreadItemsParams {
++            thread_id,
++            items: dead_generation,
++        })
++        .await
++        .expect("project dead generation");
++    let rollout_path = store
++        .live_rollout_path(thread_id)
++        .await
++        .expect("rollout path");
++    store
++        .shutdown_thread(thread_id)
++        .await
++        .expect("close dead generation");
++    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
++        home.path().abs(),
++    ))
++    .await
++    .expect("open thread history db");
++    assert_eq!(
++        projected_realtime(&pool, thread_id).await,
++        vec![("rt-a".to_string(), 7), ("rt-b".to_string(), 8)],
++        "dead generation projects both realtime rows at its own ordinals"
++    );
++
++    // The LHC rewrite: a shorter replacement generation that carries the same
++    // eligible realtime rows forward, in order.
++    let mut replacement = generation_items(thread_id, "live-turn", /*text_len*/ 8);
++    replacement.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
++    let replacement_len = replace_rollout_generation(
++        rollout_path.as_path(),
++        /*initial_ordinal*/ 0,
++        replacement,
++    );
++
++    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
++        .await
++        .expect("rebuild projection after generation swap");
++
++    assert_eq!(
++        projected_realtime(&pool, thread_id).await,
++        vec![("rt-a".to_string(), 4), ("rt-b".to_string(), 5)],
++        "carried realtime rows rebuild exactly once at the replacement ordinals"
++    );
++    assert_eq!(
++        projection_state(&pool, thread_id).await,
++        (replacement_len, 6)
++    );
++
++    // A repeated rewrite is idempotent: same rows, same ordinals, no duplicates.
++    let mut second_replacement = generation_items(thread_id, "live-turn", /*text_len*/ 4);
++    second_replacement.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
++    let second_len = replace_rollout_generation(
++        rollout_path.as_path(),
++        /*initial_ordinal*/ 0,
++        second_replacement,
++    );
++    assert!(second_len < replacement_len);
++
++    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
++        .await
++        .expect("rebuild projection after repeated generation swap");
++
++    assert_eq!(
++        projected_realtime(&pool, thread_id).await,
++        vec![("rt-a".to_string(), 4), ("rt-b".to_string(), 5)],
++        "repeated rewrites do not duplicate or move carried realtime rows"
++    );
++}
++
++/// M2: carrying realtime rows through a rewrite must not promote inherited
++/// subagent history. The projector's boundary rule is unchanged — a row below
++/// `subagent_history_start_ordinal` stays excluded.
++#[tokio::test]
++async fn generation_rewrite_keeps_inherited_subagent_realtime_rows_excluded() {
++    let home = TempDir::new().expect("temp dir");
++    let store = projection_store(home.path()).await;
++    let thread_id = ThreadId::default();
++    create_paginated_subagent_thread(
++        &store,
++        thread_id,
++        /*history_base*/ None,
++        /*subagent_history_start_ordinal*/ Some(5),
++    )
++    .await;
++    store
++        .append_items(AppendThreadItemsParams {
++            thread_id,
++            items: generation_items(thread_id, "dead-turn", /*text_len*/ 16_384),
++        })
++        .await
++        .expect("project dead generation");
++    let rollout_path = store
++        .live_rollout_path(thread_id)
++        .await
++        .expect("rollout path");
++    store
++        .shutdown_thread(thread_id)
++        .await
++        .expect("close dead generation");
++    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
++        home.path().abs(),
++    ))
++    .await
++    .expect("open thread history db");
++
++    // Ordinals 1..=3 are inherited prefix; 4 is the last inherited ordinal and
++    // 5 is the first the child owns.
++    let replacement = vec![
++        RolloutItem::RealtimeItem(realtime_session_started("rt-inherited", "parent")),
++        turn_started("inherited-turn"),
++        turn_completed("inherited-turn"),
++        RolloutItem::RealtimeItem(realtime_session_started("rt-inherited-2", "parent")),
++        RolloutItem::RealtimeItem(realtime_session_started("rt-child", "child")),
++    ];
++    replace_rollout_generation(
++        rollout_path.as_path(),
++        /*initial_ordinal*/ 0,
++        replacement,
++    );
++
++    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
++        .await
++        .expect("rebuild projection after generation swap");
++
++    assert_eq!(
++        projected_realtime(&pool, thread_id).await,
++        vec![("rt-child".to_string(), 5)],
++        "only the non-inherited realtime row projects"
++    );
++}
++
 +#[tokio::test]
 +async fn subagent_rewrite_uses_persisted_first_ordinal_above_history_base() {
 +    let home = TempDir::new().expect("temp dir");
@@ -20679,7 +21145,7 @@ index 4354e39244..cdd01757d4 100644
  #[tokio::test]
  async fn catch_up_preserves_trailing_partial_line_boundaries() {
      let home = TempDir::new().expect("temp dir");
-@@ -2598,10 +2961,14 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
+@@ -2598,10 +3117,14 @@ fn completed_item(thread_id: ThreadId, turn_id: &str, item: TurnItem) -> Rollout
  }
  
  fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
@@ -20695,10 +21161,18 @@ index 4354e39244..cdd01757d4 100644
          }],
          phase: Some(phase),
          memory_citation: None,
-@@ -2609,6 +2976,152 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
+@@ -2609,6 +3132,170 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
      })
  }
  
++fn realtime_session_started(item_id: &str, realtime_session_id: &str) -> RealtimeItem {
++    RealtimeItem {
++        id: item_id.to_string(),
++        realtime_session_id: realtime_session_id.to_string(),
++        content: RealtimeItemContent::RealtimeSessionStarted,
++    }
++}
++
 +fn generation_items(thread_id: ThreadId, turn_id: &str, text_len: usize) -> Vec<RolloutItem> {
 +    vec![
 +        turn_started(turn_id),
@@ -20826,6 +21300,16 @@ index 4354e39244..cdd01757d4 100644
 +    .await
 +    .expect("read projected items");
 +    (turns, items)
++}
++
++async fn projected_realtime(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> Vec<(String, i64)> {
++    sqlx::query_as::<_, (String, i64)>(
++        "SELECT item_id, rollout_ordinal FROM thread_realtime_items WHERE thread_id = ? ORDER BY rollout_ordinal, item_id",
++    )
++    .bind(thread_id.to_string())
++    .fetch_all(pool)
++    .await
++    .expect("read projected realtime items")
 +}
 +
 +async fn history_row_counts(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> (i64, i64, i64) {

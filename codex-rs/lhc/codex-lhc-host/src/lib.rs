@@ -232,6 +232,7 @@ pub use rollout_swap::classify_swap_state;
 pub use rollout_swap::history_from_materialized_items;
 pub use rollout_swap::model_context_token_estimate_from_rollout_items;
 pub use rollout_swap::new_rollout_generation_id;
+pub use rollout_swap::parse_prior_realtime_items;
 pub use rollout_swap::parse_rollout_items;
 pub use rollout_swap::proves_new_generation;
 pub use rollout_swap::reconcile_interrupted_swap;

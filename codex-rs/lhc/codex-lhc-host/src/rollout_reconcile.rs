@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -1155,6 +1156,50 @@ pub async fn materialize_thread_rollout_items(
         Vec::new()
     };
 
+    // M2: eligible non-inherited paginated realtime rows must survive the
+    // regenerated generation. The ordinal-bearing read is authority: an
+    // unprovable set is an error, never an empty carry-forward that would
+    // install a replacement generation missing rows the reader could not
+    // prove.
+    //
+    // The one exception is `Corrupt`: that rollout was already classified as
+    // having no usable structure, so it can never be realtime authority. Its
+    // established product purpose is recovery from LHC durable state, and the
+    // rows it cannot yield are unrecoverable presentation-only residue rather
+    // than a set the reader is refusing to prove. Every other trigger expects
+    // a valid prior generation and keeps the strict refusal.
+    let prior_realtime_items = if !path.exists() {
+        Vec::new()
+    } else {
+        match crate::rollout_swap::parse_prior_realtime_items(path) {
+            Ok(items) => items,
+            Err(err) if trigger == RolloutReconcileTrigger::Corrupt => {
+                warn!(
+                    %err,
+                    path = %path.display(),
+                    thread_id,
+                    "LHC reconcile: corrupt rollout cannot prove its realtime rows; \
+                     recovering from LHC without them"
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                error!(
+                    %err,
+                    path = %path.display(),
+                    thread_id,
+                    ?trigger,
+                    "LHC reconcile refusing to regenerate: prior rollout realtime rows cannot be \
+                     proven"
+                );
+                return Err(format!(
+                    "prior rollout realtime rows unreadable; refusing to regenerate {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    };
+
     let session_meta = prior_generation
         .iter()
         .find_map(|item| match item {
@@ -1209,6 +1254,7 @@ pub async fn materialize_thread_rollout_items(
         messages: &surfaces.messages,
         turns: &surfaces.turns,
         prior_generation: &prior_generation,
+        prior_realtime_items: &prior_realtime_items,
         boundary: CompactBoundaryMeta {
             message: durable_message,
             window_number,
@@ -1223,6 +1269,28 @@ pub async fn materialize_thread_rollout_items(
 
     for note in &result.gap_notes {
         warn!(%note, ?trigger, "LHC reconcile materialize gap_note");
+    }
+
+    // M1: a captured item the rebuilt sequence cannot represent exactly is a
+    // visible refusal, not a degradation. Stop before any rewrite rather than
+    // swapping in a generation that silently alters it.
+    if !result.refusals.is_empty() {
+        for refusal in &result.refusals {
+            error!(
+                %refusal,
+                path = %path.display(),
+                thread_id,
+                ?trigger,
+                "LHC reconcile refusing to regenerate: materialization cannot represent a \
+                 captured item exactly"
+            );
+        }
+        return Err(format!(
+            "materialization cannot represent captured items exactly; refusing to \
+             regenerate {}: {}",
+            path.display(),
+            result.refusals.join("; ")
+        ));
     }
 
     // nc4: graft the exact provider-native active suffix from the prior

@@ -254,6 +254,10 @@ async fn reconcile_missing_regenerates_file() {
     );
 }
 
+/// A rollout already classified `Corrupt` has no usable structure, so it can
+/// never be realtime authority. Recovery from LHC durable state stays its
+/// product purpose: the rows it cannot yield are unrecoverable
+/// presentation-only residue, not a set the reader is refusing to prove.
 #[tokio::test]
 async fn reconcile_corrupt_regenerates_file() {
     let dir = tempdir().unwrap();
@@ -283,6 +287,49 @@ async fn reconcile_corrupt_regenerates_file() {
             .iter()
             .any(|i| matches!(i, RolloutItem::SessionMeta(_))),
         "must be parseable with SessionMeta after corrupt rewrite"
+    );
+}
+
+#[tokio::test]
+async fn regenerate_refuses_before_rewrite_when_realtime_line_is_malformed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().join("lhc");
+    let tid = "reconcile-realtime-authority-tid";
+    seed_thread(
+        &root,
+        tid,
+        &[user("hello realtime", "u1"), assistant("hi", "a1")],
+    )
+    .await;
+
+    let path = dir.path().join("rollout-realtime-authority.jsonl");
+    let mut items = single_boundary_items(1);
+    let RolloutItem::SessionMeta(meta) = &mut items[0] else {
+        panic!("first item must be session metadata");
+    };
+    meta.meta.history_mode = ThreadHistoryMode::Paginated;
+    write_items(&path, &items);
+    let mut body = std::fs::read(&path).expect("read seeded rollout");
+    body.extend_from_slice(b"{not-json\n");
+    std::fs::write(&path, &body).expect("append malformed authority line");
+
+    let err = regenerate_rollout_from_thread(
+        &path,
+        tid,
+        Some(root.as_path()),
+        RolloutReconcileTrigger::Stale,
+        None,
+    )
+    .await
+    .expect_err("unprovable realtime set must error before rewrite");
+    assert!(
+        err.contains("prior rollout realtime rows unreadable"),
+        "refusal must name the unprovable realtime set: {err}"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read rollout after refusal"),
+        body,
+        "active rollout bytes stay unchanged on refusal"
     );
 }
 

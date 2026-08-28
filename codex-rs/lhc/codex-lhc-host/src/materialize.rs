@@ -16,6 +16,7 @@
 //!     message-reasoning twins (rollback applied by exclusion, not marker)
 //!   → carry-forward review / patch / MCP / subagent / plan-sleep /
 //!     inter-agent items
+//!   → carry-forward eligible paginated `RealtimeItem` rows (projection input)
 //! ```
 //!
 //! No file IO. Slice C wires this into the compact arm.
@@ -44,7 +45,8 @@
 //! | `WebSearchEnd` / `ImageGenerationEnd` | **Regenerated** when tail holds native tools | reverse-mapped tail |
 //! | `ItemCompleted(Plan\|Sleep)` / `InterAgentCommunication{,Metadata}` | **Carried forward** | prior generation |
 //! | Review / patch / MCP / subagent ends | **Carried forward** when present | prior generation |
-//! | Transient (`Error`, `ExecCommandEnd`, collab, realtime, …) | **Dropped** | never persisted |
+//! | `RolloutItem::RealtimeItem` (paginated) | **Carried forward** (eligible non-inherited rows, in order) | prior generation |
+//! | Transient (`Error`, `ExecCommandEnd`, collab, …) | **Dropped** | never persisted |
 //! | Fork compact-marker `runtime_note` | **Excluded** (model + display) | idempotency key namespace `codex:{tid}:compact_marker:…` — fork bookkeeping; boundary `Compacted` already records that a compact happened. Keys matched structurally ([`crate::is_compact_marker_idempotency_key`]), never by note text (law 6). Rows stay in the LHC record as provenance. |
 //!
 //! # Capture gaps (do not invent content)
@@ -105,6 +107,7 @@ use serde_json::Value;
 pub const CAPTURE_GAPS: &[&str] = &[
     "FunctionCall vs CustomToolCall: both forward-map to tool_call; reverse discriminates by recovered host ResponseItemId prefix (fc_→FunctionCall, ctc_→CustomToolCall). Outputs: fco_→FunctionCallOutput, ctco_→CustomToolCallOutput; call_id pairing carries kind when id missing. Unknown/unrepresentable id prefixes → id=None (provider remints) + gap_notes entry — never an invalid pairing (ctc_ on FunctionCall)",
     "FunctionCall.namespace / CustomToolCall.namespace: not stored on tool_call payload → always None",
+    "Unpaired FunctionCallOutput (call_id: None): name/namespace/absent-call-id ride the fork-owned synthetic tool_call_id namespace (crate::mapping::unpaired_output_call_id) and are restored exactly; a variant the closed tool_result payload cannot carry (structured output body) is a REFUSAL, not a gap — the caller must not install the rewritten context",
     "Message.phase never stored → None; ResponseItemId recovered only from id-primary idempotency keys (synthetic: keys → None)",
     "Reasoning content[] vs summary[] vs encrypted_content: text + signature stored on assistant_thinking; encrypted_content re-emitted only when stored provider/model/api match live_identity (R2 host identity gate); mismatch or missing identity → encrypted_content None",
     "LocalShellCall.status / WebSearchCall.status / ToolSearchCall.execution+status: defaulted (Completed / completed / empty)",
@@ -124,7 +127,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "Pre-slice-A turns: outcome/timing/provider_usage absent → TurnComplete without timestamps; no TokenCount; cumulative totals undercount",
     "runtime_note shape: restored as user-role Message with stored payload text (no display twin); original host provenance (HostContext vs AgentMessage vs scaffolding) is lost",
     "Fork compact-marker runtime_notes (idempotency key namespace codex:{tid}:compact_marker:…): excluded from model and display streams — fork bookkeeping, not conversation; stay in the LHC record; boundary Compacted is the compact signal. Matched by key segment only (law 6), never note text",
-    "synthetic: call_id strings retained only so call/result pairs still match; never promoted to ResponseItemId",
+    "synthetic: call_id strings retained only so call/result pairs still match; never promoted to ResponseItemId (the unpaired-output namespace above is the one exception: it reverses to call_id=None, never to a pairing)",
     "Display twin order: ResponseItem then EventMsg twin (live append is twin-then-item on some paths; reconstruction does not care)",
 ];
 
@@ -146,6 +149,13 @@ pub struct MaterializeInput<'a> {
     pub messages: &'a [MessageRecord],
     pub turns: &'a [TurnRecord],
     pub prior_generation: &'a [RolloutItem],
+    /// Prior-generation paginated `RealtimeItem` rows that are eligible to
+    /// survive the rewrite — non-inherited only (ordinal at or after the
+    /// session's `subagent_history_start_ordinal`) — in original rollout
+    /// order. Built by
+    /// [`crate::rollout_swap::parse_prior_realtime_items`]; empty for legacy
+    /// rollouts, which never persist realtime rows.
+    pub prior_realtime_items: &'a [codex_protocol::realtime::RealtimeItem],
     pub boundary: CompactBoundaryMeta,
     pub world_state: Option<Value>,
     /// Optional post-boundary `TurnContext` for `previous_turn_settings` recovery.
@@ -162,6 +172,11 @@ pub struct MaterializeResult {
     pub items: Vec<RolloutItem>,
     /// Non-empty when a capture/alignment gap forced under-exclusion or similar.
     pub gap_notes: Vec<String>,
+    /// Non-empty when a captured item cannot be represented exactly in the
+    /// rebuilt sequence. Unlike a gap note this is **not** a degradation the
+    /// caller may absorb: the caller must refuse to install this
+    /// materialization and keep the context it already holds.
+    pub refusals: Vec<String>,
 }
 
 /// Materialize a complete Legacy-mode rollout item sequence.
@@ -170,6 +185,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     let turns_by_id = index_turns(input.turns);
     let (rolled_back_turns, mut gap_notes) =
         rolled_back_turn_ids(input.prior_generation, input.messages, input.turns);
+    let mut refusals: Vec<String> = Vec::new();
     // H2: rolled-back turns' usage must not inflate projected totals.
     let usage_totals = cumulative_usage_index(input.messages, &rolled_back_turns);
 
@@ -238,20 +254,31 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         input.live_identity.as_ref(),
         &mut out,
         &mut gap_notes,
+        &mut refusals,
     );
 
     // Carry-forward non-derivable ends (NOT ThreadRolledBack — C1).
     push_carry_forwards_ends(&mut out, input.prior_generation);
+
+    // M2: paginated realtime rows are durable projection input, not model
+    // context. They are not derivable from the LHC record, so the replacement
+    // generation carries the prior generation's eligible rows verbatim and in
+    // order; the projection reset after the swap rebuilds them from here.
+    push_carry_forwards_realtime(&mut out, input.prior_realtime_items);
 
     if !gap_notes.is_empty() {
         for note in &gap_notes {
             tracing::warn!(%note, "LHC materialize gap");
         }
     }
+    for refusal in &refusals {
+        tracing::error!(%refusal, "LHC materialize refusal (context must not be installed)");
+    }
 
     MaterializeResult {
         items: out,
         gap_notes: std::mem::take(&mut gap_notes),
+        refusals,
     }
 }
 
@@ -720,6 +747,7 @@ fn emit_tail(
     live_identity: Option<&ModelIdentity>,
     out: &mut Vec<RolloutItem>,
     gap_notes: &mut Vec<String>,
+    refusals: &mut Vec<String>,
 ) {
     let mut opened: HashSet<String> = HashSet::new();
     let mut closed: HashSet<String> = HashSet::new();
@@ -893,6 +921,7 @@ fn emit_tail(
                         id_hint.as_deref(),
                         call_kind,
                         &mut *gap_notes,
+                        &mut *refusals,
                     );
                     push_response_with_twins(item, out, true);
                 }
@@ -1556,11 +1585,45 @@ fn reverse_tool_result(
     id_hint: Option<&str>,
     call_kind: Option<RecoveredToolCallKind>,
     gap_notes: &mut Vec<String>,
+    refusals: &mut Vec<String>,
 ) -> ResponseItem {
     let name = tool_name.unwrap_or("");
     let call_id = call_id_string(tool_call_id);
     let recovered = id_hint.and_then(sanitize_id);
     let prefix = recovered.as_deref().and_then(host_id_kind_prefix);
+
+    // M1: an unpaired `FunctionCallOutput` (upstream 0.150 `call_id: None`)
+    // captured under the fork-owned synthetic namespace. Restore the provider
+    // shape exactly — absent call id, exact `name` / `namespace` — instead of
+    // manufacturing a paired tool result whose synthetic call id prompt
+    // normalization would report as an orphan and drop. Matched structurally
+    // on the id namespace, never on content (law 6).
+    if let Some(identity) = crate::mapping::parse_unpaired_output_call_id(tool_call_id) {
+        if !identity.exact {
+            refusals.push(format!(
+                "unpaired FunctionCallOutput (name={:?}, namespace={:?}) was captured in a \
+                 variant the closed LHC tool_result payload cannot carry exactly \
+                 (structured output body); refusing to install a rewritten context \
+                 that would alter it",
+                identity.name, identity.namespace
+            ));
+        }
+        return ResponseItem::FunctionCallOutput {
+            id: match prefix {
+                Some("fco") => recovered.map(ResponseItemId::from_server),
+                _ => None,
+            },
+            call_id: None,
+            name: identity.name,
+            namespace: identity.namespace,
+            output: FunctionCallOutputPayload {
+                // M8: success reversed from stored isError.
+                success: is_error.map(|e| !e),
+                body: FunctionCallOutputBody::Text(content.to_string()),
+            },
+            internal_chat_message_metadata_passthrough: None,
+        };
+    }
 
     if name == "tool_search" {
         let tools = serde_json::from_str::<Vec<Value>>(content).unwrap_or_default();
@@ -1687,7 +1750,7 @@ fn parse_host_id_from_key(key: &str) -> Option<String> {
     sanitize_id(&decoded)
 }
 
-fn decode_percent(encoded: &str) -> String {
+pub(crate) fn decode_percent(encoded: &str) -> String {
     let mut out = String::with_capacity(encoded.len());
     let bytes = encoded.as_bytes();
     let mut i = 0;
@@ -1761,6 +1824,25 @@ fn push_carry_forwards_ends(out: &mut Vec<RolloutItem>, prior: &[RolloutItem]) {
             }
             _ => {}
         }
+    }
+}
+
+/// M2: carry the prior generation's eligible paginated realtime rows into the
+/// replacement generation, in original order and byte-exact.
+///
+/// Realtime rows are not model context (they are skipped by
+/// [`crate::history_from_materialized_items`]) and are not derivable from the
+/// LHC record, so a rewrite that dropped them would leave the post-swap
+/// projection reset with nothing to rebuild `thread_realtime_items` from.
+/// Eligibility (non-inherited only) is decided at the ordinal-bearing read in
+/// [`crate::rollout_swap::parse_prior_realtime_items`]; this function preserves
+/// exactly what it was given, so repeated rewrites are idempotent.
+fn push_carry_forwards_realtime(
+    out: &mut Vec<RolloutItem>,
+    realtime: &[codex_protocol::realtime::RealtimeItem],
+) {
+    for item in realtime {
+        out.push(RolloutItem::RealtimeItem(item.clone()));
     }
 }
 

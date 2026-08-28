@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::ModelIdentity;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -341,6 +342,7 @@ fn materialize_full(
         messages,
         turns,
         prior_generation: prior,
+        prior_realtime_items: &[],
         boundary: boundary(1),
         world_state: world,
         turn_context,
@@ -2784,6 +2786,7 @@ fn identity_match_reemits_encrypted_content() {
         messages: &messages,
         turns: &turns,
         prior_generation: &[],
+        prior_realtime_items: &[],
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
@@ -2843,6 +2846,7 @@ fn identity_mismatch_suppresses_encrypted_content() {
         messages: &[],
         turns: &[],
         prior_generation: &[],
+        prior_realtime_items: &[],
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
@@ -2892,6 +2896,7 @@ fn signature_only_thinking_emits_when_identity_matches() {
         messages: &[],
         turns: &[],
         prior_generation: &[],
+        prior_realtime_items: &[],
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
@@ -2915,4 +2920,308 @@ fn signature_only_thinking_emits_when_identity_matches() {
     let (enc, summary) = reasoning.unwrap();
     assert_eq!(enc.as_deref(), Some("SIG_ONLY"));
     assert!(summary.is_empty(), "no text means empty summary");
+}
+
+// ── M1: named unpaired FunctionCallOutput fidelity ────────────────────────
+
+/// Capture the fork-owned synthetic tool-call id `map_item` mints for one
+/// unpaired output, so these tests exercise the real capture encoding rather
+/// than a hand-written string.
+fn captured_unpaired_tool_call_id(item: &ResponseItem) -> String {
+    let events = crate::mapping::map_item(
+        "t",
+        item,
+        codex_extension_api::RawItemProvenance::ModelOutput,
+        &mut crate::idempotency::OccurrenceTracker::new(),
+        None,
+    );
+    assert_eq!(events.len(), 1, "one tool_result event per output");
+    assert_eq!(events[0].input.event_kind, "tool_result");
+    events[0]
+        .input
+        .payload
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .expect("captured toolCallId")
+        .to_string()
+}
+
+fn named_unpaired_output(body: FunctionCallOutputBody) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: None,
+        name: Some("notifications".into()),
+        namespace: Some("slack".into()),
+        output: FunctionCallOutputPayload {
+            body,
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+/// A production-shaped named unpaired output (`call_id: None`, nonempty name
+/// and namespace, host-assigned item id) survives capture → generation rewrite
+/// → materialize with that identity — never converted into a paired tool
+/// result with a synthetic call id.
+#[test]
+fn named_unpaired_function_output_round_trips_through_capture_and_materialize() {
+    let original = ResponseItem::FunctionCallOutput {
+        id: Some(ResponseItemId::from_server("fco_host-assigned".into())),
+        call_id: None,
+        name: Some("notifications".into()),
+        namespace: Some("slack".into()),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text("parent notification".into()),
+            success: Some(true),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let tool_call_id = captured_unpaired_tool_call_id(&original);
+    assert!(
+        tool_call_id.starts_with(crate::mapping::UNPAIRED_OUTPUT_CALL_ID_PREFIX),
+        "capture must mint a fork-owned id: {tool_call_id}"
+    );
+    let digest = crate::idempotency::item_digest(&original);
+    let key = crate::idempotency::item_event_key(
+        "t",
+        Some("fco_host-assigned"),
+        &digest,
+        0,
+        "tool_result",
+        Some(&tool_call_id),
+    );
+
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("older history"),
+            tool_result_tail_with_key(
+                "m1",
+                &tool_call_id,
+                "",
+                "parent notification",
+                None,
+                Some(key.as_str()),
+            ),
+        ],
+    };
+    let messages = [msg_tool_result(
+        "m1",
+        "t1",
+        1,
+        &tool_call_id,
+        "parent notification",
+        /*is_error*/ false,
+    )];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let result = materialize_full(view, &messages, &turns, &[], None, None);
+    assert!(
+        result.refusals.is_empty(),
+        "exactly representable variant must not refuse: {:?}",
+        result.refusals
+    );
+
+    let tail = tail_response_items(&result.items);
+    assert_eq!(tail.len(), 1, "one tail item: {tail:?}");
+    assert_eq!(tail[0], &original, "materialized item is field-exact");
+
+    // The next provider request is built from the rewritten sequence.
+    let body = crate::history_from_materialized_items(&result.items);
+    let outputs: Vec<&ResponseItem> = body
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
+        .collect();
+    assert_eq!(outputs, vec![&original], "next request carries it verbatim");
+    assert!(
+        !serde_json::to_string(&body)
+            .expect("serialize body")
+            .contains("synthetic:"),
+        "no synthetic call id reaches the provider body"
+    );
+}
+
+/// A variant the closed LHC `tool_result` payload cannot carry exactly is a
+/// visible refusal, not a silent synthetic-pairing conversion.
+#[test]
+fn unrepresentable_unpaired_function_output_is_refused_not_converted() {
+    let original = named_unpaired_output(FunctionCallOutputBody::ContentItems(vec![
+        codex_protocol::models::FunctionCallOutputContentItem::InputText {
+            text: "see attachment".into(),
+        },
+        codex_protocol::models::FunctionCallOutputContentItem::InputImage {
+            image_url: "https://example.invalid/a.png".into(),
+            detail: None,
+        },
+    ]));
+    let tool_call_id = captured_unpaired_tool_call_id(&original);
+
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("older history"),
+            tool_result_tail_with_key(
+                "m1",
+                &tool_call_id,
+                "",
+                "see attachment\n[image:https://example.invalid/a.png]",
+                None,
+                None,
+            ),
+        ],
+    };
+    let messages = [msg_tool_result(
+        "m1",
+        "t1",
+        1,
+        &tool_call_id,
+        "see attachment\n[image:https://example.invalid/a.png]",
+        /*is_error*/ false,
+    )];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let result = materialize_full(view, &messages, &turns, &[], None, None);
+
+    assert_eq!(
+        result.refusals.len(),
+        1,
+        "one refusal: {:?}",
+        result.refusals
+    );
+    assert!(
+        result.refusals[0].contains("notifications") && result.refusals[0].contains("slack"),
+        "refusal names the item: {}",
+        result.refusals[0]
+    );
+    let tail = tail_response_items(&result.items);
+    assert_eq!(tail.len(), 1);
+    assert!(
+        matches!(
+            tail[0],
+            ResponseItem::FunctionCallOutput {
+                call_id: None,
+                name: Some(n),
+                namespace: Some(ns),
+                ..
+            } if n == "notifications" && ns == "slack"
+        ),
+        "never a synthetic paired conversion, even when refused: {:?}",
+        tail[0]
+    );
+}
+
+// ── M2: paginated realtime carry-forward ──────────────────────────────────
+
+fn realtime(id: &str) -> codex_protocol::realtime::RealtimeItem {
+    codex_protocol::realtime::RealtimeItem {
+        id: id.into(),
+        realtime_session_id: "rt-session".into(),
+        content: codex_protocol::realtime::RealtimeItemContent::RealtimeSessionStarted,
+    }
+}
+
+fn realtime_ids(items: &[RolloutItem]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RealtimeItem(item) => Some(item.id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Eligible prior-generation realtime rows survive the rewrite in order and
+/// exactly once, are not model context, and repeat rewrites stay idempotent.
+#[test]
+fn prior_generation_realtime_rows_are_carried_forward_in_order() {
+    let prior_realtime = [realtime("rt-a"), realtime("rt-b"), realtime("rt-c")];
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![band_entry("band"), user_tail("m1", "tail prompt")],
+    };
+    let messages = [msg(
+        "m1",
+        "t1",
+        MessageKind::UserPrompt,
+        1,
+        "tail prompt",
+        None,
+    )];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        None,
+        None,
+    )];
+    let first = materialize_rollout(&MaterializeInput {
+        session_meta: empty_meta(),
+        thread_view: &view,
+        messages: &messages,
+        turns: &turns,
+        prior_generation: &[],
+        prior_realtime_items: &prior_realtime,
+        boundary: boundary(1),
+        world_state: None,
+        turn_context: None,
+        live_identity: None,
+    });
+    assert_eq!(
+        realtime_ids(&first.items),
+        vec!["rt-a", "rt-b", "rt-c"],
+        "carried in original order, exactly once"
+    );
+    assert!(
+        crate::history_from_materialized_items(&first.items)
+            .iter()
+            .all(|item| !matches!(item, ResponseItem::Other)),
+        "realtime rows are projection input, never model context"
+    );
+
+    // Next rewrite reads the same eligible set back out of the new generation.
+    let carried: Vec<codex_protocol::realtime::RealtimeItem> = first
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::RealtimeItem(item) => Some(item.clone()),
+            _ => None,
+        })
+        .collect();
+    let second = materialize_rollout(&MaterializeInput {
+        session_meta: empty_meta(),
+        thread_view: &SessionThreadView {
+            thread_id: "t".into(),
+            entries: vec![band_entry("band"), user_tail("m1", "tail prompt")],
+        },
+        messages: &messages,
+        turns: &turns,
+        prior_generation: &first.items,
+        prior_realtime_items: &carried,
+        boundary: boundary(2),
+        world_state: None,
+        turn_context: None,
+        live_identity: None,
+    });
+    assert_eq!(
+        realtime_ids(&second.items),
+        vec!["rt-a", "rt-b", "rt-c"],
+        "repeated rewrites do not duplicate carried realtime rows"
+    );
 }

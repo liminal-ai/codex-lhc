@@ -2132,6 +2132,162 @@ async fn committed_generation_reset_is_empty_and_next_pass_converges() {
     );
 }
 
+/// M2: an LHC generation rewrite carries the prior generation's eligible
+/// realtime rows forward. After the generation swap resets the projection, the
+/// rebuild must land those rows exactly once at the **replacement** ordinals —
+/// never pinned to the dead generation's ordinals — and a repeated rewrite must
+/// not duplicate or move them.
+#[tokio::test]
+async fn generation_rewrite_reprojects_carried_realtime_rows_exactly_once() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_thread(&store, thread_id).await;
+
+    let carried = vec![
+        realtime_session_started("rt-a", "realtime-session-1"),
+        realtime_session_started("rt-b", "realtime-session-2"),
+    ];
+    let mut dead_generation = generation_items(thread_id, "dead-turn-a", /*text_len*/ 16_384);
+    dead_generation.extend(generation_items(
+        thread_id,
+        "dead-turn-b",
+        /*text_len*/ 16_384,
+    ));
+    dead_generation.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: dead_generation,
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![("rt-a".to_string(), 7), ("rt-b".to_string(), 8)],
+        "dead generation projects both realtime rows at its own ordinals"
+    );
+
+    // The LHC rewrite: a shorter replacement generation that carries the same
+    // eligible realtime rows forward, in order.
+    let mut replacement = generation_items(thread_id, "live-turn", /*text_len*/ 8);
+    replacement.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
+    let replacement_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        replacement,
+    );
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("rebuild projection after generation swap");
+
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![("rt-a".to_string(), 4), ("rt-b".to_string(), 5)],
+        "carried realtime rows rebuild exactly once at the replacement ordinals"
+    );
+    assert_eq!(
+        projection_state(&pool, thread_id).await,
+        (replacement_len, 6)
+    );
+
+    // A repeated rewrite is idempotent: same rows, same ordinals, no duplicates.
+    let mut second_replacement = generation_items(thread_id, "live-turn", /*text_len*/ 4);
+    second_replacement.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
+    let second_len = replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        second_replacement,
+    );
+    assert!(second_len < replacement_len);
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("rebuild projection after repeated generation swap");
+
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![("rt-a".to_string(), 4), ("rt-b".to_string(), 5)],
+        "repeated rewrites do not duplicate or move carried realtime rows"
+    );
+}
+
+/// M2: carrying realtime rows through a rewrite must not promote inherited
+/// subagent history. The projector's boundary rule is unchanged — a row below
+/// `subagent_history_start_ordinal` stays excluded.
+#[tokio::test]
+async fn generation_rewrite_keeps_inherited_subagent_realtime_rows_excluded() {
+    let home = TempDir::new().expect("temp dir");
+    let store = projection_store(home.path()).await;
+    let thread_id = ThreadId::default();
+    create_paginated_subagent_thread(
+        &store,
+        thread_id,
+        /*history_base*/ None,
+        /*subagent_history_start_ordinal*/ Some(5),
+    )
+    .await;
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: generation_items(thread_id, "dead-turn", /*text_len*/ 16_384),
+        })
+        .await
+        .expect("project dead generation");
+    let rollout_path = store
+        .live_rollout_path(thread_id)
+        .await
+        .expect("rollout path");
+    store
+        .shutdown_thread(thread_id)
+        .await
+        .expect("close dead generation");
+    let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
+        home.path().abs(),
+    ))
+    .await
+    .expect("open thread history db");
+
+    // Ordinals 1..=3 are inherited prefix; 4 is the last inherited ordinal and
+    // 5 is the first the child owns.
+    let replacement = vec![
+        RolloutItem::RealtimeItem(realtime_session_started("rt-inherited", "parent")),
+        turn_started("inherited-turn"),
+        turn_completed("inherited-turn"),
+        RolloutItem::RealtimeItem(realtime_session_started("rt-inherited-2", "parent")),
+        RolloutItem::RealtimeItem(realtime_session_started("rt-child", "child")),
+    ];
+    replace_rollout_generation(
+        rollout_path.as_path(),
+        /*initial_ordinal*/ 0,
+        replacement,
+    );
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("rebuild projection after generation swap");
+
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![("rt-child".to_string(), 5)],
+        "only the non-inherited realtime row projects"
+    );
+}
+
 #[tokio::test]
 async fn subagent_rewrite_uses_persisted_first_ordinal_above_history_base() {
     let home = TempDir::new().expect("temp dir");
@@ -2976,6 +3132,14 @@ fn agent_message_with_text(id: &str, text: &str, phase: MessagePhase) -> TurnIte
     })
 }
 
+fn realtime_session_started(item_id: &str, realtime_session_id: &str) -> RealtimeItem {
+    RealtimeItem {
+        id: item_id.to_string(),
+        realtime_session_id: realtime_session_id.to_string(),
+        content: RealtimeItemContent::RealtimeSessionStarted,
+    }
+}
+
 fn generation_items(thread_id: ThreadId, turn_id: &str, text_len: usize) -> Vec<RolloutItem> {
     vec![
         turn_started(turn_id),
@@ -3103,6 +3267,16 @@ async fn projected_generation(
     .await
     .expect("read projected items");
     (turns, items)
+}
+
+async fn projected_realtime(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> Vec<(String, i64)> {
+    sqlx::query_as::<_, (String, i64)>(
+        "SELECT item_id, rollout_ordinal FROM thread_realtime_items WHERE thread_id = ? ORDER BY rollout_ordinal, item_id",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(pool)
+    .await
+    .expect("read projected realtime items")
 }
 
 async fn history_row_counts(pool: &sqlx::SqlitePool, thread_id: ThreadId) -> (i64, i64, i64) {

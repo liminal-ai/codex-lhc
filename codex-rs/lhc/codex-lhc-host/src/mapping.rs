@@ -18,7 +18,7 @@
 //! | `LocalShellCall` | `tool_call` | by call_id |
 //! | `FunctionCall` | `tool_call` | args object; verbatim wire string in `arguments.__hostRaw`; optional encrypted args in `arguments.__hostEncryptedFunctionArgs` (payload-only; never `extra`) |
 //! | `ToolSearchCall` | `tool_call` | |
-//! | `FunctionCallOutput` | `tool_result` | by call_id |
+//! | `FunctionCallOutput` | `tool_result` | by call_id; unpaired (`call_id: None`) keeps `name` / `namespace` in the fork-owned synthetic id ([`unpaired_output_call_id`]) |
 //! | `CustomToolCall` | `tool_call` | wire input in `arguments.__hostRaw` |
 //! | `CustomToolCallOutput` | `tool_result` | |
 //! | `ToolSearchOutput` | `tool_result` | |
@@ -281,16 +281,26 @@ pub fn map_item(
             call_id,
             output,
             id: _,
-            name: _,
-            namespace: _,
+            name,
+            namespace,
             internal_chat_message_metadata_passthrough: _,
         } => {
-            // An unpaired named output (`call_id: None`) takes a synthetic id
-            // like ToolSearchCall; the closed tool_result payload has no slot
-            // for `name`/`namespace`, so they are not carried (gap).
-            let tool_call_id = call_id
-                .clone()
-                .unwrap_or_else(|| format!("synthetic:{digest}"));
+            // An unpaired output (`call_id: None`, upstream 0.150) is not a
+            // paired tool result and must never be given a pairing. Its
+            // identity is encoded structurally into the fork-owned synthetic
+            // id ([`unpaired_output_call_id`]) so materialization restores
+            // `call_id: None` with the exact `name` / `namespace`, and so a
+            // variant the closed payload cannot carry exactly is refused
+            // rather than silently degraded.
+            let tool_call_id = match call_id {
+                Some(call_id) => call_id.clone(),
+                None => unpaired_output_call_id(
+                    unpaired_output_is_exact(output),
+                    name.as_deref(),
+                    namespace.as_deref(),
+                    &digest,
+                ),
+            };
             let (content, is_error) = function_output_content(output);
             vec![tool_result_event(
                 thread_id,
@@ -957,6 +967,100 @@ fn tool_call_event(
             extra: Map::new(),
         },
     }
+}
+
+/// Fork-owned synthetic `toolCallId` namespace for an **unpaired**
+/// `FunctionCallOutput` (`call_id: None`, upstream 0.150).
+///
+/// The certified `ToolResultPayload` is closed: `toolCallId` is required and
+/// there is no slot for `name` / `namespace`. Storing such an output as an
+/// ordinary paired tool result would invent a pairing the provider never sent,
+/// and the reverse map would then emit an orphan output that prompt
+/// normalization drops. Instead the fork encodes the missing identity into the
+/// synthetic id itself — structurally, never note text (law 6):
+///
+/// ```text
+/// synthetic:unpaired-output:v1:{exact|lossy}:{name}:{namespace}:{digest}
+/// ```
+///
+/// `{name}` / `{namespace}` are `-` when absent and `s{escaped}` when present
+/// (`%` → `%25`, `:` → `%3A`, matching [`crate::idempotency::encode_thread_id`]).
+/// `exact` marks a variant whose provider payload the closed `tool_result` row
+/// carries losslessly; `lossy` marks one it cannot, which materialization
+/// refuses instead of degrading silently.
+pub const UNPAIRED_OUTPUT_CALL_ID_PREFIX: &str = "synthetic:unpaired-output:v1:";
+
+/// Whether the closed `tool_result` payload carries this unpaired output's
+/// **provider payload** losslessly.
+///
+/// `content` is a string, so a `Text` body round-trips exactly while
+/// `ContentItems` flatten to text with `[image:…]` / `[audio:…]` placeholders
+/// and cannot be restored. `success` round-trips through `isError`.
+/// Host provenance (`id`, `internal_chat_message_metadata_passthrough`) is not
+/// part of this judgment: it is stripped identically for every reconstructed
+/// item (see `body_validation::HOST_PROVENANCE_KEYS`).
+pub(crate) fn unpaired_output_is_exact(output: &FunctionCallOutputPayload) -> bool {
+    matches!(output.body, FunctionCallOutputBody::Text(_))
+}
+
+fn encode_unpaired_field(value: Option<&str>) -> String {
+    match value {
+        None => "-".to_string(),
+        Some(value) => format!("s{}", crate::idempotency::encode_thread_id(value)),
+    }
+}
+
+fn decode_unpaired_field(field: &str) -> Option<Option<String>> {
+    if field == "-" {
+        return Some(None);
+    }
+    let value = field.strip_prefix('s')?;
+    Some(Some(crate::materialize::decode_percent(value)))
+}
+
+/// Build the fork-owned synthetic id for an unpaired `FunctionCallOutput`.
+pub(crate) fn unpaired_output_call_id(
+    exact: bool,
+    name: Option<&str>,
+    namespace: Option<&str>,
+    digest: &str,
+) -> String {
+    let repr = if exact { "exact" } else { "lossy" };
+    format!(
+        "{UNPAIRED_OUTPUT_CALL_ID_PREFIX}{repr}:{}:{}:{digest}",
+        encode_unpaired_field(name),
+        encode_unpaired_field(namespace),
+    )
+}
+
+/// Identity recovered from an id minted by [`unpaired_output_call_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnpairedOutputIdentity {
+    /// False when capture recorded a variant the closed payload cannot carry.
+    pub exact: bool,
+    pub name: Option<String>,
+    pub namespace: Option<String>,
+}
+
+/// Reverse of [`unpaired_output_call_id`]. `None` for any other id, including
+/// the plain `synthetic:{digest}` form older rows use.
+pub(crate) fn parse_unpaired_output_call_id(id: &str) -> Option<UnpairedOutputIdentity> {
+    let rest = id.strip_prefix(UNPAIRED_OUTPUT_CALL_ID_PREFIX)?;
+    let mut parts = rest.splitn(4, ':');
+    let exact = match parts.next()? {
+        "exact" => true,
+        "lossy" => false,
+        _ => return None,
+    };
+    let name = decode_unpaired_field(parts.next()?)?;
+    let namespace = decode_unpaired_field(parts.next()?)?;
+    // Trailing content digest — present for uniqueness, not read back.
+    parts.next()?;
+    Some(UnpairedOutputIdentity {
+        exact,
+        name,
+        namespace,
+    })
 }
 
 fn tool_result_event(
