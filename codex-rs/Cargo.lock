@@ -4362,6 +4362,7 @@ dependencies = [
  "codex-git-utils",
  "codex-history",
  "codex-install-context",
+ "codex-lhc-host",
  "codex-otel",
  "codex-protocol",
  "codex-rollout",

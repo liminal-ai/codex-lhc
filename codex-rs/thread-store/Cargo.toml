@@ -38,6 +38,9 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+# LHC fork: the M2 generation-rewrite projection proof must exercise the real
+# atomic generation writer (ordinal plan included), not hand-authored ordinals.
+codex-lhc-host = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

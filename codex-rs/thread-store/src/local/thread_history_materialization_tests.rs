@@ -2226,11 +2226,22 @@ async fn generation_rewrite_reprojects_carried_realtime_rows_exactly_once() {
     );
 }
 
-/// M2: carrying realtime rows through a rewrite must not promote inherited
-/// subagent history. The projector's boundary rule is unchanged — a row below
-/// `subagent_history_start_ordinal` stays excluded.
+/// M2 ordinal placement: a **shrinking** subagent rewrite must still land every
+/// eligible carried realtime row at or above the preserved
+/// `subagent_history_start_ordinal`.
+///
+/// This runs the production chain end to end — the real eligibility reader, the
+/// real atomic generation writer (so the ordinal plan is the writer's, never
+/// hand-authored), and the real projector — with the subagent boundary `S = 8`
+/// materially larger than the replacement's own length. Before the
+/// `ordinal_state_for_items` correction the writer derived its plan from the
+/// full replacement length, so the whole sequence landed in `[S - N, S)` and the
+/// projector reclassified the carried child row as inherited subagent history,
+/// silently emptying `thread_realtime_items`.
 #[tokio::test]
-async fn generation_rewrite_keeps_inherited_subagent_realtime_rows_excluded() {
+async fn shrinking_subagent_rewrite_keeps_carried_realtime_rows_above_the_boundary() {
+    const SUBAGENT_HISTORY_START_ORDINAL: u64 = 8;
+
     let home = TempDir::new().expect("temp dir");
     let store = projection_store(home.path()).await;
     let thread_id = ThreadId::default();
@@ -2238,16 +2249,18 @@ async fn generation_rewrite_keeps_inherited_subagent_realtime_rows_excluded() {
         &store,
         thread_id,
         /*history_base*/ None,
-        /*subagent_history_start_ordinal*/ Some(5),
+        Some(SUBAGENT_HISTORY_START_ORDINAL),
     )
     .await;
+    // The live writer creates the rollout (and its session-metadata line) on
+    // first append; the prior generation below is then written over it.
     store
         .append_items(AppendThreadItemsParams {
             thread_id,
-            items: generation_items(thread_id, "dead-turn", /*text_len*/ 16_384),
+            items: vec![turn_started("seed-turn"), turn_completed("seed-turn")],
         })
         .await
-        .expect("project dead generation");
+        .expect("create the rollout file");
     let rollout_path = store
         .live_rollout_path(thread_id)
         .await
@@ -2255,36 +2268,104 @@ async fn generation_rewrite_keeps_inherited_subagent_realtime_rows_excluded() {
     store
         .shutdown_thread(thread_id)
         .await
-        .expect("close dead generation");
+        .expect("close live writer");
     let pool = codex_state::open_thread_history_db(&codex_state::SqliteConfig::new_for_testing(
         home.path().abs(),
     ))
     .await
     .expect("open thread history db");
 
-    // Ordinals 1..=3 are inherited prefix; 4 is the last inherited ordinal and
-    // 5 is the first the child owns.
-    let replacement = vec![
+    let session_meta = codex_lhc_host::parse_rollout_items(rollout_path.as_path())
+        .expect("read created rollout")
+        .into_iter()
+        .find(|item| matches!(item, RolloutItem::SessionMeta(_)))
+        .expect("created rollout starts with session metadata");
+
+    // Prior generation, written by the real writer: eleven rows at ordinals
+    // 0..=10, straddling the boundary. `rt-inherited` (ordinal 3) is the
+    // parent's copied prefix; `rt-child` (ordinal 8) is the child's own.
+    let dead_generation = vec![
+        session_meta.clone(),
+        turn_started("inherited-turn-a"),
+        turn_completed("inherited-turn-a"),
         RolloutItem::RealtimeItem(realtime_session_started("rt-inherited", "parent")),
-        turn_started("inherited-turn"),
-        turn_completed("inherited-turn"),
-        RolloutItem::RealtimeItem(realtime_session_started("rt-inherited-2", "parent")),
+        turn_started("inherited-turn-b"),
+        turn_completed("inherited-turn-b"),
+        turn_started("inherited-turn-c"),
+        turn_completed("inherited-turn-c"),
         RolloutItem::RealtimeItem(realtime_session_started("rt-child", "child")),
+        turn_started("dead-turn"),
+        turn_completed("dead-turn"),
     ];
-    replace_rollout_generation(
-        rollout_path.as_path(),
-        /*initial_ordinal*/ 0,
-        replacement,
+    codex_lhc_host::atomic_rewrite_rollout(rollout_path.as_path(), &dead_generation)
+        .expect("write prior generation");
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("project prior generation");
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![("rt-child".to_string(), 8)],
+        "prior generation: only the child's own realtime row projects"
     );
+
+    // One shrinking rewrite: the real reader decides eligibility, and carried
+    // rows go at the replacement tail exactly as `materialize_rollout` emits
+    // them. Four rows against a boundary of eight.
+    let carried = codex_lhc_host::parse_prior_realtime_items(rollout_path.as_path())
+        .expect("read eligible realtime rows");
+    assert_eq!(
+        carried
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rt-child"],
+        "the inherited row is not eligible to be carried"
+    );
+    let mut replacement = vec![
+        session_meta.clone(),
+        turn_started("live-turn"),
+        turn_completed("live-turn"),
+    ];
+    replacement.extend(carried.iter().cloned().map(RolloutItem::RealtimeItem));
+    assert!(
+        u64::try_from(replacement.len()).expect("length fits u64") < SUBAGENT_HISTORY_START_ORDINAL,
+        "the boundary must exceed the replacement length for this to be a shrinking rewrite"
+    );
+    codex_lhc_host::atomic_rewrite_rollout(rollout_path.as_path(), &replacement)
+        .expect("atomic generation rewrite");
 
     super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
         .await
         .expect("rebuild projection after generation swap");
-
     assert_eq!(
         projected_realtime(&pool, thread_id).await,
-        vec![("rt-child".to_string(), 5)],
-        "only the non-inherited realtime row projects"
+        vec![(
+            "rt-child".to_string(),
+            SUBAGENT_HISTORY_START_ORDINAL as i64
+        )],
+        "the carried row survives exactly once, at a replacement ordinal >= the boundary"
+    );
+
+    // A repeated rewrite of a different length stays exact-once and still lands
+    // at or above the boundary; the inherited row never returns.
+    let carried = codex_lhc_host::parse_prior_realtime_items(rollout_path.as_path())
+        .expect("read eligible realtime rows after rewrite");
+    let mut second_replacement = vec![session_meta, turn_started("live-turn-2")];
+    second_replacement.extend(carried.into_iter().map(RolloutItem::RealtimeItem));
+    assert_ne!(second_replacement.len(), replacement.len());
+    codex_lhc_host::atomic_rewrite_rollout(rollout_path.as_path(), &second_replacement)
+        .expect("repeated atomic generation rewrite");
+
+    super::materialize_to_sqlite(&store, thread_id, rollout_path.as_path())
+        .await
+        .expect("rebuild projection after repeated generation swap");
+    assert_eq!(
+        projected_realtime(&pool, thread_id).await,
+        vec![(
+            "rt-child".to_string(),
+            SUBAGENT_HISTORY_START_ORDINAL as i64
+        )],
+        "repeated rewrites do not duplicate, move, or drop the carried row"
     );
 }
 

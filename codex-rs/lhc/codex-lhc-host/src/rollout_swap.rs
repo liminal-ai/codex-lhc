@@ -865,10 +865,39 @@ fn write_rollout_jsonl(
     Ok(())
 }
 
+/// Length of the trailing run of `RolloutItem::RealtimeItem` rows in `items`.
+///
+/// M2 carry-forward appends the prior generation's eligible realtime rows at
+/// the replacement tail and nowhere else
+/// ([`crate::materialize::materialize_rollout`]), so this is exactly that
+/// carried set's count and tail position.
+fn carried_realtime_tail_len(items: &[RolloutItem]) -> usize {
+    items
+        .iter()
+        .rev()
+        .take_while(|item| matches!(item, RolloutItem::RealtimeItem(_)))
+        .count()
+}
+
 /// The writer's ordinal plan for a full rewrite of `items`: from the first
 /// `SessionMeta`'s history mode / base / subagent start, legacy when there
 /// is none. Shared with the new-generation proof so both derive the same
 /// envelope.
+///
+/// M2 ordinal placement: [`RolloutOrdinalState::for_rewrite`] positions
+/// `item_count` rows so the rewrite *ends* at or above the preserved subagent
+/// boundary `S`. A shrinking subagent rewrite (`S` past the replacement's own
+/// length) therefore lands the whole sequence below `S`, and the projector
+/// classifies every row below `S` as inherited subagent history — which would
+/// drop the eligible carried realtime rows this rewrite exists to preserve.
+///
+/// So the plan is derived from the length of the prefix *before* the carried
+/// realtime tail. The prefix then ends at or above `S`, which places the first
+/// carried realtime row exactly at that boundary and every later one above it,
+/// so all of them project as the child's own history. Rows stay contiguous and
+/// the plan still starts at or above the history base. With no subagent
+/// boundary, or no carried realtime tail, this is identical to passing the
+/// full length.
 fn ordinal_state_for_items(items: &[RolloutItem]) -> std::io::Result<RolloutOrdinalState> {
     items
         .iter()
@@ -883,7 +912,7 @@ fn ordinal_state_for_items(items: &[RolloutItem]) -> std::io::Result<RolloutOrdi
                     meta.history_mode,
                     meta.history_base,
                     meta.subagent_history_start_ordinal,
-                    items.len(),
+                    items.len() - carried_realtime_tail_len(items),
                 )
             },
         )
