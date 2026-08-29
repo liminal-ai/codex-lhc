@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 74a45554ab..a5e8c68bae 100644
+index 74a45554ab..7c5d8d7908 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
 @@ -73,6 +73,8 @@ members = [
@@ -11,6 +11,15 @@ index 74a45554ab..a5e8c68bae 100644
      "lmstudio",
      "login",
      "codex-mcp",
+@@ -140,7 +142,7 @@ members = [
+ resolver = "2"
+ 
+ [workspace.package]
+-version = "0.150.1"
++version = "0.150.2"
+ # Track the edition for all workspace crates in one place. Individual
+ # crates can still override this value, but keeping it here means new
+ # crates created with `cargo new -w ...` automatically inherit the 2024
 @@ -215,6 +217,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
