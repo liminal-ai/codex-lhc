@@ -186,6 +186,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 39 | `exec/src/lib.rs` | LIM-134 empty-result truth: a completed nonblank prompt with no nonblank AgentMessage or Plan fails in human and JSONL paths; no sentinel | `0007-lhc-compact-arm` |
 | 40 | `exec/src/{lib_tests.rs,event_processor_with_human_output_tests.rs}` | LIM-134 exec human/JSONL/backfill empty-result proofs (processor-level and reclassify units); no sentinel | `0007-lhc-compact-arm` |
 | 41 | `exec/tests/suite/{apply_patch.rs,auth_env.rs}` | LIM-134 F6: fixtures gain a minimal assistant message so completed turns satisfy empty-result truth; no sentinel | `0007-lhc-compact-arm` |
+| 42 | `exec/tests/suite/resume.rs` | F7 ruling (Lee): 12 resume tests disabled-with-reasons — budgeted mount_sse_sequence mocks cannot absorb LHC background-derivation POSTs (harness artifact, prod unaffected) | `0007-lhc-compact-arm` |
 
 Rows 20-23 carry **no `LHC-HOOK` sentinel** (they are struct fields, initialisers
 and a test module, not seams). They were missing from every patch until Chunk 3
