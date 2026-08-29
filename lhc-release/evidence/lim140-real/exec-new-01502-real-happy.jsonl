@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a04f2d-8b6b-7ef1-b53f-d6ee628bdc6c"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: code_mode. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/lim140-real/new-codex-home/config.toml."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Code Mode is unavailable because failed to spawn code-mode host /srv/work/wt/codex-lhc-0150-2-qual/codex-rs/target/release/codex-code-mode-host: host executable was not found. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"LIM-140 real integration OK"}}
+{"type":"turn.completed","usage":{"input_tokens":13437,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":11,"reasoning_output_tokens":0}}

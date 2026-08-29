@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"01a04f2a-d776-71b1-81e7-e6a7131eb2df"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: code_mode. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/lim140-real/old-codex-home/config.toml."}}
+{"type":"item.completed","item":{"id":"item_1","type":"error","message":"Model metadata for `gpt-5.6-codex` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"error","message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.6-codex' model is not supported when using Codex with a ChatGPT account.\"}}"}
+{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-5.6-codex' model is not supported when using Codex with a ChatGPT account.\"}}"}}
