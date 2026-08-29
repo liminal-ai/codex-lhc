@@ -964,10 +964,12 @@ async fn status_advance_same_id_records_both() {
 }
 
 /// H15: anonymous path is an unreachable defensive fallback for host-assigned
-/// variants. CompactionTrigger/Other map to nothing; we still exercise the
-/// seed path with deliberately id-less Message fixtures.
+/// variants. CompactionTrigger/Other map to nothing; we still exercise lazy
+/// ID-less occurrence resolution with deliberately id-less Message fixtures.
+/// Open seeds nothing; high-water is resolved on the first ID-less persist
+/// after restart. Restart must neither duplicate nor drop.
 #[tokio::test]
-async fn open_seeds_occurrence_from_stored_anon_keys() {
+async fn legacy_id_less_occurrence_resolves_lazily_across_restart() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
     let thread_id = "seed-prod-path";
@@ -1026,7 +1028,7 @@ async fn open_seeds_occurrence_from_stored_anon_keys() {
     assert_eq!(
         events.len(),
         3,
-        "seeded high-water must allocate occ=2 for third presentation"
+        "lazy high-water must allocate occ=2 for third presentation"
     );
     h2.shutdown().await;
 }

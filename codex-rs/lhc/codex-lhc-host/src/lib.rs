@@ -16,6 +16,7 @@ mod install;
 mod mapping;
 mod materialize;
 mod mid_turn_parts;
+mod projections;
 mod rollout_reconcile;
 mod rollout_swap;
 mod session;
@@ -28,6 +29,10 @@ mod lim69_graft_tests;
 #[cfg(test)]
 #[path = "cxs6_canary_tests.rs"]
 mod cxs6_canary_tests;
+
+#[cfg(test)]
+#[path = "bounded_scan_tests.rs"]
+mod bounded_scan_tests;
 
 pub use band_shape::BandShapeItem;
 pub use band_shape::BandShapeReport;
@@ -202,6 +207,7 @@ pub use materialize::boundary_completeness_error;
 pub use materialize::iso_to_unix_secs;
 pub use materialize::materialize_rollout;
 pub use materialize::model_stream_response_item_count;
+pub use projections::ProjectionQueryStats;
 pub use rollout_reconcile::CaptureFrontier;
 pub use rollout_reconcile::CompactedRolloutIdentity;
 pub use rollout_reconcile::ROLLOUT_REOPEN_RECEIPT_SCHEMA;

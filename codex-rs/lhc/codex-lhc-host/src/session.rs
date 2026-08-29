@@ -8,7 +8,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use lhc::intake_stream::EventRecord;
 use lhc::sdk::Lhc;
 use lhc::sdk::OpResult;
 use lhc::sdk::SdkConfig;
@@ -25,7 +24,7 @@ use lhc::shared_tech::InferenceCallbacks;
 
 use crate::gating::lhc_root;
 use crate::idempotency::OccurrenceTracker;
-use crate::idempotency::seed_occurrence_from_keys;
+use crate::projections::ProjectionQueryStats;
 
 /// Serialize registry schema init — concurrent `new_thread` races on CREATE TABLE.
 fn registry_lock() -> &'static AsyncMutex<()> {
@@ -110,6 +109,7 @@ pub struct LhcSession {
     /// After persistent failures, further capture is disabled for this session.
     pub capture_disabled: bool,
     failure_count: u32,
+    stats: std::sync::Mutex<ProjectionQueryStats>,
 }
 
 impl LhcSession {
@@ -200,34 +200,42 @@ impl LhcSession {
             generation: 0,
             capture_disabled: false,
             failure_count: 0,
+            stats: std::sync::Mutex::new(ProjectionQueryStats::default()),
         };
 
-        let tracker = match session.seed_from_db().await {
+        // Constant-row frontier: last_event_order is the recorded counter.
+        // ID-bearing occurrence tracking starts empty; anonymous high-water
+        // is resolved lazily only when item_stable_id is None.
+        let frontier = match session.thread_frontier().await {
             Ok(v) => v,
             Err(err) => {
                 error!(
                     thread_id,
                     %err,
-                    "LHC: list_events failed at open; refusing"
+                    "LHC: thread_frontier failed at open; refusing"
                 );
                 return None;
             }
         };
+        session.generation = frontier.last_event_order.max(0) as u64;
 
-        Some((session, tracker))
+        Some((session, OccurrenceTracker::new()))
     }
 
-    /// Seed tip and occurrence tracker from stored events.
-    pub async fn seed_from_db(&mut self) -> Result<OccurrenceTracker, String> {
-        let events = self.list_events().await?;
-        self.generation = events
-            .iter()
-            .map(EventRecord::event_order)
-            .max()
-            .unwrap_or(0)
-            .max(0) as u64;
-        let keys: Vec<&str> = events.iter().map(EventRecord::idempotency_key).collect();
-        Ok(seed_occurrence_from_keys(keys))
+    pub(crate) fn record_stats(&self, update: impl FnOnce(&mut ProjectionQueryStats)) {
+        let mut stats = self
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        update(&mut stats);
+    }
+
+    /// Algorithmic selected-column/row counters for this session.
+    pub fn query_stats(&self) -> ProjectionQueryStats {
+        self.stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn latch_generation_from_batch(&mut self, batch: &lhc::intake_stream::BatchResult) {
@@ -283,13 +291,21 @@ impl LhcSession {
     }
 
     pub async fn list_events(&self) -> Result<Vec<lhc::intake_stream::EventRecord>, String> {
+        self.record_stats(|s| s.list_events_calls += 1);
         match self
             .lhc
             .intake_stream
             .list_events(self.thread_ref.clone())
             .await
         {
-            OpResult::Ok { value } => Ok(value),
+            OpResult::Ok { value } => {
+                let rows = value.len() as u64;
+                self.record_stats(|s| {
+                    s.list_events_rows += rows;
+                    s.payload_parses += rows;
+                });
+                Ok(value)
+            }
             OpResult::Err { error } => Err(error.reason),
         }
     }

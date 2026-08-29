@@ -23,6 +23,7 @@ use tracing::error;
 use tracing::warn;
 
 use crate::idempotency::OccurrenceTracker;
+use crate::idempotency::item_stable_id;
 use crate::mapping::MappedEvent;
 use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
@@ -34,6 +35,7 @@ use crate::mapping::map_model_or_thinking_change;
 use crate::mapping::map_runtime_note;
 use crate::mapping::map_turn_end;
 use crate::mapping::token_usage_to_provider_usage;
+use crate::projections::ensure_legacy_occurrence;
 use crate::session::LhcSession;
 
 /// Bound on the capture queue. Must not block the session path.
@@ -1201,6 +1203,28 @@ async fn persist_item(
     durability: &mut CaptureDurability,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
+    // Legacy ID-less items resolve occurrence from a capped prefix listing
+    // only when they have no stable id. Cap exhaustion degrades visibly and
+    // does not guess or reset tracker state.
+    if item_stable_id(item).is_none()
+        && let Err(err) = ensure_legacy_occurrence(session, tracker, item).await
+    {
+        warn!(
+            thread_id = %thread_id,
+            %err,
+            "LHC: refusing anonymous persist after occurrence listing failure"
+        );
+        durability.failed = true;
+        degraded.store(true, Ordering::SeqCst);
+        let note = map_runtime_note(
+            thread_id,
+            &format!("LHC capture degraded after anonymous occurrence listing failure: {err}"),
+            "occurrence-cap",
+        );
+        let _ = submit_mapped(session, &[note]).await;
+        return Ok(());
+    }
+
     // Contain map_item panics so one bad item cannot kill the worker (H9).
     let mut local = tracker.clone();
     let id_ref = if identity.is_complete() {

@@ -47,6 +47,10 @@ use crate::idempotency::item_stable_id;
 use crate::inference::lhc_inference_callbacks;
 use crate::mapping::ACTOR_SYSTEM;
 use crate::mapping::HARNESS;
+use crate::projections::compact_marker_key_prefix;
+use crate::projections::ensure_legacy_occurrence;
+use crate::projections::host_items_missing_from_archive_indexed;
+use crate::projections::list_keys_under_prefix;
 use crate::session::LhcSession;
 
 /// Mapping seam: LHC `LlmRequestContext` → host `ResponseItem` list.
@@ -572,6 +576,85 @@ impl DerivedProvenance {
     }
 }
 
+/// Union session provenance with derived ids/digests recovered from archive
+/// compact markers, without a whole-history `list_events` scan.
+///
+/// Walks compact-marker keys (hard-capped), fetches only those unique-index
+/// rows, then reuses [`markers_from_archive`] / [`DERIVED_MARKER_CAP`].
+pub(crate) async fn derived_from_session_and_archive_bounded(
+    session: &LhcSession,
+    session_derived: &DerivedProvenance,
+) -> Result<DerivedProvenance, String> {
+    let prefix = compact_marker_key_prefix(&session.thread_id);
+    let keys = list_keys_under_prefix(session, &prefix)
+        .await
+        .map_err(|err| err.to_string())?;
+    let events = load_events_by_idempotency_keys(&session.file_path, &keys)?;
+    Ok(DerivedProvenance::from_session_and_archive(
+        &session_derived.ids,
+        &session_derived.digests,
+        &events,
+    ))
+}
+
+fn load_events_by_idempotency_keys(
+    file_path: &Path,
+    keys: &[lhc::intake_stream::EventKeyReference],
+) -> Result<Vec<EventRecord>, String> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let db = match lhc::threads::open_thread_database(&file_path.to_string_lossy()) {
+        OpResult::Ok { value } => value,
+        OpResult::Err { error } => return Err(error.reason),
+    };
+    let stmt = db.prepare(
+        "SELECT event_order, event_kind, idempotency_key, actor, harness, payload, recorded_at
+         FROM event WHERE idempotency_key = ?",
+    );
+    let mut events = Vec::new();
+    for key in keys {
+        let row = stmt.get_params(&[lhc::shared_tech::storage::SqlParam::from(
+            key.idempotency_key.as_str(),
+        )]);
+        let Some(row) = row else {
+            continue;
+        };
+        let Some(record) = event_record_from_stored_row(&row) else {
+            continue;
+        };
+        events.push(record);
+    }
+    db.close();
+    Ok(events)
+}
+
+fn event_record_from_stored_row(row: &serde_json::Map<String, Value>) -> Option<EventRecord> {
+    let event_kind = row.get("event_kind")?.as_str()?;
+    let idempotency_key = row.get("idempotency_key")?.as_str()?;
+    let actor = row.get("actor")?.as_str()?;
+    let harness = row.get("harness")?.as_str()?;
+    let payload_json = row.get("payload")?.as_str()?;
+    let event_order = match row.get("event_order")? {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().map(|u| u as i64))
+            .or_else(|| n.as_f64().map(|f| f as i64))?,
+        _ => return None,
+    };
+    let recorded_at = row.get("recorded_at")?.as_str()?;
+    let payload: Value = serde_json::from_str(payload_json).ok()?;
+    let mut obj = Map::new();
+    obj.insert("eventKind".into(), json!(event_kind));
+    obj.insert("idempotencyKey".into(), json!(idempotency_key));
+    obj.insert("actor".into(), json!(actor));
+    obj.insert("harness".into(), json!(harness));
+    obj.insert("payload".into(), payload);
+    obj.insert("eventOrder".into(), json!(event_order));
+    obj.insert("recordedAt".into(), json!(recorded_at));
+    serde_json::from_value(Value::Object(obj)).ok()
+}
+
 /// Host messages that must exist in the archive by **identity** before compact
 /// is safe.
 ///
@@ -719,16 +802,14 @@ pub async fn import_host_items_into_archive(
     }
 
     let mut tracker = OccurrenceTracker::new();
-    // Seed from existing keys so anon occurrences do not collide.
-    if let Ok(existing) = session.list_events().await {
-        let keys: Vec<&str> = existing.iter().map(EventRecord::idempotency_key).collect();
-        tracker = crate::idempotency::seed_occurrence_from_keys(keys);
-    }
     let mut n = 0usize;
     for item in host_items {
         if !is_coverage_candidate(item) {
             continue;
         }
+        ensure_legacy_occurrence(session, &mut tracker, item)
+            .await
+            .map_err(|err| err.to_string())?;
         let provenance = match item {
             ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
             ResponseItem::Message { role, .. } if role == "assistant" => {
@@ -862,17 +943,6 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
 
     check_cancel(cancel.as_deref())?;
 
-    let mut events = session
-        .list_events()
-        .await
-        .map_err(LhcCompactUnavailable::OpenFailed)?;
-
-    let derived = DerivedProvenance::from_session_and_archive(
-        &session_derived.ids,
-        &session_derived.digests,
-        &events,
-    );
-
     // Unrepresentable provider-adjacent types hard-fail (never silent omit).
     if let Some(reason) = unrepresentable_host_items_gap(host_items) {
         session.close().await;
@@ -880,7 +950,15 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
     }
 
     // Import only identity-missing *native* items; never the served body (H1).
-    let missing = host_items_missing_from_archive_with_provenance(host_items, &events, &derived);
+    // Coverage is indexed prefix existence/count, not a whole-archive scan.
+    // Derived exclusion unions session provenance with parseable archive
+    // compact markers recovered through the compact-marker key walk.
+    let derived = derived_from_session_and_archive_bounded(&session, session_derived)
+        .await
+        .map_err(LhcCompactUnavailable::OpenFailed)?;
+    let missing = host_items_missing_from_archive_indexed(&session, host_items, &derived)
+        .await
+        .map_err(LhcCompactUnavailable::OpenFailed)?;
     if !missing.is_empty() {
         if import_missing {
             info!(
@@ -890,17 +968,9 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
             import_host_items_into_archive(&mut session, &missing)
                 .await
                 .map_err(LhcCompactUnavailable::OpenFailed)?;
-            events = session
-                .list_events()
+            let still = host_items_missing_from_archive_indexed(&session, host_items, &derived)
                 .await
                 .map_err(LhcCompactUnavailable::OpenFailed)?;
-            let derived2 = DerivedProvenance::from_session_and_archive(
-                &session_derived.ids,
-                &session_derived.digests,
-                &events,
-            );
-            let still =
-                host_items_missing_from_archive_with_provenance(host_items, &events, &derived2);
             if !still.is_empty() {
                 session.close().await;
                 return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
@@ -917,7 +987,11 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
         }
     }
 
-    if events.is_empty() {
+    let frontier = session
+        .thread_frontier()
+        .await
+        .map_err(LhcCompactUnavailable::OpenFailed)?;
+    if frontier.last_event_order <= 0 {
         session.close().await;
         return Err(LhcCompactUnavailable::NoEvents);
     }
@@ -942,7 +1016,7 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
     // drain_settled as a compact prerequisite.
     check_cancel(cancel.as_deref())?;
 
-    let archive_tip = archive_tip_identity(&events);
+    let archive_tip = format!("order:{}", frontier.last_event_order);
 
     let receipt = match session
         .lhc
@@ -2028,7 +2102,7 @@ mod tests {
             encrypted_content: Some("sig".into()),
             internal_chat_message_metadata_passthrough: None,
         };
-        let missing = host_items_missing_from_archive(&[call.clone(), reasoning.clone()], &[]);
+        let missing = host_items_missing_from_archive(&[call, reasoning], &[]);
         assert_eq!(
             missing.len(),
             2,

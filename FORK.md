@@ -23,7 +23,14 @@ history preserved and rebuildable at full fidelity.
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`b408f89`** (`b408f89712cbbb525dbfc2f7b2c51ab3133c4f45`) —
+  Current pin: **`5207952`** (`5207952b0d6d5dadb95f810c75a18e0867da6b72`) —
+  LIM-133 bounded, non-copying shared-LHC opens + frontier/key-projection
+  APIs, certified by the LHC-side director 2026-08-28 (chain
+  `b408f89 -> 6ec5796 -> 49e1887 -> dc0153c -> 5207952`; TS 45/45, Rust
+  23/23+15/15+10/10+4/4). **Certified-content, origin-reachability pending:**
+  the commit lives on local `campaign/lhc-rust-open-repair`; the tripwire pin
+  layer reports the designed side-branch WARN until the fold to origin/main
+  (hard gate at LIM-140/141, not before). Prior pin `b408f89` —
   accepted final SDK identity delta (2026-08-26), directly over `13573a1`.
   The final delta changes only TypeScript scheduler files; its
   `packages/lhc-rs` tree is byte-identical to the parent. The inherited Rust
@@ -307,6 +314,27 @@ prompts marked `[fallback]` in the rendered bands. Reading that marker would be
 parsing a render (law 1), so the arm asks LHC's typed derivation log
 (`query_derivation_log`, `TerminalFailed`) instead and fails open on any
 terminal failure.
+
+### LIM-135 — bounded scans + one ruled raw-SQL exception (2026-08-29)
+
+Normal capture open, occurrence tracking, archive coverage, and reconcile
+paths use constant-row / caller-bounded SDK projections (`thread_frontier`,
+`event_key_prefix_counts`, `list_event_keys_by_prefix`); no normal startup
+path calls `list_events` or parses historical payload JSON. Legacy ID-less
+occurrences resolve lazily under a hard cap that refuses visibly.
+
+**Ruled exception (manager, 2026-08-29):** exactly one host call site —
+`codex-lhc-host/src/compact_bridge.rs` (`load_events_by_idempotency_keys`) —
+reads the thread file with a direct exact-key `SELECT` to fetch walked
+compact-marker rows for derived-provenance recovery, because the certified
+pin has no bounded fetch-by-key operation. Bounds of the ruling: this single
+call site; exact-key SELECT only; opens via the SDK's own
+`open_thread_database`; schema authority is the vendored pin in this tree.
+**Any second raw-SQL site is a new ruling, not an extension.** A bounded
+`get_events_by_keys` SDK API is a live request with the LHC-side director;
+**next pin uptake must check whether it landed and migrate this site if so.**
+Marker-key/regenerated-boundary outputs are semantically equivalent, not
+byte-identical (accepted under the criterion's semantic arm).
 
 ## Sync drill (merge-based; weekly minimum — upstream runs ~760 commits/mo)
 
@@ -679,16 +707,21 @@ changes) that arrive before the handle is ready are **buffered** (same cap
 as the capture queue) and flushed on open. Prefer a complete session
 opening over silent loss of the first user prompt.
 
-## Kill-switch semantics
+## `lhc_capture = false` is an invalid product state (Lee, 2026-08-29)
 
-The product fork runs LHC by default because LHC is the product, not an
-optional build flavor. The single kill switch is `lhc_capture = false`. With
-that switch set,
-`on_thread_start` returns immediately and does not open a worker or insert a
-slot. Contributors remain registered (one `Box::pin` ready-future per raw-item
-batch is ~cheap); **no LHC I/O, no SQLite, no mapping**. This is not
-bit-identical registration to an upstream empty registry, but no LHC code path
-touches durable state.
+The product fork runs LHC because LHC is the product, not an optional build
+flavor. **`Feature::LhcCapture = false` is an invalid state for this product
+— product-owner ruling.** It is not a supported mode, not a fallback, and not
+a user-facing kill switch; doc language framing it as one is wrong and dies
+on touch (this section previously did). Its only legitimate uses are test
+infrastructure and diagnostic attribution (e.g. the F7 resume-regression
+discriminator, 2026-08-29).
+
+Mechanically, with the flag off `on_thread_start` returns immediately: no
+worker, no slot, no LHC I/O, no SQLite, no mapping; contributors stay
+registered (one `Box::pin` ready-future per raw-item batch). That behavior
+exists for the legitimate uses above only. Flag provenance trace and
+disposition are tracked with the campaign manager.
 
 ## Compact test policy (LIM-142)
 
@@ -797,8 +830,8 @@ Host obligations:
   `active_non_tool`, not `none`.
 - Attempt identity uses the completed provider `response_id`; provider usage is
   that response's `token_usage` (cache split exact).
-- Kill-switch off (`lhc_capture = false`) restores native MidTurn behavior
-  (visible `Unavailable` residual).
+- `lhc_capture = false` (invalid product state; test/diagnostic only) restores
+  native MidTurn behavior (visible `Unavailable` residual).
 - Schema v11 thread stores (writer claim, boundary, receipt, stage log,
   host-validation ack) are owned by the vendored pin; startup reconcile
   remains valid and additionally honors the LIM-67 host-validation reload

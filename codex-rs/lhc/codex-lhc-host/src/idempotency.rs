@@ -46,11 +46,13 @@
 //! host, so (2) holds without a counter heuristic on the id path.
 //!
 //! Occurrence counters still apply on the anonymous fallback path and are
-//! seeded from stored `anon:` keys at open.
+//! resolved lazily from stored `anon:` keys only when `item_stable_id` is
+//! `None`. Normal ID-bearing open starts the tracker empty.
 //!
 //! `thread` is percent-escaped (`:` → `%3A`, `%` → `%25`).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use codex_protocol::models::ResponseItem;
 use sha2::Digest;
@@ -61,6 +63,8 @@ use tracing::warn;
 #[derive(Debug, Default, Clone)]
 pub struct OccurrenceTracker {
     counts: HashMap<String, u64>,
+    /// Digests whose archive high-water has already been loaded this process.
+    resolved: HashSet<String>,
 }
 
 impl OccurrenceTracker {
@@ -80,11 +84,20 @@ impl OccurrenceTracker {
             let entry = self.counts.entry(digest.clone()).or_insert(0);
             *entry = (*entry).max(other_next);
         }
+        self.resolved.extend(other.resolved.iter().cloned());
     }
 
     pub fn observe(&mut self, digest: &str, occ: u64) {
         let entry = self.counts.entry(digest.to_string()).or_insert(0);
         *entry = (*entry).max(occ.saturating_add(1));
+    }
+
+    pub fn is_resolved(&self, digest: &str) -> bool {
+        self.resolved.contains(digest)
+    }
+
+    pub fn mark_resolved(&mut self, digest: &str) {
+        self.resolved.insert(digest.to_string());
     }
 }
 

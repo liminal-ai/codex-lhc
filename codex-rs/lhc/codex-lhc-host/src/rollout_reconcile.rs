@@ -286,16 +286,15 @@ pub async fn read_capture_frontier(
     let (session, _) =
         LhcSession::open_with_inference(thread_id, None, Some(root_buf.as_path()), callbacks)
             .await?;
-    let events = session.list_events().await.ok();
+    let frontier = session.thread_frontier().await.ok();
     session.close().await;
-    let events = events?;
+    let frontier = frontier?;
+    // event_order is the append-only recorded counter, so the captured count
+    // equals last_event_order on this archive (empty → 0).
+    let last_event_order = frontier.last_event_order.max(0);
     Some(CaptureFrontier {
-        last_event_order: events
-            .iter()
-            .map(lhc::intake_stream::EventRecord::event_order)
-            .max()
-            .unwrap_or(0),
-        event_count: events.len() as u64,
+        last_event_order,
+        event_count: last_event_order as u64,
     })
 }
 
@@ -783,9 +782,11 @@ pub async fn read_thread_compact_point(thread_id: &str, root: Option<&Path>) -> 
             warn!(
                 thread_id,
                 reason = %error.reason,
-                "LHC reconcile: describe failed; falling back to event scan"
+                "LHC reconcile: describe failed; falling back to compact-marker key prefix"
             );
-            // Fall back to the event-scan path for robustness.
+            // Bounded latest-marker fallback: walk compact_marker keys only
+            // (caller-bounded by marker count, hard-capped by the SDK). Never
+            // a whole-history payload scan.
             let callbacks = lhc_inference_callbacks(false).ok()?;
             let (session, _) = LhcSession::open_with_inference(
                 thread_id,
@@ -794,15 +795,26 @@ pub async fn read_thread_compact_point(thread_id: &str, root: Option<&Path>) -> 
                 callbacks,
             )
             .await?;
-            let events = match session.list_events().await {
-                Ok(e) => e,
+            let prefix = crate::projections::compact_marker_key_prefix(thread_id);
+            let point = match crate::projections::list_keys_under_prefix(&session, &prefix).await {
+                Ok(keys) => {
+                    let best = keys
+                        .iter()
+                        .filter_map(|k| {
+                            crate::projections::compact_point_from_marker_key(&k.idempotency_key)
+                        })
+                        .max();
+                    Some(best.unwrap_or(0))
+                }
                 Err(err) => {
-                    warn!(%err, thread_id, "LHC reconcile: list_events failed; fail-open");
-                    session.close().await;
-                    return None;
+                    warn!(
+                        %err,
+                        thread_id,
+                        "LHC reconcile: compact-marker key fallback failed; fail-open"
+                    );
+                    None
                 }
             };
-            let point = latest_compact_point_from_events(&events);
             session.close().await;
             point
         }
@@ -810,6 +822,10 @@ pub async fn read_thread_compact_point(thread_id: &str, root: Option<&Path>) -> 
 }
 
 /// Best-effort max compact point from archive event notes.
+///
+/// Payload-scan oracle for marker-parity tests. Production uses describe()
+/// plus a compact-marker key-prefix fallback.
+#[cfg(test)]
 pub fn latest_compact_point_from_events(events: &[lhc::intake_stream::EventRecord]) -> Option<i64> {
     let mut best: Option<i64> = None;
     for ev in events {
@@ -1211,42 +1227,22 @@ pub async fn materialize_thread_rollout_items(
     let (window_number, first_window_id, previous_window_id, window_id) =
         window_meta_from_prior(&prior_generation);
 
-    let durable_message = latest_durable_marker_message(thread_id, Some(root_buf.as_path()))
-        .await
-        .unwrap_or_else(|| {
-            // nc4: when no Codex event marker exists (crash between SDK
-            // compact and host marker write-back), synthesize boundary
-            // metadata from the installed view. Never stamp compactPoint=0
-            // when the view is ahead.
-            let (cp, cf, vid, prof) = match installed_view.as_ref() {
-                Some(v) => (
-                    v.compact_point,
-                    v.covered_from,
-                    v.view_id.as_str(),
-                    v.profile_name.as_deref(),
-                ),
-                None => (0, 0, "reconcile", None),
-            };
-            format!(
-                "lhc_compact_durable {}",
-                serde_json::json!({
-                    "viewId": vid,
-                    "coveredFrom": cf,
-                    "compactPoint": cp,
-                    "totalTokens": 0,
-                    "tailTokens": 0,
-                    "firstKeptMessageId": null,
-                    "profile": prof,
-                    "bands": null,
-                    "viewMapSeam": crate::compact_bridge::VIEW_MAP_SEAM_ID,
-                    "bodyItemCount": 0,
-                    "markerKey": format!("codex:{thread_id}:compact_marker:reconcile:{cp}"),
-                    "derivedContentDigests": [],
-                    "derivedHostIds": [],
-                    "archiveTip": "reconcile",
-                })
-            )
-        });
+    // Marker order comes from the installed compact receipt/view, not from a
+    // stale prior Compacted record and not from a whole-archive payload scan.
+    // When describe failed, fall back to the prior generation's durable
+    // boundary if any.
+    let durable_message = match installed_view.as_ref() {
+        Some(v) => synthesize_durable_boundary_message(
+            thread_id,
+            v.compact_point,
+            v.covered_from,
+            v.view_id.as_str(),
+            v.profile_name.as_deref(),
+        ),
+        None => durable_boundary_message_from_prior(&prior_generation).unwrap_or_else(|| {
+            synthesize_durable_boundary_message(thread_id, 0, 0, "reconcile", None)
+        }),
+    };
 
     let mut result = materialize_rollout(&MaterializeInput {
         session_meta,
@@ -1397,15 +1393,15 @@ pub(crate) fn graft_prior_active_suffix(
     // Every id present on either side must have exactly one call + one output.
     let mut seen_ids: Vec<String> = Vec::new();
     for item in terminal_suffix {
-        if let Some(id) = client_call_id(item) {
-            if !seen_ids.contains(&id) {
-                seen_ids.push(id);
-            }
+        if let Some(id) = client_call_id(item)
+            && !seen_ids.contains(&id)
+        {
+            seen_ids.push(id);
         }
-        if let Some(id) = output_call_id(item) {
-            if !seen_ids.contains(&id) {
-                seen_ids.push(id);
-            }
+        if let Some(id) = output_call_id(item)
+            && !seen_ids.contains(&id)
+        {
+            seen_ids.push(id);
         }
     }
     if seen_ids.is_empty() {
@@ -1549,53 +1545,41 @@ fn window_meta_from_prior(prior: &[RolloutItem]) -> (u64, String, Option<String>
     (1, "reconcile-first".into(), None, "reconcile-win-1".into())
 }
 
-async fn latest_durable_marker_message(thread_id: &str, root: Option<&Path>) -> Option<String> {
-    let callbacks = lhc_inference_callbacks(false).ok()?;
-    let (session, _) = LhcSession::open_with_inference(thread_id, None, root, callbacks).await?;
-    let events = session.list_events().await.ok()?;
-    let mut best: Option<(i64, String)> = None;
-    for ev in events {
-        let Some(tp) = ev.text_payload() else {
-            continue;
-        };
-        if CompactMarker::is_durable_writeback_record(&tp.text)
-            || tp.text.contains("lhc_compact_marker ")
-            || tp.text.starts_with("lhc_compact_marker ")
-        {
-            let order = ev.event_order();
-            if best.as_ref().is_none_or(|(o, _)| order >= *o) {
-                // Prefer durable form when we only have a summary note.
-                let msg = if CompactMarker::is_durable_writeback_record(&tp.text) {
-                    tp.text.clone()
-                } else if let Some(point) = compact_point_from_boundary_message(&tp.text) {
-                    format!(
-                        "lhc_compact_durable {}",
-                        serde_json::json!({
-                            "viewId": "reconcile",
-                            "coveredFrom": 0,
-                            "compactPoint": point,
-                            "totalTokens": 0,
-                            "tailTokens": 0,
-                            "firstKeptMessageId": null,
-                            "profile": null,
-                            "bands": null,
-                            "viewMapSeam": crate::compact_bridge::VIEW_MAP_SEAM_ID,
-                            "bodyItemCount": 0,
-                            "markerKey": format!("codex:{thread_id}:compact_marker:reconcile:{point}"),
-                            "derivedContentDigests": [],
-                            "derivedHostIds": [],
-                            "archiveTip": "reconcile",
-                        })
-                    )
-                } else {
-                    continue;
-                };
-                best = Some((order, msg));
-            }
-        }
-    }
-    session.close().await;
-    best.map(|(_, m)| m)
+/// Marker order for regeneration comes from the durable compact receipt already
+/// on the prior rollout (`Compacted` record), not from an archive payload scan.
+fn durable_boundary_message_from_prior(items: &[RolloutItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| match item {
+        RolloutItem::Compacted(c) => Some(c.message.clone()),
+        _ => None,
+    })
+}
+
+fn synthesize_durable_boundary_message(
+    thread_id: &str,
+    compact_point: i64,
+    covered_from: i64,
+    view_id: &str,
+    profile: Option<&str>,
+) -> String {
+    format!(
+        "lhc_compact_durable {}",
+        serde_json::json!({
+            "viewId": view_id,
+            "coveredFrom": covered_from,
+            "compactPoint": compact_point,
+            "totalTokens": 0,
+            "tailTokens": 0,
+            "firstKeptMessageId": null,
+            "profile": profile,
+            "bands": null,
+            "viewMapSeam": crate::compact_bridge::VIEW_MAP_SEAM_ID,
+            "bodyItemCount": 0,
+            "markerKey": format!("codex:{thread_id}:compact_marker:reconcile:{compact_point}"),
+            "derivedContentDigests": [],
+            "derivedHostIds": [],
+            "archiveTip": "reconcile",
+        })
+    )
 }
 
 #[cfg(test)]
