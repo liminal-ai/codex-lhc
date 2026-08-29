@@ -40,7 +40,7 @@ jobs:
           python scripts/lhc-release/check_version_identity.py --version "$VERSION"
           sdk_dir=codex-rs/lhc/vendor/long-horizon-context
           sdk_commit="$(git -C "$sdk_dir" rev-parse HEAD)"
-          test "$sdk_commit" = b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+          test "$sdk_commit" = 5207952b0d6d5dadb95f810c75a18e0867da6b72
           git -C "$sdk_dir" fetch --no-tags origin main
           git -C "$sdk_dir" merge-base --is-ancestor "$sdk_commit" origin/main
       - uses: ./.github/actions/setup-ci
@@ -64,11 +64,11 @@ jobs:
             --target "$TARGET" --variant codex --package-version "$VERSION" \
             --cargo-profile release --package-dir "$package_dir" \
             --archive-output "$archive" \
-            --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45 \
+            --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72 \
             --lhc-thread-schema 12 --force
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
-            --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+            --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72
       - name: Prove default LHC capture on seed
         run: >-
           python scripts/check-lhc-default-capture.py
@@ -112,7 +112,7 @@ jobs:
           python scripts/lhc-release/check_version_identity.py --version "$VERSION"
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform linux-x86_64 --version "$VERSION" \
-            --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+            --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72
           (cd seed && sha256sum "codex-lhc-v${VERSION}-linux-x86_64.tar.gz" > SHA256SUMS)
       - name: Run supplemental source regressions (not artifact qualification)
         working-directory: codex-rs
@@ -231,7 +231,7 @@ jobs:
           python scripts/lhc-release/check_version_identity.py --version "$VERSION"
           sdk_dir=codex-rs/lhc/vendor/long-horizon-context
           sdk_commit="$(git -C "$sdk_dir" rev-parse HEAD)"
-          test "$sdk_commit" = b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+          test "$sdk_commit" = 5207952b0d6d5dadb95f810c75a18e0867da6b72
           git -C "$sdk_dir" fetch --no-tags origin main
           git -C "$sdk_dir" merge-base --is-ancestor "$sdk_commit" origin/main
       - uses: ./.github/actions/setup-ci
@@ -360,11 +360,11 @@ jobs:
             --target "$TARGET" --variant codex --package-version "$VERSION" \
             --cargo-profile release --package-dir "$package_dir" \
             --archive-output "$archive" \
-            --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45 \
+            --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72 \
             --lhc-thread-schema 12 --force
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
-            --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+            --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72
       - name: Upload immutable platform archive
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -403,13 +403,13 @@ jobs:
             python scripts/lhc-release/verify_package_archive.py \
               --archive "candidate/codex-lhc-v${VERSION}-${platform}.tar.gz" \
               --platform "$platform" --version "$VERSION" \
-              --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+              --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72
           done
           for platform in windows-x86_64 windows-aarch64; do
             python scripts/lhc-release/verify_package_archive.py \
               --archive "candidate/codex-lhc-v${VERSION}-${platform}.zip" \
               --platform "$platform" --version "$VERSION" \
-              --lhc-sdk-commit b408f89712cbbb525dbfc2f7b2c51ab3133c4f45
+              --lhc-sdk-commit 5207952b0d6d5dadb95f810c75a18e0867da6b72
           done
           python scripts/lhc-release/make_manifest.py \
             --dist candidate --version "$VERSION" \
