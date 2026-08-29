@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Burn-in the LIM-134 empty-success repair against a built codex-exec.
+"""Scenario regression the LIM-134 empty-success repair against a built codex-exec.
 
 A completed Responses turn with a nonblank prompt and no assistant message
 must yield turn Failed, a nonzero process exit, and no fabricated answer.
@@ -30,7 +30,7 @@ from urllib.parse import urlparse
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BINARY = REPO_ROOT / "codex-rs" / "target" / "release" / "codex-exec"
 LIM134_FAILURE = "Turn completed without producing an agent message."
-PROMPT = "LIM-140 empty-success burn-in: produce a final agent message."
+PROMPT = "LIM-140 empty-success scenario: produce a final agent message."
 ITERATION_TIMEOUT_SECONDS = 25
 API_KEY_ENV_NAMES = (
     "OPENAI_API_KEY",
@@ -380,7 +380,7 @@ def run_iteration(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Deterministic burn-in for the LIM-134 empty-success repair "
+            "Deterministic scenario regression for the LIM-134 empty-success repair "
             "against a built codex-exec binary."
         )
     )

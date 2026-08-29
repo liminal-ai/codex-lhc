@@ -1,6 +1,6 @@
-# LIM-140 qualification evidence: paired before/after burn-in (Lee directive)
+# LIM-140 qualification evidence: paired before/after scenario regression (Lee directive)
 
-Same script (`scripts/lhc-burnin-empty-success.py`), same mock provider, same
+Same script (`scripts/lhc-empty-success-scenario.py`), same mock provider, same
 scenario, run 2026-08-29 against both binaries. The script asserts the
 LIM-134 behavior (turn Failed, exit nonzero, no fabricated answer), so PASS
 means the fix is present and FAIL means the original empty-success bug fired.
