@@ -27,7 +27,8 @@
 # assertion is native routing, never a way to silence a real regression.
 #
 # One entry per ignored test function (parameterized cases share their fn).
-# count: 112
+# count: 114
+codex-rs/core/src/session/tests.rs::interrupting_compaction_fallback_retains_last_known_step_context
 codex-rs/core/tests/suite/client.rs::response_item_ids_are_sent_for_all_remote_v2_compaction_requests
 codex-rs/core/tests/suite/compact.rs::auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events
 codex-rs/core/tests/suite/compact.rs::auto_compact_body_after_prefix_counts_growth_after_compaction
@@ -42,7 +43,7 @@ codex-rs/core/tests/suite/compact.rs::auto_compact_runs_when_reasoning_header_cl
 codex-rs/core/tests/suite/compact.rs::auto_compact_starts_after_turn_started
 codex-rs/core/tests/suite/compact.rs::body_after_prefix_model_switch_budget_compacts_with_next_model
 codex-rs/core/tests/suite/compact.rs::compact_hooks_respect_matchers_and_post_runs_after_compaction
-codex-rs/core/tests/suite/compact.rs::manual_compact_emits_api_and_local_token_usage_events
+codex-rs/core/tests/suite/compact.rs::manual_compact_records_durable_and_local_token_usage
 codex-rs/core/tests/suite/compact.rs::manual_compact_emits_context_compaction_items
 codex-rs/core/tests/suite/compact.rs::manual_compact_retries_after_context_window_error
 codex-rs/core/tests/suite/compact.rs::manual_compact_twice_preserves_latest_user_messages
@@ -52,6 +53,7 @@ codex-rs/core/tests/suite/compact.rs::manual_pre_compact_block_decision_does_not
 codex-rs/core/tests/suite/compact.rs::mid_turn_compaction_keeps_the_creation_time_global_instructions
 codex-rs/core/tests/suite/compact.rs::multiple_auto_compact_per_task_runs_after_token_limit_hit
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift
+codex-rs/core/tests/suite/compact.rs::previous_model_compaction_resolves_selected_settings
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_from_retired_previous_model_after_rename
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_when_previous_model_is_not_found
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider

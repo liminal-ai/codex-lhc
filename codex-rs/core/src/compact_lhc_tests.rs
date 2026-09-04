@@ -32,6 +32,7 @@ use crate::session::context_window::context_window_token_status;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
+use crate::session::tests::update_turn_settings_for_test;
 use crate::tasks::CompactTask;
 use crate::tasks::SessionTask;
 use codex_lhc_host::InferenceCallbacks;
@@ -887,6 +888,9 @@ fn band_body_replacement_history_byte_equal() {
         first_window_id: Some("a".into()),
         previous_window_id: None,
         window_id: Some("b".into()),
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
     let mut history = ContextManager::new();
     history.replace(
@@ -956,6 +960,9 @@ fn shape_risk_consumers_see_band_replacement() {
         first_window_id: Some("w0".into()),
         previous_window_id: Some("w1".into()),
         window_id: Some("w2".into()),
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
     let mut resume = ContextManager::new();
     resume.replace(
@@ -1239,9 +1246,10 @@ async fn j2_resolve_pins_luna_and_lowest_effort_not_turn_model() {
         target.effort
     );
     // Must not ride the turn model when it differs.
-    if tc.model_info.slug != target.model_info.slug {
+    if tc.model_info().slug != target.model_info.slug {
         assert_ne!(
-            target.model_info.slug, tc.model_info.slug,
+            target.model_info.slug,
+            tc.model_info().slug,
             "derivation must not equal turn model when they differ"
         );
     }
@@ -1638,6 +1646,9 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         },
     )];
     s2.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -1746,6 +1757,9 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         },
     )];
     child.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -2177,6 +2191,7 @@ async fn slice_c_reopen_pin_append_lands_in_new_file() {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
         ),
     )])
@@ -2580,6 +2595,7 @@ async fn slice_c_mutation_reopen_pin_demonstrates_orphan_without_reopen() {
                 phase: None,
                 memory_citation: None,
                 delivery: None,
+                questions: None,
             },
         )),
     ];
@@ -3039,14 +3055,20 @@ async fn model_downshift_does_not_refuse_on_body_size_alone() {
     handle.flush().await;
     install_deterministic_test_override(&session);
 
-    Arc::make_mut(&mut previous_tc.model_info).slug = "gpt-prev-large".into();
-    Arc::make_mut(&mut previous_tc.model_info).context_window = Some(1_000_000);
-    Arc::make_mut(&mut previous_tc.model_info).max_context_window = Some(1_000_000);
-    Arc::make_mut(&mut previous_tc.model_info).auto_compact_token_limit = Some(900_000);
+    update_turn_settings_for_test(&mut previous_tc, |settings| {
+        let model_info = Arc::make_mut(&mut settings.model_info);
+        model_info.slug = "gpt-prev-large".into();
+        model_info.context_window = Some(1_000_000);
+        model_info.max_context_window = Some(1_000_000);
+        model_info.auto_compact_token_limit = Some(900_000);
+    });
 
-    Arc::make_mut(&mut target_tc.model_info).context_window = Some(2_000);
-    Arc::make_mut(&mut target_tc.model_info).max_context_window = Some(2_000);
-    Arc::make_mut(&mut target_tc.model_info).auto_compact_token_limit = Some(32);
+    update_turn_settings_for_test(&mut target_tc, |settings| {
+        let model_info = Arc::make_mut(&mut settings.model_info);
+        model_info.context_window = Some(2_000);
+        model_info.max_context_window = Some(2_000);
+        model_info.auto_compact_token_limit = Some(32);
+    });
 
     let sess = Arc::new(session);
     let previous_step = crate::session::step_context::StepContext::for_test(Arc::new(previous_tc));
@@ -3077,9 +3099,12 @@ async fn successful_lhc_compact_clears_regular_trigger() {
     let root = dir.path().to_path_buf();
     let (mut session, mut tc) = make_session_and_context().await;
     // Codex-LHC policy for GPT-5.6 long-context operation.
-    Arc::make_mut(&mut tc.model_info).auto_compact_token_limit = Some(350_000);
-    Arc::make_mut(&mut tc.model_info).context_window = Some(370_000);
-    Arc::make_mut(&mut tc.model_info).max_context_window = Some(1_050_000);
+    update_turn_settings_for_test(&mut tc, |settings| {
+        let model_info = Arc::make_mut(&mut settings.model_info);
+        model_info.auto_compact_token_limit = Some(350_000);
+        model_info.context_window = Some(370_000);
+        model_info.max_context_window = Some(1_050_000);
+    });
 
     install_lhc_and_enable(&mut session, root).await;
     let slot = session
@@ -3402,6 +3427,9 @@ fn grafted_pair_survives_patch_materialized_history_ids() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(reconstructed_call.into()),
         RolloutItem::ResponseItem(reconstructed_out.into()),
@@ -3443,6 +3471,9 @@ fn empty_install_history_keeps_prior_body() {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })];
     assert!(
         codex_lhc_host::history_from_materialized_items(&items).is_empty(),
@@ -3513,6 +3544,9 @@ fn degraded_drops_keep_rollout_and_installed_body_identical() {
         first_window_id: None,
         previous_window_id: None,
         window_id: None,
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })];
     rollout.extend(
         tail.iter()

@@ -483,6 +483,9 @@ fn boundary_record_field_completeness_pinned() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         })]),
         Some("Compacted.replacement_history is empty")
     );
@@ -495,6 +498,9 @@ fn boundary_record_field_completeness_pinned() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         })]),
         Some("Compacted.replacement_history is None")
     );
@@ -507,6 +513,9 @@ fn boundary_record_field_completeness_pinned() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         })]),
         Some("Compacted.window_number is None")
     );
@@ -2306,6 +2315,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
     let cwd = serde_json::from_value(json!(std::env::current_dir().expect("current directory")))
         .expect("AbsolutePathBuf");
     let settings = EventMsg::ThreadSettingsApplied(ThreadSettingsAppliedEvent {
+        thread_id: None,
         thread_settings: ThreadSettingsSnapshot {
             model: "gpt-settings".into(),
             model_provider_id: "openai".into(),
@@ -2340,6 +2350,9 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
             first_window_id: None,
             previous_window_id: None,
             window_id: None,
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(TokenUsageInfo {
@@ -2356,6 +2369,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
         RolloutItem::EventMsg(EventMsg::Error(ErrorEvent {
             message: "boom".into(),
             codex_error_info: None,
+            misalignment: None,
         })),
         // Carry-forward set.
         RolloutItem::EventMsg(settings),

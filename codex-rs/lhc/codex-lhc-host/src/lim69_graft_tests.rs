@@ -58,6 +58,7 @@ fn grafted_custom_tool_pair_survives_rollout_resume() {
         message: "lhc".into(), replacement_history: Some(vec![]),
         mcp_resource_origins: None,
         window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
+        guardian_history: None, compaction_response_id: None, latest_token_usage_record: None,
     };
     let items = vec![
         RolloutItem::Compacted(compacted),

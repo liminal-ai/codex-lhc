@@ -215,6 +215,12 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         first_window_id: Some(input.boundary.first_window_id.clone()),
         previous_window_id: input.boundary.previous_window_id.clone(),
         window_id: Some(input.boundary.window_id.clone()),
+        // 0.153.3: upstream additions. The LHC boundary carries no guardian
+        // checkpoint or compaction response id; token usage is re-observed
+        // from the live session after the rewrite install.
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     };
     debug_assert!(
         compacted
@@ -636,6 +642,7 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                         phase: None,
                         memory_citation: None,
                         delivery: None,
+                        questions: None,
                     },
                 )));
             }

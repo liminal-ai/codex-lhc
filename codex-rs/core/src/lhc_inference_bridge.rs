@@ -51,6 +51,7 @@ fn effort_rank(effort: &ReasoningEffort) -> u8 {
         ReasoningEffort::XHigh => 5,
         ReasoningEffort::Max => 6,
         ReasoningEffort::Ultra => 7,
+        ReasoningEffort::Persistent => 8,
         ReasoningEffort::Custom(_) => 100,
     }
 }
@@ -243,6 +244,7 @@ pub(crate) fn derivation_prompt(text: &str) -> Prompt {
         parallel_tool_calls: false,
         output_schema: None,
         output_schema_strict: false,
+        cyber_access_program: None,
     }
 }
 

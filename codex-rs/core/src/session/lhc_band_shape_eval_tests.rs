@@ -417,6 +417,7 @@ async fn lhc_band_shape_eval_dry_run_installs_and_dumps() {
                 message: "lhc-band-shape-eval".into(),
                 window_number,
                 window_ids,
+                compaction_response_id: None,
             },
         )
         .await;
@@ -560,6 +561,7 @@ async fn lhc_band_shape_eval_live() {
                 message: "lhc-band-shape-eval-live".into(),
                 window_number,
                 window_ids,
+                compaction_response_id: None,
             },
         )
         .await;
@@ -763,6 +765,7 @@ async fn replace_compacted_history_clears_prefill_for_threshold_untrip() {
                 message: "law2".into(),
                 window_number,
                 window_ids,
+                compaction_response_id: None,
             },
         )
         .await;

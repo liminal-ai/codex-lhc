@@ -601,6 +601,7 @@ WHERE thread_id = ?
                 ..
             }
             | ThreadItem::HookPrompt { .. }
+            | ThreadItem::FunctionCallOutput { .. }
             | ThreadItem::Plan { .. }
             | ThreadItem::Reasoning { .. }
             | ThreadItem::CommandExecution { .. }

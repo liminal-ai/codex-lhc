@@ -494,6 +494,31 @@ pub async fn reconcile_rollout_before_history_load(
     thread_id: &str,
     live_identity: Option<codex_lhc_host::ModelIdentity>,
 ) {
+    // 0.153.3 sync: upstream compresses cold (7-day idle) rollouts to
+    // `.jsonl.zst`. Classification reads the plain path, so restore the plain
+    // representation first (upstream's own resume/append path does the same
+    // before it references the file); otherwise a compressed-but-intact file
+    // would classify as MISSING and be regenerated from the LHC record.
+    if !rollout_path.exists()
+        && codex_rollout::existing_rollout_path(rollout_path)
+            .await
+            .is_some()
+    {
+        match codex_rollout::materialize_rollout_for_reference(rollout_path).await {
+            Ok(plain) => info!(
+                path = %plain.display(),
+                thread_id,
+                "LHC startup reconciliation: materialized compressed rollout before classify"
+            ),
+            Err(err) => warn!(
+                %err,
+                path = %rollout_path.display(),
+                thread_id,
+                "LHC startup reconciliation: could not materialize compressed rollout; \
+                 classification proceeds on the plain path"
+            ),
+        }
+    }
     let path = rollout_path.to_path_buf();
     let tid = thread_id.to_string();
     let root = codex_lhc_host::lhc_root();
@@ -2002,7 +2027,7 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         auto_compact_limit = ?turn_context
             .config
             .model_auto_compact_token_limit
-            .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+            .or_else(|| turn_context.model_info().auto_compact_token_limit()),
         provider_window = ?turn_context.model_context_window(),
         "LHC compact produce-body size (diagnostic only; not a terminal gate)"
     );
@@ -2278,7 +2303,7 @@ async fn install_lhc_compact_rewrite(
         auto_compact_limit = ?turn_context
             .config
             .model_auto_compact_token_limit
-            .or_else(|| turn_context.model_info.auto_compact_token_limit()),
+            .or_else(|| turn_context.model_info().auto_compact_token_limit()),
         provider_window = ?turn_context.model_context_window(),
         manual,
         "LHC compact install-history size (diagnostic only; not a terminal gate)"

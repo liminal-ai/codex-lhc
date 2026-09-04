@@ -54,6 +54,9 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
             first_window_id: Some("first".into()),
             previous_window_id: None,
             window_id: Some("win-1".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
     ]
 }
@@ -340,6 +343,9 @@ fn history_from_materialized_is_bands_plus_native_tail() {
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(tail.clone().into()),
     ];
@@ -399,6 +405,9 @@ fn dual_format_history_picks_newest_compacted_only() {
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w1".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(after1.into()),
         RolloutItem::Compacted(CompactedItem {
@@ -409,6 +418,9 @@ fn dual_format_history_picks_newest_compacted_only() {
             first_window_id: Some("f".into()),
             previous_window_id: Some("w1".into()),
             window_id: Some("w2".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(after2.clone().into()),
     ];
@@ -447,6 +459,9 @@ fn fl4_model_context_estimate_like_for_like() {
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
     ];
     let baseline = model_context_token_estimate_from_rollout_items(&items);
@@ -502,6 +517,9 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
             first_window_id: Some("f".into()),
             previous_window_id: None,
             window_id: Some("w".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
     ];
     let history = history_from_materialized_items(&items);

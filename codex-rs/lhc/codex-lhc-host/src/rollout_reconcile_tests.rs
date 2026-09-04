@@ -80,6 +80,9 @@ fn single_boundary_items(compact_point: i64) -> Vec<RolloutItem> {
             first_window_id: Some("first".into()),
             previous_window_id: None,
             window_id: Some("win-1".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(user("tail", "u2").into()),
     ]
@@ -95,6 +98,9 @@ fn dual_compacted_polluted() -> Vec<RolloutItem> {
         first_window_id: Some("first".into()),
         previous_window_id: Some("win-1".into()),
         window_id: Some("win-2".into()),
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     }));
     items
 }

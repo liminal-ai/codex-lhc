@@ -1,5 +1,5 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index a0ab68f560..6af73dfe05 100644
+index ebb180755e..cf7d485081 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
 @@ -16,6 +16,7 @@ mod approval_review;
@@ -10,7 +10,7 @@ index a0ab68f560..6af73dfe05 100644
  mod skill_invocation;
  mod thread_lifecycle;
  mod tool_lifecycle;
-@@ -33,6 +34,9 @@ pub use mcp::SelectedPluginIdentity;
+@@ -34,6 +35,9 @@ pub use mcp::SelectedPluginIdentity;
  pub use mcp::SelectedPluginSnapshot;
  pub use prompt::PromptFragment;
  pub use prompt::PromptSlot;
@@ -134,10 +134,10 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index a166fdd31d..7624fecb2b 100644
+index a8ba8f1f20..2587bd442e 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
-@@ -52,6 +52,9 @@ pub use contributors::McpServerContributor;
+@@ -57,6 +57,9 @@ pub use contributors::McpToolSource;
  pub use contributors::PreviousWorldStateSection;
  pub use contributors::PromptFragment;
  pub use contributors::PromptSlot;
@@ -148,7 +148,7 @@ index a166fdd31d..7624fecb2b 100644
  pub use contributors::SelectedPluginIdentity;
  pub use contributors::SelectedPluginSnapshot;
 diff --git a/codex-rs/ext/extension-api/src/registry.rs b/codex-rs/ext/extension-api/src/registry.rs
-index eec5b9f0a7..fb15f7957d 100644
+index 8a8ae707ef..0670ba2ddb 100644
 --- a/codex-rs/ext/extension-api/src/registry.rs
 +++ b/codex-rs/ext/extension-api/src/registry.rs
 @@ -13,6 +13,7 @@ use crate::ExtensionEventSink;
@@ -189,7 +189,7 @@ index eec5b9f0a7..fb15f7957d 100644
      approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
  }
  
-@@ -259,6 +269,12 @@ impl<C: Sync> ExtensionRegistry<C> {
+@@ -270,6 +280,12 @@ impl<C: Sync> ExtensionRegistry<C> {
      pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
          &self.turn_item_contributors
      }
@@ -203,10 +203,10 @@ index eec5b9f0a7..fb15f7957d 100644
  
  /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 2e856ffedd..fb804e9118 100644
+index 2612414262..1d0f001581 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-@@ -1366,6 +1366,7 @@ impl GoalExtensionHarness {
+@@ -1672,6 +1672,7 @@ impl GoalExtensionHarness {
                      turn_id,
                      collaboration_mode: &collaboration_mode,
                      token_usage_at_turn_start: usage,
@@ -214,7 +214,7 @@ index 2e856ffedd..fb804e9118 100644
                      session_store: &self.session_store,
                      thread_store: &self.thread_store,
                      turn_store: &turn_store,
-@@ -1379,6 +1380,8 @@ impl GoalExtensionHarness {
+@@ -1685,6 +1686,8 @@ impl GoalExtensionHarness {
          for contributor in self.registry.turn_lifecycle_contributors() {
              contributor
                  .on_turn_stop(TurnStopInput {

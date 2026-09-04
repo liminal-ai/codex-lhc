@@ -256,6 +256,9 @@ fn compacted(
         first_window_id: Some("first-win".into()),
         previous_window_id: prev.map(str::to_string),
         window_id: Some(window_id.into()),
+        guardian_history: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
     })
 }
 

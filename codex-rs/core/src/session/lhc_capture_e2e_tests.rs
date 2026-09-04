@@ -378,7 +378,10 @@ async fn e2e_config_change_via_session_fanout() {
     // Production fan-out: update_settings → emit_config_changed_contributors.
     session
         .update_settings(SessionSettingsUpdate {
-            approval_policy: Some(AskForApproval::Never),
+            step_settings: crate::session::step_settings::StepSettingsUpdate {
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
             ..Default::default()
         })
         .await
@@ -1011,6 +1014,9 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
             first_window_id: Some("first".into()),
             previous_window_id: None,
             window_id: Some("win-1".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(user("after-c1").into()),
         RolloutItem::ResponseItem(assistant("reply-c1").into()),
@@ -1022,6 +1028,9 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
             first_window_id: Some("first".into()),
             previous_window_id: Some("win-1".into()),
             window_id: Some("win-2".into()),
+            guardian_history: None,
+            compaction_response_id: None,
+            latest_token_usage_record: None,
         }),
         RolloutItem::ResponseItem(user("after-c2").into()),
         RolloutItem::ResponseItem(assistant("reply-c2").into()),

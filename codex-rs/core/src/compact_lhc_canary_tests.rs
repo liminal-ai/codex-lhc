@@ -237,8 +237,7 @@ async fn canary_input_arriving_during_construction_does_not_suppress_install() {
                             format!("steer during construction {i}"),
                             /*trigger_turn*/ false,
                         ),
-                        /*parent_turn_id*/ None,
-                        /*root_turn_id*/ None,
+                        codex_protocol::turn_input::TurnStartOptions::default(),
                     )
                     .await;
                 tokio::time::sleep(Duration::from_millis(15)).await;

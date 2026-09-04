@@ -1478,7 +1478,7 @@ impl<C: Send + Sync + 'static> ToolContributor for LhcExtension<C> {
         &self,
         _session_store: &ExtensionData,
         thread_store: &ExtensionData,
-    ) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
         // Same gate as capture: slot is only inserted when LhcCapture is on at
         // thread start. No slot → no retrieval tools.
         let Some(slot) = thread_store.get::<LhcCaptureSlot>() else {

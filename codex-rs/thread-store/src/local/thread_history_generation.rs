@@ -149,6 +149,7 @@ pub(super) async fn read_rollout_head(
             | codex_rollout::RolloutItem::WorldState(_)
             | codex_rollout::RolloutItem::SecurityRiskScore(_)
             | codex_rollout::RolloutItem::RealtimeItem(_)
+            | codex_rollout::RolloutItem::TokenUsageRecord(_)
             | codex_rollout::RolloutItem::EventMsg(_) => {}
         }
     }

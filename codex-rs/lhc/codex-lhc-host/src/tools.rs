@@ -127,7 +127,9 @@ const GET_MESSAGES_DESCRIPTION: &str = concat!(
 );
 
 /// Register both retrieval tools bound to the live capture slot.
-pub fn retrieval_tools(slot: Arc<LhcCaptureSlot>) -> Vec<Arc<dyn ToolExecutor<ToolCall>>> {
+pub fn retrieval_tools(
+    slot: Arc<LhcCaptureSlot>,
+) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
     vec![
         Arc::new(GetTurnsTool {
             slot: Arc::clone(&slot),
@@ -144,7 +146,7 @@ struct GetMessagesTool {
     slot: Arc<LhcCaptureSlot>,
 }
 
-impl ToolExecutor<ToolCall> for GetTurnsTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for GetTurnsTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(GET_TURNS_TOOL_NAME)
     }
@@ -159,12 +161,15 @@ impl ToolExecutor<ToolCall> for GetTurnsTool {
 
     // Do NOT override supports_parallel_tool_calls — default false = sequential.
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
 
-impl ToolExecutor<ToolCall> for GetMessagesTool {
+impl<'call> ToolExecutor<ToolCall<'call>> for GetMessagesTool {
     fn tool_name(&self) -> ToolName {
         ToolName::plain(GET_MESSAGES_TOOL_NAME)
     }
@@ -177,13 +182,19 @@ impl ToolExecutor<ToolCall> for GetMessagesTool {
         )
     }
 
-    fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> codex_extension_api::ToolExecutorFuture<'a>
+    where
+        'call: 'a,
+    {
         Box::pin(self.handle_call(call))
     }
 }
 
 impl GetTurnsTool {
-    async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    async fn handle_call(
+        &self,
+        call: ToolCall<'_>,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_retrieval_args(&call, IdKind::Turn)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
@@ -228,7 +239,10 @@ impl GetTurnsTool {
 }
 
 impl GetMessagesTool {
-    async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    async fn handle_call(
+        &self,
+        call: ToolCall<'_>,
+    ) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_retrieval_args(&call, IdKind::Message)?;
         let thread_ref = resolve_thread_ref(&self.slot)?;
         let ids = dedupe_ids(args.ids);
@@ -551,7 +565,7 @@ mod tests {
     use crate::install::wait_for_handle;
     use crate::mapping::TurnEndFacts;
 
-    fn tool_call(name: &str, args: Value) -> ToolCall {
+    fn tool_call(name: &str, args: Value) -> ToolCall<'static> {
         ToolCall {
             turn_id: "turn-test".into(),
             call_id: "call-test".into(),

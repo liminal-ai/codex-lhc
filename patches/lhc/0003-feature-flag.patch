@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index b6a078b3da..3ea56a2ee1 100644
+index 24d7988b04..cc00a3b1a4 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -769,6 +769,9 @@
+@@ -816,6 +816,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,7 @@ index b6a078b3da..3ea56a2ee1 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -1788,9 +1791,81 @@
+@@ -1897,9 +1900,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -94,7 +94,7 @@ index b6a078b3da..3ea56a2ee1 100644
      "MarketplaceConfig": {
        "additionalProperties": false,
        "properties": {
-@@ -5775,6 +5850,9 @@
+@@ -6141,6 +6216,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -104,7 +104,7 @@ index b6a078b3da..3ea56a2ee1 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -6087,6 +6165,22 @@
+@@ -6477,6 +6555,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -128,10 +128,10 @@ index b6a078b3da..3ea56a2ee1 100644
        "allOf": [
          {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index a739f34c98..f3c5240ccf 100644
+index fdeae5c6f5..b414e0311d 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -313,6 +313,9 @@ pub enum Feature {
+@@ -339,6 +339,9 @@ pub enum Feature {
      PreventIdleSleep,
      /// Enable remote compaction v2 over the normal Responses API.
      RemoteCompactionV2,
@@ -141,7 +141,7 @@ index a739f34c98..f3c5240ccf 100644
      /// Include retained images in the remote compaction context budget.
      CompactionImageBudget,
      /// Retain client-authored developer messages across compacted context windows.
-@@ -1573,6 +1576,19 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -1685,6 +1688,19 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Stable,
          default_enabled: true,
      },
@@ -155,8 +155,8 @@ index a739f34c98..f3c5240ccf 100644
 +    FeatureSpec {
 +        id: Feature::CompactionImageBudget,
 +        key: "compaction_image_budget",
-+        stage: Stage::UnderDevelopment,
-+        default_enabled: false,
++        stage: Stage::Stable,
++        default_enabled: true,
 +    },
      FeatureSpec {
          id: Feature::CompactionImageBudget,

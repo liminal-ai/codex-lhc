@@ -476,8 +476,7 @@ async fn mid_turn_input_epoch_change_does_not_suppress_compact() {
                 "pending steer/mail".into(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            codex_protocol::turn_input::TurnStartOptions::default(),
         )
         .await;
     let history_version_after = session.clone_history().await.history_version();
@@ -3461,8 +3460,7 @@ async fn mid_turn_host_validation_failure_strict_compact_completes_turn() {
                 "pending after blocked compact".into(),
                 /*trigger_turn*/ false,
             ),
-            /*parent_turn_id*/ None,
-            /*root_turn_id*/ None,
+            codex_protocol::turn_input::TurnStartOptions::default(),
         )
         .await;
     assert!(session.input_queue.has_pending_mailbox_items().await);

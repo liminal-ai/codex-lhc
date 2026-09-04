@@ -172,7 +172,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 25 | `thread-store/src/live_thread.rs` | `LiveThread::reopen_rollout_after_rewrite` escape hatch (slice C) | `0007-lhc-compact-arm` |
 | 26 | `thread-store/src/local/{mod,live_writer}.rs` | local-store reopen implementation (slice C; no sentinel on impl) | `0007-lhc-compact-arm` |
 | 27 | `core/src/session/mod.rs` | `install_compacted_history_memory` — in-memory install without append (slice C) | (with 0004) |
-| 28 | `core/src/compact_lhc.rs` | startup reconciliation entry before history load (slice E) | (with 0007) |
+| 28 | `core/src/compact_lhc.rs` | startup reconciliation entry before history load (slice E); since 0.153.3 it materialises a compressed `.jsonl.zst` rollout to plain before classification | (with 0007) |
 | 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
 | 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
@@ -361,6 +361,92 @@ byte-identical (accepted under the criterion's semantic arm).
    sync**, not cleanup after it.
 5. `./scripts/check-lhc-hooks.sh` — all layers green before push.
 6. Commit with tripwire output summarized in the body; push to origin only.
+
+### Sync run 2026-09-04 — exact stable `rust-v0.153.3` (codex-lhc 0.153.3)
+
+Merged annotated tag `rust-v0.153.3` (peeled commit `b1a547b1f7`) onto the
+v0.150.2 release head `de0317e2a4` (workspace `0.150.2`) with a real
+two-parent `--no-ff` merge; merge-base `076f17c114`, 351 upstream commits.
+Purpose: a 0.153 client for `gpt-6-astra` (OpenAI's backend refuses it on
+0.150.2). Sync only — no new LHC features; vendored SDK pin unchanged at
+`5207952`.
+
+Nine conflicts, upstream as base with the fork's hooks re-applied on top:
+`Cargo.toml` (take `0.153.3`); `core/src/session/session.rs` and
+`session/tests.rs` x2 (upstream `executed_tool_calls: ….clone()` + fork
+`lhc_test_inference` initialiser); `core/src/session/mod.rs`
+(`replace_compacted_history`: upstream `let mut compacted_item` for the new
+guardian checkpoint, fork keeps `metadata.message.clone()` because the I2
+durable-record check reads the message afterwards);
+`protocol/src/openai_models.rs` (fork `auto_compact_token_limit` policy and
+its two tests kept; upstream's new
+`model_context_window_limits_preserve_their_distinct_meanings` test kept with
+the fork-policy expectation `250_000` instead of the 90% clamp `244_800`);
+`core/src/session/turn.rs` (LIM-134 `Err(err) => return Err(err)` kept over
+upstream's new in-loop `InvalidImageRequest` / generic emit+break arms, so
+the finalizer stays the sole terminal contributor — upstream's friendly image
+message is therefore not emitted in-loop; stream args moved to
+`step_context.settings.*` with the LC Adaptive Service Tier resolver now fed
+`step_context.settings.service_tier` and its decision still passed to
+`stream`; `response_tool_call_ids` seam kept beside upstream's new
+`reasoning_effort` tracing string; `record_observed_response_completed` takes
+upstream's `(response_id, usage, usage_metadata)` form);
+`core/src/tasks/mod.rs` (`handle_task_abort` gains upstream's
+`turn_state: &Mutex<TurnState>` parameter and keeps the fork's
+`(started_at, completed_at)` return; `run_turn_interrupt_hooks` gets the
+turn state in the fork's `TurnTerminal::Abort` arm);
+`core/tests/suite/compact.rs` (LIM-142 ignores re-applied: upstream
+parameterised `summarize_context_three_requests_and_instructions` and renamed
+`manual_compact_emits_api_and_local_token_usage_events` →
+`manual_compact_records_durable_and_local_token_usage`, allowlist entry
+renamed to match; upstream's new
+`previous_model_compaction_resolves_selected_settings` inserted — see the
+classification note below);
+`thread-store/src/local/thread_history_materialization.rs` (fork
+generation-swap projection kept; the rollout is now opened through upstream's
+`open_rollout_seekable_reader` in `spawn_blocking` so compressed
+`.jsonl.zst` rollouts project from their logical JSONL bytes, a new
+`ProjectionRead::Missing` arm mirrors upstream's `NotFound && start_offset == 0`
+early return, and the exists-check uses `existing_rollout_path`).
+
+Hook inventory unchanged: 53/53 markers, identical per-file distribution to
+v0.150.2 (no hook site moved). Adapter/fork absorptions of upstream API
+changes, no semantic change: `ToolExecutor<ToolCall<'call>>` HRTB on the
+retrieval tools and `ToolContributor::tools`; `CompactedItem` gained
+`guardian_history`, `compaction_response_id`, `latest_token_usage_record`
+(LHC boundary items carry `None` — the boundary has no guardian checkpoint or
+compaction response, and token usage is re-observed live after the rewrite
+install); `AgentMessageEvent.questions`, `ErrorEvent`/`TurnError.misalignment`,
+`ThreadSettingsAppliedEvent.thread_id`; `RolloutItem::TokenUsageRecord` joined
+the fork's rollout-head scan; `TurnContext.model_info` became a method (tests
+mutate via `update_turn_settings_for_test`); `SessionSettingsUpdate` nests
+`step_settings`; `enqueue_mailbox_communication` takes `TurnStartOptions`;
+`ReasoningEffort::Persistent` ranks above `Ultra` in the derivation-effort
+ladder; `Prompt.cyber_access_program = None` on the derivation prompt;
+`install_compacted_history_memory` passes `HistoryReplacement::Compaction` so
+the guardian review transcript is retained exactly as the native compaction
+arm does (in-memory only — the raw-item hook is not on this path; no
+double-record).
+
+**Rollout compression (upstream 0.153).** A background worker compresses
+rollouts idle for 7 days to `.jsonl.zst`; resume/append materialises them
+back to plain before use. The fork's startup reconciliation classified on the
+plain path, so a compressed-but-intact file would have read as MISSING and
+been regenerated from the LHC record. `reconcile_rollout_before_history_load`
+now materialises a compressed rollout (upstream's `materialize_rollout_for_reference`)
+before classification, exactly what upstream's own resume path does one step
+later. Live rollouts (the rewrite/swap path) are never compressed.
+
+**`features.context_management.experimental_mode`** (token budget, history
+notes, `new_context` tool; default off) is not wired into any fork seam; the
+LHC arms sit above TokenBudget in both ladders as before. Behaviour with it ON
+is a slice-2 live finding, not a merge-time change.
+
+Release identity: workspace `0.153.3` (upstream), `lhc-release/VERSION` and
+`ALIGNED_VERSION` in the release-helper test moved `0.150.2` → `0.153.3`.
+`patches/lhc/BASE` advanced to `b1a547b1f7`; all seven patches regenerated.
+`Cargo.lock` regenerated by cargo. Test counts and tripwire summary: see the
+merge commit body and the campaign STATUS.md done bar.
 
 ### Drill run 2026-08-27 — exact stable `rust-v0.150.1` (LIM-132)
 

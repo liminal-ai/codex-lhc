@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 4dbbd3a424..d24ac3190a 100644
+index 49306c357c..038510350a 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -70,6 +70,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+@@ -69,6 +69,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
  /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
  /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
  /// initial context into the replacement history just above the last real user message.
@@ -13,7 +13,7 @@ index 4dbbd3a424..d24ac3190a 100644
  pub(crate) enum InitialContextInjection {
      BeforeLastUserMessage {
          world_state: Arc<WorldState>,
-@@ -762,8 +766,13 @@ async fn drain_to_completed(
+@@ -763,8 +767,13 @@ async fn drain_to_completed(
          };
          match event {
              Ok(ResponseEvent::OutputItemDone(item)) => {
@@ -30,10 +30,10 @@ index 4dbbd3a424..d24ac3190a 100644
              Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                  sess.set_server_reasoning_included(included).await;
 diff --git a/codex-rs/core/src/session/inject.rs b/codex-rs/core/src/session/inject.rs
-index 6e51aa40e2..a9a3ec3dd4 100644
+index 6c103f266c..adb512bb80 100644
 --- a/codex-rs/core/src/session/inject.rs
 +++ b/codex-rs/core/src/session/inject.rs
-@@ -110,8 +110,13 @@ impl Session {
+@@ -138,8 +138,13 @@ impl Session {
                  }
              }));
          }
@@ -51,10 +51,10 @@ index 6e51aa40e2..a9a3ec3dd4 100644
      /// Injects items into active work, or records them without starting a turn.
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..d04c499850
+index 0000000000..5d64f48450
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1204 @@
+@@ -0,0 +1,1213 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -435,7 +435,10 @@ index 0000000000..d04c499850
 +    // Production fan-out: update_settings → emit_config_changed_contributors.
 +    session
 +        .update_settings(SessionSettingsUpdate {
-+            approval_policy: Some(AskForApproval::Never),
++            step_settings: crate::session::step_settings::StepSettingsUpdate {
++                approval_policy: Some(AskForApproval::Never),
++                ..Default::default()
++            },
 +            ..Default::default()
 +        })
 +        .await
@@ -1068,6 +1071,9 @@ index 0000000000..d04c499850
 +            first_window_id: Some("first".into()),
 +            previous_window_id: None,
 +            window_id: Some("win-1".into()),
++            guardian_history: None,
++            compaction_response_id: None,
++            latest_token_usage_record: None,
 +        }),
 +        RolloutItem::ResponseItem(user("after-c1").into()),
 +        RolloutItem::ResponseItem(assistant("reply-c1").into()),
@@ -1079,6 +1085,9 @@ index 0000000000..d04c499850
 +            first_window_id: Some("first".into()),
 +            previous_window_id: Some("win-1".into()),
 +            window_id: Some("win-2".into()),
++            guardian_history: None,
++            compaction_response_id: None,
++            latest_token_usage_record: None,
 +        }),
 +        RolloutItem::ResponseItem(user("after-c2").into()),
 +        RolloutItem::ResponseItem(assistant("reply-c2").into()),
@@ -1260,10 +1269,10 @@ index 0000000000..d04c499850
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index d14cadcad9..5a8fa2f69b 100644
+index 91300365bb..00c5de0bf5 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1372,6 +1372,9 @@ impl Session {
+@@ -1424,6 +1424,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1272,8 +1281,8 @@ index d14cadcad9..5a8fa2f69b 100644
 +                    .await;
  
                  // If resuming, warn when the last recorded model differs from the current one.
-                 let curr: &str = turn_context.model_info.slug.as_str();
-@@ -1412,6 +1415,8 @@ impl Session {
+                 let curr: &str = turn_context.model_info().slug.as_str();
+@@ -1466,6 +1469,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1282,7 +1291,7 @@ index d14cadcad9..5a8fa2f69b 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3139,6 +3144,25 @@ impl Session {
+@@ -3351,6 +3356,25 @@ impl Session {
          &self,
          turn_context: &TurnContext,
          items: &[ResponseItem],
@@ -1308,7 +1317,7 @@ index d14cadcad9..5a8fa2f69b 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, items);
-@@ -3147,8 +3171,13 @@ impl Session {
+@@ -3359,8 +3383,13 @@ impl Session {
              .into_iter()
              .map(ResponseItemEnvelope::new)
              .collect();
@@ -1324,7 +1333,7 @@ index d14cadcad9..5a8fa2f69b 100644
      }
  
      async fn record_prepared_conversation_items(
-@@ -3156,6 +3185,7 @@ impl Session {
+@@ -3368,6 +3397,7 @@ impl Session {
          turn_context: &TurnContext,
          items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
@@ -1332,7 +1341,7 @@ index d14cadcad9..5a8fa2f69b 100644
      ) {
          let response_items = items
              .iter()
-@@ -3188,7 +3218,7 @@ impl Session {
+@@ -3400,7 +3430,7 @@ impl Session {
          {
              mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
          }
@@ -1341,7 +1350,7 @@ index d14cadcad9..5a8fa2f69b 100644
              .await;
      }
  
-@@ -3375,7 +3405,13 @@ impl Session {
+@@ -3675,7 +3705,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1356,16 +1365,16 @@ index d14cadcad9..5a8fa2f69b 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3459,7 +3495,7 @@ impl Session {
+@@ -3760,7 +3796,7 @@ impl Session {
              Self::assign_missing_response_item_id(&mut envelope.item);
          }
-         let compacted_item = CompactedItem {
+         let mut compacted_item = CompactedItem {
 -            message: metadata.message,
 +            message: metadata.message.clone(),
              replacement_history: Some(items.clone()),
+             guardian_history: None,
              mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-             window_number: Some(metadata.window_number),
-@@ -3480,6 +3516,10 @@ impl Session {
+@@ -3792,6 +3828,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1375,8 +1384,8 @@ index d14cadcad9..5a8fa2f69b 100644
 +            }
          }
  
-         self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-@@ -3499,10 +3539,79 @@ impl Session {
+         let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
+@@ -3813,10 +3853,83 @@ impl Session {
          }
      }
  
@@ -1397,7 +1406,11 @@ index d14cadcad9..5a8fa2f69b 100644
 +        let items = items.into_iter().map(Into::into).collect();
 +        {
 +            let mut state = self.state.lock().await;
-+            state.replace_annotated_history(items, reference_context_item);
++            state.replace_annotated_history(
++                items,
++                reference_context_item,
++                HistoryReplacement::Compaction,
++            );
 +            if let Some(world_state) = world_state_baseline {
 +                let snapshot = world_state.snapshot();
 +                state.history.set_world_state_baseline(snapshot);
@@ -1456,7 +1469,7 @@ index d14cadcad9..5a8fa2f69b 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3538,7 +3647,42 @@ impl Session {
+@@ -3856,7 +3969,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1500,7 +1513,7 @@ index d14cadcad9..5a8fa2f69b 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -3849,6 +3993,32 @@ impl Session {
+@@ -4170,6 +4318,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1533,7 +1546,7 @@ index d14cadcad9..5a8fa2f69b 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4149,9 +4319,13 @@ impl Session {
+@@ -4505,9 +4679,13 @@ impl Session {
          turn_context: &TurnContext,
          response_item: ResponseItem,
      ) {
@@ -1550,7 +1563,7 @@ index d14cadcad9..5a8fa2f69b 100644
  
          // Derive a turn item and emit lifecycle events if applicable.
          if let Some(item) = parse_turn_item(&response_item) {
-@@ -4171,8 +4345,13 @@ impl Session {
+@@ -4527,8 +4705,13 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1566,7 +1579,7 @@ index d14cadcad9..5a8fa2f69b 100644
          let mut user_message_item = UserMessageItem::new(input);
          user_message_item.client_id = client_id;
          let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4336,3 +4515,14 @@ mod elicitation_holders_tests;
+@@ -4694,3 +4877,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
@@ -1582,10 +1595,10 @@ index d14cadcad9..5a8fa2f69b 100644
 +#[path = "lhc_band_shape_eval_tests.rs"]
 +mod lhc_band_shape_eval_tests;
 diff --git a/codex-rs/core/src/stream_events_utils.rs b/codex-rs/core/src/stream_events_utils.rs
-index 53afbf1d7e..155fbfc6bd 100644
+index a75dbe2af8..ef0c24c0ab 100644
 --- a/codex-rs/core/src/stream_events_utils.rs
 +++ b/codex-rs/core/src/stream_events_utils.rs
-@@ -94,8 +94,13 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
+@@ -95,8 +95,13 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
      item: &ResponseItem,
      finalized_facts: Option<&FinalizedTurnItemFacts>,
  ) {

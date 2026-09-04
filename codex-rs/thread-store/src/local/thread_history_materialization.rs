@@ -31,9 +31,9 @@ pub(super) async fn materialize_to_sqlite(
     }
     let mut projection_state = super::thread_history::projection_state(store, thread_id).await?;
     if projection_state.is_none()
-        && !tokio::fs::try_exists(rollout_path)
+        && codex_rollout::existing_rollout_path(rollout_path)
             .await
-            .map_err(thread_store_io_error)?
+            .is_none()
     {
         return Ok(());
     }
@@ -61,6 +61,7 @@ pub(super) async fn materialize_to_sqlite(
                 )
                 .await;
             }
+            ProjectionRead::Missing => return Ok(()),
             ProjectionRead::GenerationSwap {
                 active_file_size,
                 replacement_initial_ordinal,
@@ -100,6 +101,8 @@ enum ProjectionRead {
         active_file_size: u64,
         replacement_initial_ordinal: u64,
     },
+    /// No plain or compressed rollout exists yet and nothing was projected.
+    Missing,
 }
 
 async fn read_projection_steps(
@@ -107,9 +110,24 @@ async fn read_projection_steps(
     projection_state: Option<RolloutProjectionState>,
     thread_id: ThreadId,
 ) -> ThreadStoreResult<ProjectionRead> {
-    let file = tokio::fs::File::open(rollout_path)
-        .await
-        .map_err(thread_store_io_error)?;
+    // 0.153.3 sync: cold rollouts may be compressed (`.jsonl.zst`); open the
+    // logical JSONL bytes through upstream's seekable reader so offsets and the
+    // fork's generation-head scan address the same representation.
+    let path = rollout_path.to_path_buf();
+    let file =
+        tokio::task::spawn_blocking(move || codex_rollout::open_rollout_seekable_reader(&path))
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!("failed to join rollout projection read: {err}"),
+            })?;
+    let start_offset = projection_state.map_or(0, |state| state.next_byte_offset);
+    let file = match file {
+        Ok(file) => tokio::fs::File::from_std(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && start_offset == 0 => {
+            return Ok(ProjectionRead::Missing);
+        }
+        Err(err) => return Err(thread_store_io_error(err)),
+    };
     let mut file = BufReader::new(file);
     let head = read_rollout_head(&mut file, rollout_path).await?;
     let file_end_offset = file
@@ -118,7 +136,6 @@ async fn read_projection_steps(
         .await
         .map_err(thread_store_io_error)?
         .len();
-    let start_offset = projection_state.map_or(0, |state| state.next_byte_offset);
     let expected_ordinal =
         projection_state.map_or(head.initial_ordinal, |state| state.next_ordinal);
     if projection_state
@@ -143,7 +160,12 @@ async fn read_projection_steps(
             replacement_initial_ordinal: head.initial_ordinal,
         });
     }
-    let byte_count = file_end_offset - start_offset;
+    let byte_count =
+        file_end_offset
+            .checked_sub(start_offset)
+            .ok_or_else(|| ThreadStoreError::Internal {
+                message: "durable rollout shrank before projection".to_string(),
+            })?;
     let byte_count = usize::try_from(byte_count).map_err(|_| ThreadStoreError::Internal {
         message: "durable rollout append exceeds addressable memory".to_string(),
     })?;
