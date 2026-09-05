@@ -1,0 +1,28 @@
+Tripwire logs: /tmp/lhc-tripwire.DQLoQw2a
+ok vendor[start]: CLEAN at 5207952b
+ok tripwire-reporting: temporary-repository tests
+ok sentinel: 53/53 LHC-HOOK markers
+ok compact-ignores: 114 reviewed native-routing ignores, no drift
+ok check: codex-core + codex-app-server + codex-extension-api
+ok bare-exec: bounded exit persisted prompt, assistant, turn_end, and completed turn in 1.06s total, 0.46s after response.completed
+info midturn-parts: offered tools ['exec_command', 'write_stdin', 'request_user_input', 'view_image', 'multi_agent_v1', 'get_goal', 'create_goal', 'update_goal', 'get_turns', 'get_messages', 'web_search']
+info midturn-parts: final view still serves parts
+ok midturn-parts: canonical bootstrap/task/empty-successor turns, real exec_command tool path, sequential step stamps over 9 cycles, intact tool pairs, parts seam served from request 7 (632711 -> 197235 chars), no continuation turn or forced-boundary marker
+ok lib-test: codex-lhc-host --lib
+ok cert-test: codex-lhc-host certification
+ok e2e: codex-core lhc_capture_e2e (real Session seam)
+ok upstream-schema: core config_schema_matches_fixture
+ok compact-bridge: codex-lhc-host produce + marker
+ok compact-arm: law1 write-back + law2 prefill + fail-open
+ok mid-turn: compact_lhc::mid_turn_tests::
+ok mid-turn-loops: suite::compact_lhc_mid_turn_loops (RUST_MIN_STACK=8M)
+ok fmt: codex-lhc-host
+ok clippy: codex-lhc-host --no-deps (-D unused -D dead_code)
+ok golden: 21 fixture files (byte-checked by certification mapping_goldens)
+ok patch-repro: drill at b1a547b1f7 reproduces 101 files byte-identically
+ok slice-d: drill + dual-format + display + layer-2 matrix
+vendor pin: 5207952b0d6d5dadb95f810c75a18e0867da6b72 (certification is a separate requirement)
+ok pin: on shared main line (69 commits behind shared tip)
+ok vendor[end]: CLEAN at 5207952b
+Tripwire logs retained at: /tmp/lhc-tripwire.DQLoQw2a
+ALL TRIPWIRES GREEN

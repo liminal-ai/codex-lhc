@@ -4,8 +4,9 @@ Working plans, review rounds, certification fixtures, and retained live-run
 evidence for the Codex host live here. They are useful maintenance history,
 but they are not part of the fork's public product explanation.
 
-- `design/` — historical schema, rollout, and rewrite working notes
-- `reviews/` — bounded implementation review rounds
+- `design/` — working proposals and historical schema/rollout notes; check each status
+- `reviews/` — bounded implementation reviews and verification handoffs
+- `history/` — dated maintenance evidence extracted from the current fork contract
 - `live-cert/evidence/` — committed live-cert transcripts and verdict inputs
 - `live-cert/workspace/` — the committed disposable certification fixture
 - `live-cert/scratch/` — local ignored runtime state; never commit it
