@@ -170,17 +170,20 @@ just install       # rustup show active-toolchain + cargo fetch
 ### 3. Build
 
 ```bash
-cd codex-rs
-cargo build --release -p codex-cli
+python3 scripts/with-codex-v8.py cargo build --release -p codex-cli --manifest-path codex-rs/Cargo.toml
 ```
 
 Produces the `codex` binary. LHC is a normal workspace dependency, not a
-cargo feature — there are no extra build flags.
+cargo feature. The wrapper uses the package builder's checksum-verified,
+exact-version V8 archive and bindings, retaining upstream's V8 sandbox feature.
+It caches the downloaded pair and forwards the command's exit status. For a
+cross-build, give the wrapper `--target <triple>` and pass the same target to
+Cargo. Existing complete V8 environment overrides and source builds are honored.
 
 Run the source-built binary directly:
 
 ```bash
-./target/release/codex
+./codex-rs/target/release/codex
 ```
 
 ### 4. LHC default and troubleshooting
@@ -229,7 +232,7 @@ Override with `CODEX_LHC_ROOT`.
 ### 7. Verify the fork is intact
 
 ```bash
-./scripts/check-lhc-hooks.sh
+python3 scripts/with-codex-v8.py ./scripts/check-lhc-hooks.sh
 ```
 
 Runs the full tripwire — sentinel count, submodule cleanliness, compile,

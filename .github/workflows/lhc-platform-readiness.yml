@@ -75,6 +75,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Configure sandbox-enabled V8 artifacts
+        uses: ./.github/actions/setup-rusty-v8
+        with:
+          target: ${{ matrix.target }}
+
       - name: Check hooked crates
         working-directory: codex-rs
         run: cargo check --locked -p codex-core -p codex-app-server -p codex-extension-api

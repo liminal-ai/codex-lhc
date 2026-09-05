@@ -282,21 +282,3 @@ index 0000000000..9edca52724
 +    assert_eq!(output.stderr, b"");
 +    Ok(())
 +}
-diff --git a/codex-rs/code-mode-runtime/Cargo.toml b/codex-rs/code-mode-runtime/Cargo.toml
-index 5a4d9e1d09..be53485c97 100644
---- a/codex-rs/code-mode-runtime/Cargo.toml
-+++ b/codex-rs/code-mode-runtime/Cargo.toml
-@@ -23,7 +23,12 @@ serde_json = { workspace = true }
- tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
- tokio-util = { workspace = true, features = ["rt"] }
- tracing = { workspace = true }
--v8 = { workspace = true, features = ["v8_enable_sandbox"] }
-+# Local-build workaround (G-hook, 2026-08-08): rusty_v8 150.4.0 publishes no
-+# x86_64-linux prebuilt for the sandbox variant (404), and building V8 from
-+# source is impractical here. The plain release prebuilt exists, so the
-+# sandbox feature is dropped for local builds. Revert when upstream's pin
-+# gains a published sandbox prebuilt.
-+v8 = { workspace = true }
- 
- [dev-dependencies]
- pretty_assertions = { workspace = true }

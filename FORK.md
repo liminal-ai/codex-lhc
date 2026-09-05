@@ -182,7 +182,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 28 | `core/src/compact_lhc.rs` | startup reconciliation entry before history load (slice E); since 0.153.3 it materialises a compressed `.jsonl.zst` rollout to plain before classification | (with 0007) |
 | 29 | `core/src/thread_manager.rs` | call reconcile before `initial_history_from_rollout_path` loads history (slice E) | (with 0007) |
 | 30 | `app-server/.../thread_processor.rs` | call reconcile before resume history load (slice E) | (with 0007) |
-| 31 | `code-mode-runtime/Cargo.toml` | local Linux build workaround: use the published non-sandbox V8 artifact | `0001-workspace-member` |
+| 31 | `code-mode-runtime/Cargo.toml` | restored to upstream sandbox feature; no remaining fork delta (2026-09-05) | none |
 | 32 | `cli/Cargo.toml`, `cli/tests/version.rs` | inherits the mapped upstream workspace version reported by `codex --version`, with fork regression coverage | `0001-workspace-member` (test only; manifest restored to upstream) |
 | 33 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,lc_adaptive_service_tier.rs,session/turn.rs,lib.rs}` | LC Adaptive Service Tier config, validation, prepared-request resolver, and request-seam selection | `0007-lhc-compact-arm` |
 | 34 | `protocol/src/config_types.rs`, `config/src/config_toml.rs`, `core/src/{config/mod.rs,config/config_tests.rs,compact_lhc.rs}`, `lhc/codex-lhc-host/src/{compact_bridge.rs,compact_continuation.rs,lib.rs}` | Per-session LHC band percentages across manual, automatic, and mid-turn compact | `0007-lhc-compact-arm` |

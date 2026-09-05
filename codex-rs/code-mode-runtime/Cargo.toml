@@ -23,12 +23,7 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
-# Local-build workaround (G-hook, 2026-08-08): rusty_v8 150.4.0 publishes no
-# x86_64-linux prebuilt for the sandbox variant (404), and building V8 from
-# source is impractical here. The plain release prebuilt exists, so the
-# sandbox feature is dropped for local builds. Revert when upstream's pin
-# gains a published sandbox prebuilt.
-v8 = { workspace = true }
+v8 = { workspace = true, features = ["v8_enable_sandbox"] }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
