@@ -32,6 +32,12 @@ max-threads = 1
 max-threads = 2
 
 [[profile.default.overrides]]
+# LHC capacity replay fixtures can approach 60s even without a competing build.
+# Keep a bounded 120s ceiling; the tripwire still passes --retries 0.
+filter = '(package(codex-lhc-host) & test(=install::install_pre_open_tests::pre_open_exact_cap_stays_healthy_and_replays_all)) | (package(codex-core) & test(=compact_lhc::tests::queue_loss_imports_missing_tool_and_reasoning))'
+slow-timeout = { period = "30s", terminate-after = 4 }
+
+[[profile.default.overrides]]
 # Do not add new tests here
 filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
 slow-timeout = { period = "1m", terminate-after = 4 }
