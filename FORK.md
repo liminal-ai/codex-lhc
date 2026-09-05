@@ -53,8 +53,10 @@ the adapter captures; it cannot recover host structure discarded during capture
   start **and** end of `scripts/check-lhc-hooks.sh`, so fmt-churn or any
   mid-run dirt in the certified port cannot go green.
 - `codex-rs/lhc/codex-lhc-host` — the adapter crate (fork-only). Owns capture, SDK access, mapping, and reconstruction primitives.
-  Core owns Session-dependent compaction preparation, worker execution, and
-  durable/in-memory installation coordination in `core/src/compact_lhc.rs`.
+  Core owns strict routing and orchestration in `core/src/compact_lhc.rs`;
+  Session-dependent preparation, SDK worker boundaries, and durable/in-memory
+  installation live in
+  `core/src/compact_lhc/{preparation,workers,installation}.rs`.
 - `codex-rs/lhc/goldens/` — capture mapping goldens (Chunk 1). Byte-equality
   is enforced by `mapping_goldens_round_trip_and_match_fixtures` in
   certification (mapper shapes after a real `LhcSession` round-trip);
@@ -160,7 +162,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
 | 10 | `core/src/compact.rs` | compaction model-output tags `ModelOutput` | (with 0004) |
-| 11 | `core/src/compact_lhc.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + turn-parts MidTurn arm (Story 5: certified `mid_turn_compact` at the settled seam, exact active-turn identity, typed-only `ForcedBoundaryThread` route to the LIM-63B compact-continuation runtime; one-writer, no native fall-open); LIM-134 required PreTurn/Standalone compact awaits capture Ready/Failed/Stopped (bounded, cancellable) | `0007-lhc-compact-arm` |
+| 11 | `core/src/compact_lhc.rs`, `core/src/compact_lhc/{preparation,workers,installation}.rs` | LHC compact arm + write-back (real `lhc.compact` body) + slice C rewrite install + turn-parts MidTurn arm (Story 5: certified `mid_turn_compact` at the settled seam, exact active-turn identity, typed-only `ForcedBoundaryThread` route to the LIM-63B compact-continuation runtime; one-writer, no native fall-open); LIM-134 required PreTurn/Standalone compact awaits capture Ready/Failed/Stopped (bounded, cancellable) | `0007-lhc-compact-arm` |
 | 12 | `core/src/tasks/compact.rs` | manual ladder: LHC arm above TokenBudget | (with 0007) |
 | 13 | `core/src/session/turn.rs` | auto ladder: LHC arm above TokenBudget; MidTurn passes settled seam facts (response_id/usage/tool IDs + total continuation intent + input-queue epoch); LIM-134 compact over prior native history before recording the new prompt and records accepted input exactly once | (with 0007) |
 | 13b | `core/src/session/turn.rs` | turn parts F2: begin the provider request/response cycle before each outer sampling request so raw-item capture stamps `stepIndex` on assistant_text/assistant_thinking/tool_call/tool_result | (with 0007) |
@@ -251,7 +253,7 @@ fallback path.** In-memory history installed at compact equals
 `ResponseItem`s — the same split resume rebuilds from the rewritten file.
 
 Implementation: pure swap in `codex-lhc-host::rollout_swap`; materializer
-wiring in `core/src/compact_lhc.rs`; reopen on `RolloutRecorder` +
+wiring in `core/src/compact_lhc/installation.rs`; reopen on `RolloutRecorder` +
 `LiveThread`.
 
 Every rewrite mints a UUIDv4 generation identity and persists it as a top-level
