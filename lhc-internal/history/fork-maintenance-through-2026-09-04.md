@@ -453,3 +453,15 @@ parsing a render (law 1), so the arm asks LHC's typed derivation log
 (`query_derivation_log`, `TerminalFailed`) instead and fails open on any
 terminal failure.
 
+
+### LIM-141 — v0.150.2 release-machinery pin update (2026-08-29)
+
+The release workflows' hardcoded SDK identity advanced from the v0.149.2
+pin `b408f89` to the LIM-135 certified pin `5207952` (9 occurrences in
+`lhc-release.yml`, 1 assert in `lhc-release-promote.yml`). The
+`test_verify_package_archive.py` fixture constant is self-consistent test
+data, not a gate, and was left untouched. Note: `5207952` sits on the SDK's
+`campaign/lhc-rust-open-repair` branch on origin, not yet on `main`; the
+workflows' ancestor-of-main policy check is under separate disposition
+(main-fold preferred, ruled exception fallback).
+

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # LHC fork tripwires — run after every upstream sync and before every push.
 # Layers are enumerated below; SDK ancestry is reported separately from certification.
-# Exit nonzero on any tripped layer. Keep this script dependency-free.
+# Exit nonzero on any tripped layer. Requires bash, git, standard Unix tools, python3, Rust/Cargo, just,
+# and cargo-nextest (plus the build dependencies of the checked crates).
+# All nextest runs disable retries; a first-attempt failure trips the gate.
 #
 # WHAT THIS SCRIPT ACTUALLY RUNS (keep in lockstep with FORK.md inventory —
 # Phase 3 lesson: a gate you haven't enumerated is a gate you haven't run):
@@ -20,19 +22,18 @@
 #        mid-turn compact as turn parts (one turn id, sequential step stamps,
 #        intact tool pairs, durable parts seam, reduced next request, no
 #        continuation turn / forced-boundary marker)
-#   2b. just test -p codex-lhc-host --lib
-#   2c. just test -p codex-lhc-host --features test-util --test certification
-#   2d. just test -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
-#   2d1b. just test -p codex-core --lib config_schema_matches_fixture
-#   2d2. just test compact_bridge + compact_lhc (capture→rebuild / arm)
+#   2b. just test --retries 0 -p codex-lhc-host --lib
+#   2c. just test --retries 0 -p codex-lhc-host --features test-util --test certification
+#   2d. just test --retries 0 -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
+#   2d1b. just test --retries 0 -p codex-core --lib config_schema_matches_fixture
+#   2d2. just test --retries 0 compact_bridge + compact_lhc (capture→rebuild / arm)
 #   2e. cargo fmt --check for the adapter crate
 #   2e2. cargo clippy -p codex-lhc-host --lib --no-deps (-D unused -D dead_code)
 #   3.  golden presence under codex-rs/lhc/goldens/ (byte-checked by 2c)
 #   4.  history-reset drill: apply patches/lhc/0*.patch at patches/lhc/BASE and
 #       require byte-identity with the live tree, plus full fork-file coverage
-#   5.  slice D certification (just test -p codex-core --lib slice_d_
+#   5.  slice D certification (just test --retries 0 -p codex-core --lib slice_d_
 #       -j 1): drill + dual-format + display + layer-2 matrix
-#   0b. tripwire reporting tests (temporary Git repositories, no model calls)
 #   0'. vendor CLEAN re-check (end of run)
 set -u
 cd "$(dirname "$0")/.."
@@ -76,16 +77,6 @@ check_vendor_clean() {
   return 0
 }
 if ! check_vendor_clean start; then
-  fail=1
-fi
-
-# Reporting control paths must preserve failures and distinguish unavailable evidence.
-if python3 -m unittest discover -s scripts -p test_lhc_tripwire.py \
-    >"$lhc_log_dir/tripwire-reporting.log" 2>&1; then
-  echo "ok tripwire-reporting: temporary-repository tests"
-else
-  echo "TRIPWIRE reporting: tests failed"
-  cat "$lhc_log_dir/tripwire-reporting.log"
   fail=1
 fi
 
@@ -154,7 +145,7 @@ else
 fi
 
 # ── Layer 2b/2c: adapter unit + certification ─────────────────────────
-if just test -p codex-lhc-host --lib \
+if just test --retries 0 -p codex-lhc-host --lib \
     >"$lhc_log_dir/lhc-hook-lib.log" 2>&1; then
   echo "ok lib-test: codex-lhc-host --lib"
 else
@@ -164,7 +155,7 @@ else
 fi
 # Neutralize UPDATE_LHC_GOLDENS so a polluted env cannot rewrite fixtures
 # while the header claims byte-checked goldens (H9).
-if env -u UPDATE_LHC_GOLDENS just test -p codex-lhc-host --features test-util \
+if env -u UPDATE_LHC_GOLDENS just test --retries 0 -p codex-lhc-host --features test-util \
     --test certification \
     >"$lhc_log_dir/lhc-hook-cert.log" 2>&1; then
   echo "ok cert-test: codex-lhc-host certification"
@@ -175,7 +166,7 @@ else
 fi
 
 # ── Layer 2d: F11 e2e through real Session seam ───────────────────────
-if just test -p codex-core --lib lhc_capture_e2e \
+if just test --retries 0 -p codex-core --lib lhc_capture_e2e \
     >"$lhc_log_dir/lhc-hook-e2e.log" 2>&1; then
   echo "ok e2e: codex-core lhc_capture_e2e (real Session seam)"
 else
@@ -191,7 +182,7 @@ fi
 # Chunk 1 and no gate noticed for two chunks, because every other layer
 # runs a targeted LHC test subset. Any fork change that alters upstream
 # config surface must keep upstream's own test green.
-if just test -p codex-core --lib config_schema_matches_fixture \
+if just test --retries 0 -p codex-core --lib config_schema_matches_fixture \
     >"$lhc_log_dir/lhc-hook-schema.log" 2>&1; then
   echo "ok upstream-schema: core config_schema_matches_fixture"
 else
@@ -202,7 +193,7 @@ else
 fi
 
 # ── Layer 2d2: Chunk 2b compact arm + capture→rebuild (law 1/2) ───────
-if just test -p codex-lhc-host --lib compact_bridge \
+if just test --retries 0 -p codex-lhc-host --lib compact_bridge \
     >"$lhc_log_dir/lhc-hook-bridge.log" 2>&1; then
   echo "ok compact-bridge: codex-lhc-host produce + marker"
 else
@@ -213,7 +204,7 @@ fi
 # Filter is the `tests` submodule only — slice D lives in `slice_d_tests` and
 # is gated by layer 5 (so crash-injection failpoint races don't contaminate
 # the arm suite when both run under the broad `compact_lhc` substring).
-if RUST_MIN_STACK=8388608 just test -p codex-core --lib 'compact_lhc::tests::' \
+if RUST_MIN_STACK=8388608 just test --retries 0 -p codex-core --lib 'compact_lhc::tests::' \
     >"$lhc_log_dir/lhc-hook-arm.log" 2>&1; then
   echo "ok compact-arm: law1 write-back + law2 prefill + fail-open"
 else
@@ -223,7 +214,7 @@ else
 fi
 
 # LIM-63B MidTurn module evidence (plain parallel — serial guards inside).
-if just test -p codex-core --lib 'compact_lhc::mid_turn_tests::' \
+if just test --retries 0 -p codex-core --lib 'compact_lhc::mid_turn_tests::' \
     >"$lhc_log_dir/lhc-hook-midturn.log" 2>&1; then
   echo "ok mid-turn: compact_lhc::mid_turn_tests::"
 else
@@ -233,7 +224,7 @@ else
 fi
 
 # Full-loop MidTurn suite requires elevated stack (documented in the suite).
-if RUST_MIN_STACK=8388608 just test -p codex-core --test all suite::compact_lhc_mid_turn_loops \
+if RUST_MIN_STACK=8388608 just test --retries 0 -p codex-core --test all suite::compact_lhc_mid_turn_loops \
     >"$lhc_log_dir/lhc-hook-loops.log" 2>&1; then
   echo "ok mid-turn-loops: suite::compact_lhc_mid_turn_loops (RUST_MIN_STACK=8M)"
 else
@@ -368,7 +359,7 @@ fi
 # The regenerate-and-resume drill plus dual-format, display consumers, and the
 # full layer-2 deterministic matrix. Serial threads avoid failpoint races
 # between crash-injection scenarios that share the global SWAP_FAILPOINT.
-if just test -p codex-core --lib slice_d_ \
+if just test --retries 0 -p codex-core --lib slice_d_ \
      -j 1 \
     >"$lhc_log_dir/lhc-hook-drill.log" 2>&1; then
   echo "ok slice-d: drill + dual-format + display + layer-2 matrix"

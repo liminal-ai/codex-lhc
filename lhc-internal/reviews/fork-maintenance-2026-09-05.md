@@ -122,3 +122,34 @@ schema-13 image mapping at SDK `e9456a6e`; Codex needs its own structural reques
 proof, including image detail and tool-result shape. S11's source audit confirms
 that `new_context` reaches strict LHC; the unqualified issue is advertised reset
 semantics and enabled notes/history behavior, not an observed native bypass.
+
+## S1/S2 independent-review follow-up
+
+Moved the dated LIM-141 branch-status account into maintenance history; current
+FORK.md retains the verified main-line pin statement. README and gating.rs now
+use “diagnostic kill switch” and explicitly preserve the no-native-fallback
+contract. S4 and S5 implementation is unchanged.
+
+Every tripwire nextest invocation now passes `--retries 0`. The just recipe
+selects `local`, which inherits the default retry and 60-second timeout policy;
+the explicit argument overrides retries. The header lists the required tools.
+Trimmed reporting tests to five exit-status cases and moved execution into the
+repo-checks CI workflow, removing the per-tripwire self-test layer. Those five
+tests passed locally, as did shell syntax and diff whitespace checks.
+
+The stricter full tripwire run is recorded in
+[fork-maintenance-2026-09-05-review-tripwire.txt](fork-maintenance-2026-09-05-review-tripwire.txt).
+It is **not a green merge qualification**: host library test
+`install::install_pre_open_tests::pre_open_exact_cap_stays_healthy_and_replays_all`
+timed out at 60.006 seconds (209 other host tests passed). No retry was run.
+The same fixture passed in 34.916 seconds in the earlier qualification; its
+variable runtime is observed, but the cause of this timeout is not established.
+The queue-loss fixture named in review passed on its first attempt in 38.117
+seconds in this run; all 48 compact-arm tests passed.
+
+Push of these review fixes was explicitly requested. That push does not qualify
+the branch as green or resolve the host fixture timeout.
+
+Final result: exit 1. All other tripwire layers passed, including the 18-test
+crash/recovery suite, patch reconstruction (101 files), and refreshed SDK
+ancestry. The vendor tree remained clean.

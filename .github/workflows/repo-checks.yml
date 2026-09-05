@@ -17,6 +17,9 @@ jobs:
 
       - uses: ./.github/actions/setup-ci
 
+      - name: Test LHC tripwire exit status
+        run: python3 -m unittest discover -s scripts -p test_lhc_tripwire.py
+
       - name: Verify codex-rs Cargo manifests inherit workspace settings
         run: python3 .github/scripts/verify_cargo_workspace_manifests.py
 

@@ -67,7 +67,7 @@ the adapter captures; it cannot recover host structure discarded during capture
   patch collection; the LHC series lives under `patches/lhc/`.
 - `scripts/check-lhc-hooks.sh` — tripwire layers (see header for the
   exact list — it must stay truthful). Inventory:
-  **0** vendor CLEAN (start); **0b** reporting control-path tests; **1** sentinel count; **1b** strict-routing
+  **0** vendor CLEAN (start); **1** sentinel count; **1b** strict-routing
   ignore allowlist (`scripts/check-lhc-compact-ignores.sh`); **2a–2e2** compile /
   lib / certification / e2e / schema fixture / compact_bridge+arm / fmt /
   clippy; **3** goldens present; **4** history-reset patch-repro; **5**
@@ -76,6 +76,8 @@ the adapter captures; it cannot recover host structure discarded during capture
   ancestry is refreshed once: an unavailable remote is UNVERIFIED, and an
   off-main pin remains WARN. Either changes the final summary; neither is
   called fully green. Existing local failures still produce a nonzero exit.
+  All nextest invocations use `--retries 0`; a first-attempt failure trips the gate. Reporting exit-status
+  tests run in the `repo-checks` CI workflow.
 - `scripts/check-lhc-compact-ignores.sh` +
   `scripts/lhc-native-routing-ignored-tests.txt` — reviewed native-routing
   ignore allowlist and drift gate (see §Compact test policy).
@@ -271,17 +273,6 @@ full-fidelity residue when summaries are unavailable. Any explicit settle/shutdo
 wait must remain bounded. See §Compact vs derivation and the capture session's
 close path. The earlier manual-scheduler incident and superseded compact-time
 wait policy are preserved in the maintenance history.
-
-### LIM-141 — v0.150.2 release-machinery pin update (2026-08-29)
-
-The release workflows' hardcoded SDK identity advanced from the v0.149.2
-pin `b408f89` to the LIM-135 certified pin `5207952` (9 occurrences in
-`lhc-release.yml`, 1 assert in `lhc-release-promote.yml`). The
-`test_verify_package_archive.py` fixture constant is self-consistent test
-data, not a gate, and was left untouched. Note: `5207952` sits on the SDK's
-`campaign/lhc-rust-open-repair` branch on origin, not yet on `main`; the
-workflows' ancestor-of-main policy check is under separate disposition
-(main-fold preferred, ruled exception fallback).
 
 ### LIM-135 — bounded scans + one ruled raw-SQL exception (2026-08-29)
 

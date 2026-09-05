@@ -95,7 +95,7 @@ The user does not need to restate content that remains in the canonical record.
 | Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
 | Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
 | Failure behavior | Manual, pre-turn, and mid-turn compaction use strict LHC routing; native compaction is not a fallback. MidTurn uses LHC as the single writer: safe transient failures keep the current body for a later seam; cancellation or an unproven rollout state can stop the next request; there is no silent native fallback |
-| Current default | Capture on; disabling it is an unsupported diagnostic state, not stock-Codex mode |
+| Current default | Capture on; the diagnostic kill switch disables capture without restoring native compaction |
 
 ## What this fork is not
 
@@ -234,8 +234,9 @@ file. Provenance is carried explicitly (a typed `RawItemProvenance`, not
 inferred from content) so LHC's own derived output can never be mistaken for
 source material and re-ingested.
 
-LHC capture is **on by default in this product fork**. The single kill switch
-is `lhc_capture = false`, reserved for troubleshooting.
+LHC capture is **on by default in this product fork**. The diagnostic kill switch
+is `lhc_capture = false`, reserved for troubleshooting. It disables capture;
+compaction requests fail with history preserved instead of using native compaction.
 
 **2. The compaction ladder** — Codex already tries several compaction
 strategies in order. The fork inserts an LHC arm at the front of that

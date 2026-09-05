@@ -1,7 +1,8 @@
 //! Feature gate and LHC storage root for Codex capture.
 //!
 //! LHC runs by default in the product fork. The `lhc_capture = false` config
-//! value is its single kill switch. Tests may override the storage root via
+//! value is its diagnostic kill switch: it disables capture without restoring
+//! native compaction. Tests may override the storage root via
 //! `CODEX_LHC_ROOT`.
 
 use std::path::PathBuf;
