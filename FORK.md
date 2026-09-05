@@ -67,12 +67,15 @@ the adapter captures; it cannot recover host structure discarded during capture
   patch collection; the LHC series lives under `patches/lhc/`.
 - `scripts/check-lhc-hooks.sh` — tripwire layers (see header for the
   exact list — it must stay truthful). Inventory:
-  **0** vendor CLEAN (start); **1** sentinel count; **1b** strict-routing
+  **0** vendor CLEAN (start); **0b** reporting control-path tests; **1** sentinel count; **1b** strict-routing
   ignore allowlist (`scripts/check-lhc-compact-ignores.sh`); **2a–2e2** compile /
   lib / certification / e2e / schema fixture / compact_bridge+arm / fmt /
   clippy; **3** goldens present; **4** history-reset patch-repro; **5**
   slice D certification suite (`slice_d_`, serial); **0'** vendor CLEAN
-  (end).
+  (end). Each run prints and retains a unique temporary log directory. SDK
+  ancestry is refreshed once: an unavailable remote is UNVERIFIED, and an
+  off-main pin remains WARN. Either changes the final summary; neither is
+  called fully green. Existing local failures still produce a nonzero exit.
 - `scripts/check-lhc-compact-ignores.sh` +
   `scripts/lhc-native-routing-ignored-tests.txt` — reviewed native-routing
   ignore allowlist and drift gate (see §Compact test policy).
