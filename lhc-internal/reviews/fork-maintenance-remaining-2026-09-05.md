@@ -5,7 +5,7 @@ Base: `10384cc52d` on `lhc`. No upstream release sync is part of these slices.
 
 | Slice | Commit | Result |
 |---|---|---|
-| S8 | `daa196b373` | Schema-13 SDK pin and ordered user/tool image blocks, image-detail preservation, copy-based migration and structural provider-request/restart proofs. |
+| S8 | `daa196b373` | Schema-13 SDK pin and ordered user/tool image blocks, image-detail preservation, in-place migration verified on a test-created copy, and structural provider-request/restart proofs. |
 | S11 | `e6052c7f73` | Conservative startup rejection of incompatible upstream notes/reset mode while LHC is active; authenticated app-server, default-mode, and unchanged-rollout resume proofs. |
 | S6a | `454b425cbd` | Mechanical extraction of preparation and dedicated runtime worker boundaries. |
 | S6b | `7b293f69c9` | Mechanical extraction of installation coordination, preserving all 19 original declarations and caller paths. |
@@ -21,6 +21,11 @@ parts loop, 212 host tests, 24 certification tests, core capture/schema checks,
 two authenticated app-server startup rejection cases, and 18 crash/recovery
 cases. The seven-test app-server notes/backend suite and ten release-workflow
 checks also passed independently. S6a passed all 132 compact unit tests.
+
+The SDK migrates the opened file in place within one `BEGIN IMMEDIATE`
+transaction, setting `user_version` to 13 before committing. Only the
+certification test copies the file before opening it; its unopened source
+fixture remains schema 12.
 
 After that full run, the migration assertion was strengthened to compare all
 thread metadata, including a non-null sticky turn-parts activation marker.

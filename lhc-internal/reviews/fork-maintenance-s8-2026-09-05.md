@@ -22,8 +22,11 @@ Evidence:
 
 - 212 host library tests pass.
 - 24 production certification tests pass, including ordered image/tool capture
-  and restart, missing-blob behavior, and copy-based schema-12 migration preserving
-  message IDs, turns, and step indices. The source stays schema 12 until opened.
+  and restart, missing-blob behavior, and schema-12 migration on a test-created copy,
+  preserving message IDs, turns, and step indices. Only the certification test
+  copies the file before opening it. The SDK migrates the opened file in place
+  within one `BEGIN IMMEDIATE` transaction, setting `user_version` to 13 before
+  committing. The unopened source fixture remains schema 12.
 - Seven full-loop tests pass, including an actual parts install followed by a
   provider request containing native view_image output bytes, and a pasted image
   whose compressed placeholder persists through resume. Tests assert the served
