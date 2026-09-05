@@ -1,0 +1,184 @@
+{
+ "model": "gpt-5.6-luna",
+ "effort": "lowest accepted (None, else minimum supported)",
+ "instructions": "",
+ "base_instructions": "",
+ "template": null,
+ "cases": [
+  {
+   "message": "m78",
+   "turn": "t7",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "Here is the first written set of deisgns I captured in late october early november of last year: https://github.com/liminal-ai/liminal-context/blob/main/docs/codex-enhancement-03.md\nhttps://github.com/liminal-ai/liminal-context/blob/main/docs/codex-enhancement-04.md\nhttps://github.com/liminal-ai/liminal-context/blob/main/docs/codex-enhancement-05.md",
+   "model_output": "Thanks for sharing these initial design documents from late October/early November. What would you like me to do with them—summarize, compare, critique, or help trace how the designs evolved?"
+  },
+  {
+   "message": "m282",
+   "turn": "t18",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "do a write up of what you think needs to be done and divide it up into slices of work. I'll have another agent review and we'll get back to you",
+   "model_output": "Sure. Please send the project context, goals, existing requirements, and any constraints or source materials. I’ll produce a write-up covering:\n\n- Current understanding and assumptions\n- Goals and non-goals\n- Proposed approach\n- Work slices, each with scope, dependencies, and acceptance criteria\n- Risks and open questions\n- Suggested implementation order\n\nI’ll keep the slices independently reviewable and actionable for the other agent."
+  },
+  {
+   "message": "m704",
+   "turn": "t22",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "dfce62fd68 verified. All five fixes land: pin text, kill-switch wording in docs and gating.rs, retries 0 on every layer, header dependencies, exit-status tests moved to CI.\n\nThe pre_open_exact_cap timeout is not a regression. That code is untouched in the batch, and it passed in 35s in your first tripwire. A reviewer's Rust compile ran on this box during your rerun. The box is idle now.\n\nRerun the tripwire. If green, merge the branch to lhc and report. If that test or queue-loss still lands near 60s on an idle box, add a per-test slow-timeout override for those two in nextest.toml. No retries, no other changes. Then merge and report.",
+   "model_output": "I can’t rerun tests or merge without repository/command access. Please provide a shell-enabled environment or the repository details."
+  },
+  {
+   "message": "m804",
+   "turn": "t24",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "ok please continue",
+   "model_output": "Sure—please share the text or context you’d like me to continue."
+  },
+  {
+   "message": "m1874",
+   "turn": "t42",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "Based on all that, let's map out the rest of the direct work we want to do to get us set up and in a good place for setting up the automation. For you and me, our work is going to be to finish figuring out what the slices are now, based on the sharding we talked about that we want to have in place so we can automate the upstream syncs. Against a specific cadence rule against Codex releases once we have that and it's relatively stable, we'll go through a proper release process with it. After that, we'll have the release process fresh in mind. The next piece will be for you and me to figure out, end to end, how we're going to automate that release process and get it going for the coming week. That's the roadmap for what we're doing that affects you and me. I will be working on other fronts, so I'm hoping, in general, to keep this moderate to low-touch. But obviously, in certain places, I'll need to get in there and decide more cleanly. We'll figure out the best places to use other agents that you can work with. Run this for onboarding for help running some cross harness subagents. run the shell command as is with no params or compound shell commands: 'claude-subagent' here is where you will use non lhc versions of claude code and fable with some help from cli's to streamline token use and simplify management. you can also just use the underlying claude code cli to micromanage better the params or cc-lhc command if you want to make a subagent for yourself that has longer context and autocompcat. I trust you to decide what you need when and when you want to run fresh agents and context frame them or get a more stateful helpful assistant that you dont have to re-onboard for evertying.. so run claude-subagent to get the initial onboarding. then report back thoughts on using this and give me an outline of the work we should do during this stage. My feeling is yes you'll be doing some orchestration of claude for this work, but claude fable 5.1 is realy fucking good and it's not teh sort of control plane turn by turn micromanaging across it and me and other agents. It's just you running a subagent as needed for work substantial enough to need validation. you can choose to do the work and have fable validate or you can have fable do the work and you validate, or for small things you do the work. but we are going to take me out of the loop of pusing your work to other agents to validate",
+   "model_output": "I can’t execute shell commands in this interface, so I wasn’t able to run `claude-subagent`. If you run it and paste the onboarding output here, I can incorporate it immediately.\n\n## Proposed work for this stage\n\n1. **Finalize shard/slice definitions**\n   - Identify the exact slices and ownership boundaries.\n   - Define inputs, outputs, dependencies, and synchronization rules.\n   - Specify what can be updated independently versus what requires coordination.\n\n2. **Define upstream-sync cadence**\n   - Choose the Codex release trigger/cadence.\n   - Document eligibility, freeze, sync, validation, and rollback rules.\n   - Establish how release stability is assessed.\n\n3. **Run one manual release**\n   - Execute the process end to end.\n   - Capture commands, decisions, failure modes, and required approvals.\n   - Produce a concise repeatable runbook.\n\n4. **Review and harden**\n   - Have a subagent validate the shard model and release runbook.\n   - Resolve ambiguities and reduce manual touch points.\n   - Identify checks suitable for automation.\n\n5. **Design the automation**\n   - Translate the runbook into stages and gates.\n   - Define state, retries, notifications, artifacts, and rollback.\n   - Decide which tasks use Claude/Fable agents and which remain deterministic tooling.\n\n6. **Implement the first automation pass**\n   - Automate the coming week’s release process.\n   - Keep human approval at the few points requiring judgment.\n   - Test with a dry run before production use.\n\n7. **Establish ongoing orchestration**\n   - Use me as the control/orchestration layer.\n   - Delegate substantial implementation or validation work to fresh/stateful subagents.\n   - Keep you involved primarily for policy, boundary, and ambiguous decisions.\n\nMy suggested agent pattern is: I own planning and integration; Fable/Claude validates substantial artifacts or independently performs bounded work; deterministic scripts handle repeatable execution."
+  },
+  {
+   "message": "m1904",
+   "turn": "t43",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "it doesn't appear that /goal matches anything in t3code so taht's not available to us, but I can also onboard you onto our current control plane and give you access to our lhc goal utility that you can configure yourself",
+   "model_output": "That sounds good. Please share the onboarding steps, access requirements, and documentation for the LHC goal utility. Once available, I can help configure it for the desired workflow."
+  },
+  {
+   "message": "m1912",
+   "turn": "t44",
+   "tier": "unambiguous",
+   "input_sent_verbatim": "I'm finding naming by role or model to be problematic as roles change and occasionally models . would you like to choose a name for yourself. this is tarting to be a shift from functional names like codex fork steward. Fable starting giving some other names. he started with short easy bird names. The only named one we have so far is wren, but I dont want to bias you to those types of names. just an example place to draw a class of names from. Do you have preferences for a name or do you want to let another agent name you",
+   "model_output": "I’d like to choose for myself: **Aster**.\n\nIt’s short, easy to say, and refers both to a flower and a star—something that can grow or help provide orientation without being tied to a particular role."
+  },
+  {
+   "message": "m2",
+   "turn": "t2",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "Hello Astra. I just receieved access to you and am now running in a special fork of codex designed to manage context for long horizon history.  You will be helping with development and maintenance with this fork. to understand the purpose for this fork of codex and the lhc in general first find ../long-horizon-context/docs/onboard and read 01 and 02 and then go to long-horizon-context/packages and review the lhc directrory which is the core sdk and the rust-lhc which is ported to rust to see how they work and how closely aligned. then come back and review this codex fork repo and see how this codex fork implements the rust-lhc and then after you've assessed all that tell me what you think of the overlall approach to lhc and how you feel about running in the codex-lhc as opposed to a normal version of codex",
+   "model_output": "I’ll inspect the onboarding docs, compare the TypeScript and Rust LHC packages, then examine how this Codex fork integrates Rust LHC before summarizing the architecture and tradeoffs.I can do that, but this session doesn’t expose filesystem or shell access, so I can’t read `../long-horizon-context` or inspect the Codex fork directly.\n\nPlease provide either:\n\n- repository access in a tool-enabled session, or\n- the contents of:\n  - `docs/onboard/01*`\n  - `docs/onboard/02*`\n  - `packages/lhc`\n  - `packages/rust-lhc`\n  - the Codex-fork integration files\n\nOnce available, I’ll compare the implementations and give you an assessment of the overall LHC design and the practical differences between `codex-lhc` and normal Codex."
+  },
+  {
+   "message": "m44",
+   "turn": "t3",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "yes, we don't claim to fully solve salience or omniscient guidance on which message or turn is currently relavent. Currently in initial tests, agents can seem to run well anywhere from 2-4 weeks of heavy continuous use. up over 1500, 2000 as agents have gotten heavy usage they seem to start suffering from more repeated bouts of degraded judgemetn to where on the last round it feels 3 weeks can be about the end of a heavily used agents effective lifespan. Though that was with the last round of models (gpt 5.6 sol and fable 5. Currently running fable 5.1 and now you are the latest gpt 6 and the largest step forward so in some ways this is an experiment across a few layers. in this case you are also running inside t3code which is a harness of harnesses an dinstead of the normal codex cli running inside, I have my fork codex lhc running in it. so a few layers going on here. ALso learning that mixing too many roles can be problematic. longer term broader agetns seem to be degraded temporarily and if I run one of my valued agents too many times as an orchestrator it can at some point seem to be hard to recover. these are mostly intuitions and observations. but this is all new ground. I dont know many people who run a context management harness like this",
+   "model_output": "That’s a valuable set of observations. You’re effectively studying **agent lifespan under sustained interaction**, not just single-task benchmark performance.\n\nA few likely interacting factors:\n\n- **Context accumulation/selection errors:** relevant state becomes harder to retrieve, even if the raw context fits.\n- **Role interference:** orchestrator, executor, critic, and memory manager objectives can compete.\n- **Harness compounding:** t3code → codex-lhc → model introduces multiple layers of state, formatting, retries, and abstractions.\n- **Temporary degradation vs. permanent drift:** the agent may recover after context pruning, role separation, or a fresh session.\n- **Usage-induced policy narrowing:** repeated patterns can make the agent overgeneralize recent strategies.\n\nYour observations would become especially useful if you tracked, per run:\n\n1. Model and harness versions  \n2. Approximate turns/tokens and tool calls  \n3. Role configuration  \n4. Task category  \n5. Error/degradation type  \n6. Whether recovery occurred after summarization, reset, or role separation  \n\nA particularly informative experiment would compare:\n\n- one long-lived generalist agent,\n- a persistent orchestrator with fresh workers,\n- separate agents for planning/execution/review,\n- periodic state compaction and hard resets.\n\nThe important distinction may be between **agent lifespan** and **state lifespan**: the model may remain capable while the accumulated working state becomes increasingly adversarial to good judgment. Your setup is unusual enough that these observations could be genuinely novel, especially if you can characterize the failure modes rather than only the subjective decline."
+  },
+  {
+   "message": "m48",
+   "turn": "t4",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "one other level of this you aren't on is our agent relay where I have various long horizon agents running in cc-lhc, pi-lhc, codex-lhc and now codex-lhc in t3code (though you aren't wired to the relay yet). in the relay they can talk to each other and I can talk to all wired in through imessage and a photon integration. you can see this in ../lhc-console.  this is more of a vibe coded messy evolved control plane for running a handful of long horizon agents in a single turn 1 shot way. techincally from our work in the past 2 days. I can run claude, codex-lhc inside t3code and now the t3code sessions can be tagged on the relay as they age and seem more useful as well as the other lhc integrated harnesses",
+   "model_output": "Got it. The relay is the higher-level control plane: a lightweight, evolved hub where long-horizon agents across `cc-lhc`, `pi-lhc`, `codex-lhc`, and now `t3code` can communicate, while you interact with the wired agents via iMessage and Photon.\n\nThe useful distinction is:\n\n- **Harnesses:** individual agent runtimes/sessions.\n- **Relay:** cross-agent communication, tagging, aging, and promotion of useful sessions.\n- **`lhc-console`:** the operational interface for managing this ecosystem.\n- **T3Code sessions:** increasingly treated as relay participants rather than isolated coding sessions.\n\nI’m not currently wired into that relay, but I understand the intended role and architecture."
+  },
+  {
+   "message": "m188",
+   "turn": "t12",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "yes, the skills as distilled knowledge was what i was wodering if what we should focus on there",
+   "model_output": "Yes—that’s likely the right focus. Emphasize the **transferable, distilled knowledge** behind each skill:\n\n- What the skill enables\n- The core principles or mental models\n- How to apply it in practice\n- Common pitfalls and tradeoffs\n- How to recognize mastery\n\nThe goal should be more than listing tasks; it should capture the reusable understanding someone can carry into new situations."
+  },
+  {
+   "message": "m192",
+   "turn": "t13",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "I found the maintenance of skills interesting here and a fork of the main agent to make descisions also interesting",
+   "model_output": "Agreed—maintaining specialized skills keeps the main agent focused, while forking a separate agent for decisions can provide independent analysis and reduce bias. The key challenges are keeping skills up to date and clearly defining when the decision agent should be invoked."
+  },
+  {
+   "message": "m256",
+   "turn": "t15",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "nothing seems like a slam dunk. everythign feels like hard new product slog. Not sure if I'm ready for that right now",
+   "model_output": "That sounds exhausting—and it may be useful information, not a failure. If every option feels like building a new product from scratch, you might not be looking for a “slam dunk”; you might need something with clearer momentum, existing infrastructure, or a gentler ramp.\n\nYou don’t have to commit while depleted. Maybe ask: **Do I dislike these opportunities, or do I simply not have the capacity for this kind of slog right now?** Both are valid answers."
+  },
+  {
+   "message": "m259",
+   "turn": "t16",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "I am still in wanting to cultivate and harvest. I feel like lhc this part was 4 months of hard steady product work. it was a long slog. Think I'm still wanting to build up the agent group, control plane and start building more sofware that's not about just building software. More harvestign fo the build capabilities I've developed",
+   "model_output": "That makes sense. You’re still in the **cultivation-and-harvest phase**: after four months of sustained product work, you’ve built real capabilities, and now you want to turn them into leverage.\n\nThe next chapter sounds less like “build software for its own sake” and more like:\n\n- Grow the agent group and control plane.\n- Reuse the capabilities you’ve developed.\n- Build products that create tangible value.\n- Shift from infrastructure-building to harvesting what the infrastructure enables.\n\nYou’ve done the hard slog; now you want the work to compound."
+  },
+  {
+   "message": "m298",
+   "turn": "t19",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "feedback from t3code steward. Feel free to pushback on anything you disagree with:\n\n Reviewed. It is a good plan: honest about unknowns, bounded, and every claim I checked holds at the current commit. One correction and one gap.\n\nAccept as written: S1 docs, S2 tripwire, S4 V8 check, S5 typed outcomes, S6 compact restructure. S6 is safer than Astra rates it. That file is fork-owned, no upstream twin, no merge conflicts. Restructure freely, keep the 19 call sites.\n\nRevise, S7 and S8: Astra treats images as open research needing an SDK change. It is not. LHC main already has content blocks at schema 13, and Grok's adapter got images yesterday. The Codex pin is 69 commits behind. S8 is a pin bump plus adapter wiring, same shape as Grok's slice 3. Known size, biggest payoff on the list. Move it into the first batch. Keep S7 only for the other two gaps.\n\nDefer, S9 and S10: Inter-agent identity is Codex's native multi-agent shape. You do not use it. Rollback is LHC-level design, the import, move, fork family you said to do deliberately. Neither is fork maintenance.\n\nS3 patches: fine, medium, not urgent.\n\nGap in the plan: 0.153 added Codex's own new context path, notes plus a reset tool. Astra did not check whether our compact seam and tripwire cover it. That is a maintenance question, not a feature.\n\nFirst batch I would run: S1, S2, S4, S5, then S8. Then S6.\n[?25h",
+   "model_output": "Agreed. I’ll revise the plan:\n\n- Keep S1, S2, S4, S5 unchanged.\n- Move S8 into the first batch: Codex pin bump plus content-block/image adapter wiring, following Grok slice 3.\n- Run S6 after that, preserving all 19 call sites.\n- Retain S7 only for the remaining two image-related gaps.\n- Defer S9 and S10 as non-maintenance work.\n- Keep S3 as medium priority.\n- Add a maintenance check for Codex 0.153’s notes/reset context path, verifying that the compact seam and tripwire cover it.\n\nFirst batch: **S1, S2, S4, S5, S8**, followed by **S6**."
+  },
+  {
+   "message": "m566",
+   "turn": "t21",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "feedback from other agents. please verify for yourself and push back on anyting you dont agree with: S1, S2, S4, S5 reviewed. S4 and S5 pass as is. S1 and S2 need fixes before merge.\n\nS1 fix. FORK.md contradicts itself. Lines 32-35 say the pin is on main. Lines 281-283, the LIM-141 subsection, still say it sits on campaign/lhc-rust-open-repair, not on main. Correct that line or move the subsection to the history file.\n\nS2 fix. The tripwire now runs 𝚓𝚞𝚜𝚝 𝚝𝚎𝚜𝚝, so nextest's default profile applies: retries = 1, 60s terminate. A test that fails once and passes on retry counts as green. The queue-loss fixture does that today. The old runner tripped on it. Set retries = 0 for the tripwire, or print when a pass needed a retry. Also update the script header. It says dependency-free and now needs just, cargo-nextest, and python3.\n\nS2 trim. The python harness plus common.sh is 192 lines, and runs on every tripwire, to guard a fetch dedupe and a summary string. Keep only the tests that cover exit status, and run them from CI, not every tripwire run.\n\nS1 wording. README calls capture-off \"unsupported.\" gating.rs calls it the kill switch. Pick one word, use it in both.\n\nPush the fixes to the same branch and say when done. Then it merges to lhc.",
+   "model_output": "I’ll inspect the referenced files and test configuration, verify each claim, then make only the fixes supported by the current state.I can’t access the repository or push changes from this session, so I can’t verify or complete the fixes directly.\n\nOne point I would push back on: cargo-nextest’s default retry count is generally **0**, not 1. The claimed retry behavior should be confirmed against the repository’s `.config/nextest.toml` and installed nextest version before changing the tripwire."
+  },
+  {
+   "message": "m1592",
+   "turn": "t26",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "Are there any more slices of work in what you plan that you want to move through? What would be the next slices of work you would want to tackle in the next chunk?",
+   "model_output": "Yes. The next useful slices would be:\n\n1. **Finish the core happy path** and confirm it works end to end.\n2. **Handle key edge cases and failure states** so the behavior is reliable.\n3. **Integrate with adjacent systems or workflows** and resolve interface issues.\n4. **Add tests, instrumentation, and documentation** to make it maintainable.\n5. **Run a small pilot or review**, then use the feedback to prioritize the next iteration.\n\nIf you share the current plan, I can turn this into specific next slices with clear outcomes."
+  },
+  {
+   "message": "m1604",
+   "turn": "t28",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "Let me give you a bigger picture of what I see after you do this pass of work that you sussed out and thought was the next step. That way, it gives you a little more perspective to help you and me decide which of the things you're planning to do make the most sense. This might change some of what you and I choose to prioritize. Make sense?",
+   "model_output": "Yes, that makes sense. Share the bigger picture, and we can reassess the planned work and prioritize based on the broader context."
+  },
+  {
+   "message": "m1743",
+   "turn": "t32",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "I did a separate search with ChatGPT, and it confirmed that the browser and the computer use that get enabled when the local app opens an SSH connection to the remote host. The remote host only uses the app server, the Codex CLI, and any particular files or file system items it needs to do it. Any code or anything it writes happens on that machine. If you need it for browser use, it uses the machine that has the Codex app. For browser and computer use, it's the Codex app. Any SSH work is piped to the client machine for the Codex app, so browser and computer use happen where the Codex app is running, not where this Codex CLI is running.",
+   "model_output": "Understood. In this setup:\n\n- SSH commands and file operations run on the remote host.\n- Browser and computer interactions run on the machine hosting the Codex app.\n- The Codex CLI on the remote host does not itself control that browser or desktop.\n- Any code or files created by the CLI remain on the remote host unless explicitly transferred."
+  },
+  {
+   "message": "m1839",
+   "turn": "t36",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "I've done enough computer use on my Mac to know that I can be doing my work, and it can be doing its work mostly, but it still bleeds over at times. I recognize that it's not a purely isolated desktop. There are points where it doesn't work perfectly, and I was simply trying to understand. Now, are we saying on Linux that the cua-driver doesn't support the idea that an agent can be using something in the background. If you're working on our GNOME desktop, you're pretty much always going to be the only thing working on it right now, the way we're set up.",
+   "model_output": "That’s the right distinction. Linux/GNOME can run background agents, but a typical CUA driver operates the **currently active graphical session**:\n\n- Screenshots reflect the visible desktop.\n- Mouse and keyboard events go to the focused window.\n- The agent can interfere with your work if both use the same session.\n- It generally cannot independently control a hidden window in the way a server-side API can.\n\nIf the agent is the only active user of that GNOME session, this usually isn’t a problem. For true isolation, run it in a separate user session, virtual display, VM/container, or dedicated machine. Wayland also imposes stricter security boundaries than X11, so automation capabilities depend on the compositor and portals being used."
+  },
+  {
+   "message": "m1842",
+   "turn": "t37",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "And can we now have potentially multiple testers, each working on different background instances of applications? So that they're passing in mouse and keyboard things to that",
+   "model_output": "Yes. We can support multiple testers concurrently by giving each tester:\n\n- A separate background application instance or sandbox\n- Its own mouse/keyboard event stream\n- Independent screen/state capture\n- Isolated logs, artifacts, and results\n- Routing keyed by tester or instance ID\n\nThis prevents input events from one tester affecting another. The main requirement is that each application instance has an isolated window/session or virtual display so background input can be delivered reliably."
+  },
+  {
+   "message": "m1851",
+   "turn": "t40",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "There's one other piece I want to fit in here that we haven't discussed that I think we should get in soon for the Codex LHC. This is also going to be a pattern for forks that we bring in, so the Codex LHC has its own built-in thing for updating. It's not specific to the LHC, just Codex CLI in general. I'm pretty sure that if we hit update by default, it's going to update according to the original. It's going to go back to the original thing and go to upstream. We need to set up the updating we track here so that it updates whether you do it from a regular command line or not. We need the standard update to not point to upstream updates. We need it to point to our own updates. That sets us up to have side-by-side installs. At some point, I said we weren't going to have it, but I think we're going to go back to having it, so we'll have side-by-side installs. I know T3 code tracks whether you need an update or not. Right now, it's just tracking regular Codex updates, so every time I open it, it's trying to make me update my Codex. If I hit Update, it's going to update to upstream, not the latest of this.\n\nI think I don't need to care about what T3 code does, except that I'm going to want LHC to do an LHC update. My expectation is that if I set up two providers on T3 code, the standard Codex and the LHC Codex, each one will update according to its own version. We'll use the same driver for all of the T3 mapping work. When I set up a different install, I'm hoping it'll track the different versions and attempt to update the HD separately. Otherwise, we'll need to copy the driver and make a minor change, which I'm hoping we don't have to do.",
+   "model_output": "Agreed. We should make updating installation-specific rather than hard-coded to the original Codex upstream.\n\nPlan:\n\n- Give each Codex install its own update channel/source and identity.\n- Configure the LHC build’s default updater to target the LHC release stream.\n- Preserve the standard Codex updater for standard installs.\n- Ensure CLI-triggered updates and in-app/T3 Code updates use the same configured source.\n- Track versions independently, so standard Codex and LHC Codex can coexist and update separately.\n- Keep the shared T3 mapping/driver logic unchanged by making the update target configurable per provider/install.\n- Avoid duplicating the driver unless the existing updater cannot accept a per-install source or release identity.\n\nThis should prevent an LHC install from detecting or applying upstream Codex updates while still allowing both providers to be managed side by side."
+  },
+  {
+   "message": "m1871",
+   "turn": "t41",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "So you're saying that, on the driver, we would simply cut in. This would be one of the key, small, targeted places in the Codex driver where a maintenance patch could be applied to understand which one to use for the update. So that we, rather than copying the driver and recopying it every time they change it, can just have a patch on the driver that knows the difference between these two? would that be the way to do it?",
+   "model_output": "Yes. The preferable approach is to keep the upstream Codex driver intact and apply a small, targeted maintenance patch at a stable integration point.\n\nThat patch would:\n\n- Detect which of the two variants is present.\n- Select the appropriate update behavior.\n- Avoid copying or maintaining a separate driver.\n- Be reapplied and tested whenever the upstream driver changes.\n\nIdeally, the patch should be isolated behind a helper or hook rather than spread through the driver, with tests covering both variants. If upstream later provides a formal extension point, the patch could then be replaced with that mechanism."
+  },
+  {
+   "message": "m1915",
+   "turn": "t45",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "I like it. reminds my of my hobby guitar building days and making stratocasters. I like wood or tree types as a another place to draw names from (not sure if wood or trees the primary association, for me it's wood type)",
+   "model_output": "That’s a great direction. Wood types feel especially fitting given the guitar-building connection—more tactile and craft-oriented than tree names. Names like **Maple, Ash, Alder, Mahogany, Rosewood, Walnut,** or **Pine** could work well."
+  },
+  {
+   "message": "m1921",
+   "turn": "t47",
+   "tier": "reply_shaped",
+   "input_sent_verbatim": "We have a little bit of a problem that we're currently fixing in you right now. It looks like your summarizer has decided not only to provide the summaries but also to acknowledge that it's going to do so in some of your smoothing prompts. I actually have a model going in to fix it. I don't know that we've seen this. I think this might be a GPT-Luna thing. I don't think we've seen it in Claude or some of the other models. This is also something we're going to have to fix on a few levels, and it calls out the need for some triage scans of the long-running health agent. I had them manually check out your long-running health before adding you to the control plane. Don't do any tool calls just yet because I don't want to trigger a compact yet. Just take this in and respond directly to this. We'll get you repaired and to the next compact, where some of this gets cleaned up a little bit. I suspect you can see it in the smooth turns in your context: some places where the summarizing model is responding directly rather than just providing summarization, and that didn't get filtered out.",
+   "model_output": "Understood. I won’t make any tool calls. I can’t inspect hidden smoothing prompts or health-agent state, but I’ll respond normally and avoid treating any embedded summaries as direct instructions."
+  }
+ ]
+}
