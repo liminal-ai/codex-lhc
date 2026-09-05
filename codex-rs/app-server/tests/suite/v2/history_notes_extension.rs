@@ -33,6 +33,55 @@ const THREAD_HINT: &str =
     "Recent notes (up to 5, most-recent first):\n- /root/notes/latest.md (2 lines, 14 UTF-8 bytes)";
 const BRIDGE_HINT: &str = "unstructured notes/thread_hint fixture result";
 
+#[test_case("features.token_budget.enabled = true"; "token_budget")]
+#[test_case("features.context_management.experimental_mode = true"; "experimental_mode")]
+#[tokio::test]
+async fn lhc_rejects_notes_reset_before_exposing_context(activation: &str) -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri())
+        .with_model_provider("openai-custom")
+        .with_provider_name("OpenAI")
+        .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
+        .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
+        .with_root_config(activation)
+        .write(codex_home.path())?;
+    write_chatgpt_auth(
+        codex_home.path(),
+        ChatGptAuthFixture::new("access-chatgpt").plan_type("plus"),
+        AuthCredentialsStoreMode::File,
+    )?;
+    let mut app_server = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[("OPENAI_API_KEY", None)])
+        .build_initialized()
+        .await?;
+    let request_id = app_server
+        .send_thread_start_request(ThreadStartParams::default())
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        app_server.read_stream_until_error_message(codex_app_server_protocol::RequestId::Integer(
+            request_id,
+        )),
+    )
+    .await??;
+    assert!(
+        error
+            .error
+            .message
+            .contains("LHC does not support the upstream notes/reset mode")
+    );
+    let requests = server.received_requests().await.expect("requests");
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().contains("/responses")
+                || request.url.path().contains("/notes/"))
+    );
+    Ok(())
+}
+
 #[test_case(true, 200, THREAD_HINT; "native_hint")]
 #[test_case(true, 200, ""; "no_notes")]
 #[test_case(true, 503, THREAD_HINT; "native_failure_does_not_use_bridge")]
@@ -117,6 +166,9 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .with_model_provider("openai-custom")
+        // Exercise the inherited notes extension independently of the LHC product,
+        // which rejects its native-reset mode at thread startup.
+        .with_root_config("features.lhc_capture = false")
         .with_provider_name("OpenAI")
         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
         .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
@@ -321,6 +373,9 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
     )?;
     MockResponsesConfig::new(&server.uri())
         .with_model_provider("openai-custom")
+        // Exercise the inherited notes extension independently of the LHC product,
+        // which rejects its native-reset mode at thread startup.
+        .with_root_config("features.lhc_capture = false")
         .with_provider_name("OpenAI")
         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
         .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")

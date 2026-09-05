@@ -303,6 +303,11 @@ different here."
 
 ## Status
 
+Keep `features.context_management.experimental_mode` and
+`features.token_budget.enabled` disabled with LHC. Their inherited notes/reset
+mode assumes native context clearing, so this fork rejects it at thread startup.
+Normal LHC compaction and its configured thresholds remain available.
+
 Capture, background derivation, banded compact/write-back, turn-parts MidTurn
 Compact, resume, and stable-ID retrieval are integrated and gated. The fork
 uses LHC thread schema 13. Opening schema-12 state adds blob storage while

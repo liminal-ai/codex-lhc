@@ -42,6 +42,86 @@ index 56eb6fdc93..8ab765fcd3 100644
          if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
              let model_context = self
                  .thread_store
+diff --git a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs b/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
+index d49f66dd6f..5ea51df4ec 100644
+--- a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
++++ b/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
+@@ -33,6 +33,55 @@ const THREAD_HINT: &str =
+     "Recent notes (up to 5, most-recent first):\n- /root/notes/latest.md (2 lines, 14 UTF-8 bytes)";
+ const BRIDGE_HINT: &str = "unstructured notes/thread_hint fixture result";
+ 
++#[test_case("features.token_budget.enabled = true"; "token_budget")]
++#[test_case("features.context_management.experimental_mode = true"; "experimental_mode")]
++#[tokio::test]
++async fn lhc_rejects_notes_reset_before_exposing_context(activation: &str) -> Result<()> {
++    let server = responses::start_mock_server().await;
++    let codex_home = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri())
++        .with_model_provider("openai-custom")
++        .with_provider_name("OpenAI")
++        .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
++        .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
++        .with_root_config(activation)
++        .write(codex_home.path())?;
++    write_chatgpt_auth(
++        codex_home.path(),
++        ChatGptAuthFixture::new("access-chatgpt").plan_type("plus"),
++        AuthCredentialsStoreMode::File,
++    )?;
++    let mut app_server = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[("OPENAI_API_KEY", None)])
++        .build_initialized()
++        .await?;
++    let request_id = app_server
++        .send_thread_start_request(ThreadStartParams::default())
++        .await?;
++    let error = timeout(
++        DEFAULT_READ_TIMEOUT,
++        app_server.read_stream_until_error_message(codex_app_server_protocol::RequestId::Integer(
++            request_id,
++        )),
++    )
++    .await??;
++    assert!(
++        error
++            .error
++            .message
++            .contains("LHC does not support the upstream notes/reset mode")
++    );
++    let requests = server.received_requests().await.expect("requests");
++    assert!(
++        !requests
++            .iter()
++            .any(|request| request.url.path().contains("/responses")
++                || request.url.path().contains("/notes/"))
++    );
++    Ok(())
++}
++
+ #[test_case(true, 200, THREAD_HINT; "native_hint")]
+ #[test_case(true, 200, ""; "no_notes")]
+ #[test_case(true, 503, THREAD_HINT; "native_failure_does_not_use_bridge")]
+@@ -117,6 +166,9 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
+     let codex_home = TempDir::new()?;
+     MockResponsesConfig::new(&server.uri())
+         .with_model_provider("openai-custom")
++        // Exercise the inherited notes extension independently of the LHC product,
++        // which rejects its native-reset mode at thread startup.
++        .with_root_config("features.lhc_capture = false")
+         .with_provider_name("OpenAI")
+         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
+         .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
+@@ -321,6 +373,9 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
+     )?;
+     MockResponsesConfig::new(&server.uri())
+         .with_model_provider("openai-custom")
++        // Exercise the inherited notes extension independently of the LHC product,
++        // which rejects its native-reset mode at thread startup.
++        .with_root_config("features.lhc_capture = false")
+         .with_provider_name("OpenAI")
+         .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
+         .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
 diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
 index 5f0cc99a47..4f4e25be2d 100644
 --- a/codex-rs/config/src/config_toml.rs
@@ -17202,10 +17282,33 @@ index 0000000000..400e4b4c25
 +    );
 +}
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
-index 6d1953e3a2..e00b8633f9 100644
+index 6d1953e3a2..1036b2198a 100644
 --- a/codex-rs/core/src/session/session.rs
 +++ b/codex-rs/core/src/session/session.rs
-@@ -1476,6 +1476,8 @@ impl Session {
+@@ -1391,6 +1391,22 @@ impl Session {
+                 }).await;
+             }
+ 
++            // Strict LHC preserves/rebuilds history; upstream token-budget mode
++            // promises native clearing. Reject before tools/context are exposed.
++            // Isolated upstream extension tests without an LHC slot remain valid.
++            if (config.features.enabled(Feature::TokenBudget)
++                    || config.features.enabled(Feature::ContextManagement))
++                && thread_extension_data.get::<codex_lhc_host::LhcCaptureSlot>().is_some()
++            {
++                for contributor in extensions.thread_lifecycle_contributors() {
++                    contributor.on_thread_stop(codex_extension_api::ThreadStopInput {
++                        session_store: &session_extension_data,
++                        thread_store: &thread_extension_data,
++                    }).await;
++                }
++                anyhow::bail!("LHC does not support the upstream notes/reset mode. Disable features.context_management.experimental_mode and features.token_budget.enabled; LHC compaction remains available.");
++            }
++
+             let executed_tool_calls = config
+                 .features
+                 .enabled(Feature::ExecutedToolCallMetadata)
+@@ -1476,6 +1492,8 @@ impl Session {
                      tx_event.clone(),
                  ),
                  executed_tool_calls: executed_tool_calls.clone(),
@@ -19117,6 +19220,133 @@ index 3473e39628..25a0cd502c 100644
  async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
  -> Result<()> {
      skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/core/tests/suite/compact_lhc_context_management.rs b/codex-rs/core/tests/suite/compact_lhc_context_management.rs
+new file mode 100644
+index 0000000000..bcf0ad6ddf
+--- /dev/null
++++ b/codex-rs/core/tests/suite/compact_lhc_context_management.rs
+@@ -0,0 +1,121 @@
++//! The LHC product rejects native notes/reset semantics before model exposure.
++
++use std::sync::Arc;
++
++use anyhow::Result;
++use codex_extension_api::ExtensionRegistryBuilder;
++use codex_features::Feature;
++use core_test_support::responses::ev_assistant_message;
++use core_test_support::responses::ev_completed;
++use core_test_support::responses::ev_response_created;
++use core_test_support::responses::mount_sse_once;
++use core_test_support::responses::sse;
++use core_test_support::responses::start_mock_server;
++use core_test_support::skip_if_no_network;
++use core_test_support::test_codex::test_codex;
++use tempfile::TempDir;
++
++#[tokio::test]
++async fn rejects_notes_reset_before_provider_requests_at_any_threshold() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    // A deliberately unavailable notes backend must not weaken rejection.
++    // Both explicit token-budget mode and experimental auto-activation are gated.
++    for feature in [Feature::TokenBudget, Feature::ContextManagement] {
++        for threshold in [1, 1_000_000] {
++            let server = start_mock_server().await;
++            let root = TempDir::new()?;
++            let mut registry = ExtensionRegistryBuilder::<codex_core::config::Config>::new();
++            codex_lhc_host::install_with_root(
++                &mut registry,
++                |config| config.features.enabled(Feature::LhcCapture),
++                root.path().to_path_buf(),
++            );
++            let result = test_codex()
++                .with_extensions(Arc::new(registry.build()))
++                .with_config(move |config| {
++                    let _ = config.features.enable(Feature::LhcCapture);
++                    let _ = config.features.enable(feature);
++                    config.model_auto_compact_token_limit = Some(threshold);
++                })
++                .build(&server)
++                .await;
++            let error = result.err().expect("incompatible mode must fail startup");
++            assert!(
++                format!("{error:#}").contains("LHC does not support the upstream notes/reset mode")
++            );
++            let requests = server.received_requests().await.expect("requests");
++            assert!(
++                !requests
++                    .iter()
++                    .any(|request| request.url.path().contains("/responses")
++                        || request.url.path().contains("/notes/")),
++                "rejection must precede model context, tools, and notes calls"
++            );
++        }
++    }
++    Ok(())
++}
++
++#[tokio::test]
++async fn default_lhc_mode_exposes_no_native_reset_tool() -> Result<()> {
++    skip_if_no_network!(Ok(()));
++    let server = start_mock_server().await;
++    let root = TempDir::new()?;
++    let mut registry = ExtensionRegistryBuilder::<codex_core::config::Config>::new();
++    codex_lhc_host::install_with_root(
++        &mut registry,
++        |config| config.features.enabled(Feature::LhcCapture),
++        root.path().to_path_buf(),
++    );
++    let mock = mount_sse_once(
++        &server,
++        sse(vec![
++            ev_response_created("default-lhc"),
++            ev_assistant_message("default-answer", "done"),
++            ev_completed("default-lhc"),
++        ]),
++    )
++    .await;
++    let mut builder = test_codex()
++        .with_extensions(Arc::new(registry.build()))
++        .with_config(|config| {
++            let _ = config.features.enable(Feature::LhcCapture);
++            let _ = config.features.disable(Feature::TokenBudget);
++            let _ = config.features.disable(Feature::ContextManagement);
++        });
++    let test = builder.build(&server).await?;
++    test.submit_turn("continue with LHC").await?;
++    let requests = mock.requests();
++    assert_eq!(requests.len(), 1);
++    let body = requests[0].body_json();
++    assert!(
++        !body["tools"]
++            .as_array()
++            .expect("tools")
++            .iter()
++            .any(|tool| tool["name"] == "new_context")
++    );
++    test.codex.shutdown_and_wait().await?;
++    let rollout = test
++        .session_configured
++        .rollout_path
++        .clone()
++        .expect("rollout");
++    let before = std::fs::read(&rollout)?;
++    builder = builder.with_config(|config| {
++        let _ = config.features.enable(Feature::TokenBudget);
++    });
++    let error = builder
++        .resume(&server, Arc::clone(&test.home), rollout.clone())
++        .await
++        .err()
++        .expect("incompatible resume must fail before a provider request");
++    assert!(format!("{error:#}").contains("LHC does not support the upstream notes/reset mode"));
++    assert_eq!(
++        std::fs::read(rollout)?,
++        before,
++        "rejected resume must preserve recorded history"
++    );
++    assert_eq!(mock.requests().len(), 1);
++    Ok(())
++}
 diff --git a/codex-rs/core/tests/suite/compact_lhc_image_tests.rs b/codex-rs/core/tests/suite/compact_lhc_image_tests.rs
 new file mode 100644
 index 0000000000..861d276cc4
@@ -22065,18 +22295,19 @@ index 0000000000..9f8ad3ddf4
 +    Ok(())
 +}
 diff --git a/codex-rs/core/tests/suite/mod.rs b/codex-rs/core/tests/suite/mod.rs
-index 8d43ca03ef..7317488f44 100644
+index 8d43ca03ef..ef578cd18d 100644
 --- a/codex-rs/core/tests/suite/mod.rs
 +++ b/codex-rs/core/tests/suite/mod.rs
-@@ -55,6 +55,7 @@ mod code_mode_elicitation;
+@@ -55,6 +55,8 @@ mod code_mode_elicitation;
  mod codex_delegate;
  mod collaboration_instructions;
  mod compact;
++mod compact_lhc_context_management;
 +mod compact_lhc_mid_turn_loops;
  mod compact_remote;
  mod compact_remote_parity;
  mod compact_resume_fork;
-@@ -92,6 +93,7 @@ mod injected_models_cache;
+@@ -92,6 +94,7 @@ mod injected_models_cache;
  mod interrupt_hooks;
  mod items;
  mod json_result;

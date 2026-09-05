@@ -27,6 +27,8 @@
 #   2d. just test --retries 0 -p codex-core --lib lhc_capture_e2e  (F11 seam wiring)
 #   2d1b. just test --retries 0 -p codex-core --lib config_schema_matches_fixture
 #   2d2. just test --retries 0 compact_bridge + compact_lhc (capture→rebuild / arm)
+#         Core full loops include MidTurn/images and notes/reset startup rejection;
+#         app-server notes/reset startup rejection is checked through its real API.
 #   2e. cargo fmt --check for the adapter crate
 #   2e2. cargo clippy -p codex-lhc-host --lib --no-deps (-D unused -D dead_code)
 #   3.  golden presence under codex-rs/lhc/goldens/ (byte-checked by 2c)
@@ -223,13 +225,23 @@ else
   fail=1
 fi
 
-# Full-loop MidTurn suite requires elevated stack (documented in the suite).
-if RUST_MIN_STACK=8388608 just test --retries 0 -p codex-core --test all suite::compact_lhc_mid_turn_loops \
+# Full-loop MidTurn and context-mode compatibility (S11); elevated stack is required.
+if RUST_MIN_STACK=8388608 just test --retries 0 -p codex-core --test all \
+    -E 'test(suite::compact_lhc_mid_turn_loops) | test(suite::compact_lhc_context_management)' \
     >"$lhc_log_dir/lhc-hook-loops.log" 2>&1; then
-  echo "ok mid-turn-loops: suite::compact_lhc_mid_turn_loops (RUST_MIN_STACK=8M)"
+  echo "ok full-loops: mid-turn/images + notes/reset compatibility (RUST_MIN_STACK=8M)"
 else
-  echo "TRIPWIRE mid-turn-loops: failed:"
+  echo "TRIPWIRE full-loops: failed:"
   grep -E "^error|FAIL|panicked|SIGABRT" -A5 "$lhc_log_dir/lhc-hook-loops.log" | head -40
+  fail=1
+fi
+
+if just test --retries 0 -p codex-app-server --test all lhc_rejects_notes_reset_before_exposing_context \
+    >"$lhc_log_dir/lhc-hook-context-startup.log" 2>&1; then
+  echo "ok context-startup: app-server notes/reset rejection"
+else
+  echo "TRIPWIRE context-startup: failed:"
+  grep -E "^error|FAIL|panicked" -A5 "$lhc_log_dir/lhc-hook-context-startup.log" | head -40
   fail=1
 fi
 

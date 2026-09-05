@@ -316,10 +316,20 @@ Dated merge accounts, qualification evidence, and conflict resolutions are in
 [the maintenance history](lhc-internal/history/fork-maintenance-through-2026-09-04.md).
 Current upstream base: `patches/lhc/BASE` (`rust-v0.153.3` at this revision).
 
-**Upstream experimental context management:** notes/history and `new_context`
-remain unqualified with `features.context_management.experimental_mode` enabled.
-The request currently reaches strict LHC through `run_auto_compact`; native reset
-semantics must not be assumed. See maintenance slice S11 before enabling this mode.
+**Upstream experimental context management:** intentionally rejected while the
+LHC extension is active. Enabling either `features.context_management.experimental_mode`
+or `features.token_budget.enabled` fails thread startup before model context,
+notes calls, or reset tools are exposed. Registered extensions receive normal
+shutdown. Default LHC behavior is unchanged; `new_context` cannot promise native
+clearing while secretly invoking LHC reconstruction. Native compaction remains
+unavailable as a fallback. Independent upstream notes tests disable LHC capture
+to exercise that backend in isolation; they are not product-mode qualification.
+
+The existing core full-loop tripwire layer owns
+`suite::compact_lhc_context_management`: rejection of both activation paths at
+low/high thresholds with no provider/notes requests, and default-mode tool
+exposure. These are the active fork counterparts of the ignored native-reset
+premises in `token_budget.rs`.
 
 ## History-reset recovery — **works, verified** (Chunk 3 round 9, 2026-07-26)
 

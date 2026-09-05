@@ -1391,6 +1391,22 @@ impl Session {
                 }).await;
             }
 
+            // Strict LHC preserves/rebuilds history; upstream token-budget mode
+            // promises native clearing. Reject before tools/context are exposed.
+            // Isolated upstream extension tests without an LHC slot remain valid.
+            if (config.features.enabled(Feature::TokenBudget)
+                    || config.features.enabled(Feature::ContextManagement))
+                && thread_extension_data.get::<codex_lhc_host::LhcCaptureSlot>().is_some()
+            {
+                for contributor in extensions.thread_lifecycle_contributors() {
+                    contributor.on_thread_stop(codex_extension_api::ThreadStopInput {
+                        session_store: &session_extension_data,
+                        thread_store: &thread_extension_data,
+                    }).await;
+                }
+                anyhow::bail!("LHC does not support the upstream notes/reset mode. Disable features.context_management.experimental_mode and features.token_budget.enabled; LHC compaction remains available.");
+            }
+
             let executed_tool_calls = config
                 .features
                 .enabled(Feature::ExecutedToolCallMetadata)

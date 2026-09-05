@@ -134,6 +134,8 @@ codex-rs/core/tests/suite/retry_after.rs::compact_v2_stream_failure_without_retr
 codex-rs/core/tests/suite/retry_after.rs::compact_v2_uses_local_backoff_despite_retry_after
 codex-rs/core/tests/suite/rollout_budget.rs::compaction_budget_exhaustion_fails_without_retry
 codex-rs/core/tests/suite/rollout_budget.rs::restates_the_current_remainder_after_compaction
+# Native reset premises: active LHC startup-rejection owner is
+# suite::compact_lhc_context_management (core full-loop tripwire layer).
 codex-rs/core/tests/suite/token_budget.rs::new_context_tool_skips_auto_compact_fallback
 codex-rs/core/tests/suite/token_budget.rs::token_budget_auto_compact_fallback_rolls_over_after_buffer
 codex-rs/core/tests/suite/token_budget.rs::token_budget_auto_compact_fallback_uses_buffer_until_new_context
