@@ -105,6 +105,18 @@ rewrite. That pair is the before/after test for the fix.
    payload equals the rendered template, carries the input only wrapped,
    and contains no agent-prompt marker. The J2 wiremock test asserts the
    same on the actual HTTP body for all four lanes.
+   **Live check (release build e23ef782, three `codex exec` turns, throwaway
+   LHC root):** the derivation log shows the smoothing-v1 template on the wire
+   (6,277-char instructions + wrapped input). Turn 2's prompt came back as a
+   rewrite: "ok now reply with exactly BRIDGE_OK_2. dont explain anything, i
+   just wanna see the reply come thru" -> "Okay, now reply with exactly
+   BRIDGE_OK_2. Don't explain anything; I just want to see the reply come
+   through." Turn 1's smoothing fell to the floor with `stream closed before
+   response.completed`: `codex exec` exits at turn end and cuts in-flight
+   derivations. Host lifecycle, not the bridge; app-server hosts keep the
+   process alive. Installed into both 0.153.3 trees with the prior binary
+   kept as `bin/codex.pre-bridge-fix-20260905`. Running app-servers keep the
+   old binary until restarted.
 3. Open: SDK-side reply-shape guard for all hosts.
 4. Open: triage scan of live threads by source overlap.
 5. Open: re-derive this thread by machine and diff against the hand repair.
