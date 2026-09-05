@@ -192,10 +192,10 @@ index eb0137c03e..9f30169c4a 100644
  codex-home = { workspace = true }
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..9b46801c43
+index 0000000000..df53e375ee
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
-@@ -0,0 +1,3191 @@
+@@ -0,0 +1,2219 @@
 +//! LHC compact arm — real `lhc.compact` body + write-back (Chunk 2b redo).
 +//!
 +//! Fork policy (strict): manual `/compact` and every automatic compact caller
@@ -287,6 +287,29 @@ index 0000000000..9b46801c43
 +use crate::session::session::Session;
 +use crate::session::turn_context::TurnContext;
 +
++#[path = "compact_lhc/preparation.rs"]
++mod preparation;
++#[cfg(test)]
++use preparation::STRICT_COMPACT_READINESS_BOUND;
++use preparation::configured_band_percentages;
++pub(crate) use preparation::seed_lhc_derivation_callbacks;
++use preparation::select_production_inference_callbacks;
++pub(crate) use preparation::try_run_lhc_compact_arm_with_callbacks_and_cancel;
++#[path = "compact_lhc/workers.rs"]
++mod workers;
++#[cfg(test)]
++use workers::MIDTURN_WORKER_THREAD_PREFIX;
++use workers::MidTurnPartsHopError;
++use workers::commit_marker_with_retry;
++use workers::inspect_mid_turn_recovery_on_thread;
++use workers::persist_reopen_failure_receipt;
++use workers::produce_lhc_compact_on_thread;
++use workers::read_materialize_surfaces_on_thread;
++use workers::record_host_validation_on_thread;
++use workers::run_mid_turn_on_thread;
++use workers::run_mid_turn_parts_on_thread;
++use workers::writer_claim_owner_on_thread;
++
 +const COMPACT_THREAD_TIMEOUT: Duration = Duration::from_secs(120);
 +/// Best-effort capture flush before produce. Must stay well below the produce
 +/// bound so a wedged worker cannot hide the compact deadline.
@@ -300,76 +323,6 @@ index 0000000000..9b46801c43
 +const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(5);
 +#[cfg(test)]
 +const MIDTURN_COMPACT_FLUSH_BOUND: Duration = Duration::from_secs(2);
-+
-+/// LIM-134: how long a **required** PreTurn / Standalone strict compact waits
-+/// for the asynchronous capture open before failing visibly.
-+///
-+/// Ordinary thread startup stays off the critical path; this bound is only
-+/// consumed once strict compact is known to be required. Expiry is a hard
-+/// visible compact failure — never `Ok(None)`, never native fallback.
-+pub(crate) const STRICT_COMPACT_READINESS_BOUND: Duration = Duration::from_secs(60);
-+
-+/// Required strict compact waits for the capture slot to settle (LIM-134).
-+///
-+/// PreTurn / Standalone only: MidTurn keeps its distinct settled in-flight
-+/// policy and never reaches this wait. Ready continues through the existing
-+/// strict arm; `Failed`, `Stopped`, and bound expiry are hard visible compact
-+/// failures that preserve the prior body and issue zero provider requests;
-+/// turn cancellation aborts the turn without native fallback.
-+async fn await_capture_ready_for_required_compact(
-+    slot: &LhcCaptureSlot,
-+    cancellation_token: &CancellationToken,
-+) -> Result<codex_lhc_host::CaptureHandle, LhcCompactAttempt> {
-+    match slot.state() {
-+        CaptureState::Ready(handle) => return Ok(handle),
-+        CaptureState::Failed(reason) => {
-+            return Err(failed_attempt(format!("LHC capture open failed: {reason}")));
-+        }
-+        CaptureState::Stopped => {
-+            return Err(failed_attempt(
-+                "LHC capture has shut down; compact cannot run",
-+            ));
-+        }
-+        CaptureState::Opening => {}
-+    }
-+    let bound = STRICT_COMPACT_READINESS_BOUND;
-+    info!(
-+        bound_ms = bound.as_millis() as u64,
-+        "LHC capture is still opening; required strict compact waits for readiness"
-+    );
-+    let settled = tokio::select! {
-+        biased;
-+        () = cancellation_token.cancelled() => {
-+            return Err(cancelled_attempt(
-+                "turn cancelled while waiting for the LHC capture open",
-+            ));
-+        }
-+        settled = slot.await_settled(bound) => settled,
-+    };
-+    match settled {
-+        Some(CaptureState::Ready(handle)) => Ok(handle),
-+        Some(CaptureState::Failed(reason)) => {
-+            Err(failed_attempt(format!("LHC capture open failed: {reason}")))
-+        }
-+        Some(CaptureState::Stopped) => Err(failed_attempt(
-+            "LHC capture has shut down; compact cannot run",
-+        )),
-+        Some(CaptureState::Opening) | None => Err(failed_attempt(format!(
-+            "LHC capture did not open within {}s; compact cannot run",
-+            bound.as_secs_f64()
-+        ))),
-+    }
-+}
-+
-+fn configured_band_percentages(turn_context: &TurnContext) -> LhcBandPercentages {
-+    let percentages = turn_context.config.lhc_compact.percentages;
-+    LhcBandPercentages {
-+        full: percentages.full,
-+        smooth: percentages.smooth,
-+        detailed: percentages.detailed,
-+        brief: percentages.brief,
-+    }
-+}
 +
 +/// Process-wide MidTurn worker timeout override used only by offline tests.
 +/// `None` restores the production 120s bound.
@@ -1670,606 +1623,6 @@ index 0000000000..9b46801c43
 +    })
 +}
 +
-+/// Hop `run_mid_turn_compact_continuation` onto a current-thread runtime.
-+/// Keeps `!Send` LHC futures off the multi-thread session path.
-+///
-+/// Once mutation begins this is an **uninterruptible critical section**: the
-+/// join handle is always awaited. The operation timeout lives **inside** the
-+/// worker runtime so the future is dropped on that same thread at the deadline
-+/// and the thread exits; the caller then joins. Cancellation never detaches a
-+/// mutator — host apply is suppressed if the turn token cancelled during the
-+/// section.
-+/// Record host full-body validation on a dedicated thread (SDK futures are
-+/// `!Send`). Durable ok/failed acknowledgment for a protected-escalation
-+/// attempt; never rolls the core install back.
-+async fn record_host_validation_on_thread(
-+    thread_id: String,
-+    root: Option<PathBuf>,
-+    attempt_id: String,
-+    ok: bool,
-+    reason: Option<String>,
-+) -> Result<(), String> {
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let spawn = std::thread::Builder::new()
-+        .name(format!("lhc-midturn-hv-{attempt_id}"))
-+        .spawn(move || {
-+            let rt = match tokio::runtime::Builder::new_current_thread()
-+                .enable_all()
-+                .build()
-+            {
-+                Ok(rt) => rt,
-+                Err(err) => {
-+                    let _ = tx.send(Err(format!("runtime: {err}")));
-+                    return;
-+                }
-+            };
-+            let result = rt.block_on(codex_lhc_host::record_mid_turn_host_validation(
-+                &thread_id,
-+                root.as_deref(),
-+                &attempt_id,
-+                ok,
-+                reason,
-+            ));
-+            let _ = tx.send(result.map(|_| ()));
-+        });
-+    if let Err(err) = spawn {
-+        return Err(format!("spawn: {err}"));
-+    }
-+    match rx.await {
-+        Ok(result) => result,
-+        Err(_) => Err("host validation record thread dropped".into()),
-+    }
-+}
-+
-+/// R12 (CX-S2): write-behind receipt for a rollout whose append recorder could
-+/// not reopen onto the freshly rewritten inode.
-+///
-+/// The compacted rollout is already durable and stays authoritative. This
-+/// records what the next open needs to reconcile appends that will not land in
-+/// it: the compacted rollout's identity/hash, the recorder frontier at failure,
-+/// and the canonical LHC capture frontier/event order (capture can keep
-+/// advancing while this process lives, even with a dead recorder handle).
-+///
-+/// Every failure in here is swallowed: a receipt that cannot be written costs
-+/// the next open its accounting, never the compact.
-+async fn persist_reopen_failure_receipt(
-+    path: &std::path::Path,
-+    thread_id: &str,
-+    root: Option<PathBuf>,
-+    recorder_frontier_items: u64,
-+    reopen_error: &str,
-+) {
-+    let compacted_rollout = match codex_lhc_host::compacted_rollout_identity(path) {
-+        Ok(identity) => identity,
-+        Err(err) => {
-+            warn!(
-+                %err,
-+                path = %path.display(),
-+                "LHC reopen-failure receipt: compacted rollout identity unreadable; \
-+                 recording the receipt without it"
-+            );
-+            codex_lhc_host::CompactedRolloutIdentity {
-+                sha256: String::new(),
-+                bytes: 0,
-+                items: recorder_frontier_items,
-+            }
-+        }
-+    };
-+    let capture_frontier = capture_frontier_on_thread(thread_id, root).await;
-+    if capture_frontier.is_none() {
-+        warn!(
-+            thread_id,
-+            "LHC reopen-failure receipt: canonical capture frontier unavailable; \
-+             next open falls back to ordinary LHC-view reconstruction"
-+        );
-+    }
-+    let receipt = codex_lhc_host::RolloutReopenFailureReceipt {
-+        schema: codex_lhc_host::ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
-+        written_at: chrono::Utc::now().to_rfc3339(),
-+        thread_id: thread_id.to_string(),
-+        rollout_path: path.display().to_string(),
-+        compacted_rollout,
-+        recorder_frontier_items,
-+        capture_frontier,
-+        reopen_error: reopen_error.to_string(),
-+    };
-+    match codex_lhc_host::write_rollout_reopen_failure_receipt(path, &receipt) {
-+        Ok(()) => info!(
-+            path = %path.display(),
-+            recorder_frontier_items,
-+            "LHC reopen-failure receipt persisted; compacted rollout remains authoritative"
-+        ),
-+        Err(err) => warn!(
-+            %err,
-+            path = %path.display(),
-+            "LHC reopen-failure receipt write failed; compact stands (receipts observe, never govern)"
-+        ),
-+    }
-+}
-+
-+/// Read the canonical LHC capture frontier on a dedicated thread (SDK futures
-+/// are `!Send`). `None` whenever the archive cannot be read.
-+async fn capture_frontier_on_thread(
-+    thread_id: &str,
-+    root: Option<PathBuf>,
-+) -> Option<codex_lhc_host::CaptureFrontier> {
-+    let tid = thread_id.to_string();
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let spawn = std::thread::Builder::new()
-+        .name(format!("lhc-capture-frontier-{tid}"))
-+        .spawn(move || {
-+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .ok()?;
-+                rt.block_on(codex_lhc_host::read_capture_frontier(&tid, root.as_deref()))
-+            }))
-+            .unwrap_or(None);
-+            let _ = tx.send(out);
-+        });
-+    let join = match spawn {
-+        Ok(join) => join,
-+        Err(err) => {
-+            warn!(%err, "spawn lhc capture-frontier thread failed");
-+            return None;
-+        }
-+    };
-+    let frontier = rx.await.ok().flatten();
-+    let _ = tokio::task::spawn_blocking(move || join.join()).await;
-+    frontier
-+}
-+
-+/// Name the attempt holding the durable LHC writer row, on a dedicated thread
-+/// (SDK inspection futures are `!Send`). `None` on any failure — a reclaim
-+/// probe never stops a compact.
-+async fn writer_claim_owner_on_thread(thread_id: &str, root: Option<PathBuf>) -> Option<String> {
-+    let tid = thread_id.to_string();
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let spawn = std::thread::Builder::new()
-+        .name(format!("lhc-midturn-claim-{tid}"))
-+        .spawn(move || {
-+            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .ok()?;
-+                rt.block_on(codex_lhc_host::inspect_compact_continuation_writer_owner(
-+                    &tid,
-+                    root.as_deref(),
-+                ))
-+            }))
-+            .unwrap_or(None);
-+            let _ = tx.send(out);
-+        });
-+    let join = match spawn {
-+        Ok(join) => join,
-+        Err(err) => {
-+            warn!(%err, "spawn lhc-midturn writer-claim probe thread failed");
-+            return None;
-+        }
-+    };
-+    let owner = rx.await.ok().flatten();
-+    let _ = tokio::task::spawn_blocking(move || join.join()).await;
-+    owner
-+}
-+
-+/// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
-+/// inspection futures are `!Send`).
-+async fn inspect_mid_turn_recovery_on_thread(
-+    thread_id: &str,
-+    root: Option<PathBuf>,
-+) -> Result<Option<codex_lhc_host::MidTurnRecoveryIdentity>, String> {
-+    let tid = thread_id.to_string();
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let join = std::thread::Builder::new()
-+        .name(format!("lhc-midturn-inspect-{tid}"))
-+        .spawn(move || {
-+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .map_err(|e| format!("runtime: {e}"))?;
-+                rt.block_on(resolve_mid_turn_recovery_identity(&tid, root.as_deref()))
-+            }));
-+            let out = match result {
-+                Ok(inner) => inner,
-+                Err(_) => Err("lhc-midturn inspect thread panicked".into()),
-+            };
-+            let _ = tx.send(out);
-+        })
-+        .map_err(|e| format!("spawn lhc-midturn inspect thread: {e}"))?;
-+    let worker_out = rx.await;
-+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
-+    match join_result {
-+        Ok(Ok(())) => {}
-+        Ok(Err(_)) => return Err("lhc-midturn inspect thread panicked during join".into()),
-+        Err(err) => return Err(format!("lhc-midturn inspect join task failed: {err}")),
-+    }
-+    match worker_out {
-+        Ok(r) => r,
-+        Err(_) => Err("lhc-midturn inspect channel closed".into()),
-+    }
-+}
-+
-+/// Thread-name prefix for the MidTurn compact-continuation worker — the one
-+/// thread that mutates LHC SQLite for an attempt.
-+pub(crate) const MIDTURN_WORKER_THREAD_PREFIX: &str = "lhc-mt-";
-+
-+async fn run_mid_turn_on_thread(
-+    req: MidTurnCompactContinuationRequest,
-+    turn_cancel: &CancellationToken,
-+) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, CompactWorkerError> {
-+    // If already cancelled before the critical section, refuse without spawn.
-+    if turn_cancel.is_cancelled() {
-+        return Err(CompactWorkerError::Cancelled(
-+            "lhc-midturn cancelled by turn abort before critical section".into(),
-+        ));
-+    }
-+
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let attempt = req.attempt_id.clone();
-+    let worker_timeout = midturn_worker_timeout();
-+    // Short prefix on purpose: Linux truncates a thread's `comm` to 15 bytes,
-+    // so `lhc-midturn-{attempt}` reached /proc as `lhc-midturn-can` and every
-+    // MidTurn worker in the process looked alike. `lhc-mt-` leaves 8 bytes of
-+    // attempt id, which is what makes "is *this* attempt's mutator still
-+    // running?" answerable — from a debugger or from the no-detached-mutator
-+    // tests. Do not lengthen it.
-+    let join = std::thread::Builder::new()
-+        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt}"))
-+        .spawn(move || {
-+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
-+                // Bound the operation future on this worker thread so a hung
-+                // `run_mid_turn_compact_continuation` is dropped at the deadline
-+                // and the thread can exit. The outer path always joins.
-+                rt.block_on(async move {
-+                    let op = async {
-+                        #[cfg(test)]
-+                        if let Some(stall) = midturn_worker_stall() {
-+                            tokio::time::sleep(stall).await;
-+                        }
-+                        run_mid_turn_compact_continuation(req).await
-+                    };
-+                    match tokio::time::timeout(worker_timeout, op).await {
-+                        Ok(inner) => inner.map_err(CompactWorkerError::Operation),
-+                        Err(_) => Err(CompactWorkerError::TimedOut(format!(
-+                            "lhc-midturn worker timed out after {}s (operation future dropped on worker)",
-+                            worker_timeout.as_secs_f64()
-+                        ))),
-+                    }
-+                })
-+            }));
-+            let out = match result {
-+                Ok(inner) => inner,
-+                Err(_) => Err(CompactWorkerError::Worker("lhc-midturn thread panicked".into())),
-+            };
-+            let _ = tx.send(out);
-+        })
-+        .map_err(|e| CompactWorkerError::Worker(format!("spawn lhc-midturn thread: {e}")))?;
-+
-+    // Always join the worker. Never drop `join` while the mutator may still
-+    // run — R6 (CX-S2): cancellation no longer suppresses the host apply; the
-+    // joined worker's result is applied and the smaller body stands. Joining
-+    // here is what keeps the one-writer invariant: no detached thread may keep
-+    // mutating LHC SQLite after this function returns. The operation is
-+    // already bounded inside the worker, so join cannot hang forever on a
-+    // stalled compact-continuation future.
-+    let worker_out = rx.await;
-+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
-+    match join_result {
-+        Ok(Ok(())) => {}
-+        Ok(Err(_)) => {
-+            return Err(CompactWorkerError::Worker(
-+                "lhc-midturn thread panicked during join".into(),
-+            ));
-+        }
-+        Err(err) => {
-+            return Err(CompactWorkerError::Worker(format!(
-+                "lhc-midturn join task failed: {err}"
-+            )));
-+        }
-+    }
-+
-+    // R6 (CX-S2): the worker has finished and may have installed a view. A turn
-+    // that cancelled while it ran does not un-install that view, so its result
-+    // is returned and the caller applies it. Suppressing here is what left the
-+    // split state the next seam had to repair.
-+    match worker_out {
-+        Ok(r) => {
-+            if turn_cancel.is_cancelled() {
-+                warn!(
-+                    "lhc-midturn turn cancelled during the critical section; returning the \
-+                     worker outcome so the installed view is applied"
-+                );
-+            }
-+            r
-+        }
-+        Err(_) => Err(CompactWorkerError::Worker(
-+            "lhc-midturn channel closed".into(),
-+        )),
-+    }
-+}
-+
-+/// Why the parts hop produced no outcome. Only `Cancelled` blocks the next
-+/// provider request (the turn is ending); every `Failed` keeps the current
-+/// body and retries at a later eligible seam.
-+#[derive(Debug)]
-+enum MidTurnPartsHopError {
-+    Cancelled(String),
-+    Failed(String),
-+}
-+
-+/// Hop `run_mid_turn_parts_compact` onto a bounded current-thread runtime
-+/// (SDK futures are `!Send`). The SDK install is atomic, so a cancellation
-+/// during the section never leaves a split state; the worker is always joined.
-+async fn run_mid_turn_parts_on_thread(
-+    req: MidTurnPartsRequest,
-+    attempt_id: &str,
-+    turn_cancel: &CancellationToken,
-+) -> Result<MidTurnPartsOutcome, MidTurnPartsHopError> {
-+    if turn_cancel.is_cancelled() {
-+        return Err(MidTurnPartsHopError::Cancelled(
-+            "lhc-midturn-parts cancelled by turn abort before critical section".into(),
-+        ));
-+    }
-+    run_mid_turn_parts_worker(req, attempt_id)
-+        .await
-+        .map_err(MidTurnPartsHopError::Failed)
-+}
-+
-+async fn run_mid_turn_parts_worker(
-+    req: MidTurnPartsRequest,
-+    attempt_id: &str,
-+) -> Result<MidTurnPartsOutcome, String> {
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let worker_timeout = midturn_worker_timeout();
-+    // Same short prefix + attempt id as the legacy hop: "is *this* attempt's
-+    // mutator still running?" stays answerable from /proc and the tests.
-+    let join = std::thread::Builder::new()
-+        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt_id}"))
-+        .spawn(move || {
-+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .map_err(|e| format!("runtime: {e}"))?;
-+                rt.block_on(async move {
-+                    let op = async {
-+                        #[cfg(test)]
-+                        if let Some(stall) = midturn_worker_stall() {
-+                            tokio::time::sleep(stall).await;
-+                        }
-+                        codex_lhc_host::run_mid_turn_parts_compact(req).await
-+                    };
-+                    match tokio::time::timeout(worker_timeout, op).await {
-+                        Ok(inner) => inner,
-+                        Err(_) => Err(format!(
-+                            "lhc-midturn-parts worker timed out after {}s (operation future dropped on worker)",
-+                            worker_timeout.as_secs_f64()
-+                        )),
-+                    }
-+                })
-+            }));
-+            let out = match result {
-+                Ok(inner) => inner,
-+                Err(_) => Err("lhc-midturn-parts thread panicked".into()),
-+            };
-+            let _ = tx.send(out);
-+        })
-+        .map_err(|e| format!("spawn lhc-midturn-parts thread: {e}"))?;
-+    let worker_out = rx.await;
-+    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
-+    match join_result {
-+        Ok(Ok(())) => {}
-+        Ok(Err(_)) => return Err("lhc-midturn-parts thread panicked during join".into()),
-+        Err(err) => return Err(format!("lhc-midturn-parts join task failed: {err}")),
-+    }
-+    match worker_out {
-+        Ok(r) => r,
-+        Err(_) => Err("lhc-midturn-parts channel closed".into()),
-+    }
-+}
-+
-+/// N3: the arm, bound to the **turn's own** cancellation token.
-+///
-+/// When the user aborts a turn, produce must stop — no partial install, no
-+/// marker. Cancellation is cancellation, not permission to compact natively.
-+/// Background capture-session derivation may continue (session work); the
-+/// abandoned compact worker is cancelled via the shared flag.
-+pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
-+    sess: &Arc<Session>,
-+    turn_context: &TurnContext,
-+    initial_context_injection: InitialContextInjection,
-+    manual: bool,
-+    callbacks: InferenceCallbacks,
-+    cancellation_token: &CancellationToken,
-+) -> CodexResult<LhcCompactAttempt> {
-+    if cancellation_token.is_cancelled() {
-+        return Ok(cancelled_attempt(
-+            "turn cancelled before LHC compact started",
-+        ));
-+    }
-+    if !sess.enabled(Feature::LhcCapture) {
-+        return Ok(failed_attempt("Feature::LhcCapture off"));
-+    }
-+
-+    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
-+        return Ok(failed_attempt("no LhcCaptureSlot (capture not opened)"));
-+    };
-+    // LIM-134: strict compact is already known to be required here, so a slot
-+    // that is still Opening is waited for (bounded, cancellation-aware) rather
-+    // than declared not-ready.
-+    let handle = match await_capture_ready_for_required_compact(&slot, cancellation_token).await {
-+        Ok(handle) => handle,
-+        Err(attempt) => return Ok(attempt),
-+    };
-+
-+    // Degraded capture is not a hard stop: flush what we can, then rely on
-+    // archive-coverage validation + host import to retain current content.
-+    // Flush is bounded — a busy/wedged capture worker must not stall compact
-+    // before the produce timeout starts.
-+    if handle.is_degraded() {
-+        warn!(
-+            manual,
-+            "LHC capture is degraded; compact continues (flush + import + coverage check)"
-+        );
-+    }
-+    if !handle.flush_within(COMPACT_FLUSH_BOUND).await {
-+        warn!(
-+            manual,
-+            timeout_ms = COMPACT_FLUSH_BOUND.as_millis() as u64,
-+            "LHC capture flush did not complete in time; compact continues (import + coverage)"
-+        );
-+    }
-+
-+    // Derivation readiness affects quality only. Do not wait for
-+    // drain_settled — pending/running/terminal-failed work uses the fallback
-+    // ladder (less-derived bands, full-fidelity residue).
-+
-+    let thread_id = handle.thread_id().to_string();
-+    let root = handle.root().map(std::path::Path::to_path_buf);
-+    let host_items = sess
-+        .clone_history()
-+        .await
-+        .raw_items()
-+        .cloned()
-+        .collect::<Vec<_>>();
-+
-+    let cancel = Arc::new(AtomicBool::new(false));
-+
-+    // I2: re-seed slot from durable CompactedItem record (resume / crash window).
-+    reseed_slot_from_durable_session(sess.as_ref(), &slot).await;
-+
-+    // Diagnostic like-for-like baseline = current model-context size.
-+    // Prefer the rollout file's dual-format extract (what resume would rebuild).
-+    // A larger compact body is reported but never blocks compaction; imperfect
-+    // reduction is not catastrophic and later compacts can improve it.
-+    let host_est = estimate_response_items_tokens(&host_items);
-+    let (rollout_est, native_append_polluted) = match sess.current_rollout_path().await {
-+        Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
-+            Ok(items) => {
-+                let polluted = codex_lhc_host::is_native_append_polluted(&items);
-+                (
-+                    model_context_token_estimate_from_rollout_items(&items),
-+                    polluted,
-+                )
-+            }
-+            Err(err) => {
-+                warn!(%err, path = %path.display(), "rollout parse for reduction baseline failed");
-+                (0, false)
-+            }
-+        },
-+        _ => (0, false),
-+    };
-+    let baseline_tokens = if rollout_est > 0 && rollout_est.saturating_mul(2) >= host_est {
-+        rollout_est
-+    } else {
-+        host_est
-+    };
-+
-+    // H1/G3: ids + digests from prior write-backs (process-local + durable reseed).
-+    let session_derived = DerivedProvenance {
-+        ids: slot.derived_ids(),
-+        digests: slot.derived_digests(),
-+    };
-+    let produced = match produce_lhc_compact_on_thread(
-+        thread_id.clone(),
-+        root.clone(),
-+        host_items,
-+        /*import_missing*/ true,
-+        callbacks,
-+        Arc::clone(&cancel),
-+        session_derived,
-+        configured_band_percentages(turn_context),
-+        cancellation_token,
-+    )
-+    .await
-+    {
-+        Ok(v) => v,
-+        Err(err) => {
-+            if matches!(&err, CompactWorkerError::Cancelled(_)) {
-+                return Ok(cancelled_attempt(err.to_string()));
-+            }
-+            if matches!(&err, CompactWorkerError::TimedOut(_)) {
-+                // R14 (CX-S1): the produce worker outran its bound. Warn and
-+                // continue on the current usable body; the next eligible seam
-+                // retries. The ordinary path has no MidTurn result, so this is
-+                // a non-stranding outcome that lets the turn complete.
-+                warn!(
-+                    %err,
-+                    manual,
-+                    "LHC compact worker timed out; turn continues on its current body (retry at next seam)"
-+                );
-+                return Ok(LhcCompactAttempt::ContinuedWithoutCompact {
-+                    reason: err.to_string(),
-+                });
-+            }
-+            warn!(%err, manual, "LHC compact hard failure; preserving history");
-+            return Ok(failed_attempt(err.to_string()));
-+        }
-+    };
-+
-+    let produce_body = produced.body.clone();
-+    if produce_body.is_empty() {
-+        return Ok(failed_attempt("LHC compact produced empty body"));
-+    }
-+
-+    let body_token_estimate = estimate_response_items_tokens(&produce_body);
-+    if body_token_estimate > baseline_tokens {
-+        warn!(
-+            body_tokens = body_token_estimate,
-+            rollout_model_context_tokens = baseline_tokens,
-+            items_body = produce_body.len(),
-+            native_append_polluted,
-+            manual,
-+            "LHC compact did not reduce this estimate; proceeding with the usable compact"
-+        );
-+    }
-+
-+    let (_initial_context, world_state_baseline) =
-+        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
-+
-+    info!(
-+        body_tokens = body_token_estimate,
-+        auto_compact_limit = ?turn_context
-+            .config
-+            .model_auto_compact_token_limit
-+            .or_else(|| turn_context.model_info().auto_compact_token_limit()),
-+        provider_window = ?turn_context.model_context_window(),
-+        "LHC compact produce-body size (diagnostic only; not a terminal gate)"
-+    );
-+
-+    let reference_context_item = match &initial_context_injection {
-+        InitialContextInjection::DoNotInject => None,
-+        InitialContextInjection::BeforeLastUserMessage { .. } => {
-+            Some(turn_context.to_turn_context_item())
-+        }
-+    };
-+
-+    // LHC-HOOK: rollout rewrite at LHC compact install (slice C)
-+    // Box the rewrite future so the parent arm body stays under rustc's
-+    // query-depth limit when nested under run_turn.
-+    Box::pin(install_lhc_compact_rewrite(
-+        sess,
-+        turn_context,
-+        &slot,
-+        thread_id,
-+        root,
-+        produced.marker,
-+        world_state_baseline,
-+        reference_context_item,
-+        manual,
-+        /*host_validation*/ None,
-+        cancellation_token,
-+    ))
-+    .await
-+}
-+
 +/// Materialize → atomic rewrite → in-memory bands+tail install.
 +///
 +/// Extracted from the arm entry so the main future stays under the rustc
@@ -2909,71 +2262,6 @@ index 0000000000..9b46801c43
 +    })
 +}
 +
-+/// Hand the LHC capture slot the **production** derivation callbacks that its
-+/// background scheduler derives with.
-+///
-+/// Resolved once per thread (the models-manager lookup is not free) and only
-+/// through [`select_production_inference_callbacks`] — the same selection the
-+/// compact arm uses, so background derivation can never be the path that
-+/// quietly persists deterministic text into the durable record (J1). If the
-+/// derivation model is unavailable the capture session's `LateBoundCallbacks`
-+/// stay unseeded (waiting, not terminal Err). Compact does not wait on that
-+/// work and does not seed inert Err callbacks into the capture session.
-+pub(crate) async fn seed_lhc_derivation_callbacks(sess: &Session) {
-+    if !sess.enabled(Feature::LhcCapture) {
-+        return;
-+    }
-+    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
-+        return;
-+    };
-+    if slot.has_derivation_callbacks() {
-+        return;
-+    }
-+    match select_production_inference_callbacks(sess).await {
-+        Ok(callbacks) => slot.set_derivation_callbacks(callbacks),
-+        Err(reason) => {
-+            debug!(
-+                %reason,
-+                "LHC background derivation callbacks unavailable; capture stays unseeded"
-+            );
-+        }
-+    }
-+}
-+
-+/// Production inference selection: real ModelClient bridge only.
-+///
-+/// Under `cfg(test)`, an explicit session override may supply callbacks (for
-+/// CompactTask / auto-ladder tests that cannot pass callbacks through the
-+/// production entry). The override is never set for real sessions.
-+async fn select_production_inference_callbacks(
-+    sess: &Session,
-+) -> Result<InferenceCallbacks, String> {
-+    #[cfg(test)]
-+    {
-+        if let Ok(guard) = sess.services.lhc_test_inference.lock()
-+            && let Some(cbs) = guard.as_ref()
-+        {
-+            return Ok(cbs.clone());
-+        }
-+    }
-+    crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
-+}
-+
-+/// I2/L3: re-seed process slot from durable CompactedItem record.
-+/// Durable is source of truth — always merge even when the cache is warm.
-+async fn reseed_slot_from_durable_session(sess: &Session, slot: &LhcCaptureSlot) {
-+    let Some(msg) = sess.last_lhc_durable_derived_message().await else {
-+        return;
-+    };
-+    let Some(marker) = CompactMarker::parse_durable_writeback_record(&msg) else {
-+        return;
-+    };
-+    slot.ensure_derived_from_durable(
-+        marker.derived_host_ids.iter().cloned(),
-+        marker.derived_content_digests.iter().cloned(),
-+    );
-+}
-+
 +/// Apply the degrade ladder's keep mask to the materialized rollout items so
 +/// the rewritten file rebuilds exactly the body the session installs (law 1).
 +///
@@ -3048,54 +2336,6 @@ index 0000000000..9b46801c43
 +    }
 +}
 +
-+/// Read materialize surfaces on a dedicated thread (LHC SDK futures are !Send).
-+async fn read_materialize_surfaces_on_thread(
-+    thread_id: String,
-+    root: Option<PathBuf>,
-+    turn_cancel: &CancellationToken,
-+) -> Result<codex_lhc_host::MaterializeSurfaces, CompactWorkerError> {
-+    let (tx, rx) = tokio::sync::oneshot::channel();
-+    let join = std::thread::Builder::new()
-+        .name(format!("lhc-materialize-{thread_id}"))
-+        .spawn(move || {
-+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                let rt = tokio::runtime::Builder::new_current_thread()
-+                    .enable_all()
-+                    .build()
-+                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
-+                rt.block_on(async move {
-+                    read_materialize_surfaces(&thread_id, root.as_deref())
-+                        .await
-+                        .map_err(CompactWorkerError::Operation)
-+                })
-+            }))
-+            .unwrap_or_else(|payload| {
-+                let msg = payload
-+                    .downcast_ref::<&str>()
-+                    .map(|s| (*s).to_string())
-+                    .or_else(|| payload.downcast_ref::<String>().cloned())
-+                    .unwrap_or_else(|| "panic in materialize surfaces thread".into());
-+                Err(CompactWorkerError::Worker(msg))
-+            });
-+            let _ = tx.send(result);
-+        })
-+        .map_err(|e| {
-+            CompactWorkerError::Worker(format!("spawn materialize surfaces thread: {e}"))
-+        })?;
-+
-+    let result = tokio::select! {
-+        biased;
-+        () = turn_cancel.cancelled() => {
-+            // Detach: join will finish; we fail open.
-+            return Err(CompactWorkerError::Cancelled("turn cancelled while reading materialize surfaces".into()));
-+        }
-+        r = rx => r.map_err(|_| CompactWorkerError::Worker("materialize surfaces thread dropped".to_string()))?,
-+    };
-+    // Best-effort join so we don't leak threads on the happy path.
-+    let _ = join.join();
-+    result
-+}
-+
 +/// Structural equality for law 1: role + each content variant (incl. media URLs).
 +pub(crate) fn response_items_structurally_equal(a: &[ResponseItem], b: &[ResponseItem]) -> bool {
 +    if a.len() != b.len() {
@@ -3144,8 +2384,846 @@ index 0000000000..9b46801c43
 +    })
 +}
 +
++/// Used by law-2 next-turn test.
++#[cfg_attr(not(test), allow(dead_code))]
++pub(crate) async fn token_limit_reached(sess: &Session, turn_context: &TurnContext) -> bool {
++    context_window_token_status(sess, turn_context)
++        .await
++        .token_limit_reached
++}
++
++#[cfg(test)]
++#[path = "compact_lhc_tests.rs"]
++mod tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_strict_routing_tests.rs"]
++mod strict_routing_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_slice_d_tests.rs"]
++mod slice_d_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_mid_turn_tests.rs"]
++mod mid_turn_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_canary_tests.rs"]
++mod canary_tests;
++
++#[cfg(test)]
++#[path = "compact_lhc_readiness_tests.rs"]
++mod readiness_tests;
+diff --git a/codex-rs/core/src/compact_lhc/preparation.rs b/codex-rs/core/src/compact_lhc/preparation.rs
+new file mode 100644
+index 0000000000..e99cef481a
+--- /dev/null
++++ b/codex-rs/core/src/compact_lhc/preparation.rs
+@@ -0,0 +1,334 @@
++//! Capture readiness, PreTurn/manual preparation, and production callbacks.
++//! Producing an SDK view does not make it the authoritative host generation.
++
++use super::*;
++
++/// LIM-134: how long a **required** PreTurn / Standalone strict compact waits
++/// for the asynchronous capture open before failing visibly.
++///
++/// Ordinary thread startup stays off the critical path; this bound is only
++/// consumed once strict compact is known to be required. Expiry is a hard
++/// visible compact failure — never `Ok(None)`, never native fallback.
++pub(crate) const STRICT_COMPACT_READINESS_BOUND: Duration = Duration::from_secs(60);
++
++/// Required strict compact waits for the capture slot to settle (LIM-134).
++///
++/// PreTurn / Standalone only: MidTurn keeps its distinct settled in-flight
++/// policy and never reaches this wait. Ready continues through the existing
++/// strict arm; `Failed`, `Stopped`, and bound expiry are hard visible compact
++/// failures that preserve the prior body and issue zero provider requests;
++/// turn cancellation aborts the turn without native fallback.
++async fn await_capture_ready_for_required_compact(
++    slot: &LhcCaptureSlot,
++    cancellation_token: &CancellationToken,
++) -> Result<codex_lhc_host::CaptureHandle, LhcCompactAttempt> {
++    match slot.state() {
++        CaptureState::Ready(handle) => return Ok(handle),
++        CaptureState::Failed(reason) => {
++            return Err(failed_attempt(format!("LHC capture open failed: {reason}")));
++        }
++        CaptureState::Stopped => {
++            return Err(failed_attempt(
++                "LHC capture has shut down; compact cannot run",
++            ));
++        }
++        CaptureState::Opening => {}
++    }
++    let bound = STRICT_COMPACT_READINESS_BOUND;
++    info!(target: "codex_core::compact_lhc",
++        bound_ms = bound.as_millis() as u64,
++        "LHC capture is still opening; required strict compact waits for readiness"
++    );
++    let settled = tokio::select! {
++        biased;
++        () = cancellation_token.cancelled() => {
++            return Err(cancelled_attempt(
++                "turn cancelled while waiting for the LHC capture open",
++            ));
++        }
++        settled = slot.await_settled(bound) => settled,
++    };
++    match settled {
++        Some(CaptureState::Ready(handle)) => Ok(handle),
++        Some(CaptureState::Failed(reason)) => {
++            Err(failed_attempt(format!("LHC capture open failed: {reason}")))
++        }
++        Some(CaptureState::Stopped) => Err(failed_attempt(
++            "LHC capture has shut down; compact cannot run",
++        )),
++        Some(CaptureState::Opening) | None => Err(failed_attempt(format!(
++            "LHC capture did not open within {}s; compact cannot run",
++            bound.as_secs_f64()
++        ))),
++    }
++}
++
++pub(super) fn configured_band_percentages(turn_context: &TurnContext) -> LhcBandPercentages {
++    let percentages = turn_context.config.lhc_compact.percentages;
++    LhcBandPercentages {
++        full: percentages.full,
++        smooth: percentages.smooth,
++        detailed: percentages.detailed,
++        brief: percentages.brief,
++    }
++}
++
++/// N3: the arm, bound to the **turn's own** cancellation token.
++///
++/// When the user aborts a turn, produce must stop — no partial install, no
++/// marker. Cancellation is cancellation, not permission to compact natively.
++/// Background capture-session derivation may continue (session work); the
++/// abandoned compact worker is cancelled via the shared flag.
++pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
++    sess: &Arc<Session>,
++    turn_context: &TurnContext,
++    initial_context_injection: InitialContextInjection,
++    manual: bool,
++    callbacks: InferenceCallbacks,
++    cancellation_token: &CancellationToken,
++) -> CodexResult<LhcCompactAttempt> {
++    if cancellation_token.is_cancelled() {
++        return Ok(cancelled_attempt(
++            "turn cancelled before LHC compact started",
++        ));
++    }
++    if !sess.enabled(Feature::LhcCapture) {
++        return Ok(failed_attempt("Feature::LhcCapture off"));
++    }
++
++    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
++        return Ok(failed_attempt("no LhcCaptureSlot (capture not opened)"));
++    };
++    // LIM-134: strict compact is already known to be required here, so a slot
++    // that is still Opening is waited for (bounded, cancellation-aware) rather
++    // than declared not-ready.
++    let handle = match await_capture_ready_for_required_compact(&slot, cancellation_token).await {
++        Ok(handle) => handle,
++        Err(attempt) => return Ok(attempt),
++    };
++
++    // Degraded capture is not a hard stop: flush what we can, then rely on
++    // archive-coverage validation + host import to retain current content.
++    // Flush is bounded — a busy/wedged capture worker must not stall compact
++    // before the produce timeout starts.
++    if handle.is_degraded() {
++        warn!(target: "codex_core::compact_lhc",
++            manual,
++            "LHC capture is degraded; compact continues (flush + import + coverage check)"
++        );
++    }
++    if !handle.flush_within(COMPACT_FLUSH_BOUND).await {
++        warn!(target: "codex_core::compact_lhc",
++            manual,
++            timeout_ms = COMPACT_FLUSH_BOUND.as_millis() as u64,
++            "LHC capture flush did not complete in time; compact continues (import + coverage)"
++        );
++    }
++
++    // Derivation readiness affects quality only. Do not wait for
++    // drain_settled — pending/running/terminal-failed work uses the fallback
++    // ladder (less-derived bands, full-fidelity residue).
++
++    let thread_id = handle.thread_id().to_string();
++    let root = handle.root().map(std::path::Path::to_path_buf);
++    let host_items = sess
++        .clone_history()
++        .await
++        .raw_items()
++        .cloned()
++        .collect::<Vec<_>>();
++
++    let cancel = Arc::new(AtomicBool::new(false));
++
++    // I2: re-seed slot from durable CompactedItem record (resume / crash window).
++    reseed_slot_from_durable_session(sess.as_ref(), &slot).await;
++
++    // Diagnostic like-for-like baseline = current model-context size.
++    // Prefer the rollout file's dual-format extract (what resume would rebuild).
++    // A larger compact body is reported but never blocks compaction; imperfect
++    // reduction is not catastrophic and later compacts can improve it.
++    let host_est = estimate_response_items_tokens(&host_items);
++    let (rollout_est, native_append_polluted) = match sess.current_rollout_path().await {
++        Ok(Some(path)) if path.exists() => match parse_rollout_items(&path) {
++            Ok(items) => {
++                let polluted = codex_lhc_host::is_native_append_polluted(&items);
++                (
++                    model_context_token_estimate_from_rollout_items(&items),
++                    polluted,
++                )
++            }
++            Err(err) => {
++                warn!(target: "codex_core::compact_lhc", %err, path = %path.display(), "rollout parse for reduction baseline failed");
++                (0, false)
++            }
++        },
++        _ => (0, false),
++    };
++    let baseline_tokens = if rollout_est > 0 && rollout_est.saturating_mul(2) >= host_est {
++        rollout_est
++    } else {
++        host_est
++    };
++
++    // H1/G3: ids + digests from prior write-backs (process-local + durable reseed).
++    let session_derived = DerivedProvenance {
++        ids: slot.derived_ids(),
++        digests: slot.derived_digests(),
++    };
++    let produced = match produce_lhc_compact_on_thread(
++        thread_id.clone(),
++        root.clone(),
++        host_items,
++        /*import_missing*/ true,
++        callbacks,
++        Arc::clone(&cancel),
++        session_derived,
++        configured_band_percentages(turn_context),
++        cancellation_token,
++    )
++    .await
++    {
++        Ok(v) => v,
++        Err(err) => {
++            if matches!(&err, CompactWorkerError::Cancelled(_)) {
++                return Ok(cancelled_attempt(err.to_string()));
++            }
++            if matches!(&err, CompactWorkerError::TimedOut(_)) {
++                // R14 (CX-S1): the produce worker outran its bound. Warn and
++                // continue on the current usable body; the next eligible seam
++                // retries. The ordinary path has no MidTurn result, so this is
++                // a non-stranding outcome that lets the turn complete.
++                warn!(target: "codex_core::compact_lhc",
++                    %err,
++                    manual,
++                    "LHC compact worker timed out; turn continues on its current body (retry at next seam)"
++                );
++                return Ok(LhcCompactAttempt::ContinuedWithoutCompact {
++                    reason: err.to_string(),
++                });
++            }
++            warn!(target: "codex_core::compact_lhc", %err, manual, "LHC compact hard failure; preserving history");
++            return Ok(failed_attempt(err.to_string()));
++        }
++    };
++
++    let produce_body = produced.body.clone();
++    if produce_body.is_empty() {
++        return Ok(failed_attempt("LHC compact produced empty body"));
++    }
++
++    let body_token_estimate = estimate_response_items_tokens(&produce_body);
++    if body_token_estimate > baseline_tokens {
++        warn!(target: "codex_core::compact_lhc",
++            body_tokens = body_token_estimate,
++            rollout_model_context_tokens = baseline_tokens,
++            items_body = produce_body.len(),
++            native_append_polluted,
++            manual,
++            "LHC compact did not reduce this estimate; proceeding with the usable compact"
++        );
++    }
++
++    let (_initial_context, world_state_baseline) =
++        build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
++
++    info!(target: "codex_core::compact_lhc",
++        body_tokens = body_token_estimate,
++        auto_compact_limit = ?turn_context
++            .config
++            .model_auto_compact_token_limit
++            .or_else(|| turn_context.model_info().auto_compact_token_limit()),
++        provider_window = ?turn_context.model_context_window(),
++        "LHC compact produce-body size (diagnostic only; not a terminal gate)"
++    );
++
++    let reference_context_item = match &initial_context_injection {
++        InitialContextInjection::DoNotInject => None,
++        InitialContextInjection::BeforeLastUserMessage { .. } => {
++            Some(turn_context.to_turn_context_item())
++        }
++    };
++
++    // LHC-HOOK: rollout rewrite at LHC compact install (slice C)
++    // Box the rewrite future so the parent arm body stays under rustc's
++    // query-depth limit when nested under run_turn.
++    Box::pin(install_lhc_compact_rewrite(
++        sess,
++        turn_context,
++        &slot,
++        thread_id,
++        root,
++        produced.marker,
++        world_state_baseline,
++        reference_context_item,
++        manual,
++        /*host_validation*/ None,
++        cancellation_token,
++    ))
++    .await
++}
++
++/// Hand the LHC capture slot the **production** derivation callbacks that its
++/// background scheduler derives with.
++///
++/// Resolved once per thread (the models-manager lookup is not free) and only
++/// through [`select_production_inference_callbacks`] — the same selection the
++/// compact arm uses, so background derivation can never be the path that
++/// quietly persists deterministic text into the durable record (J1). If the
++/// derivation model is unavailable the capture session's `LateBoundCallbacks`
++/// stay unseeded (waiting, not terminal Err). Compact does not wait on that
++/// work and does not seed inert Err callbacks into the capture session.
++pub(crate) async fn seed_lhc_derivation_callbacks(sess: &Session) {
++    if !sess.enabled(Feature::LhcCapture) {
++        return;
++    }
++    let Some(slot) = sess.services.thread_extension_data.get::<LhcCaptureSlot>() else {
++        return;
++    };
++    if slot.has_derivation_callbacks() {
++        return;
++    }
++    match select_production_inference_callbacks(sess).await {
++        Ok(callbacks) => slot.set_derivation_callbacks(callbacks),
++        Err(reason) => {
++            debug!(target: "codex_core::compact_lhc",
++                %reason,
++                "LHC background derivation callbacks unavailable; capture stays unseeded"
++            );
++        }
++    }
++}
++
++/// Production inference selection: real ModelClient bridge only.
++///
++/// Under `cfg(test)`, an explicit session override may supply callbacks (for
++/// CompactTask / auto-ladder tests that cannot pass callbacks through the
++/// production entry). The override is never set for real sessions.
++pub(super) async fn select_production_inference_callbacks(
++    sess: &Session,
++) -> Result<InferenceCallbacks, String> {
++    #[cfg(test)]
++    {
++        if let Ok(guard) = sess.services.lhc_test_inference.lock()
++            && let Some(cbs) = guard.as_ref()
++        {
++            return Ok(cbs.clone());
++        }
++    }
++    crate::lhc_inference_bridge::try_lhc_model_inference_callbacks(sess).await
++}
++
++/// I2/L3: re-seed process slot from durable CompactedItem record.
++/// Durable is source of truth — always merge even when the cache is warm.
++async fn reseed_slot_from_durable_session(sess: &Session, slot: &LhcCaptureSlot) {
++    let Some(msg) = sess.last_lhc_durable_derived_message().await else {
++        return;
++    };
++    let Some(marker) = CompactMarker::parse_durable_writeback_record(&msg) else {
++        return;
++    };
++    slot.ensure_derived_from_durable(
++        marker.derived_host_ids.iter().cloned(),
++        marker.derived_content_digests.iter().cloned(),
++    );
++}
+diff --git a/codex-rs/core/src/compact_lhc/workers.rs b/codex-rs/core/src/compact_lhc/workers.rs
+new file mode 100644
+index 0000000000..ec109112a2
+--- /dev/null
++++ b/codex-rs/core/src/compact_lhc/workers.rs
+@@ -0,0 +1,674 @@
++//! Dedicated SDK runtime threads and their cancellation/join boundaries.
++//! Worker timeouts and critical-section ordering are preserved from the caller.
++
++use super::*;
++
++/// Hop `run_mid_turn_compact_continuation` onto a current-thread runtime.
++/// Keeps `!Send` LHC futures off the multi-thread session path.
++///
++/// Once mutation begins this is an **uninterruptible critical section**: the
++/// join handle is always awaited. The operation timeout lives **inside** the
++/// worker runtime so the future is dropped on that same thread at the deadline
++/// and the thread exits; the caller then joins. Cancellation never detaches a
++/// mutator — host apply is suppressed if the turn token cancelled during the
++/// section.
++/// Record host full-body validation on a dedicated thread (SDK futures are
++/// `!Send`). Durable ok/failed acknowledgment for a protected-escalation
++/// attempt; never rolls the core install back.
++pub(super) async fn record_host_validation_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    attempt_id: String,
++    ok: bool,
++    reason: Option<String>,
++) -> Result<(), String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let spawn = std::thread::Builder::new()
++        .name(format!("lhc-midturn-hv-{attempt_id}"))
++        .spawn(move || {
++            let rt = match tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++            {
++                Ok(rt) => rt,
++                Err(err) => {
++                    let _ = tx.send(Err(format!("runtime: {err}")));
++                    return;
++                }
++            };
++            let result = rt.block_on(codex_lhc_host::record_mid_turn_host_validation(
++                &thread_id,
++                root.as_deref(),
++                &attempt_id,
++                ok,
++                reason,
++            ));
++            let _ = tx.send(result.map(|_| ()));
++        });
++    if let Err(err) = spawn {
++        return Err(format!("spawn: {err}"));
++    }
++    match rx.await {
++        Ok(result) => result,
++        Err(_) => Err("host validation record thread dropped".into()),
++    }
++}
++
++/// R12 (CX-S2): write-behind receipt for a rollout whose append recorder could
++/// not reopen onto the freshly rewritten inode.
++///
++/// The compacted rollout is already durable and stays authoritative. This
++/// records what the next open needs to reconcile appends that will not land in
++/// it: the compacted rollout's identity/hash, the recorder frontier at failure,
++/// and the canonical LHC capture frontier/event order (capture can keep
++/// advancing while this process lives, even with a dead recorder handle).
++///
++/// Every failure in here is swallowed: a receipt that cannot be written costs
++/// the next open its accounting, never the compact.
++pub(super) async fn persist_reopen_failure_receipt(
++    path: &std::path::Path,
++    thread_id: &str,
++    root: Option<PathBuf>,
++    recorder_frontier_items: u64,
++    reopen_error: &str,
++) {
++    let compacted_rollout = match codex_lhc_host::compacted_rollout_identity(path) {
++        Ok(identity) => identity,
++        Err(err) => {
++            warn!(target: "codex_core::compact_lhc",
++                %err,
++                path = %path.display(),
++                "LHC reopen-failure receipt: compacted rollout identity unreadable; \
++                 recording the receipt without it"
++            );
++            codex_lhc_host::CompactedRolloutIdentity {
++                sha256: String::new(),
++                bytes: 0,
++                items: recorder_frontier_items,
++            }
++        }
++    };
++    let capture_frontier = capture_frontier_on_thread(thread_id, root).await;
++    if capture_frontier.is_none() {
++        warn!(target: "codex_core::compact_lhc",
++            thread_id,
++            "LHC reopen-failure receipt: canonical capture frontier unavailable; \
++             next open falls back to ordinary LHC-view reconstruction"
++        );
++    }
++    let receipt = codex_lhc_host::RolloutReopenFailureReceipt {
++        schema: codex_lhc_host::ROLLOUT_REOPEN_RECEIPT_SCHEMA.to_string(),
++        written_at: chrono::Utc::now().to_rfc3339(),
++        thread_id: thread_id.to_string(),
++        rollout_path: path.display().to_string(),
++        compacted_rollout,
++        recorder_frontier_items,
++        capture_frontier,
++        reopen_error: reopen_error.to_string(),
++    };
++    match codex_lhc_host::write_rollout_reopen_failure_receipt(path, &receipt) {
++        Ok(()) => info!(target: "codex_core::compact_lhc",
++            path = %path.display(),
++            recorder_frontier_items,
++            "LHC reopen-failure receipt persisted; compacted rollout remains authoritative"
++        ),
++        Err(err) => warn!(target: "codex_core::compact_lhc",
++            %err,
++            path = %path.display(),
++            "LHC reopen-failure receipt write failed; compact stands (receipts observe, never govern)"
++        ),
++    }
++}
++
++/// Read the canonical LHC capture frontier on a dedicated thread (SDK futures
++/// are `!Send`). `None` whenever the archive cannot be read.
++async fn capture_frontier_on_thread(
++    thread_id: &str,
++    root: Option<PathBuf>,
++) -> Option<codex_lhc_host::CaptureFrontier> {
++    let tid = thread_id.to_string();
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let spawn = std::thread::Builder::new()
++        .name(format!("lhc-capture-frontier-{tid}"))
++        .spawn(move || {
++            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .ok()?;
++                rt.block_on(codex_lhc_host::read_capture_frontier(&tid, root.as_deref()))
++            }))
++            .unwrap_or(None);
++            let _ = tx.send(out);
++        });
++    let join = match spawn {
++        Ok(join) => join,
++        Err(err) => {
++            warn!(target: "codex_core::compact_lhc", %err, "spawn lhc capture-frontier thread failed");
++            return None;
++        }
++    };
++    let frontier = rx.await.ok().flatten();
++    let _ = tokio::task::spawn_blocking(move || join.join()).await;
++    frontier
++}
++
++/// Name the attempt holding the durable LHC writer row, on a dedicated thread
++/// (SDK inspection futures are `!Send`). `None` on any failure — a reclaim
++/// probe never stops a compact.
++pub(super) async fn writer_claim_owner_on_thread(
++    thread_id: &str,
++    root: Option<PathBuf>,
++) -> Option<String> {
++    let tid = thread_id.to_string();
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let spawn = std::thread::Builder::new()
++        .name(format!("lhc-midturn-claim-{tid}"))
++        .spawn(move || {
++            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .ok()?;
++                rt.block_on(codex_lhc_host::inspect_compact_continuation_writer_owner(
++                    &tid,
++                    root.as_deref(),
++                ))
++            }))
++            .unwrap_or(None);
++            let _ = tx.send(out);
++        });
++    let join = match spawn {
++        Ok(join) => join,
++        Err(err) => {
++            warn!(target: "codex_core::compact_lhc", %err, "spawn lhc-midturn writer-claim probe thread failed");
++            return None;
++        }
++    };
++    let owner = rx.await.ok().flatten();
++    let _ = tokio::task::spawn_blocking(move || join.join()).await;
++    owner
++}
++
++/// Inspect durable MidTurn recovery identity on a dedicated thread (SDK
++/// inspection futures are `!Send`).
++pub(super) async fn inspect_mid_turn_recovery_on_thread(
++    thread_id: &str,
++    root: Option<PathBuf>,
++) -> Result<Option<codex_lhc_host::MidTurnRecoveryIdentity>, String> {
++    let tid = thread_id.to_string();
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let join = std::thread::Builder::new()
++        .name(format!("lhc-midturn-inspect-{tid}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| format!("runtime: {e}"))?;
++                rt.block_on(resolve_mid_turn_recovery_identity(&tid, root.as_deref()))
++            }));
++            let out = match result {
++                Ok(inner) => inner,
++                Err(_) => Err("lhc-midturn inspect thread panicked".into()),
++            };
++            let _ = tx.send(out);
++        })
++        .map_err(|e| format!("spawn lhc-midturn inspect thread: {e}"))?;
++    let worker_out = rx.await;
++    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
++    match join_result {
++        Ok(Ok(())) => {}
++        Ok(Err(_)) => return Err("lhc-midturn inspect thread panicked during join".into()),
++        Err(err) => return Err(format!("lhc-midturn inspect join task failed: {err}")),
++    }
++    match worker_out {
++        Ok(r) => r,
++        Err(_) => Err("lhc-midturn inspect channel closed".into()),
++    }
++}
++
++/// Thread-name prefix for the MidTurn compact-continuation worker — the one
++/// thread that mutates LHC SQLite for an attempt.
++pub(crate) const MIDTURN_WORKER_THREAD_PREFIX: &str = "lhc-mt-";
++
++pub(super) async fn run_mid_turn_on_thread(
++    req: MidTurnCompactContinuationRequest,
++    turn_cancel: &CancellationToken,
++) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, CompactWorkerError> {
++    // If already cancelled before the critical section, refuse without spawn.
++    if turn_cancel.is_cancelled() {
++        return Err(CompactWorkerError::Cancelled(
++            "lhc-midturn cancelled by turn abort before critical section".into(),
++        ));
++    }
++
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let attempt = req.attempt_id.clone();
++    let worker_timeout = midturn_worker_timeout();
++    // Short prefix on purpose: Linux truncates a thread's `comm` to 15 bytes,
++    // so `lhc-midturn-{attempt}` reached /proc as `lhc-midturn-can` and every
++    // MidTurn worker in the process looked alike. `lhc-mt-` leaves 8 bytes of
++    // attempt id, which is what makes "is *this* attempt's mutator still
++    // running?" answerable — from a debugger or from the no-detached-mutator
++    // tests. Do not lengthen it.
++    let join = std::thread::Builder::new()
++        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
++                // Bound the operation future on this worker thread so a hung
++                // `run_mid_turn_compact_continuation` is dropped at the deadline
++                // and the thread can exit. The outer path always joins.
++                rt.block_on(async move {
++                    let op = async {
++                        #[cfg(test)]
++                        if let Some(stall) = midturn_worker_stall() {
++                            tokio::time::sleep(stall).await;
++                        }
++                        run_mid_turn_compact_continuation(req).await
++                    };
++                    match tokio::time::timeout(worker_timeout, op).await {
++                        Ok(inner) => inner.map_err(CompactWorkerError::Operation),
++                        Err(_) => Err(CompactWorkerError::TimedOut(format!(
++                            "lhc-midturn worker timed out after {}s (operation future dropped on worker)",
++                            worker_timeout.as_secs_f64()
++                        ))),
++                    }
++                })
++            }));
++            let out = match result {
++                Ok(inner) => inner,
++                Err(_) => Err(CompactWorkerError::Worker("lhc-midturn thread panicked".into())),
++            };
++            let _ = tx.send(out);
++        })
++        .map_err(|e| CompactWorkerError::Worker(format!("spawn lhc-midturn thread: {e}")))?;
++
++    // Always join the worker. Never drop `join` while the mutator may still
++    // run — R6 (CX-S2): cancellation no longer suppresses the host apply; the
++    // joined worker's result is applied and the smaller body stands. Joining
++    // here is what keeps the one-writer invariant: no detached thread may keep
++    // mutating LHC SQLite after this function returns. The operation is
++    // already bounded inside the worker, so join cannot hang forever on a
++    // stalled compact-continuation future.
++    let worker_out = rx.await;
++    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
++    match join_result {
++        Ok(Ok(())) => {}
++        Ok(Err(_)) => {
++            return Err(CompactWorkerError::Worker(
++                "lhc-midturn thread panicked during join".into(),
++            ));
++        }
++        Err(err) => {
++            return Err(CompactWorkerError::Worker(format!(
++                "lhc-midturn join task failed: {err}"
++            )));
++        }
++    }
++
++    // R6 (CX-S2): the worker has finished and may have installed a view. A turn
++    // that cancelled while it ran does not un-install that view, so its result
++    // is returned and the caller applies it. Suppressing here is what left the
++    // split state the next seam had to repair.
++    match worker_out {
++        Ok(r) => {
++            if turn_cancel.is_cancelled() {
++                warn!(target: "codex_core::compact_lhc",
++                    "lhc-midturn turn cancelled during the critical section; returning the \
++                     worker outcome so the installed view is applied"
++                );
++            }
++            r
++        }
++        Err(_) => Err(CompactWorkerError::Worker(
++            "lhc-midturn channel closed".into(),
++        )),
++    }
++}
++
++/// Why the parts hop produced no outcome. Only `Cancelled` blocks the next
++/// provider request (the turn is ending); every `Failed` keeps the current
++/// body and retries at a later eligible seam.
++#[derive(Debug)]
++pub(super) enum MidTurnPartsHopError {
++    Cancelled(String),
++    Failed(String),
++}
++
++/// Hop `run_mid_turn_parts_compact` onto a bounded current-thread runtime
++/// (SDK futures are `!Send`). The SDK install is atomic, so a cancellation
++/// during the section never leaves a split state; the worker is always joined.
++pub(super) async fn run_mid_turn_parts_on_thread(
++    req: MidTurnPartsRequest,
++    attempt_id: &str,
++    turn_cancel: &CancellationToken,
++) -> Result<MidTurnPartsOutcome, MidTurnPartsHopError> {
++    if turn_cancel.is_cancelled() {
++        return Err(MidTurnPartsHopError::Cancelled(
++            "lhc-midturn-parts cancelled by turn abort before critical section".into(),
++        ));
++    }
++    run_mid_turn_parts_worker(req, attempt_id)
++        .await
++        .map_err(MidTurnPartsHopError::Failed)
++}
++
++async fn run_mid_turn_parts_worker(
++    req: MidTurnPartsRequest,
++    attempt_id: &str,
++) -> Result<MidTurnPartsOutcome, String> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let worker_timeout = midturn_worker_timeout();
++    // Same short prefix + attempt id as the legacy hop: "is *this* attempt's
++    // mutator still running?" stays answerable from /proc and the tests.
++    let join = std::thread::Builder::new()
++        .name(format!("{MIDTURN_WORKER_THREAD_PREFIX}{attempt_id}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| format!("runtime: {e}"))?;
++                rt.block_on(async move {
++                    let op = async {
++                        #[cfg(test)]
++                        if let Some(stall) = midturn_worker_stall() {
++                            tokio::time::sleep(stall).await;
++                        }
++                        codex_lhc_host::run_mid_turn_parts_compact(req).await
++                    };
++                    match tokio::time::timeout(worker_timeout, op).await {
++                        Ok(inner) => inner,
++                        Err(_) => Err(format!(
++                            "lhc-midturn-parts worker timed out after {}s (operation future dropped on worker)",
++                            worker_timeout.as_secs_f64()
++                        )),
++                    }
++                })
++            }));
++            let out = match result {
++                Ok(inner) => inner,
++                Err(_) => Err("lhc-midturn-parts thread panicked".into()),
++            };
++            let _ = tx.send(out);
++        })
++        .map_err(|e| format!("spawn lhc-midturn-parts thread: {e}"))?;
++    let worker_out = rx.await;
++    let join_result = tokio::task::spawn_blocking(move || join.join()).await;
++    match join_result {
++        Ok(Ok(())) => {}
++        Ok(Err(_)) => return Err("lhc-midturn-parts thread panicked during join".into()),
++        Err(err) => return Err(format!("lhc-midturn-parts join task failed: {err}")),
++    }
++    match worker_out {
++        Ok(r) => r,
++        Err(_) => Err("lhc-midturn-parts channel closed".into()),
++    }
++}
++
++/// Read materialize surfaces on a dedicated thread (LHC SDK futures are !Send).
++pub(super) async fn read_materialize_surfaces_on_thread(
++    thread_id: String,
++    root: Option<PathBuf>,
++    turn_cancel: &CancellationToken,
++) -> Result<codex_lhc_host::MaterializeSurfaces, CompactWorkerError> {
++    let (tx, rx) = tokio::sync::oneshot::channel();
++    let join = std::thread::Builder::new()
++        .name(format!("lhc-materialize-{thread_id}"))
++        .spawn(move || {
++            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++                let rt = tokio::runtime::Builder::new_current_thread()
++                    .enable_all()
++                    .build()
++                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
++                rt.block_on(async move {
++                    read_materialize_surfaces(&thread_id, root.as_deref())
++                        .await
++                        .map_err(CompactWorkerError::Operation)
++                })
++            }))
++            .unwrap_or_else(|payload| {
++                let msg = payload
++                    .downcast_ref::<&str>()
++                    .map(|s| (*s).to_string())
++                    .or_else(|| payload.downcast_ref::<String>().cloned())
++                    .unwrap_or_else(|| "panic in materialize surfaces thread".into());
++                Err(CompactWorkerError::Worker(msg))
++            });
++            let _ = tx.send(result);
++        })
++        .map_err(|e| {
++            CompactWorkerError::Worker(format!("spawn materialize surfaces thread: {e}"))
++        })?;
++
++    let result = tokio::select! {
++        biased;
++        () = turn_cancel.cancelled() => {
++            // Detach: join will finish; we fail open.
++            return Err(CompactWorkerError::Cancelled("turn cancelled while reading materialize surfaces".into()));
++        }
++        r = rx => r.map_err(|_| CompactWorkerError::Worker("materialize surfaces thread dropped".to_string()))?,
++    };
++    // Best-effort join so we don't leak threads on the happy path.
++    let _ = join.join();
++    result
++}
++
 +#[allow(clippy::too_many_arguments)]
-+async fn produce_lhc_compact_on_thread(
++pub(super) async fn produce_lhc_compact_on_thread(
 +    thread_id: String,
 +    root: Option<PathBuf>,
 +    host_items: Vec<ResponseItem>,
@@ -3208,7 +3286,7 @@ index 0000000000..9b46801c43
 +        () = turn_cancel.cancelled() => {
 +            cancel.store(true, Ordering::SeqCst);
 +            drop(join);
-+            warn!("LHC compact cancelled by turn abort; stopping produce (no native fallback)");
++            warn!(target: "codex_core::compact_lhc", "LHC compact cancelled by turn abort; stopping produce (no native fallback)");
 +            return Err(CompactWorkerError::Cancelled("lhc-compact cancelled by turn abort".into()));
 +        }
 +        r = tokio::time::timeout(thread_timeout, rx) => r,
@@ -3232,10 +3310,12 @@ index 0000000000..9b46801c43
 +                        ));
 +                    }
 +                }
-+                Ok(Err(e)) => warn!(%e, "join spawn_blocking failed"),
++                Ok(Err(e)) => {
++                    warn!(target: "codex_core::compact_lhc", %e, "join spawn_blocking failed")
++                }
 +                Err(_) => {
 +                    // Detach: drop JoinHandle (detaches thread) rather than block.
-+                    warn!("lhc-compact join timed out after success path; detaching thread");
++                    warn!(target: "codex_core::compact_lhc", "lhc-compact join timed out after success path; detaching thread");
 +                }
 +            }
 +            r
@@ -3253,7 +3333,7 @@ index 0000000000..9b46801c43
 +            // F4: do not await join on the timeout path — leak/detach the thread
 +            // so the turn can fail-open. A leaked thread beats a hung session.
 +            drop(join);
-+            warn!(
++            warn!(target: "codex_core::compact_lhc",
 +                timeout_ms = thread_timeout.as_millis() as u64,
 +                "lhc-compact timed out; detaching worker thread (turn continues on its current body)"
 +            );
@@ -3289,7 +3369,7 @@ index 0000000000..9b46801c43
 +///
 +/// The budget is a ceiling, not a target — it is spent only when the archive is
 +/// genuinely wedged, and it never lengthens the successful path.
-+async fn commit_marker_with_retry(
++pub(super) async fn commit_marker_with_retry(
 +    thread_id: String,
 +    root: Option<PathBuf>,
 +    marker: &CompactMarker,
@@ -3315,7 +3395,7 @@ index 0000000000..9b46801c43
 +        if remaining <= backoff {
 +            return Err(format!("{err} (after {attempt} attempt(s))"));
 +        }
-+        warn!(
++        warn!(target: "codex_core::compact_lhc",
 +            %err,
 +            attempt,
 +            "LHC compact archive marker commit failed; retrying within the commit budget"
@@ -3355,38 +3435,6 @@ index 0000000000..9b46801c43
 +        Err(_) => Err("marker commit timed out".into()),
 +    }
 +}
-+
-+/// Used by law-2 next-turn test.
-+#[cfg_attr(not(test), allow(dead_code))]
-+pub(crate) async fn token_limit_reached(sess: &Session, turn_context: &TurnContext) -> bool {
-+    context_window_token_status(sess, turn_context)
-+        .await
-+        .token_limit_reached
-+}
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_tests.rs"]
-+mod tests;
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_strict_routing_tests.rs"]
-+mod strict_routing_tests;
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_slice_d_tests.rs"]
-+mod slice_d_tests;
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_mid_turn_tests.rs"]
-+mod mid_turn_tests;
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_canary_tests.rs"]
-+mod canary_tests;
-+
-+#[cfg(test)]
-+#[path = "compact_lhc_readiness_tests.rs"]
-+mod readiness_tests;
 diff --git a/codex-rs/core/src/compact_lhc_canary_tests.rs b/codex-rs/core/src/compact_lhc_canary_tests.rs
 new file mode 100644
 index 0000000000..20d93ed082
