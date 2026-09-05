@@ -37,6 +37,9 @@ async fn copied_schema12_preserves_text_ids_and_step_indices() {
     };
     // Reverse only the additive schema-13 blob migration on a text-only fixture.
     db.exec("DROP TABLE blob; PRAGMA user_version = 12;");
+    // The sticky parts witness must survive even if the latest view is full.
+    db.exec("UPDATE thread_metadata SET parts_activated_at = '2026-09-05T00:00:00Z' WHERE id = 1");
+    let metadata = db.prepare("SELECT * FROM thread_metadata").all(&[]);
     let messages = db
         .prepare("SELECT * FROM message ORDER BY message_id")
         .all(&[]);
@@ -65,6 +68,10 @@ async fn copied_schema12_preserves_text_ids_and_step_indices() {
             .prepare("SELECT * FROM turns ORDER BY turn_id")
             .all(&[]),
         turns
+    );
+    assert_eq!(
+        migrated.prepare("SELECT * FROM thread_metadata").all(&[]),
+        metadata
     );
     assert!(matches!(
         lhc::shared_tech::storage::get_schema_version(&migrated),

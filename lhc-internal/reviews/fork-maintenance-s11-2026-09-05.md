@@ -30,3 +30,5 @@ No configuration fields or schema shapes changed. The supported configuration
 is documented in FORK.md and the reader README. Logs: `/tmp/lhc-s11-resume-tests.log`
 and `/tmp/lhc-s11-app-tests.log`. Formatting completed. Combined fork qualification
 follows S6 before publication.
+
+Final combined qualification passed: [remaining-slices handoff](fork-maintenance-remaining-2026-09-05.md).

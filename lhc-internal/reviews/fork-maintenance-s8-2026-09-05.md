@@ -41,3 +41,5 @@ passed; `/tmp/lhc-s8-final-clippy.log` records that result. `just fix` and
 `just fmt` completed; unrelated formatter/lint churn was reverted. This is
 layer-by-layer qualification, not a claim that the original invocation exited 0.
 The next combined fork qualification must run before publication.
+
+Final combined qualification passed: [remaining-slices handoff](fork-maintenance-remaining-2026-09-05.md).

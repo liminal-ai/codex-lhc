@@ -3,6 +3,7 @@
 Status: **first maintenance batch authorized by Lee after steward review, 2026-09-05**.
 S7/S9/S10 remain deferred; this does not authorize releases or remote publication.
 Implementation and verification evidence: [batch handoff](../reviews/fork-maintenance-2026-09-05.md).
+S8, S11, and S6 implementation: [remaining-slices handoff](../reviews/fork-maintenance-remaining-2026-09-05.md).
 
 Prepared 2026-09-05 against fork commit `b27db354c678c6a983f44d90f8795add0947cbb6`
 (upstream sync `rust-v0.153.3`), with SDK pin `5207952`. Findings come from source

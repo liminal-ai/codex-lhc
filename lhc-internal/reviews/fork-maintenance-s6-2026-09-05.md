@@ -1,7 +1,7 @@
 # S6 — explicit compaction stages and owners
 
 S6a is commit `454b425cbd`: preparation and SDK worker boundaries.
-S6b moves installation coordination, retaining the original facade paths.
+S6b is commit `7b293f69c9`: it moves installation coordination, retaining the original facade paths.
 The refactor starts from S11 commit `e6052c7f73` and adds no context policy.
 
 | Location | Responsibility and authority |
@@ -36,4 +36,4 @@ Verification of the mechanical change:
   test targets. `just fix -p codex-core --lib` and `just fmt` completed; unrelated
   auto-fixes were reverted so caller files and moved bodies remain unchanged.
 
-Final combined fork qualification is recorded in the remaining-slices handoff.
+Final combined fork qualification passed: [remaining-slices handoff](fork-maintenance-remaining-2026-09-05.md).
