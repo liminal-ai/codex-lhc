@@ -4,8 +4,9 @@
 [`openai/codex`](https://github.com/openai/codex) that integrates Long Horizon
 Context (LHC).
 
-It keeps the **full transcript** of a session and serves **long-horizon
-views**. Recent work stays verbatim. Older work is progressively compressed.
+It keeps the transcript captured by the host adapter and serves **long-horizon
+views**. Capture and reconstruction have documented limits, including some
+multimodal content and host metadata (see the fidelity note below). Recent work stays verbatim. Older work is progressively compressed.
 The full record remains available underneath each view.
 
 Every compressed span remains addressable. Stable turn and message IDs let
@@ -93,8 +94,8 @@ The user does not need to restate content that remains in the canonical record.
 | Fidelity ramp | Oldest material is brief; recent work keeps texture; the live tail is verbatim |
 | Pull by ID | `get_turns` and `get_messages` recover exact evidence from compressed spans |
 | Resume continuity | The LHC view is written back through Codex's native rollout and resume paths |
-| Failure behavior | PreTurn/manual can continue down the native compact ladder when LHC is unavailable. MidTurn uses LHC as the single writer: safe transient failures keep the current body for a later seam; cancellation or an unproven rollout state can stop the next request; there is no silent native fallback |
-| Current default | Capture on; set `lhc_capture = false` only for troubleshooting |
+| Failure behavior | Manual, pre-turn, and mid-turn compaction use strict LHC routing; native compaction is not a fallback. MidTurn uses LHC as the single writer: safe transient failures keep the current body for a later seam; cancellation or an unproven rollout state can stop the next request; there is no silent native fallback |
+| Current default | Capture on; disabling it is an unsupported diagnostic state, not stock-Codex mode |
 
 ## What this fork is not
 
@@ -103,8 +104,20 @@ The user does not need to restate content that remains in the canonical record.
   replaces the transcript; the event record remains the source of truth.
 - It is not a promise that every short session improves. Stock Codex remains
   the clean comparison when long-horizon continuity is irrelevant.
-- It is not a rewrite of Codex. The host integration stays deliberately thin
-  and is carried through regular upstream merges.
+- The host adapter owns SDK capture and reconstruction; Codex core also carries
+  Session-dependent compaction and recovery integration. Regular upstream merges
+  must preserve those seams.
+
+## Fidelity boundary
+
+The durable archive preserves what the Codex adapter records. It does not recover
+host structure omitted during capture. At the current SDK pin, image/audio input
+can be flattened into text, inter-agent metadata is not fully reconstructable,
+and rolled-back content can remain in older compressed bands. The maintained
+inventory is `CAPTURE_GAPS` in
+[`materialize.rs`](../codex-rs/lhc/codex-lhc-host/src/materialize.rs).
+“Exact retrieval” refers to the recorded representation, not a guarantee that
+all original provider or UI metadata survived capture.
 
 ## Branches and releases
 

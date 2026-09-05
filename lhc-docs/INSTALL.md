@@ -195,8 +195,10 @@ lhc_capture = false
 
 The flag can also be set per-profile.
 
-With the flag off, no LHC worker or SQLite archive is opened and native Codex
-compaction remains available.
+With the flag off, no LHC worker or SQLite archive is opened. This is an
+unsupported diagnostic state: required compaction fails visibly because the
+product routes compaction through LHC only. Use a separate stock Codex binary
+to compare native behavior, and re-enable capture before normal fork use.
 
 ### 5. Use retrieval
 
