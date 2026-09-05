@@ -15,6 +15,10 @@
 //! sequence. In-memory history is bands (`replacement_history`) + native tail
 //! — equal to what resume rebuilds from the rewritten file.
 
+#[path = "compact_lhc_worker_error.rs"]
+mod worker_error;
+use worker_error::CompactWorkerError;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -1312,7 +1316,7 @@ async fn run_mid_turn_forced_boundary_continuation(
             // R14 (CX-S1): a worker that outruns its bound is detected and
             // warned about, never stranded on. The session proceeds with its
             // current body and compact retries at the next seam.
-            let timed_out = is_worker_timeout_reason(&err);
+            let timed_out = matches!(&err, CompactWorkerError::TimedOut(_));
             if timed_out {
                 warn!(
                     %err,
@@ -1322,7 +1326,7 @@ async fn run_mid_turn_forced_boundary_continuation(
                 error!(%err, "LHC MidTurn compact-continuation operation failed");
             }
             return Ok(LhcCompactAttempt::MidTurnBlocked {
-                reason: err,
+                reason: err.to_string(),
                 next_provider_request_allowed: timed_out,
             });
         }
@@ -1697,10 +1701,12 @@ pub(crate) const MIDTURN_WORKER_THREAD_PREFIX: &str = "lhc-mt-";
 async fn run_mid_turn_on_thread(
     req: MidTurnCompactContinuationRequest,
     turn_cancel: &CancellationToken,
-) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, String> {
+) -> Result<codex_lhc_host::MidTurnCompactContinuationOutcome, CompactWorkerError> {
     // If already cancelled before the critical section, refuse without spawn.
     if turn_cancel.is_cancelled() {
-        return Err("lhc-midturn cancelled by turn abort before critical section".into());
+        return Err(CompactWorkerError::Cancelled(
+            "lhc-midturn cancelled by turn abort before critical section".into(),
+        ));
     }
 
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1719,7 +1725,7 @@ async fn run_mid_turn_on_thread(
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("runtime: {e}"))?;
+                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
                 // Bound the operation future on this worker thread so a hung
                 // `run_mid_turn_compact_continuation` is dropped at the deadline
                 // and the thread can exit. The outer path always joins.
@@ -1732,21 +1738,21 @@ async fn run_mid_turn_on_thread(
                         run_mid_turn_compact_continuation(req).await
                     };
                     match tokio::time::timeout(worker_timeout, op).await {
-                        Ok(inner) => inner,
-                        Err(_) => Err(format!(
+                        Ok(inner) => inner.map_err(CompactWorkerError::Operation),
+                        Err(_) => Err(CompactWorkerError::TimedOut(format!(
                             "lhc-midturn worker timed out after {}s (operation future dropped on worker)",
                             worker_timeout.as_secs_f64()
-                        )),
+                        ))),
                     }
                 })
             }));
             let out = match result {
                 Ok(inner) => inner,
-                Err(_) => Err("lhc-midturn thread panicked".into()),
+                Err(_) => Err(CompactWorkerError::Worker("lhc-midturn thread panicked".into())),
             };
             let _ = tx.send(out);
         })
-        .map_err(|e| format!("spawn lhc-midturn thread: {e}"))?;
+        .map_err(|e| CompactWorkerError::Worker(format!("spawn lhc-midturn thread: {e}")))?;
 
     // Always join the worker. Never drop `join` while the mutator may still
     // run — R6 (CX-S2): cancellation no longer suppresses the host apply; the
@@ -1760,10 +1766,14 @@ async fn run_mid_turn_on_thread(
     match join_result {
         Ok(Ok(())) => {}
         Ok(Err(_)) => {
-            return Err("lhc-midturn thread panicked during join".into());
+            return Err(CompactWorkerError::Worker(
+                "lhc-midturn thread panicked during join".into(),
+            ));
         }
         Err(err) => {
-            return Err(format!("lhc-midturn join task failed: {err}"));
+            return Err(CompactWorkerError::Worker(format!(
+                "lhc-midturn join task failed: {err}"
+            )));
         }
     }
 
@@ -1781,7 +1791,9 @@ async fn run_mid_turn_on_thread(
             }
             r
         }
-        Err(_) => Err("lhc-midturn channel closed".into()),
+        Err(_) => Err(CompactWorkerError::Worker(
+            "lhc-midturn channel closed".into(),
+        )),
     }
 }
 
@@ -1982,10 +1994,10 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     {
         Ok(v) => v,
         Err(err) => {
-            if is_cancel_reason(&err) {
-                return Ok(cancelled_attempt(err));
+            if matches!(&err, CompactWorkerError::Cancelled(_)) {
+                return Ok(cancelled_attempt(err.to_string()));
             }
-            if is_worker_timeout_reason(&err) {
+            if matches!(&err, CompactWorkerError::TimedOut(_)) {
                 // R14 (CX-S1): the produce worker outran its bound. Warn and
                 // continue on the current usable body; the next eligible seam
                 // retries. The ordinary path has no MidTurn result, so this is
@@ -1995,10 +2007,12 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
                     manual,
                     "LHC compact worker timed out; turn continues on its current body (retry at next seam)"
                 );
-                return Ok(LhcCompactAttempt::ContinuedWithoutCompact { reason: err });
+                return Ok(LhcCompactAttempt::ContinuedWithoutCompact {
+                    reason: err.to_string(),
+                });
             }
             warn!(%err, manual, "LHC compact hard failure; preserving history");
-            return Ok(failed_attempt(err));
+            return Ok(failed_attempt(err.to_string()));
         }
     };
 
@@ -2058,19 +2072,6 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
     .await
 }
 
-fn is_cancel_reason(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    lower.contains("cancel") || lower.contains("aborted")
-}
-
-/// R14 (CX-S1): worker-timeout reasons degrade instead of stranding. The bound
-/// still exists — a hung worker is detached at the deadline — but the session
-/// keeps its current body and compact retries at the next eligible seam.
-fn is_worker_timeout_reason(reason: &str) -> bool {
-    let lower = reason.to_ascii_lowercase();
-    lower.contains("timed out") || lower.contains("timeout")
-}
-
 /// Materialize → atomic rewrite → in-memory bands+tail install.
 ///
 /// Extracted from the arm entry so the main future stays under the rustc
@@ -2105,8 +2106,8 @@ async fn install_lhc_compact_rewrite(
     {
         Ok(s) => s,
         Err(err) => {
-            if is_cancel_reason(&err) {
-                return Ok(cancelled_attempt(err));
+            if matches!(&err, CompactWorkerError::Cancelled(_)) {
+                return Ok(cancelled_attempt(err.to_string()));
             }
             warn!(%err, manual, "LHC materialize surfaces unavailable; hard stop");
             return Ok(failed_attempt(format!("materialize surfaces: {err}")));
@@ -2854,7 +2855,7 @@ async fn read_materialize_surfaces_on_thread(
     thread_id: String,
     root: Option<PathBuf>,
     turn_cancel: &CancellationToken,
-) -> Result<codex_lhc_host::MaterializeSurfaces, String> {
+) -> Result<codex_lhc_host::MaterializeSurfaces, CompactWorkerError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let join = std::thread::Builder::new()
         .name(format!("lhc-materialize-{thread_id}"))
@@ -2863,10 +2864,12 @@ async fn read_materialize_surfaces_on_thread(
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("runtime: {e}"))?;
-                rt.block_on(
-                    async move { read_materialize_surfaces(&thread_id, root.as_deref()).await },
-                )
+                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
+                rt.block_on(async move {
+                    read_materialize_surfaces(&thread_id, root.as_deref())
+                        .await
+                        .map_err(CompactWorkerError::Operation)
+                })
             }))
             .unwrap_or_else(|payload| {
                 let msg = payload
@@ -2874,19 +2877,21 @@ async fn read_materialize_surfaces_on_thread(
                     .map(|s| (*s).to_string())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "panic in materialize surfaces thread".into());
-                Err(msg)
+                Err(CompactWorkerError::Worker(msg))
             });
             let _ = tx.send(result);
         })
-        .map_err(|e| format!("spawn materialize surfaces thread: {e}"))?;
+        .map_err(|e| {
+            CompactWorkerError::Worker(format!("spawn materialize surfaces thread: {e}"))
+        })?;
 
     let result = tokio::select! {
         biased;
         () = turn_cancel.cancelled() => {
             // Detach: join will finish; we fail open.
-            return Err("turn cancelled while reading materialize surfaces".into());
+            return Err(CompactWorkerError::Cancelled("turn cancelled while reading materialize surfaces".into()));
         }
-        r = rx => r.map_err(|_| "materialize surfaces thread dropped".to_string())?,
+        r = rx => r.map_err(|_| CompactWorkerError::Worker("materialize surfaces thread dropped".to_string()))?,
     };
     // Best-effort join so we don't leak threads on the happy path.
     let _ = join.join();
@@ -2952,7 +2957,7 @@ async fn produce_lhc_compact_on_thread(
     session_derived: DerivedProvenance,
     percentages: LhcBandPercentages,
     turn_cancel: &CancellationToken,
-) -> Result<LhcCompactResult, String> {
+) -> Result<LhcCompactResult, CompactWorkerError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let cancel_thread = Arc::clone(&cancel);
     let join = std::thread::Builder::new()
@@ -2962,7 +2967,7 @@ async fn produce_lhc_compact_on_thread(
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("runtime: {e}"))?;
+                    .map_err(|e| CompactWorkerError::Worker(format!("runtime: {e}")))?;
                 rt.block_on(async move {
                     produce_lhc_compact_with_provenance_and_percentages(
                         &thread_id,
@@ -2975,7 +2980,7 @@ async fn produce_lhc_compact_on_thread(
                         percentages,
                     )
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(CompactWorkerError::from)
                 })
             }));
             let out = match result {
@@ -2988,12 +2993,12 @@ async fn produce_lhc_compact_on_thread(
                     } else {
                         "lhc-compact thread panicked".into()
                     };
-                    Err(msg)
+                    Err(CompactWorkerError::Worker(msg))
                 }
             };
             let _ = tx.send(out);
         })
-        .map_err(|e| format!("spawn lhc-compact thread: {e}"))?;
+        .map_err(|e| CompactWorkerError::Worker(format!("spawn lhc-compact thread: {e}")))?;
 
     let thread_timeout = COMPACT_THREAD_TIMEOUT;
     // N3: the turn's own cancellation races the worker and the timeout. The
@@ -3006,7 +3011,7 @@ async fn produce_lhc_compact_on_thread(
             cancel.store(true, Ordering::SeqCst);
             drop(join);
             warn!("LHC compact cancelled by turn abort; stopping produce (no native fallback)");
-            return Err("lhc-compact cancelled by turn abort".into());
+            return Err(CompactWorkerError::Cancelled("lhc-compact cancelled by turn abort".into()));
         }
         r = tokio::time::timeout(thread_timeout, rx) => r,
     };
@@ -3024,7 +3029,9 @@ async fn produce_lhc_compact_on_thread(
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(_))) => {
                     if r.is_ok() {
-                        return Err("lhc-compact thread panicked after success".into());
+                        return Err(CompactWorkerError::Worker(
+                            "lhc-compact thread panicked after success".into(),
+                        ));
                     }
                 }
                 Ok(Err(e)) => warn!(%e, "join spawn_blocking failed"),
@@ -3039,7 +3046,9 @@ async fn produce_lhc_compact_on_thread(
             cancel.store(true, Ordering::SeqCst);
             // Detach rather than join — timeout must bound the caller (F4).
             drop(join);
-            Err("lhc-compact thread dropped".into())
+            Err(CompactWorkerError::Worker(
+                "lhc-compact thread dropped".into(),
+            ))
         }
         Err(_) => {
             cancel.store(true, Ordering::SeqCst);
@@ -3050,10 +3059,10 @@ async fn produce_lhc_compact_on_thread(
                 timeout_ms = thread_timeout.as_millis() as u64,
                 "lhc-compact timed out; detaching worker thread (turn continues on its current body)"
             );
-            Err(format!(
+            Err(CompactWorkerError::TimedOut(format!(
                 "lhc-compact timed out after {}ms",
                 thread_timeout.as_millis()
-            ))
+            )))
         }
     }
 }

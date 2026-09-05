@@ -43,6 +43,79 @@ fn deterministic_callbacks() -> InferenceCallbacks {
     codex_lhc_host::lhc_inference_callbacks(false).expect("deterministic offline callbacks")
 }
 
+#[tokio::test]
+async fn worker_storage_failures_preserve_operation_classification() {
+    let temp = tempdir().expect("tempdir");
+    for name in ["ordinary_failure", "aborted timeout"] {
+        let root = temp.path().join(name);
+        std::fs::write(&root, "a file cannot be an archive directory").expect("block root");
+        let error = super::produce_lhc_compact_on_thread(
+            "worker-error".into(),
+            Some(root.clone()),
+            Vec::new(),
+            /*import_missing*/ false,
+            deterministic_callbacks(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            codex_lhc_host::DerivedProvenance::default(),
+            codex_lhc_host::LhcBandPercentages::default(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid storage must fail");
+        assert!(
+            matches!(error, super::CompactWorkerError::Produce(_)),
+            "storage failure must retain its SDK type: {error:?}"
+        );
+        let error = super::read_materialize_surfaces_on_thread(
+            "worker-error".into(),
+            Some(root),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid storage must fail");
+        assert!(
+            matches!(error, super::CompactWorkerError::Operation(_)),
+            "surface read must remain an operation failure: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn sdk_failure_conversion_preserves_diagnostics_without_reclassifying_them() {
+    for diagnostic in [
+        "ordinary failure",
+        "request cancelled",
+        "operation timed out",
+    ] {
+        let sdk_error = codex_lhc_host::LhcCompactUnavailable::Inference(diagnostic.into());
+        let expected_diagnostic = sdk_error.to_string();
+        let error = super::CompactWorkerError::from(sdk_error);
+        assert_eq!(error.to_string(), expected_diagnostic);
+        assert!(matches!(
+            error,
+            super::CompactWorkerError::Produce(codex_lhc_host::LhcCompactUnavailable::Inference(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn compact_worker_preserves_sdk_cancellation_without_a_cancelled_turn() {
+    let error = super::produce_lhc_compact_on_thread(
+        "worker-cancel".into(),
+        None,
+        Vec::new(),
+        /*import_missing*/ false,
+        deterministic_callbacks(),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        codex_lhc_host::DerivedProvenance::default(),
+        codex_lhc_host::LhcBandPercentages::default(),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect_err("SDK cancellation must survive the thread boundary");
+    assert!(matches!(error, super::CompactWorkerError::Cancelled(_)));
+}
+
 /// Install deterministic override so production entry (CompactTask / auto ladder)
 /// can exercise Install offline. Explicit test setup only.
 fn install_deterministic_test_override(session: &Session) {
