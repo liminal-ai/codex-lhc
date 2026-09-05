@@ -45,6 +45,7 @@ fn boundary(n: u64) -> CompactBoundaryMeta {
 
 fn band_entry(text: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+        blocks: None,
         content: format!("[context · brief]\n{text}"),
         source_messages: Vec::new(),
     }))
@@ -52,6 +53,7 @@ fn band_entry(text: &str) -> SessionThreadViewEntry {
 
 fn user_tail(mid: &str, text: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+        blocks: None,
         content: text.into(),
         source_messages: vec![SessionThreadViewEntrySource {
             message_id: mid.into(),
@@ -64,6 +66,7 @@ fn assistant_text_tail(mid: &str, text: &str, key: Option<&str>) -> SessionThrea
     SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
         SessionAssistantMessage {
             content: vec![SessionAssistantPart {
+                block: None,
                 type_: SessionAssistantPartType::Text,
                 text: Some(text.into()),
                 thinking: None,
@@ -87,6 +90,7 @@ fn thinking_tail(mid: &str, text: &str) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
         SessionAssistantMessage {
             content: vec![SessionAssistantPart {
+                block: None,
                 type_: SessionAssistantPartType::Thinking,
                 text: None,
                 thinking: Some(text.into()),
@@ -125,6 +129,7 @@ fn tool_call_tail_with_key(
     SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
         SessionAssistantMessage {
             content: vec![SessionAssistantPart {
+                block: None,
                 type_: SessionAssistantPartType::ToolCall,
                 text: None,
                 thinking: None,
@@ -164,6 +169,7 @@ fn tool_result_tail_with_key(
 ) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::ToolResult(
         SessionToolResultMessage {
+            blocks: None,
             tool_call_id: call_id.into(),
             tool_name: Some(name.into()),
             content: content.into(),
@@ -1069,6 +1075,7 @@ fn h2_token_count_emits_after_last_part_regardless_of_kind() {
                 SessionAssistantMessage {
                     content: vec![
                         SessionAssistantPart {
+                            block: None,
                             type_: SessionAssistantPartType::Thinking,
                             text: None,
                             thinking: Some("plan".into()),
@@ -1078,6 +1085,7 @@ fn h2_token_count_emits_after_last_part_regardless_of_kind() {
                             arguments: None,
                         },
                         SessionAssistantPart {
+                            block: None,
                             type_: SessionAssistantPartType::ToolCall,
                             text: None,
                             thinking: None,
@@ -1957,6 +1965,7 @@ fn f1_compact_marker_runtime_note_excluded_from_model_and_display() {
             band_entry("b"),
             user_tail("m1", "live prompt"),
             SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                blocks: None,
                 // Body deliberately contains the marker text — exclusion must
                 // still fire only via the key, not this string.
                 content: "lhc_compact_marker {\"viewId\":\"v1\"}".into(),
@@ -1967,6 +1976,7 @@ fn f1_compact_marker_runtime_note_excluded_from_model_and_display() {
             })),
             // Ordinary runtime note (no compact_marker key) still emits.
             SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                blocks: None,
                 content: "[runtime note] scaffolding".into(),
                 source_messages: vec![SessionThreadViewEntrySource {
                     message_id: "m-rn".into(),
@@ -2057,6 +2067,7 @@ fn m6_runtime_note_uses_stored_text_no_display_twin() {
             band_entry("b"),
             // View adds the prefix; source is runtime_note.
             SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
+                blocks: None,
                 content: "[runtime note] host scaffolding".into(),
                 source_messages: vec![SessionThreadViewEntrySource {
                     message_id: "m-rn".into(),
@@ -2515,6 +2526,7 @@ fn m10_synthetic_ids_become_none_on_response_item_id() {
             SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(
                 SessionAssistantMessage {
                     content: vec![SessionAssistantPart {
+                        block: None,
                         type_: SessionAssistantPartType::Text,
                         text: Some("hi".into()),
                         thinking: None,
@@ -2774,6 +2786,7 @@ fn identity_match_reemits_encrypted_content() {
         entries: vec![SessionThreadViewEntry::Message(
             SessionThreadViewMessage::Assistant(SessionAssistantMessage {
                 content: vec![SessionAssistantPart {
+                    block: None,
                     type_: SessionAssistantPartType::Thinking,
                     thinking: Some("plan".into()),
                     thinking_signature: Some("OPAQUE_SIG".into()),
@@ -2836,6 +2849,7 @@ fn identity_mismatch_suppresses_encrypted_content() {
         entries: vec![SessionThreadViewEntry::Message(
             SessionThreadViewMessage::Assistant(SessionAssistantMessage {
                 content: vec![SessionAssistantPart {
+                    block: None,
                     type_: SessionAssistantPartType::Thinking,
                     thinking: Some("plan".into()),
                     thinking_signature: Some("OPAQUE_SIG".into()),
@@ -2886,6 +2900,7 @@ fn signature_only_thinking_emits_when_identity_matches() {
         entries: vec![SessionThreadViewEntry::Message(
             SessionThreadViewMessage::Assistant(SessionAssistantMessage {
                 content: vec![SessionAssistantPart {
+                    block: None,
                     type_: SessionAssistantPartType::Thinking,
                     thinking: None,
                     thinking_signature: Some("SIG_ONLY".into()),

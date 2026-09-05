@@ -1483,3 +1483,6 @@ fn canonical_message_rows_blocking(
     .join()
     .expect("canonical rows thread")
 }
+
+#[path = "compact_lhc_image_tests.rs"]
+mod image_tests;

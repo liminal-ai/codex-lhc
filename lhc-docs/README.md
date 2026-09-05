@@ -304,9 +304,12 @@ different here."
 ## Status
 
 Capture, background derivation, banded compact/write-back, turn-parts MidTurn
-Compact, resume, and stable-ID retrieval are integrated and gated. Product
-releases use LHC thread schema 12. Opening schema-11 state migrates it to schema
-12; downgrade to a schema-11 binary is unsupported after migration.
+Compact, resume, and stable-ID retrieval are integrated and gated. The fork
+uses LHC thread schema 13. Opening schema-12 state adds blob storage while
+preserving turn parts. Earlier image markers remain text; newly captured user
+and tool-result images retain their ordered blocks and detail settings when
+served in full. Compressed bands use text placeholders. Older binaries cannot
+open a migrated schema-13 archive.
 
 The tripwire covers the host seams, certified SDK, step capture, turn-parts and
 legacy-thread exclusivity, rollout reconstruction and interrupted-swap

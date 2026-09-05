@@ -183,8 +183,11 @@ struct TurnLine {
 }
 
 fn event_text(ev: &EventRecord) -> String {
-    if let Some(tp) = ev.text_payload() {
-        return tp.text.clone();
+    if let Some(text) = ev.prompt_or_note_text() {
+        return text.to_owned();
+    }
+    if let Some(payload) = ev.assistant_text_payload() {
+        return payload.text.clone();
     }
     if let Some(tc) = ev.tool_call_payload() {
         return format!(

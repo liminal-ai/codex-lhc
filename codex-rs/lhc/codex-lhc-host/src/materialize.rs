@@ -115,7 +115,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "ToolSearchOutput.tools JSON / status: parsed from tool_result content when possible; status from stored isError",
     "AgentMessage (inter-agent): forward folds to runtime_note text; reverse cannot restore author/recipient structure → runtime_note user Message without display twin (stored text, no view prefix)",
     "AdditionalTools / Compaction / ContextCompaction: runtime_note stored text only; CompactionTrigger never captured",
-    "ContentItem InputImage/InputAudio: forward embeds [image:url]/[audio:url] in text; reverse leaves plain text",
+    "Legacy image markers and InputAudio remain text; schema-13 user/tool images restore from full blocks, compressed or missing images remain placeholders",
     "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage; usage on rolled-back turns is excluded from the projected cumulative (those turns are out of the tail)",
     "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only)",
     "TurnAbortReason enum: coarse map from outcome_reason string; unknown → Interrupted",
@@ -634,7 +634,34 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                 return;
             }
             if role == "user" {
-                out.push(user_message_event(&text));
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        ContentItem::InputAudio { audio_url } => Some(audio_url.as_str()),
+                        ContentItem::InputImage { .. } => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let mut event = user_message_event(&text);
+                if let RolloutItem::EventMsg(EventMsg::UserMessage(user)) = &mut event {
+                    let images: Vec<_> = content
+                        .iter()
+                        .filter_map(|part| match part {
+                            ContentItem::InputImage { image_url, detail } => {
+                                Some((image_url.clone(), *detail))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !images.is_empty() {
+                        user.images = Some(images.iter().map(|(url, _)| url.clone()).collect());
+                        user.image_details = images.into_iter().map(|(_, detail)| detail).collect();
+                    }
+                }
+                out.push(event);
             } else if role == "assistant" {
                 out.push(RolloutItem::EventMsg(EventMsg::AgentMessage(
                     AgentMessageEvent {
@@ -833,7 +860,13 @@ fn emit_tail(
                         .map(|m| stored_text(m))
                         .filter(|t| !t.is_empty())
                         .unwrap_or_else(|| u.content.clone());
-                    push_response_with_twins(user_text_message(&text), out, true);
+                    let mut item = user_text_message(&text);
+                    if let Some(blocks) = &u.blocks
+                        && let ResponseItem::Message { content, .. } = &mut item
+                    {
+                        *content = crate::image_blocks::restore_user(blocks);
+                    }
+                    push_response_with_twins(item, out, true);
                 }
             }
             SessionThreadViewEntry::Message(SessionThreadViewMessage::Assistant(a)) => {
@@ -867,6 +900,7 @@ fn emit_tail(
                         &mut tool_call_kinds,
                         &mut *gap_notes,
                         out,
+                        &mut *refusals,
                     );
                     // H2: emit TokenCount after the LAST part of a usage-bearing
                     // message, regardless of part kind (text/thinking/tool).
@@ -920,7 +954,7 @@ fn emit_tail(
                             .and_then(parse_host_id_from_key)
                     });
                     let call_kind = tool_call_kinds.get(tr.tool_call_id.as_str()).copied();
-                    let item = reverse_tool_result(
+                    let mut item = reverse_tool_result(
                         &tr.tool_call_id,
                         tr.tool_name.as_deref(),
                         &tr.content,
@@ -930,6 +964,15 @@ fn emit_tail(
                         &mut *gap_notes,
                         &mut *refusals,
                     );
+                    if let Some(blocks) = &tr.blocks {
+                        match &mut item {
+                            ResponseItem::FunctionCallOutput { output, .. }
+                            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                                output.body = crate::image_blocks::restore_tool(blocks);
+                            }
+                            _ => {}
+                        }
+                    }
                     push_response_with_twins(item, out, true);
                 }
                 // H2: tool_result messages can carry usage (rare); emit if last of that msg.
@@ -1258,6 +1301,7 @@ fn reverse_assistant_part(
     tool_call_kinds: &mut HashMap<String, RecoveredToolCallKind>,
     gap_notes: &mut Vec<String>,
     out: &mut Vec<RolloutItem>,
+    refusals: &mut Vec<String>,
 ) {
     match part.type_ {
         SessionAssistantPartType::Text => {
@@ -1334,6 +1378,26 @@ fn reverse_assistant_part(
                 tool_call_kinds.insert(tool_call_id.to_string(), kind);
             }
             push_response_with_twins(item, out, true);
+        }
+        SessionAssistantPartType::Image
+        | SessionAssistantPartType::Document
+        | SessionAssistantPartType::ToolUse
+        | SessionAssistantPartType::ToolResult
+        | SessionAssistantPartType::RedactedThinking
+        | SessionAssistantPartType::ServerToolUse
+        | SessionAssistantPartType::WebSearchToolResult
+        | SessionAssistantPartType::WebFetchToolResult
+        | SessionAssistantPartType::CodeExecutionToolResult
+        | SessionAssistantPartType::BashCodeExecutionToolResult
+        | SessionAssistantPartType::TextEditorCodeExecutionToolResult
+        | SessionAssistantPartType::ToolSearchToolResult
+        | SessionAssistantPartType::SearchResult
+        | SessionAssistantPartType::ContainerUpload
+        | SessionAssistantPartType::ToolReference => {
+            refusals.push(format!(
+                "unsupported assistant content block {:?}",
+                part.type_
+            ));
         }
     }
 }

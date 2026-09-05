@@ -158,7 +158,7 @@ async fn e2e_item_order_preserved_across_records() {
     let prompt_texts: Vec<String> = events
         .iter()
         .filter(|e| e.event_kind().as_str() == "user_prompt")
-        .filter_map(|e| e.text_payload().map(|p| p.text.clone()))
+        .filter_map(|e| e.user_prompt_payload().map(|p| p.text.clone()))
         .collect();
     assert_eq!(
         prompt_texts,

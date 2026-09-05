@@ -51,7 +51,7 @@ index 6c103f266c..adb512bb80 100644
      /// Injects items into active work, or records them without starting a turn.
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..5d64f48450
+index 0000000000..8d1df98816
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 @@ -0,0 +1,1213 @@
@@ -215,7 +215,7 @@ index 0000000000..5d64f48450
 +    let prompt_texts: Vec<String> = events
 +        .iter()
 +        .filter(|e| e.event_kind().as_str() == "user_prompt")
-+        .filter_map(|e| e.text_payload().map(|p| p.text.clone()))
++        .filter_map(|e| e.user_prompt_payload().map(|p| p.text.clone()))
 +        .collect();
 +    assert_eq!(
 +        prompt_texts,

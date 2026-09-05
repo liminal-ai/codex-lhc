@@ -11,6 +11,7 @@ mod compact_bridge;
 mod compact_continuation;
 mod gating;
 mod idempotency;
+mod image_blocks;
 mod inference;
 mod install;
 mod mapping;

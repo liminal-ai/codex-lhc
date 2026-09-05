@@ -1346,10 +1346,12 @@ mod tests {
             if !matches!(kind, "user_prompt" | "assistant_text") {
                 return false;
             }
-            e.text_payload().is_some_and(|p| {
-                p.text.contains("[context ·")
-                    || (p.text.contains("lhc_compact_marker") && kind == "user_prompt")
-            })
+            e.prompt_or_note_text()
+                .or_else(|| e.assistant_text_payload().map(|p| p.text.as_str()))
+                .is_some_and(|text| {
+                    text.contains("[context ·")
+                        || (text.contains("lhc_compact_marker") && kind == "user_prompt")
+                })
         })
     }
 

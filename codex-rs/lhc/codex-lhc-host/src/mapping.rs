@@ -8,7 +8,7 @@
 //!
 //! | Variant | LHC event_kind(s) | Payload / notes |
 //! |---|---|---|
-//! | `Message` + `UserPrompt` | `user_prompt` | `text` from content parts; full image/audio URLs in text (TextPayload is closed) |
+//! | `Message` + `UserPrompt` | `user_prompt` | `text` projection plus ordered schema-13 image blocks; audio remains text |
 //! | `Message` + `HostContext`/`InterAgent`/other | `runtime_note` | Host scaffolding or non-human origin |
 //! | `Message` role=assistant | `assistant_text` | joined InputText + OutputText |
 //! | `Message` role=developer/system | not captured | Host scaffolding meta |
@@ -302,7 +302,7 @@ pub fn map_item(
                 ),
             };
             let (content, is_error) = function_output_content(output);
-            vec![tool_result_event(
+            let mut event = tool_result_event(
                 thread_id,
                 sid,
                 &digest,
@@ -310,7 +310,15 @@ pub fn map_item(
                 &tool_call_id,
                 &content,
                 is_error,
-            )]
+            );
+            if let Some(blocks) = crate::image_blocks::tool_blocks(&output.body) {
+                event.input.payload.insert(
+                    "content".into(),
+                    json!(crate::image_blocks::text_projection(&blocks)),
+                );
+                event.input.payload.insert("blocks".into(), blocks);
+            }
+            vec![event]
         }
         ResponseItem::CustomToolCall {
             call_id,
@@ -334,9 +342,16 @@ pub fn map_item(
             internal_chat_message_metadata_passthrough: _,
         } => {
             let (content, is_error) = function_output_content(output);
-            vec![tool_result_event(
-                thread_id, sid, &digest, occ, call_id, &content, is_error,
-            )]
+            let mut event =
+                tool_result_event(thread_id, sid, &digest, occ, call_id, &content, is_error);
+            if let Some(blocks) = crate::image_blocks::tool_blocks(&output.body) {
+                event.input.payload.insert(
+                    "content".into(),
+                    json!(crate::image_blocks::text_projection(&blocks)),
+                );
+                event.input.payload.insert("blocks".into(), blocks);
+            }
+            vec![event]
         }
         ResponseItem::ToolSearchOutput {
             call_id,
@@ -684,9 +699,17 @@ fn map_message(
                 | RawItemProvenance::InterAgent
                 | RawItemProvenance::ModelOutput => ("runtime_note", ACTOR_SYSTEM),
             };
-            vec![text_event(
-                thread_id, sid, digest, occ, kind, actor, &text, None,
-            )]
+            let mut event = text_event(thread_id, sid, digest, occ, kind, actor, &text, None);
+            if kind == "user_prompt"
+                && let Some(blocks) = crate::image_blocks::user_blocks(content)
+            {
+                event.input.payload.insert(
+                    "text".into(),
+                    json!(crate::image_blocks::text_projection(&blocks)),
+                );
+                event.input.payload.insert("blocks".into(), blocks);
+            }
+            vec![event]
         }
         "assistant" => {
             let text = content_items_text(content);
@@ -1240,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn image_url_full_in_text_payload() {
+    fn image_url_moves_to_blocks_with_bounded_text_projection() {
         let url = format!("data:image/png;base64,{}", "A".repeat(4000));
         let item = ResponseItem::Message {
             id: None,
@@ -1265,10 +1288,11 @@ mod tests {
             .get("text")
             .and_then(|v| v.as_str())
             .expect("text");
-        assert!(
-            text.contains(&url),
-            "full image URL must be in text payload, got {} chars",
-            text.len()
+        assert!(!text.contains(&url));
+        assert!(text.len() < 100);
+        assert_eq!(
+            events[0].input.payload["blocks"][0]["source"]["data"],
+            json!("A".repeat(4000))
         );
         assert!(events[0].input.extra.is_empty());
     }

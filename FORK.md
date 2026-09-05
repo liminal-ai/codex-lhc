@@ -25,14 +25,12 @@ the adapter captures; it cannot recover host structure discarded during capture
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`5207952`** (`5207952b0d6d5dadb95f810c75a18e0867da6b72`) —
-  LIM-133 bounded, non-copying shared-LHC opens + frontier/key-projection
-  APIs, certified by the LHC-side director 2026-08-28 (chain
-  `b408f89 -> 6ec5796 -> 49e1887 -> dc0153c -> 5207952`; TS 45/45, Rust
-  23/23+15/15+10/10+4/4). **Certified-content:** the pin is an ancestor of the
-  locally available
-  `origin/main` ref (checked 2026-09-05). The tripwire refreshes and reports
-  ancestry separately from certification; main ancestry alone is not certification.
+  Current pin: **`e9456a6e`** (`e9456a6ee23a10cf04e15b16bcf77738c52b0f7c`) — schema 13 content
+  blocks and blob storage on top of schema-12 turn parts. Selected from the
+  shared Rust port ledger and Grok's image integration reference; Codex image,
+  migration, and compact/recovery qualification must pass at this pin.
+  The tripwire refreshes and reports ancestry separately from certification;
+  main ancestry alone is not certification.
   Prior pin `b408f89` —
   accepted final SDK identity delta (2026-08-26), directly over `13573a1`.
   The final delta changes only TypeScript scheduler files; its

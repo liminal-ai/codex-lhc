@@ -478,13 +478,27 @@ async fn image_url_full_round_trip() {
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
     assert_eq!(events.len(), 1);
-    let text = &events[0].text_payload().expect("text").text;
-    assert!(
-        text.contains(&url),
-        "full image URL must be in stored text, got len={}",
-        text.len()
-    );
+    let text = &events[0].user_prompt_payload().expect("user prompt").text;
+    assert!(!text.contains(&url));
+    assert!(text.len() < 100);
     handle.shutdown().await;
+    let items = codex_lhc_host::materialize_thread_rollout_items(
+        &dir.path().join("rebuilt.jsonl"),
+        "img-full",
+        Some(dir.path()),
+        codex_lhc_host::RolloutReconcileTrigger::Missing,
+        None,
+    )
+    .await
+    .expect("reconstruct after restart");
+    let history = codex_lhc_host::history_from_materialized_items(&items);
+    assert!(
+        history.iter().any(|entry| matches!(entry,
+            ResponseItem::Message { content, .. }
+            if content == &vec![ContentItem::InputImage { image_url: url.clone(), detail: None }]
+        )),
+        "reconstructed provider history must contain the original image"
+    );
 }
 
 /// F1: open, capture, restart, re-present same id → still one row.
@@ -1298,10 +1312,7 @@ async fn worker_survives_map_item_panic_and_records_later_items() {
             .map(|e| e.event_kind().as_str())
             .collect::<Vec<_>>()
     );
-    let text = events[0]
-        .text_payload()
-        .map(|p| p.text.as_str())
-        .unwrap_or("");
+    let text = events[0].prompt_or_note_text().unwrap_or("");
     assert!(
         text.contains("after-map-panic"),
         "stored row must be the post-panic item; got {text:?}"
@@ -1531,3 +1542,6 @@ async fn f2_step_index_stamped_on_step_bearing_kinds_only() {
         "a tool result shares its call's cycle"
     );
 }
+
+#[path = "certification/image_blocks.rs"]
+mod image_blocks_certification;
