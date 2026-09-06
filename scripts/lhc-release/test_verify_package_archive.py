@@ -43,7 +43,7 @@ def fixture(root: Path, platform: str) -> Path:
         "lhc": {
             "repository": "https://github.com/liminal-ai/long-horizon-context",
             "sdkCommit": SDK,
-            "threadSchema": 12,
+            "threadSchema": 13,
         },
     }
     (package / "codex-package.json").write_text(json.dumps(metadata))

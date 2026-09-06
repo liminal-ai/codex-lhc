@@ -253,7 +253,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
 
         # The build and archive contract is unchanged.
-        self.assertIn("--lhc-thread-schema 12 --force", remaining)
+        self.assertIn("--lhc-thread-schema 13 --force", remaining)
         self.assertIn("verify_package_archive.py", remaining)
 
     def test_remaining_normalizes_the_inherited_gcc_frame_warning_option(

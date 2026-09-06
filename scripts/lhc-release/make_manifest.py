@@ -84,7 +84,7 @@ def main() -> None:
         "sourceCommit": args.source_commit,
         "upstreamCodexCommit": args.upstream_commit,
         "lhcSdkCommit": args.lhc_sdk_commit,
-        "lhcThreadSchema": 12,
+        "lhcThreadSchema": 13,
         "buildRunId": args.run_id,
         "captureDefault": "on",
         "compactAlgorithmDefault": "bounded-selector",
@@ -94,11 +94,11 @@ def main() -> None:
         },
         "artifacts": artifacts,
         "migration": {
-            "id": "thread-schema-11-to-12",
-            "fromSchema": 11,
-            "toSchema": 12,
+            "id": "thread-schema-12-to-13",
+            "fromSchema": 12,
+            "toSchema": 13,
             "rollbackSupported": False,
-            "rollbackBoundary": f"Opening a schema-v11 thread with v{args.version} migrates it to schema 12; downgrade to v0.149.0 is unsupported.",
+            "rollbackBoundary": f"Opening a schema-12 thread with v{args.version} migrates it in place to schema 13 in one transaction; v0.150.2 and earlier cannot open a migrated thread and there is no downgrade.",
         },
     }
     manifest_path = args.dist / "release-manifest.json"

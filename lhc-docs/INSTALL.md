@@ -27,7 +27,7 @@ sh install.sh
 To install a specific release:
 
 ```bash
-sh install.sh --version 0.149.2
+sh install.sh --version 0.153.4
 ```
 
 Supported release targets are Linux x86-64/ARM64 and Apple Silicon macOS.
@@ -44,7 +44,7 @@ Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/downlo
 To install a specific release:
 
 ```powershell
-.\install.ps1 -Version 0.149.2
+.\install.ps1 -Version 0.153.4
 ```
 
 The installer selects the Windows x86-64 or ARM64 package from the process
@@ -101,12 +101,12 @@ instructions pointing at the installer instead.
 
 ## Upgrade and compatibility
 
-The current `v0.149.2` release retains LHC thread schema 12; it introduces no
-new migration.
+The current `v0.153.4` release uses LHC thread schema 13 (content blocks and
+blob storage on top of the schema-12 turn parts).
 
-> **One-way migration:** opening schema-11 state with `v0.149.1` or newer
-> migrates it to schema 12. After migration, downgrade to `v0.149.0` is
-> unsupported.
+> **One-way migration:** opening a schema-12 (or older) thread with `v0.153.4`
+> migrates it in place, in one transaction, to schema 13. `v0.150.2` and
+> earlier cannot open a migrated thread; there is no downgrade.
 
 The bounded selector is the default. To run the legacy eager selector on Linux
 or macOS:
@@ -123,7 +123,7 @@ codex-lhc
 ```
 
 This setting changes compact selection. It does not reverse a schema migration
-or make schema-12 state compatible with `v0.149.0`.
+or make schema-13 state readable by `v0.150.2` or earlier.
 
 Threads that already used the older forced-boundary MidTurn path retain that
 compatibility behavior. New turn-parts threads do not switch between the old

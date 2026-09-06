@@ -6,7 +6,7 @@ on:
       version:
         description: "Release version"
         required: true
-        default: "0.149.2"
+        default: "0.153.4"
         type: string
       candidate_run_id:
         description: "Successful five-platform candidate workflow run id"

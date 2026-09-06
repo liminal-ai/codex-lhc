@@ -6,7 +6,7 @@ on:
       version:
         description: "Release version without the v prefix"
         required: true
-        default: "0.149.2"
+        default: "0.153.4"
         type: string
 
 permissions:
@@ -65,7 +65,7 @@ jobs:
             --cargo-profile release --package-dir "$package_dir" \
             --archive-output "$archive" \
             --lhc-sdk-commit e9456a6ee23a10cf04e15b16bcf77738c52b0f7c \
-            --lhc-thread-schema 12 --force
+            --lhc-thread-schema 13 --force
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
             --lhc-sdk-commit e9456a6ee23a10cf04e15b16bcf77738c52b0f7c
@@ -366,7 +366,7 @@ jobs:
             --cargo-profile release --package-dir "$package_dir" \
             --archive-output "$archive" \
             --lhc-sdk-commit e9456a6ee23a10cf04e15b16bcf77738c52b0f7c \
-            --lhc-thread-schema 12 --force
+            --lhc-thread-schema 13 --force
           python scripts/lhc-release/verify_package_archive.py \
             --archive "$archive" --platform "$PLATFORM" --version "$VERSION" \
             --lhc-sdk-commit e9456a6ee23a10cf04e15b16bcf77738c52b0f7c
