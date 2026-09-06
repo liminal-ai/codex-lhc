@@ -206,7 +206,7 @@ jobs:
       matrix:
         include:
           - { platform: linux-aarch64, target: aarch64-unknown-linux-musl, kind: linux, archive: tar.gz, runs_on: ubuntu-24.04-arm }
-          - { platform: windows-x86_64, target: x86_64-pc-windows-msvc, kind: windows, archive: zip, runs_on: blacksmith-32vcpu-windows-2025 }
+          - { platform: windows-x86_64, target: x86_64-pc-windows-msvc, kind: windows, archive: zip, runs_on: blacksmith-16vcpu-windows-2025 }
           - platform: windows-aarch64
             target: aarch64-pc-windows-msvc
             kind: windows
