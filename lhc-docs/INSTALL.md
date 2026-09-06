@@ -52,12 +52,9 @@ architecture.
 
 ### Command name and managed updates
 
-The default command name is deliberate:
-
-| Existing command | Installed command |
-|---|---|
-| no `codex` found | `codex` — Codex + LHC becomes the primary Codex |
-| `codex` already exists | `codex-lhc` — stock and LHC builds remain side by side |
+A new install is named `codex-lhc` on every platform, so a stock `codex`
+command is never touched and both builds can sit side by side. Re-running the
+installer keeps the name recorded by the existing managed install.
 
 Choose another name or prefix explicitly on Linux or macOS:
 
@@ -74,8 +71,9 @@ On Windows:
 ```
 
 Re-running the installer updates the managed package. The Unix installer
-prints the fork version transition and installed LHC SDK commit. Neither
-installer replaces an unrelated command.
+prints the fork version transition and installed LHC SDK commit. On Linux or
+macOS, an occupied unmanaged command name is refused before the package
+store changes.
 
 Uninstall an installer-managed command on Linux or macOS:
 

@@ -36,8 +36,8 @@
 > ```
 >
 > Releases provide **Linux x86-64/ARM64, Windows x86-64/ARM64, and Apple
-> Silicon macOS** packages from one source identity. The installer uses `codex`
-> when no Codex command exists and `codex-lhc` for a side-by-side install.
+> Silicon macOS** packages from one source identity. The installer names a new
+> install `codex-lhc` and leaves any stock `codex` command alone.
 > Official Codex installers and `openai/codex` releases do **not** include LHC.
 >
 > Everything below is upstream's README. Its install commands install stock

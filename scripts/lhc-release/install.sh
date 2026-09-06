@@ -16,7 +16,8 @@ Install Codex + LHC from a codex-lhc GitHub release.
 Usage: install.sh [OPTIONS]
 
   --version VERSION    Install a specific release (default: latest)
-  --name NAME          Command name (default: codex, or codex-lhc if codex exists)
+  --name NAME          Command name (default: codex-lhc for a new install, or the
+                       name recorded by an existing managed install)
   --prefix DIR         Command prefix (default: ~/.local)
   --install-root DIR   Versioned package storage
   --asset-dir DIR      Install from a validated local candidate directory
@@ -56,10 +57,8 @@ BIN_DIR="${PREFIX}/bin"
 if [ -z "$NAME" ]; then
   if [ -f "$STORE/installed-name" ]; then
     NAME=$(cat "$STORE/installed-name")
-  elif [ -e "${BIN_DIR}/codex" ] || command -v codex >/dev/null 2>&1; then
-    NAME=codex-lhc
   else
-    NAME=codex
+    NAME=codex-lhc
   fi
 fi
 LINK="${BIN_DIR}/${NAME}"
@@ -83,6 +82,19 @@ if [ "$UNINSTALL" -eq 1 ]; then
   say "Removed Codex + LHC command '$NAME' and managed packages from $STORE."
   say "User configuration and LHC archives were preserved."
   exit 0
+fi
+
+# Refuse an occupied command before touching the package store, so a rerun
+# never switches the selected package and then fails on the command name.
+if [ -e "$LINK" ] || [ -L "$LINK" ]; then
+  if [ ! -L "$LINK" ]; then
+    die "$LINK already exists; choose another name with --name"
+  fi
+  old_target=$(readlink "$LINK")
+  case "$old_target" in
+    "$STORE"/*) ;;
+    *) die "$LINK is not managed by this installer; choose another name with --name" ;;
+  esac
 fi
 
 command -v tar >/dev/null 2>&1 || die "tar is required"
@@ -147,17 +159,6 @@ tar -xzf "${TMP}/${ASSET}" -C "$STAGE"
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"
 ln -sfn "$DEST" "$STORE/current"
-
-if [ -e "$LINK" ] || [ -L "$LINK" ]; then
-  if [ ! -L "$LINK" ]; then
-    die "$LINK already exists; choose another name with --name"
-  fi
-  old_target=$(readlink "$LINK")
-  case "$old_target" in
-    "$STORE"/*) ;;
-    *) die "$LINK is not managed by this installer; choose another name with --name" ;;
-  esac
-fi
 
 old_version="none"
 if [ -f "$STORE/installed-version" ]; then

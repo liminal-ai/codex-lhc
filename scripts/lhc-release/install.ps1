@@ -17,13 +17,13 @@ $BinDir = Join-Path $Prefix "bin"
 
 function Fail([string]$Message) { throw "codex-lhc installer: $Message" }
 
+# Default command name: the name recorded by an existing managed install,
+# otherwise codex-lhc. An existing stock codex command is left alone.
 if (-not $Name) {
     if (Test-Path (Join-Path $InstallRoot "installed-name")) {
         $Name = (Get-Content (Join-Path $InstallRoot "installed-name") -Raw).Trim()
-    } elseif (Get-Command codex -ErrorAction SilentlyContinue) {
-        $Name = "codex-lhc"
     } else {
-        $Name = "codex"
+        $Name = "codex-lhc"
     }
 }
 if ($Name -notmatch '^[A-Za-z0-9._-]+$') { Fail "invalid command name: $Name" }

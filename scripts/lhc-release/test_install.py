@@ -33,7 +33,11 @@ def native_unix_platform() -> str:
     raise RuntimeError(f"unsupported POSIX installer fixture host: {system} {machine}")
 
 
-ASSET = f"codex-lhc-v{VERSION}-{native_unix_platform()}.tar.gz"
+def asset_name(version: str) -> str:
+    return f"codex-lhc-v{version}-{native_unix_platform()}.tar.gz"
+
+
+ASSET = asset_name(VERSION)
 
 
 class QuietHandler(http.server.SimpleHTTPRequestHandler):
@@ -53,22 +57,8 @@ class InstallTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         release = self.root / "release"
-        payload = self.root / "payload"
-        (payload / "bin").mkdir(parents=True)
-        for name in ("codex", "codex-code-mode-host"):
-            path = payload / "bin" / name
-            path.write_text("#!/bin/sh\nprintf '%s\\n' fixture\n", encoding="utf-8")
-            path.chmod(0o755)
-        (payload / "codex-package.json").write_text(
-            f'{{"version":"{VERSION}","lhc":{{"sdkCommit":"test-pin"}}}}\n',
-            encoding="utf-8",
-        )
         release.mkdir()
-        with tarfile.open(release / ASSET, "w:gz") as archive:
-            for child in payload.iterdir():
-                archive.add(child, arcname=child.name)
-        digest = hashlib.sha256((release / ASSET).read_bytes()).hexdigest()
-        (release / "SHA256SUMS").write_text(f"{digest}  {ASSET}\n", encoding="utf-8")
+        self.add_release(VERSION)
 
         handler = lambda *args, **kwargs: QuietHandler(  # noqa: E731
             *args, directory=str(release), **kwargs
@@ -87,13 +77,34 @@ class InstallTest(unittest.TestCase):
         )
         curl.chmod(0o755)
 
+    def add_release(self, version: str) -> None:
+        """Publish a fixture release for `version` on the local server."""
+        release = self.root / "release"
+        payload = self.root / f"payload-{version}"
+        (payload / "bin").mkdir(parents=True)
+        for name in ("codex", "codex-code-mode-host"):
+            path = payload / "bin" / name
+            path.write_text("#!/bin/sh\nprintf '%s\\n' fixture\n", encoding="utf-8")
+            path.chmod(0o755)
+        (payload / "codex-package.json").write_text(
+            f'{{"version":"{version}","lhc":{{"sdkCommit":"test-pin"}}}}\n',
+            encoding="utf-8",
+        )
+        asset = asset_name(version)
+        with tarfile.open(release / asset, "w:gz") as archive:
+            for child in payload.iterdir():
+                archive.add(child, arcname=child.name)
+        digest = hashlib.sha256((release / asset).read_bytes()).hexdigest()
+        with (release / "SHA256SUMS").open("a", encoding="utf-8") as sums:
+            sums.write(f"{digest}  {asset}\n")
+
     def tearDown(self) -> None:
         self.server.shutdown()
         self.server.server_close()
         self.temp.cleanup()
 
     def run_installer(
-        self, *args: str, path_prefix: str = ""
+        self, *args: str, path_prefix: str = "", version: str = VERSION
     ) -> subprocess.CompletedProcess[str]:
         prefix = self.root / "prefix"
         store = self.root / "store"
@@ -122,7 +133,7 @@ class InstallTest(unittest.TestCase):
         )
         shim.chmod(0o755)
         return subprocess.run(
-            ["sh", str(INSTALLER), "--version", VERSION, *args],
+            ["sh", str(INSTALLER), "--version", version, *args],
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -130,11 +141,16 @@ class InstallTest(unittest.TestCase):
             check=False,
         )
 
-    def test_installs_as_codex_when_absent_and_uninstalls_safely(self) -> None:
+    def test_installs_as_codex_lhc_by_default_and_uninstalls_safely(self) -> None:
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        command = self.root / "prefix/bin/codex"
+        command = self.root / "prefix/bin/codex-lhc"
         self.assertTrue(command.is_symlink())
+        self.assertFalse((self.root / "prefix/bin/codex").exists())
+        self.assertEqual(
+            (self.root / "store/installed-name").read_text(encoding="utf-8").strip(),
+            "codex-lhc",
+        )
         self.assertIn("LHC engine updated to test-pin", result.stdout)
         self.assertEqual(
             subprocess.check_output([command], text=True).strip(), "fixture"
@@ -150,16 +166,52 @@ class InstallTest(unittest.TestCase):
         self.assertFalse(command.exists())
         self.assertFalse((self.root / "store").exists())
 
-    def test_existing_codex_selects_side_by_side_name(self) -> None:
-        existing = self.root / "existing"
-        existing.mkdir()
-        codex = existing / "codex"
-        codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        codex.chmod(0o755)
-        result = self.run_installer(path_prefix=f"{existing}:")
+    def test_existing_stock_codex_is_preserved_beside_default_name(self) -> None:
+        stock = self.root / "prefix/bin/codex"
+        stock.parent.mkdir(parents=True)
+        stock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stock.chmod(0o755)
+        result = self.run_installer(path_prefix=f"{stock.parent}:")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.root / "prefix/bin/codex-lhc").is_symlink())
-        self.assertFalse((self.root / "prefix/bin/codex").exists())
+        self.assertFalse(stock.is_symlink())
+        self.assertEqual(stock.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+
+    def test_stored_name_survives_rerun_without_name(self) -> None:
+        result = self.run_installer("--name", "codex-memory")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.root / "prefix/bin/codex-memory").is_symlink())
+        self.assertFalse((self.root / "prefix/bin/codex-lhc").exists())
+
+    def test_command_conflict_is_refused_before_switching_package(self) -> None:
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        store = self.root / "store"
+        current = store / "current"
+        self.assertEqual(current.resolve(), (store / "versions" / VERSION).resolve())
+
+        stock = self.root / "prefix/bin/codex"
+        self.assertFalse(stock.exists())
+        stock.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stock.chmod(0o755)
+        newer = "0.0.0-conflict"
+        self.add_release(newer)
+        result = self.run_installer("--name", "codex", version=newer)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("choose another name with --name", result.stderr)
+
+        self.assertEqual(current.resolve(), (store / "versions" / VERSION).resolve())
+        self.assertFalse((store / "versions" / newer).exists())
+        self.assertEqual(
+            (store / "installed-version").read_text(encoding="utf-8").strip(), VERSION
+        )
+        self.assertEqual(
+            (store / "installed-name").read_text(encoding="utf-8").strip(), "codex-lhc"
+        )
+        self.assertFalse(stock.is_symlink())
+        self.assertTrue((self.root / "prefix/bin/codex-lhc").is_symlink())
 
     def test_custom_name(self) -> None:
         result = self.run_installer("--name", "codex-memory")
