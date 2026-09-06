@@ -16,6 +16,8 @@ use chrono::Utc;
 use codex_http_client::ClientRouteClass;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RouteAwareClientPool;
+use codex_install_context::LHC_LATEST_RELEASE_API_URL;
+use codex_install_context::LHC_RELEASE_VERSION;
 use codex_login::default_client::default_headers;
 use serde::Deserialize;
 use std::path::Path;
@@ -49,7 +51,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
     }
 
     info.and_then(|info| {
-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
+        if is_newer(&info.latest_version, LHC_RELEASE_VERSION).unwrap_or(false) {
             Some(info.latest_version)
         } else {
             None
@@ -59,7 +61,9 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
 
 // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+// This fork has one reachable release source; the registry arms below are
+// retained unchanged from upstream but no UpdateAction reaches them.
+const LATEST_RELEASE_URL: &str = LHC_LATEST_RELEASE_API_URL;
 
 #[derive(Deserialize, Debug, Clone)]
 struct ReleaseInfo {

@@ -2,11 +2,12 @@
 source: tui/src/update_prompt.rs
 expression: terminal.backend()
 ---
-  ✨ Update available! 0.0.0 -> 9.9.9
 
-  Release notes: https://github.com/openai/codex/releases/latest
+  ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1
 
-› 1. Update now (runs `npm install -g @openai/codex@latest`)                    
+  Release notes: https://github.com/liminal-ai/codex-lhc/releases/latest
+
+› 1. Update now (re-runs the Codex + LHC installer)                             
   2. Skip
   3. Skip until next version
 

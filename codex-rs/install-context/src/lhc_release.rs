@@ -4,6 +4,17 @@
 /// The fork release recorded in `lhc-release/VERSION`, without trailing whitespace.
 pub const LHC_RELEASE_VERSION: &str = include_str!("../../../lhc-release/VERSION").trim_ascii();
 
+/// The GitHub API endpoint describing the fork's latest published release.
+pub const LHC_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/liminal-ai/codex-lhc/releases/latest";
+
+/// The fork's latest release page: notes, checksums, packages, and installers.
+pub const LHC_RELEASES_URL: &str = "https://github.com/liminal-ai/codex-lhc/releases/latest";
+
+/// The fork's install and update instructions.
+pub const LHC_INSTALL_DOCS_URL: &str =
+    "https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md";
+
 /// The latest-release download URL of the fork's Unix installer.
 pub const LHC_INSTALLER_URL_UNIX: &str =
     "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh";

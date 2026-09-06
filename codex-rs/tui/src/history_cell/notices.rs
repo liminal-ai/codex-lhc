@@ -26,29 +26,35 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         use ratatui_macros::line;
         use ratatui_macros::text;
-        let update_instruction = if let Some(update_action) = &self.update_action {
-            line!["Run ", update_action.command_str().cyan(), " to update."]
-        } else {
-            line![
+        // The fork's installer action is a shell script; give advice instead
+        // of printing it. Upstream's retained variants keep their command.
+        let update_instruction = match &self.update_action {
+            Some(UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. }) => line![
+                "Run your Codex + LHC command with ",
+                "update".cyan(),
+                " to install it."
+            ],
+            Some(update_action) => {
+                line!["Run ", update_action.command_str().cyan(), " to update."]
+            }
+            None => line![
                 "See ",
-                "https://github.com/openai/codex".cyan().underlined(),
+                LHC_INSTALL_DOCS_URL.cyan().underlined(),
                 " for installation options."
-            ]
+            ],
         };
 
         let content = text![
             line![
                 "✨\u{200A}".bold().cyan(),
-                "Update available!".bold().cyan(),
+                "Codex + LHC update available!".bold().cyan(),
                 " ",
-                format!("{CODEX_CLI_VERSION} -> {}", self.latest_version).bold(),
+                format!("{LHC_RELEASE_VERSION} -> {}", self.latest_version).bold(),
             ],
             update_instruction,
             "",
             "See full release notes:",
-            "https://github.com/openai/codex/releases/latest"
-                .cyan()
-                .underlined(),
+            LHC_RELEASES_URL.cyan().underlined(),
         ];
 
         let inner_width = content
@@ -60,18 +66,20 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let update_instruction = if let Some(update_action) = &self.update_action {
-            format!("Run {} to update.", update_action.command_str())
-        } else {
-            "See https://github.com/openai/codex for installation options.".to_string()
+        let update_instruction = match &self.update_action {
+            Some(UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. }) => {
+                "Run your Codex + LHC command with update to install it.".to_string()
+            }
+            Some(update_action) => format!("Run {} to update.", update_action.command_str()),
+            None => format!("See {LHC_INSTALL_DOCS_URL} for installation options."),
         };
         vec![
-            Line::from("Update available!"),
-            Line::from(format!("{CODEX_CLI_VERSION} -> {}", self.latest_version)),
+            Line::from("Codex + LHC update available!"),
+            Line::from(format!("{LHC_RELEASE_VERSION} -> {}", self.latest_version)),
             Line::from(update_instruction),
             Line::from(""),
             Line::from("See full release notes:"),
-            Line::from("https://github.com/openai/codex/releases/latest"),
+            Line::from(LHC_RELEASES_URL),
         ]
     }
 

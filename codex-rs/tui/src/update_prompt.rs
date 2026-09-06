@@ -12,6 +12,8 @@ use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use crate::update_action::UpdateAction;
 use crate::updates;
+use codex_install_context::LHC_RELEASE_VERSION;
+use codex_install_context::LHC_RELEASES_URL;
 use color_eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -26,7 +28,7 @@ use ratatui::widgets::Clear;
 use ratatui::widgets::WidgetRef;
 use tokio_stream::StreamExt;
 
-const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
+const RELEASE_NOTES_URL: &str = LHC_RELEASES_URL;
 
 pub(crate) enum UpdatePromptOutcome {
     Continue,
@@ -114,7 +116,7 @@ impl UpdatePromptScreen {
         Self {
             request_frame,
             latest_version,
-            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            current_version: LHC_RELEASE_VERSION.to_string(),
             update_action,
             highlighted: UpdateSelection::UpdateNow,
             selection: None,
@@ -192,12 +194,19 @@ impl WidgetRef for &UpdatePromptScreen {
         Clear.render(area, buf);
         let mut column = ColumnRenderable::new();
 
-        let update_command = self.update_action.command_str();
+        // The fork's installer action is a shell script; describe it instead
+        // of printing it. Upstream's retained variants keep their command.
+        let update_now = match &self.update_action {
+            UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. } => {
+                "Update now (re-runs the Codex + LHC installer)".to_string()
+            }
+            action => format!("Update now (runs `{}`)", action.command_str()),
+        };
 
         column.push("");
         column.push(Line::from(vec![
             "  ✨\u{200A}".bold().cyan(),
-            "Update available!".bold(),
+            "Codex + LHC update available!".bold(),
             " ".into(),
             format!(
                 "{current} -> {latest}",
@@ -217,7 +226,7 @@ impl WidgetRef for &UpdatePromptScreen {
         column.push("");
         column.push(selection_option_row(
             0,
-            format!("Update now (runs `{update_command}`)"),
+            update_now,
             self.highlighted == UpdateSelection::UpdateNow,
         ));
         column.push(selection_option_row(
@@ -256,10 +265,17 @@ mod tests {
     use ratatui::widgets::FrameExt;
 
     fn new_prompt() -> UpdatePromptScreen {
+        let store =
+            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
+                r"C:\CodexLHC\packages"
+            } else {
+                "/home/codex/.local/share/codex-lhc"
+            })
+            .expect("store should be absolute");
         UpdatePromptScreen::new(
             FrameRequester::test_dummy(),
-            "9.9.9".into(),
-            UpdateAction::NpmGlobalLatest,
+            "9.9.9-lhc.1".into(),
+            UpdateAction::LhcUnix { store },
         )
     }
 

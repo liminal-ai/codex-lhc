@@ -1220,6 +1220,14 @@ fn standalone_unix_update_available_history_cell_snapshot() {
     insta::assert_snapshot!(rendered);
 }
 
+#[test]
+fn unmanaged_update_available_history_cell_snapshot() {
+    let cell = UpdateAvailableHistoryCell::new("9.9.9-lhc.1".to_string(), None);
+    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
+
+    insta::assert_snapshot!(rendered);
+}
+
 #[cfg(unix)]
 #[test]
 fn lhc_unix_update_available_history_cell_snapshot() {

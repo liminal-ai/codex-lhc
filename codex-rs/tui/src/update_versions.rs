@@ -1,13 +1,17 @@
+use codex_install_context::parse_lhc_release;
+
+/// Compare fork releases (`major.minor.patch[-lhc.revision]`, bare revision 0).
 pub(crate) fn is_newer(latest: &str, current: &str) -> Option<bool> {
-    match (parse_version(latest), parse_version(current)) {
+    match (parse_lhc_release(latest), parse_lhc_release(current)) {
         (Some(l), Some(c)) => Some(l > c),
         _ => None,
     }
 }
 
+/// Fork releases are tagged `v<release>`.
 pub(crate) fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
     latest_tag_name
-        .strip_prefix("rust-v")
+        .strip_prefix('v')
         .map(str::to_owned)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
 }
@@ -32,14 +36,29 @@ mod tests {
     #[test]
     fn extracts_version_from_latest_tag() {
         assert_eq!(
-            extract_version_from_latest_tag("rust-v1.5.0").expect("failed to parse version"),
+            extract_version_from_latest_tag("v0.153.3-lhc.1").expect("failed to parse version"),
+            "0.153.3-lhc.1"
+        );
+        assert_eq!(
+            extract_version_from_latest_tag("v1.5.0").expect("failed to parse version"),
             "1.5.0"
         );
     }
 
     #[test]
-    fn latest_tag_without_prefix_is_invalid() {
-        assert!(extract_version_from_latest_tag("v1.5.0").is_err());
+    fn latest_tag_without_v_prefix_is_invalid() {
+        for tag in ["rust-v1.5.0", "1.5.0"] {
+            assert!(extract_version_from_latest_tag(tag).is_err(), "{tag:?}");
+        }
+    }
+
+    #[test]
+    fn fork_revision_and_upstream_base_increases_are_newer() {
+        assert_eq!(is_newer("0.153.3-lhc.1", "0.153.3"), Some(true));
+        assert_eq!(is_newer("0.153.3-lhc.2", "0.153.3-lhc.1"), Some(true));
+        assert_eq!(is_newer("0.153.4", "0.153.3-lhc.9"), Some(true));
+        assert_eq!(is_newer("0.153.3", "0.153.3-lhc.1"), Some(false));
+        assert_eq!(is_newer("0.153.3-lhc.1", "0.153.3-lhc.1"), Some(false));
     }
 
     #[test]

@@ -22,9 +22,12 @@ const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
 
 mod lhc_release;
+pub use lhc_release::LHC_INSTALL_DOCS_URL;
 pub use lhc_release::LHC_INSTALLER_URL_UNIX;
 pub use lhc_release::LHC_INSTALLER_URL_WINDOWS;
+pub use lhc_release::LHC_LATEST_RELEASE_API_URL;
 pub use lhc_release::LHC_RELEASE_VERSION;
+pub use lhc_release::LHC_RELEASES_URL;
 pub use lhc_release::parse_lhc_release;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

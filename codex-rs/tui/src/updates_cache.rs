@@ -15,7 +15,9 @@ pub(crate) struct VersionInfo {
     pub(crate) dismissed_version: Option<String>,
 }
 
-const VERSION_FILENAME: &str = "version.json";
+/// Fork-owned cache so a CODEX_HOME shared with stock Codex keeps its own
+/// `version.json` untouched.
+const VERSION_FILENAME: &str = "lhc-version.json";
 
 pub(crate) fn version_filepath(config: &Config) -> PathBuf {
     config.codex_home.join(VERSION_FILENAME).into_path_buf()

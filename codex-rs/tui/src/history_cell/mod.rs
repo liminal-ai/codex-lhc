@@ -59,6 +59,9 @@ use codex_app_server_protocol::ToolRequestUserInputQuestion;
 use codex_app_server_protocol::WebSearchAction;
 #[cfg(test)]
 use codex_config::types::McpServerTransportConfig;
+use codex_install_context::LHC_INSTALL_DOCS_URL;
+use codex_install_context::LHC_RELEASE_VERSION;
+use codex_install_context::LHC_RELEASES_URL;
 #[cfg(test)]
 use codex_mcp::qualified_mcp_tool_name_prefix;
 use codex_otel::RuntimeMetricsSummary;
