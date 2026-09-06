@@ -1,0 +1,1619 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+index a0223e9d72..c8ac9ec2c1 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -74,6 +74,7 @@ alias(
+ 
+ exports_files([
+     "AGENTS.md",
++    "lhc-release/VERSION",
+     "workspace_root_test_launcher.bat.tpl",
+     "workspace_root_test_launcher.sh.tpl",
+ ])
+diff --git a/codex-rs/cli/src/doctor/output.rs b/codex-rs/cli/src/doctor/output.rs
+index d3d7dfd914..ba4914e76f 100644
+--- a/codex-rs/cli/src/doctor/output.rs
++++ b/codex-rs/cli/src/doctor/output.rs
+@@ -529,7 +529,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
+         .find(|check| check.category == category)
+ }
+ 
+-fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote> {
++fn update_note(check: &DoctorCheck, _report: &DoctorReport) -> Option<DoctorNote> {
+     let status = detail::detail_value(check, "latest version status")?;
+     if !status.contains("newer version is available") {
+         return None;
+@@ -538,7 +538,7 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
+         .or_else(|| detail::detail_value(check, "cached latest version"))
+         .unwrap_or_else(|| "newer version".to_string());
+     let dismissed = detail::detail_value(check, "dismissed version");
+-    let mut parenthetical = format!("current {}", report.codex_version);
++    let mut parenthetical = format!("current {}", codex_install_context::LHC_RELEASE_VERSION);
+     if let Some(dismissed) = dismissed
+         && !detail::is_falsy(&dismissed)
+     {
+@@ -1664,7 +1664,10 @@ Run codex doctor without --summary for detailed diagnostics.
+         let rendered = render_human_report(&report, summary_no_color_unicode_options());
+ 
+         assert!(rendered.contains("Notes\n   ↑ updates"));
+-        assert!(rendered.contains("0.130.0 available (current 0.0.0, dismissed 0.128.0)"));
++        assert!(rendered.contains(&format!(
++            "0.130.0 available (current {}, dismissed 0.128.0)",
++            codex_install_context::LHC_RELEASE_VERSION
++        )));
+         assert!(rendered.contains("⚠ rollouts"));
+         assert!(rendered.contains("⚠ sandbox"));
+         assert!(rendered.contains("⚠ mcp"));
+diff --git a/codex-rs/cli/src/doctor/updates.rs b/codex-rs/cli/src/doctor/updates.rs
+index 08d0d3d276..3fb2cf06c3 100644
+--- a/codex-rs/cli/src/doctor/updates.rs
++++ b/codex-rs/cli/src/doctor/updates.rs
+@@ -19,6 +19,10 @@ use codex_http_client::ClientRouteClass;
+ use codex_http_client::RouteAwareClientPool;
+ use codex_install_context::InstallContext;
+ use codex_install_context::InstallMethod;
++use codex_install_context::LHC_INSTALL_DOCS_URL;
++use codex_install_context::LHC_LATEST_RELEASE_API_URL;
++use codex_install_context::LHC_RELEASE_VERSION;
++use codex_install_context::parse_lhc_release;
+ #[cfg(any(target_os = "macos", target_os = "windows"))]
+ use http::Method;
+ use serde::Deserialize;
+@@ -39,8 +43,8 @@ use super::network;
+ use super::npm_global_root_check;
+ use super::run_command;
+ 
+-const VERSION_FILE_NAME: &str = "version.json";
+-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
++/// The TUI's fork-owned cache; stock `version.json` is not inspected.
++const VERSION_FILE_NAME: &str = "lhc-version.json";
+ const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
+ #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+ const DESKTOP_UPDATE_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
+@@ -65,7 +69,10 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
+             "check for update on startup: {}",
+             config.check_for_update_on_startup
+         ),
+-        format!("update action: {}", update_action_label(&install_context)),
++        format!("running fork release: {LHC_RELEASE_VERSION}"),
++        "update action: installer-managed release builds run this executable with `update`"
++            .to_string(),
++        format!("manual update: {LHC_INSTALL_DOCS_URL}"),
+     ];
+     let version_file = config.codex_home.join(VERSION_FILE_NAME);
+     push_cached_version_details(&mut details, &version_file);
+@@ -115,7 +122,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
+     match fetch_latest_version(&install_context) {
+         Ok(latest_version) => {
+             details.push(format!("latest version: {latest_version}"));
+-            if is_newer(&latest_version, env!("CARGO_PKG_VERSION")) == Some(true) {
++            if is_newer_fork_release(&latest_version) {
+                 details.push("latest version status: newer version is available".to_string());
+             } else {
+                 details.push("latest version status: current version is not older".to_string());
+@@ -428,18 +435,6 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
+     }
+ }
+ 
+-fn update_action_label(context: &InstallContext) -> &'static str {
+-    match &context.method {
+-        InstallMethod::Npm => "npm install -g @openai/codex",
+-        InstallMethod::Bun => "bun install -g @openai/codex",
+-        InstallMethod::VitePlus => "vp install -g @openai/codex",
+-        InstallMethod::Pnpm => "pnpm add -g @openai/codex",
+-        InstallMethod::Brew => "brew upgrade --cask codex",
+-        InstallMethod::Standalone { .. } => "standalone installer",
+-        InstallMethod::Other => "manual or unknown",
+-    }
+-}
+-
+ fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
+     match &context.method {
+         InstallMethod::Brew => fetch_homebrew_cask_version(),
+@@ -458,11 +453,16 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
+         tag_name: String,
+     }
+ 
+-    let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
+-    info.tag_name
+-        .strip_prefix("rust-v")
++    let info = http_get_json::<ReleaseInfo>(LHC_LATEST_RELEASE_API_URL)?;
++    release_from_tag(&info.tag_name)
++}
++
++/// Fork releases are tagged `v<release>`.
++fn release_from_tag(tag_name: &str) -> Result<String, String> {
++    tag_name
++        .strip_prefix('v')
+         .map(str::to_string)
+-        .ok_or_else(|| format!("failed to parse latest tag {}", info.tag_name))
++        .ok_or_else(|| format!("failed to parse latest tag {tag_name}"))
+ }
+ 
+ fn fetch_homebrew_cask_version() -> Result<String, String> {
+@@ -482,19 +482,13 @@ where
+     serde_json::from_str::<T>(&body).map_err(|err| err.to_string())
+ }
+ 
+-fn is_newer(latest: &str, current: &str) -> Option<bool> {
+-    match (parse_version(latest), parse_version(current)) {
+-        (Some(latest), Some(current)) => Some(latest > current),
+-        (Some(_), None) | (None, Some(_)) | (None, None) => None,
+-    }
+-}
+-
+-fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
+-    let mut parts = value.trim().split('.');
+-    let major = parts.next()?.parse::<u64>().ok()?;
+-    let minor = parts.next()?.parse::<u64>().ok()?;
+-    let patch = parts.next()?.parse::<u64>().ok()?;
+-    Some((major, minor, patch))
++/// Whether `latest` is a newer fork release than the running one
++/// (`major.minor.patch[-lhc.revision]`, bare revision 0).
++fn is_newer_fork_release(latest: &str) -> bool {
++    matches!(
++        (parse_lhc_release(latest), parse_lhc_release(LHC_RELEASE_VERSION)),
++        (Some(latest), Some(current)) if latest > current
++    )
+ }
+ 
+ #[derive(Deserialize)]
+@@ -622,34 +616,55 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn is_newer_compares_plain_semver() {
+-        assert_eq!(is_newer("1.2.4", "1.2.3"), Some(true));
+-        assert_eq!(is_newer("1.2.3", "1.2.4"), Some(false));
+-        assert_eq!(is_newer("1.2.3-beta.1", "1.2.2"), None);
++    fn release_tags_drop_the_fork_prefix() {
++        assert_eq!(
++            release_from_tag("v0.153.3-lhc.1"),
++            Ok("0.153.3-lhc.1".to_string())
++        );
++        assert_eq!(release_from_tag("v0.154.0"), Ok("0.154.0".to_string()));
++        assert!(release_from_tag("rust-v0.153.3").is_err());
+     }
+ 
+     #[test]
+-    fn update_action_labels_install_contexts() {
+-        assert_eq!(
+-            update_action_label(&InstallContext {
+-                method: InstallMethod::Npm,
+-                package_layout: None,
+-            }),
+-            "npm install -g @openai/codex"
+-        );
+-        assert_eq!(
+-            update_action_label(&InstallContext {
+-                method: InstallMethod::Pnpm,
+-                package_layout: None,
+-            }),
+-            "pnpm add -g @openai/codex"
+-        );
++    fn newer_fork_releases_beat_the_running_release_by_revision_or_base() {
++        let (major, minor, patch, revision) =
++            parse_lhc_release(LHC_RELEASE_VERSION).expect("embedded release should parse");
++        let next_revision = format!("{major}.{minor}.{patch}-lhc.{}", revision + 1);
++        let next_base = format!("{major}.{minor}.{}", patch + 1);
++
++        assert!(is_newer_fork_release(&next_revision));
++        assert!(is_newer_fork_release(&next_base));
++        assert!(!is_newer_fork_release(LHC_RELEASE_VERSION));
++        assert!(!is_newer_fork_release(&format!("{major}.{minor}.{patch}")));
++        assert!(!is_newer_fork_release("0.153.3-beta.1"));
++    }
++
++    #[test]
++    fn cached_details_come_from_the_fork_cache_not_the_stock_file() {
++        let codex_home = tempfile::tempdir().expect("temporary Codex home should be created");
++        std::fs::write(
++            codex_home.path().join("version.json"),
++            r#"{"latest_version":"9.9.9","dismissed_version":"9.9.8"}"#,
++        )
++        .expect("stock cache should be written");
++        std::fs::write(
++            codex_home.path().join(VERSION_FILE_NAME),
++            r#"{"latest_version":"0.153.3-lhc.2","last_checked_at":"2026-09-06T00:00:00Z","dismissed_version":"0.153.3-lhc.1"}"#,
++        )
++        .expect("fork cache should be written");
++        let version_file = codex_home.path().join(VERSION_FILE_NAME);
++
++        let mut details = Vec::new();
++        push_cached_version_details(&mut details, &version_file);
++
+         assert_eq!(
+-            update_action_label(&InstallContext {
+-                method: InstallMethod::Other,
+-                package_layout: None,
+-            }),
+-            "manual or unknown"
++            details,
++            vec![
++                format!("version cache: {}", version_file.display()),
++                "cached latest version: 0.153.3-lhc.2".to_string(),
++                "last checked at: 2026-09-06T00:00:00Z".to_string(),
++                "dismissed version: 0.153.3-lhc.1".to_string(),
++            ]
+         );
+     }
+ }
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index 71d0323735..b71a98548e 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -124,6 +124,10 @@ struct MultitoolCli {
+     #[clap(flatten)]
+     interactive: TuiCli,
+ 
++    /// Print the codex-lhc fork release and exit.
++    #[arg(long = "lhc-version")]
++    lhc_version: bool,
++
+     #[clap(subcommand)]
+     subcommand: Option<Subcommand>,
+ }
+@@ -796,7 +800,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+         | ExitReason::ThreadRemoved => false,
+     };
+ 
+-    let update_action = exit_info.update_action;
++    let update_action = exit_info.update_action.clone();
+     let color_enabled = supports_color::on(Stream::Stdout).is_some();
+     for line in exit_info.format_exit_messages(color_enabled) {
+         println!("{line}");
+@@ -820,7 +824,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+         #[cfg(windows)]
+         {
+             let (cmd, args) = action.command_args();
+-            let cmd = if action == UpdateAction::StandaloneWindows {
++            let cmd = if matches!(
++                action,
++                UpdateAction::StandaloneWindows | UpdateAction::LhcWindows { .. }
++            ) {
+                 // These args contain PowerShell metacharacters, so do not let
+                 // PATHEXT select a batch shim for this action.
+                 "powershell.exe"
+@@ -889,8 +896,19 @@ fn run_update_command() -> anyhow::Result<()> {
+     #[cfg(not(debug_assertions))]
+     {
+         let Some(action) = codex_tui::get_update_action() else {
++            let installer = if cfg!(windows) {
++                format!(
++                    "Invoke-WebRequest {} -OutFile install.ps1; .\\install.ps1",
++                    codex_install_context::LHC_INSTALLER_URL_WINDOWS
++                )
++            } else {
++                format!(
++                    "curl -fsSLO {} && sh install.sh",
++                    codex_install_context::LHC_INSTALLER_URL_UNIX
++                )
++            };
+             anyhow::bail!(
+-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
++                "This Codex + LHC binary was not installed by the fork installer, so it cannot update itself. Install or update it manually:\n  {installer}"
+             );
+         };
+         run_update_action(action)
+@@ -1052,8 +1070,13 @@ async fn cli_main(
+         feature_toggles,
+         remote,
+         mut interactive,
++        lhc_version,
+         subcommand,
+     } = MultitoolCli::parse();
++    if lhc_version {
++        println!("{}", codex_install_context::LHC_RELEASE_VERSION);
++        return Ok(());
++    }
+     // Fold --enable/--disable into config overrides so they flow to all subcommands.
+     let toggle_overrides = feature_toggles.to_overrides()?;
+     root_config_overrides.raw_overrides.extend(toggle_overrides);
+@@ -3019,6 +3042,7 @@ mod tests {
+             subcommand,
+             feature_toggles: _,
+             remote: _,
++            lhc_version: _,
+         } = cli;
+         interactive
+             .shared
+@@ -3056,6 +3080,7 @@ mod tests {
+             subcommand,
+             feature_toggles: _,
+             remote: _,
++            lhc_version: _,
+         } = cli;
+         interactive
+             .shared
+@@ -3100,6 +3125,7 @@ mod tests {
+             subcommand,
+             feature_toggles: _,
+             remote: _,
++            lhc_version: _,
+         } = cli;
+ 
+         let Subcommand::Archive(SessionArchiveCommand {
+diff --git a/codex-rs/install-context/BUILD.bazel b/codex-rs/install-context/BUILD.bazel
+index 68254d10cc..470fe758d8 100644
+--- a/codex-rs/install-context/BUILD.bazel
++++ b/codex-rs/install-context/BUILD.bazel
+@@ -2,5 +2,6 @@ load("//:defs.bzl", "codex_rust_crate")
+ 
+ codex_rust_crate(
+     name = "install-context",
++    compile_data = ["//:lhc-release/VERSION"],
+     crate_name = "codex_install_context",
+ )
+diff --git a/codex-rs/install-context/src/lhc_release.rs b/codex-rs/install-context/src/lhc_release.rs
+new file mode 100644
+index 0000000000..9c3767011a
+--- /dev/null
++++ b/codex-rs/install-context/src/lhc_release.rs
+@@ -0,0 +1,48 @@
++//! Fork release identity: the `lhc-release/VERSION` value embedded in the binary
++//! and the `major.minor.patch-lhc.revision` ordering used by release lookups.
++
++/// The fork release recorded in `lhc-release/VERSION`, without trailing whitespace.
++pub const LHC_RELEASE_VERSION: &str = include_str!("../../../lhc-release/VERSION").trim_ascii();
++
++/// The GitHub API endpoint describing the fork's latest published release.
++pub const LHC_LATEST_RELEASE_API_URL: &str =
++    "https://api.github.com/repos/liminal-ai/codex-lhc/releases/latest";
++
++/// The fork's latest release page: notes, checksums, packages, and installers.
++pub const LHC_RELEASES_URL: &str = "https://github.com/liminal-ai/codex-lhc/releases/latest";
++
++/// The fork's install and update instructions.
++pub const LHC_INSTALL_DOCS_URL: &str =
++    "https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md";
++
++/// The latest-release download URL of the fork's Unix installer.
++pub const LHC_INSTALLER_URL_UNIX: &str =
++    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh";
++
++/// The latest-release download URL of the fork's PowerShell installer.
++pub const LHC_INSTALLER_URL_WINDOWS: &str =
++    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1";
++
++/// Parse a fork release (`major.minor.patch-lhc.revision`) or bare upstream
++/// release (`major.minor.patch`, treated as revision 0) into a sortable tuple.
++/// Any other form, including tag prefixes, returns `None`.
++pub fn parse_lhc_release(release: &str) -> Option<(u64, u64, u64, u64)> {
++    let (base, revision) = match release.trim().split_once("-lhc.") {
++        Some((base, revision)) => (base, revision.parse::<u64>().ok()?),
++        None => (release.trim(), 0),
++    };
++    let mut parts = base.split('.').map(str::parse::<u64>);
++    let (major, minor, patch) = (
++        parts.next()?.ok()?,
++        parts.next()?.ok()?,
++        parts.next()?.ok()?,
++    );
++    if parts.next().is_some() {
++        return None;
++    }
++    Some((major, minor, patch, revision))
++}
++
++#[cfg(test)]
++#[path = "lhc_release_tests.rs"]
++mod tests;
+diff --git a/codex-rs/install-context/src/lhc_release_tests.rs b/codex-rs/install-context/src/lhc_release_tests.rs
+new file mode 100644
+index 0000000000..9d4ab4fe47
+--- /dev/null
++++ b/codex-rs/install-context/src/lhc_release_tests.rs
+@@ -0,0 +1,32 @@
++use super::*;
++use pretty_assertions::assert_eq;
++
++#[test]
++fn orders_by_base_then_revision() {
++    assert_eq!(parse_lhc_release("0.153.3-lhc.2"), Some((0, 153, 3, 2)));
++    assert!(parse_lhc_release("0.153.3-lhc.2") > parse_lhc_release("0.153.3-lhc.1"));
++    assert!(parse_lhc_release("0.154.0-lhc.1") > parse_lhc_release("0.153.3-lhc.9"));
++    assert!(parse_lhc_release("1.0.0") > parse_lhc_release("0.153.3-lhc.9"));
++}
++
++#[test]
++fn bare_release_is_revision_zero() {
++    assert_eq!(parse_lhc_release("0.153.3\n"), Some((0, 153, 3, 0)));
++    assert!(parse_lhc_release("0.153.3-lhc.1") > parse_lhc_release("0.153.3"));
++}
++
++#[test]
++fn rejects_unsupported_forms() {
++    for release in [
++        "v0.153.3",
++        "rust-v0.153.3",
++        "0.153",
++        "0.153.3.4",
++        "0.153.3-lhc",
++        "0.153.3-lhc.x",
++        "0.153.3-beta.1",
++        "",
++    ] {
++        assert_eq!(parse_lhc_release(release), None, "{release:?}");
++    }
++}
+diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
+index 699add63db..0b6fd407cc 100644
+--- a/codex-rs/install-context/src/lib.rs
++++ b/codex-rs/install-context/src/lib.rs
+@@ -21,6 +21,15 @@ const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
+ const ZSH_DIRNAME: &str = "zsh";
+ static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
+ 
++mod lhc_release;
++pub use lhc_release::LHC_INSTALL_DOCS_URL;
++pub use lhc_release::LHC_INSTALLER_URL_UNIX;
++pub use lhc_release::LHC_INSTALLER_URL_WINDOWS;
++pub use lhc_release::LHC_LATEST_RELEASE_API_URL;
++pub use lhc_release::LHC_RELEASE_VERSION;
++pub use lhc_release::LHC_RELEASES_URL;
++pub use lhc_release::parse_lhc_release;
++
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum StandalonePlatform {
+     Unix,
+diff --git a/codex-rs/tui/src/app/exit_summary.rs b/codex-rs/tui/src/app/exit_summary.rs
+index 39b023805b..f2417680cc 100644
+--- a/codex-rs/tui/src/app/exit_summary.rs
++++ b/codex-rs/tui/src/app/exit_summary.rs
+@@ -71,7 +71,7 @@ impl App {
+                 self.chat_widget.rollout_path().as_deref(),
+             ),
+             disconnect_info,
+-            update_action: self.pending_update_action,
++            update_action: self.pending_update_action.clone(),
+             exit_reason,
+         }
+     }
+diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
+index 4e51d50f7c..38e2861727 100644
+--- a/codex-rs/tui/src/history_cell/mod.rs
++++ b/codex-rs/tui/src/history_cell/mod.rs
+@@ -59,6 +59,9 @@ use codex_app_server_protocol::ToolRequestUserInputQuestion;
+ use codex_app_server_protocol::WebSearchAction;
+ #[cfg(test)]
+ use codex_config::types::McpServerTransportConfig;
++use codex_install_context::LHC_INSTALL_DOCS_URL;
++use codex_install_context::LHC_RELEASE_VERSION;
++use codex_install_context::LHC_RELEASES_URL;
+ #[cfg(test)]
+ use codex_mcp::qualified_mcp_tool_name_prefix;
+ use codex_otel::RuntimeMetricsSummary;
+diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
+index bd68c83457..8b2445897c 100644
+--- a/codex-rs/tui/src/history_cell/notices.rs
++++ b/codex-rs/tui/src/history_cell/notices.rs
+@@ -26,29 +26,35 @@ impl HistoryCell for UpdateAvailableHistoryCell {
+     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+         use ratatui_macros::line;
+         use ratatui_macros::text;
+-        let update_instruction = if let Some(update_action) = self.update_action {
+-            line!["Run ", update_action.command_str().cyan(), " to update."]
+-        } else {
+-            line![
++        // The fork's installer action is a shell script; give advice instead
++        // of printing it. Upstream's retained variants keep their command.
++        let update_instruction = match &self.update_action {
++            Some(UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. }) => line![
++                "Run your Codex + LHC command with ",
++                "update".cyan(),
++                " to install it."
++            ],
++            Some(update_action) => {
++                line!["Run ", update_action.command_str().cyan(), " to update."]
++            }
++            None => line![
+                 "See ",
+-                "https://github.com/openai/codex".cyan().underlined(),
++                LHC_INSTALL_DOCS_URL.cyan().underlined(),
+                 " for installation options."
+-            ]
++            ],
+         };
+ 
+         let content = text![
+             line![
+                 "✨\u{200A}".bold().cyan(),
+-                "Update available!".bold().cyan(),
++                "Codex + LHC update available!".bold().cyan(),
+                 " ",
+-                format!("{CODEX_CLI_VERSION} -> {}", self.latest_version).bold(),
++                format!("{LHC_RELEASE_VERSION} -> {}", self.latest_version).bold(),
+             ],
+             update_instruction,
+             "",
+             "See full release notes:",
+-            "https://github.com/openai/codex/releases/latest"
+-                .cyan()
+-                .underlined(),
++            LHC_RELEASES_URL.cyan().underlined(),
+         ];
+ 
+         let inner_width = content
+@@ -60,18 +66,20 @@ impl HistoryCell for UpdateAvailableHistoryCell {
+     }
+ 
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+-        let update_instruction = if let Some(update_action) = self.update_action {
+-            format!("Run {} to update.", update_action.command_str())
+-        } else {
+-            "See https://github.com/openai/codex for installation options.".to_string()
++        let update_instruction = match &self.update_action {
++            Some(UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. }) => {
++                "Run your Codex + LHC command with update to install it.".to_string()
++            }
++            Some(update_action) => format!("Run {} to update.", update_action.command_str()),
++            None => format!("See {LHC_INSTALL_DOCS_URL} for installation options."),
+         };
+         vec![
+-            Line::from("Update available!"),
+-            Line::from(format!("{CODEX_CLI_VERSION} -> {}", self.latest_version)),
++            Line::from("Codex + LHC update available!"),
++            Line::from(format!("{LHC_RELEASE_VERSION} -> {}", self.latest_version)),
+             Line::from(update_instruction),
+             Line::from(""),
+             Line::from("See full release notes:"),
+-            Line::from("https://github.com/openai/codex/releases/latest"),
++            Line::from(LHC_RELEASES_URL),
+         ]
+     }
+ 
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap
+new file mode 100644
+index 0000000000..f579e8ea9f
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap
+@@ -0,0 +1,11 @@
++---
++source: tui/src/history_cell/tests.rs
++expression: rendered
++---
++╭─────────────────────────────────────────────────────────╮
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ Run your Codex + LHC command with update to install it. │
++│                                                         │
++│ See full release notes:                                 │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest │
++╰─────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
+index a9dd9cac78..d424a4fb57 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
+@@ -2,10 +2,10 @@
+ source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+-╭─────────────────────────────────────────────────╮
+-│ ✨ Update available! 0.0.0 -> 9.9.9             │
+-│ Run pnpm add -g @openai/codex to update.        │
+-│                                                 │
+-│ See full release notes:                         │
+-│ https://github.com/openai/codex/releases/latest │
+-╰─────────────────────────────────────────────────╯
++╭─────────────────────────────────────────────────────────╮
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ Run pnpm add -g @openai/codex to update.                │
++│                                                         │
++│ See full release notes:                                 │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest │
++╰─────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
+index c8f352dbb4..11151ea1d6 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
+@@ -3,9 +3,9 @@ source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+ ╭─────────────────────────────────────────────────────────────────────────────────────────────────────╮
+-│ ✨ Update available! 0.0.0 -> 9.9.9                                                                 │
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9                                                   │
+ │ Run sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh' to update. │
+ │                                                                                                     │
+ │ See full release notes:                                                                             │
+-│ https://github.com/openai/codex/releases/latest                                                     │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest                                             │
+ ╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
+index fb15a05775..cff797ffa5 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
+@@ -3,10 +3,10 @@ source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+-│ ✨ Update available! 0.0.0 -> 9.9.9                                                                        │
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9                                                          │
+ │ Run powershell -ExecutionPolicy Bypass -c '$env:CODEX_NON_INTERACTIVE=1; irm                               │
+ │ https://chatgpt.com/codex/install.ps1 | iex' to update.                                                    │
+ │                                                                                                            │
+ │ See full release notes:                                                                                    │
+-│ https://github.com/openai/codex/releases/latest                                                            │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest                                                    │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
+new file mode 100644
+index 0000000000..42ee77ffb5
+--- /dev/null
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
+@@ -0,0 +1,11 @@
++---
++source: tui/src/history_cell/tests.rs
++expression: rendered
++---
++╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1                                            │
++│ See https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md for installation options. │
++│                                                                                                    │
++│ See full release notes:                                                                            │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest                                            │
++╰────────────────────────────────────────────────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
+index 1a2df82a9d..e97c306559 100644
+--- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
++++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
+@@ -2,10 +2,10 @@
+ source: tui/src/history_cell/tests.rs
+ expression: rendered
+ ---
+-╭─────────────────────────────────────────────────╮
+-│ ✨ Update available! 0.0.0 -> 9.9.9             │
+-│ Run vp install -g @openai/codex to update.      │
+-│                                                 │
+-│ See full release notes:                         │
+-│ https://github.com/openai/codex/releases/latest │
+-╰─────────────────────────────────────────────────╯
++╭─────────────────────────────────────────────────────────╮
++│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ Run vp install -g @openai/codex to update.              │
++│                                                         │
++│ See full release notes:                                 │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest │
++╰─────────────────────────────────────────────────────────╯
+diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
+index ae781fc3a9..a38ad6eaa8 100644
+--- a/codex-rs/tui/src/history_cell/tests.rs
++++ b/codex-rs/tui/src/history_cell/tests.rs
+@@ -1220,6 +1220,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
+     insta::assert_snapshot!(rendered);
+ }
+ 
++#[test]
++fn unmanaged_update_available_history_cell_snapshot() {
++    let cell = UpdateAvailableHistoryCell::new("9.9.9-lhc.1".to_string(), None);
++    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
++
++    insta::assert_snapshot!(rendered);
++}
++
++#[cfg(unix)]
++#[test]
++fn lhc_unix_update_available_history_cell_snapshot() {
++    let store = AbsolutePathBuf::from_absolute_path("/home/codex/.local/share/codex-lhc")
++        .expect("store should be absolute");
++    let cell =
++        UpdateAvailableHistoryCell::new("9.9.9".to_string(), Some(UpdateAction::LhcUnix { store }));
++    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
++
++    insta::assert_snapshot!(rendered);
++}
++
+ #[test]
+ fn standalone_windows_update_available_history_cell_snapshot() {
+     let cell =
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
+index 24d8831c95..3b959a0702 100644
+--- a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
++++ b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
+@@ -2,11 +2,12 @@
+ source: tui/src/update_prompt.rs
+ expression: terminal.backend()
+ ---
+-  ✨ Update available! 0.0.0 -> 9.9.9
+ 
+-  Release notes: https://github.com/openai/codex/releases/latest
++  ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1
+ 
+-› 1. Update now (runs `npm install -g @openai/codex@latest`)                    
++  Release notes: https://github.com/liminal-ai/codex-lhc/releases/latest
++
++› 1. Update now (re-runs the Codex + LHC installer)                             
+   2. Skip
+   3. Skip until next version
+ 
+diff --git a/codex-rs/tui/src/update_action.rs b/codex-rs/tui/src/update_action.rs
+index 225c457086..59cc4f07d7 100644
+--- a/codex-rs/tui/src/update_action.rs
++++ b/codex-rs/tui/src/update_action.rs
+@@ -1,12 +1,13 @@
+ #[cfg(any(not(debug_assertions), test))]
+ use codex_install_context::InstallContext;
++use codex_install_context::LHC_INSTALLER_URL_UNIX;
++use codex_install_context::LHC_INSTALLER_URL_WINDOWS;
++use codex_utils_absolute_path::AbsolutePathBuf;
+ #[cfg(any(not(debug_assertions), test))]
+-use codex_install_context::InstallMethod;
+-#[cfg(any(not(debug_assertions), test))]
+-use codex_install_context::StandalonePlatform;
++use std::ffi::OsStr;
+ 
+ /// Update action the CLI should perform after the TUI exits.
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++#[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum UpdateAction {
+     /// Update via `npm install -g @openai/codex@latest`.
+     NpmGlobalLatest,
+@@ -22,159 +23,128 @@ pub enum UpdateAction {
+     StandaloneUnix,
+     /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
+     StandaloneWindows,
++    /// Update via the fork's `install.sh` against the managed package store.
++    /// The installer reads the recorded command name and prefix from the store.
++    LhcUnix { store: AbsolutePathBuf },
++    /// Update via the fork's `install.ps1` against the managed package store.
++    LhcWindows { store: AbsolutePathBuf },
+ }
+ 
+ impl UpdateAction {
++    /// The fork updates one install shape only: the running package is
++    /// `<store>/versions/<version>` and the store carries the installer's
++    /// ownership record. Every other install gets manual instructions.
+     #[cfg(any(not(debug_assertions), test))]
+     pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
+-        match &context.method {
+-            InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
+-            InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
+-            InstallMethod::VitePlus => Some(UpdateAction::VitePlusGlobalLatest),
+-            InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
+-            InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
+-            InstallMethod::Standalone { platform, .. } => Some(match platform {
+-                StandalonePlatform::Unix => UpdateAction::StandaloneUnix,
+-                StandalonePlatform::Windows => UpdateAction::StandaloneWindows,
+-            }),
+-            InstallMethod::Other => None,
++        let package_dir = &context.package_layout.as_ref()?.package_dir;
++        let versions_dir = package_dir.parent()?;
++        if versions_dir.file_name() != Some(OsStr::new("versions")) {
++            return None;
++        }
++        // The layout was canonicalized with std::fs, which on Windows keeps a
++        // verbatim `\\?\` prefix that neither the PowerShell installer nor the
++        // launcher it writes can use.
++        let store = AbsolutePathBuf::from_absolute_path(dunce::simplified(
++            versions_dir.parent()?.as_path(),
++        ))
++        .ok()?;
++        let ownership_record = if cfg!(windows) {
++            ".codex-lhc-managed"
++        } else {
++            "installed-name"
++        };
++        if !store.join(ownership_record).is_file() {
++            return None;
+         }
++        Some(if cfg!(windows) {
++            UpdateAction::LhcWindows { store }
++        } else {
++            UpdateAction::LhcUnix { store }
++        })
+     }
+ 
+-    /// Returns the list of command-line arguments for invoking the update.
+-    pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
++    /// Returns the command and arguments for invoking the update.
++    pub fn command_args(&self) -> (&'static str, Vec<String>) {
+         match self {
+-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
+-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
+-            UpdateAction::VitePlusGlobalLatest => ("vp", &["install", "-g", "@openai/codex"]),
+-            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
+-            UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
++            UpdateAction::NpmGlobalLatest => {
++                ("npm", static_args(&["install", "-g", "@openai/codex"]))
++            }
++            UpdateAction::BunGlobalLatest => {
++                ("bun", static_args(&["install", "-g", "@openai/codex"]))
++            }
++            UpdateAction::VitePlusGlobalLatest => {
++                ("vp", static_args(&["install", "-g", "@openai/codex"]))
++            }
++            UpdateAction::PnpmGlobalLatest => {
++                ("pnpm", static_args(&["add", "-g", "@openai/codex"]))
++            }
++            UpdateAction::BrewUpgrade => ("brew", static_args(&["upgrade", "--cask", "codex"])),
+             UpdateAction::StandaloneUnix => (
+                 "sh",
+-                &[
++                static_args(&[
+                     "-c",
+                     "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
+-                ],
++                ]),
+             ),
+             UpdateAction::StandaloneWindows => (
+                 "powershell",
+-                &[
++                static_args(&[
+                     "-ExecutionPolicy",
+                     "Bypass",
+                     "-c",
+                     "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
++                ]),
++            ),
++            // Download to a file first: a failed download then stops the
++            // update instead of piping a partial script into the shell. The
++            // store travels as `$1` so its path is never re-parsed, and the
++            // script avoids single quotes so its shell-quoted display stays
++            // readable.
++            UpdateAction::LhcUnix { store } => (
++                "sh",
++                vec![
++                    "-c".to_string(),
++                    format!(
++                        "f=$(mktemp \"${{TMPDIR:-/tmp}}/codex-lhc-install.XXXXXX\") && curl -fsSL {LHC_INSTALLER_URL_UNIX} -o \"$f\" && sh \"$f\" --install-root \"$1\"; s=$?; rm -f \"$f\"; exit $s"
++                    ),
++                    "sh".to_string(),
++                    store.to_string_lossy().into_owned(),
+                 ],
+             ),
++            UpdateAction::LhcWindows { store } => {
++                let store = store.to_string_lossy().replace('\'', "''");
++                (
++                    "powershell",
++                    vec![
++                        "-ExecutionPolicy".to_string(),
++                        "Bypass".to_string(),
++                        "-c".to_string(),
++                        format!(
++                            "$ErrorActionPreference = 'Stop'; $installer = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-lhc-install-' + [guid]::NewGuid() + '.ps1'); try {{ Invoke-WebRequest '{LHC_INSTALLER_URL_WINDOWS}' -OutFile $installer; & $installer -InstallRoot '{store}' }} finally {{ Remove-Item $installer -Force -ErrorAction SilentlyContinue }}"
++                        ),
++                    ],
++                )
++            }
+         }
+     }
+ 
+     /// Returns string representation of the command-line arguments for invoking the update.
+-    pub fn command_str(self) -> String {
++    pub fn command_str(&self) -> String {
+         let (command, args) = self.command_args();
+-        shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
++        shlex::try_join(std::iter::once(command).chain(args.iter().map(String::as_str)))
+             .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
+     }
+ }
+ 
++fn static_args(args: &[&str]) -> Vec<String> {
++    args.iter().map(ToString::to_string).collect()
++}
++
+ #[cfg(not(debug_assertions))]
+ pub fn get_update_action() -> Option<UpdateAction> {
+     UpdateAction::from_install_context(InstallContext::current())
+ }
+ 
+ #[cfg(test)]
+-mod tests {
+-    use super::*;
+-    use codex_utils_absolute_path::AbsolutePathBuf;
+-    use pretty_assertions::assert_eq;
+-
+-    #[test]
+-    fn maps_install_context_to_update_action() {
+-        let native_release_dir =
+-            AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("native-release"))
+-                .expect("temp dir path should be absolute");
+-
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Other,
+-                package_layout: None,
+-            }),
+-            None
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Npm,
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::NpmGlobalLatest)
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Bun,
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::BunGlobalLatest)
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Pnpm,
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::PnpmGlobalLatest)
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Brew,
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::BrewUpgrade)
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Standalone {
+-                    platform: StandalonePlatform::Unix,
+-                    release_dir: native_release_dir.clone(),
+-                    resources_dir: Some(native_release_dir.join("codex-resources")),
+-                },
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::StandaloneUnix)
+-        );
+-        assert_eq!(
+-            UpdateAction::from_install_context(&InstallContext {
+-                method: InstallMethod::Standalone {
+-                    platform: StandalonePlatform::Windows,
+-                    release_dir: native_release_dir.clone(),
+-                    resources_dir: Some(native_release_dir.join("codex-resources")),
+-                },
+-                package_layout: None,
+-            }),
+-            Some(UpdateAction::StandaloneWindows)
+-        );
+-    }
+-
+-    #[test]
+-    fn standalone_update_commands_rerun_latest_installer() {
+-        assert_eq!(
+-            UpdateAction::StandaloneUnix.command_args(),
+-            (
+-                "sh",
+-                &[
+-                    "-c",
+-                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
+-                ][..],
+-            )
+-        );
+-        assert_eq!(
+-            UpdateAction::StandaloneWindows.command_args(),
+-            (
+-                "powershell",
+-                &[
+-                    "-ExecutionPolicy",
+-                    "Bypass",
+-                    "-c",
+-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
+-                ][..],
+-            )
+-        );
+-    }
+-}
++#[path = "update_action_tests.rs"]
++mod tests;
+diff --git a/codex-rs/tui/src/update_action_tests.rs b/codex-rs/tui/src/update_action_tests.rs
+new file mode 100644
+index 0000000000..f29c5b22c3
+--- /dev/null
++++ b/codex-rs/tui/src/update_action_tests.rs
+@@ -0,0 +1,361 @@
++use super::*;
++use codex_install_context::CodexPackageLayout;
++use codex_install_context::InstallMethod;
++use pretty_assertions::assert_eq;
++use std::fs;
++use std::path::Path;
++
++/// The store file this platform's detection requires, and the one it ignores.
++const REQUIRED_RECORD: &str = if cfg!(windows) {
++    ".codex-lhc-managed"
++} else {
++    "installed-name"
++};
++const OTHER_RECORD: &str = if cfg!(windows) {
++    "installed-name"
++} else {
++    ".codex-lhc-managed"
++};
++
++fn lhc_action(store: AbsolutePathBuf) -> UpdateAction {
++    if cfg!(windows) {
++        UpdateAction::LhcWindows { store }
++    } else {
++        UpdateAction::LhcUnix { store }
++    }
++}
++
++/// The install context a binary launched from `package_dir/bin` would see.
++fn package_layout_context(package_dir: &Path) -> InstallContext {
++    let package_dir =
++        AbsolutePathBuf::from_absolute_path(package_dir).expect("package dir should be absolute");
++    InstallContext {
++        method: InstallMethod::Other,
++        package_layout: Some(CodexPackageLayout {
++            bin_dir: package_dir.join("bin"),
++            package_dir,
++            resources_dir: None,
++            path_dir: None,
++        }),
++    }
++}
++
++/// Lay out `<store>/versions/<version>` with both store records the fork
++/// installers write, returning the package directory.
++fn managed_package(store: &Path) -> std::path::PathBuf {
++    let package_dir = store.join("versions").join("0.153.3");
++    fs::create_dir_all(package_dir.join("bin")).expect("create package bin dir");
++    fs::write(store.join("installed-name"), "codex-lhc\n").expect("write installed-name");
++    fs::write(store.join(".codex-lhc-managed"), "managed\n").expect("write marker");
++    package_dir
++}
++
++#[test]
++fn managed_package_store_maps_to_lhc_installer() {
++    let temp = tempfile::tempdir().expect("temp dir");
++    let store = temp.path().join("codex-lhc");
++    let package_dir = managed_package(&store);
++    // InstallContext canonicalizes the running package with std::fs, so feed
++    // the same shape (verbatim-prefixed on Windows) and expect a plain store.
++    let canonical_package_dir = fs::canonicalize(&package_dir).expect("canonical package dir");
++    let expected_store =
++        AbsolutePathBuf::from_absolute_path(dunce::canonicalize(&store).expect("canonical store"))
++            .expect("store should be absolute");
++
++    assert_eq!(
++        UpdateAction::from_install_context(&package_layout_context(&canonical_package_dir)),
++        Some(lhc_action(expected_store))
++    );
++}
++
++#[test]
++fn unmanaged_layouts_get_no_update_action() {
++    let temp = tempfile::tempdir().expect("temp dir");
++
++    // No package layout at all, whatever upstream's method detection decided.
++    for method in [
++        InstallMethod::Other,
++        InstallMethod::Npm,
++        InstallMethod::Brew,
++    ] {
++        assert_eq!(
++            UpdateAction::from_install_context(&InstallContext {
++                method,
++                package_layout: None,
++            }),
++            None
++        );
++    }
++
++    // A package that is not under `<store>/versions/`, even with the records.
++    let loose_store = temp.path().join("loose");
++    let loose_package = loose_store.join("0.153.3");
++    fs::create_dir_all(loose_package.join("bin")).expect("create loose package");
++    fs::write(loose_store.join(REQUIRED_RECORD), "codex-lhc\n").expect("write record");
++    assert_eq!(
++        UpdateAction::from_install_context(&package_layout_context(&loose_package)),
++        None
++    );
++
++    // The supported layout without this platform's ownership record.
++    let unowned_store = temp.path().join("unowned");
++    let unowned_package = managed_package(&unowned_store);
++    fs::remove_file(unowned_store.join(REQUIRED_RECORD)).expect("remove required record");
++    assert!(unowned_store.join(OTHER_RECORD).is_file());
++    assert_eq!(
++        UpdateAction::from_install_context(&package_layout_context(&unowned_package)),
++        None
++    );
++}
++
++#[test]
++fn standalone_update_commands_rerun_latest_installer() {
++    assert_eq!(
++        UpdateAction::StandaloneUnix.command_args(),
++        (
++            "sh",
++            static_args(&[
++                "-c",
++                "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
++            ]),
++        )
++    );
++    assert_eq!(
++        UpdateAction::StandaloneWindows.command_args(),
++        (
++            "powershell",
++            static_args(&[
++                "-ExecutionPolicy",
++                "Bypass",
++                "-c",
++                "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
++            ]),
++        )
++    );
++}
++
++#[cfg(unix)]
++mod unix_process {
++    use super::*;
++    use pretty_assertions::assert_eq;
++    use std::os::unix::fs::PermissionsExt;
++    use std::process::Command;
++    use std::process::ExitStatus;
++
++    struct UpdateRun {
++        status: ExitStatus,
++        curl_args: Option<String>,
++        installer_args: Option<String>,
++        leftover_downloads: Vec<std::path::PathBuf>,
++        downloads_dir: std::path::PathBuf,
++    }
++
++    fn write_script(path: &Path, body: &str) {
++        fs::write(path, body).expect("write script");
++        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod script");
++    }
++
++    /// Run the real Unix update command with `curl` replaced by a shim that
++    /// records its arguments and "downloads" a recording installer. Nothing
++    /// reaches the network or a real store.
++    fn run_lhc_unix_update(store: &Path, curl_exit: i32, installer_exit: i32) -> UpdateRun {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let bin = temp.path().join("bin");
++        let downloads_dir = temp.path().join("downloads");
++        fs::create_dir_all(&bin).expect("create shim bin");
++        fs::create_dir_all(&downloads_dir).expect("create downloads dir");
++        let curl_args = temp.path().join("curl-args");
++        let installer = temp.path().join("installer.sh");
++        let installer_args = temp.path().join("installer-args");
++        write_script(
++            &bin.join("curl"),
++            "#!/bin/sh\n\
++             printf '%s\\n' \"$@\" > \"$CODEX_LHC_TEST_CURL_ARGS\"\n\
++             [ \"$CODEX_LHC_TEST_CURL_EXIT\" -eq 0 ] || exit \"$CODEX_LHC_TEST_CURL_EXIT\"\n\
++             while [ \"$#\" -gt 1 ]; do\n\
++               if [ \"$1\" = -o ]; then cp \"$CODEX_LHC_TEST_INSTALLER\" \"$2\"; exit 0; fi\n\
++               shift\n\
++             done\n\
++             exit 1\n",
++        );
++        write_script(
++            &installer,
++            "#!/bin/sh\n\
++             printf '%s\\n' \"$@\" > \"$CODEX_LHC_TEST_INSTALLER_ARGS\"\n\
++             exit \"$CODEX_LHC_TEST_INSTALLER_EXIT\"\n",
++        );
++
++        let action = UpdateAction::LhcUnix {
++            store: AbsolutePathBuf::from_absolute_path(store).expect("store should be absolute"),
++        };
++        let (command, args) = action.command_args();
++        let status = Command::new(command)
++            .args(&args)
++            .env_clear()
++            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
++            .env("TMPDIR", &downloads_dir)
++            .env("CODEX_LHC_TEST_CURL_ARGS", &curl_args)
++            .env("CODEX_LHC_TEST_CURL_EXIT", curl_exit.to_string())
++            .env("CODEX_LHC_TEST_INSTALLER", &installer)
++            .env("CODEX_LHC_TEST_INSTALLER_ARGS", &installer_args)
++            .env("CODEX_LHC_TEST_INSTALLER_EXIT", installer_exit.to_string())
++            .status()
++            .expect("run update command");
++        UpdateRun {
++            status,
++            curl_args: fs::read_to_string(&curl_args).ok(),
++            installer_args: fs::read_to_string(&installer_args).ok(),
++            leftover_downloads: fs::read_dir(&downloads_dir)
++                .expect("read downloads dir")
++                .map(|entry| entry.expect("downloads entry").path())
++                .collect(),
++            downloads_dir,
++        }
++    }
++
++    #[test]
++    fn lhc_unix_update_runs_downloaded_installer_against_selected_store() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_unix_update(
++            store.path(),
++            /*curl_exit*/ 0,
++            /*installer_exit*/ 0,
++        );
++
++        assert!(run.status.success(), "status {}", run.status);
++        let curl_args = run.curl_args.expect("curl should record its arguments");
++        let download_prefix = format!(
++            "-fsSL\n{LHC_INSTALLER_URL_UNIX}\n-o\n{}/codex-lhc-install.",
++            run.downloads_dir.display()
++        );
++        assert!(
++            curl_args.starts_with(&download_prefix),
++            "curl args {curl_args:?} should start with {download_prefix:?}"
++        );
++        assert_eq!(
++            run.installer_args,
++            Some(format!("--install-root\n{}\n", store.path().display()))
++        );
++        assert_eq!(run.leftover_downloads, Vec::<std::path::PathBuf>::new());
++    }
++
++    #[test]
++    fn lhc_unix_update_stops_when_download_fails() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_unix_update(
++            store.path(),
++            /*curl_exit*/ 22,
++            /*installer_exit*/ 0,
++        );
++
++        assert_eq!(run.status.code(), Some(22));
++        assert_eq!(run.installer_args, None);
++        assert_eq!(run.leftover_downloads, Vec::<std::path::PathBuf>::new());
++    }
++
++    #[test]
++    fn lhc_unix_update_reports_installer_failure() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_unix_update(
++            store.path(),
++            /*curl_exit*/ 0,
++            /*installer_exit*/ 3,
++        );
++
++        assert_eq!(run.status.code(), Some(3));
++        assert_eq!(
++            run.installer_args,
++            Some(format!("--install-root\n{}\n", store.path().display()))
++        );
++        assert_eq!(run.leftover_downloads, Vec::<std::path::PathBuf>::new());
++    }
++}
++
++#[cfg(windows)]
++mod windows_process {
++    use super::*;
++    use pretty_assertions::assert_eq;
++    use std::process::Command;
++    use std::process::ExitStatus;
++
++    struct UpdateRun {
++        status: ExitStatus,
++        download_url: Option<String>,
++        installer_args: Option<String>,
++    }
++
++    /// Run the real Windows update script with `Invoke-WebRequest` shadowed by
++    /// a function that records the URL and "downloads" a recording installer.
++    /// Nothing reaches the network or a real store.
++    fn run_lhc_windows_update(
++        store: &Path,
++        download_fail: &str,
++        installer_fail: &str,
++    ) -> UpdateRun {
++        let temp = tempfile::tempdir().expect("temp dir");
++        let installer = temp.path().join("installer.ps1");
++        let download_url = temp.path().join("download-url");
++        let installer_args = temp.path().join("installer-args");
++        fs::write(
++            &installer,
++            "param([string]$InstallRoot)\r\n\
++             Set-Content $env:CODEX_LHC_TEST_INSTALLER_ARGS $InstallRoot\r\n\
++             if ($env:CODEX_LHC_TEST_INSTALLER_FAIL) { throw 'installer failed' }\r\n",
++        )
++        .expect("write installer fixture");
++
++        let action = UpdateAction::LhcWindows {
++            store: AbsolutePathBuf::from_absolute_path(store).expect("store should be absolute"),
++        };
++        let (command, mut args) = action.command_args();
++        let script = args.pop().expect("update script");
++        let shim = "function Invoke-WebRequest { param([string]$Uri, [string]$OutFile) Set-Content $env:CODEX_LHC_TEST_DOWNLOAD_URL $Uri; if ($env:CODEX_LHC_TEST_DOWNLOAD_FAIL) { throw 'download failed' }; Copy-Item $env:CODEX_LHC_TEST_INSTALLER $OutFile }; ";
++        let status = Command::new(format!("{command}.exe"))
++            .args(&args)
++            .arg(format!("{shim}{script}"))
++            .env("CODEX_LHC_TEST_INSTALLER", &installer)
++            .env("CODEX_LHC_TEST_INSTALLER_ARGS", &installer_args)
++            .env("CODEX_LHC_TEST_INSTALLER_FAIL", installer_fail)
++            .env("CODEX_LHC_TEST_DOWNLOAD_URL", &download_url)
++            .env("CODEX_LHC_TEST_DOWNLOAD_FAIL", download_fail)
++            .status()
++            .expect("run update command");
++        UpdateRun {
++            status,
++            download_url: fs::read_to_string(&download_url)
++                .ok()
++                .map(|url| url.trim().to_string()),
++            installer_args: fs::read_to_string(&installer_args)
++                .ok()
++                .map(|args| args.trim().to_string()),
++        }
++    }
++
++    #[test]
++    fn lhc_windows_update_runs_downloaded_installer_against_selected_store() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_windows_update(store.path(), "", "");
++
++        assert!(run.status.success(), "status {}", run.status);
++        assert_eq!(run.download_url.as_deref(), Some(LHC_INSTALLER_URL_WINDOWS));
++        assert_eq!(run.installer_args, Some(store.path().display().to_string()));
++    }
++
++    #[test]
++    fn lhc_windows_update_stops_when_download_fails() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_windows_update(store.path(), "1", "");
++
++        assert!(!run.status.success());
++        assert_eq!(run.installer_args, None);
++    }
++
++    #[test]
++    fn lhc_windows_update_reports_installer_failure() {
++        let store = tempfile::tempdir().expect("store dir");
++        let run = run_lhc_windows_update(store.path(), "", "1");
++
++        assert!(!run.status.success());
++        assert_eq!(run.installer_args, Some(store.path().display().to_string()));
++    }
++}
+diff --git a/codex-rs/tui/src/update_prompt.rs b/codex-rs/tui/src/update_prompt.rs
+index 688d113487..9ec36be654 100644
+--- a/codex-rs/tui/src/update_prompt.rs
++++ b/codex-rs/tui/src/update_prompt.rs
+@@ -12,6 +12,8 @@ use crate::tui::Tui;
+ use crate::tui::TuiEvent;
+ use crate::update_action::UpdateAction;
+ use crate::updates;
++use codex_install_context::LHC_RELEASE_VERSION;
++use codex_install_context::LHC_RELEASES_URL;
+ use color_eyre::Result;
+ use crossterm::event::KeyCode;
+ use crossterm::event::KeyEvent;
+@@ -26,7 +28,7 @@ use ratatui::widgets::Clear;
+ use ratatui::widgets::WidgetRef;
+ use tokio_stream::StreamExt;
+ 
+-const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
++const RELEASE_NOTES_URL: &str = LHC_RELEASES_URL;
+ 
+ pub(crate) enum UpdatePromptOutcome {
+     Continue,
+@@ -44,8 +46,11 @@ pub(crate) async fn run_update_prompt_if_needed(
+         return Ok(UpdatePromptOutcome::Continue);
+     };
+ 
+-    let mut screen =
+-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
++    let mut screen = UpdatePromptScreen::new(
++        tui.frame_requester(),
++        latest_version.clone(),
++        update_action.clone(),
++    );
+     tui.draw(u16::MAX, |frame| {
+         frame.render_widget_ref(&screen, frame.area());
+     })?;
+@@ -111,7 +116,7 @@ impl UpdatePromptScreen {
+         Self {
+             request_frame,
+             latest_version,
+-            current_version: env!("CARGO_PKG_VERSION").to_string(),
++            current_version: LHC_RELEASE_VERSION.to_string(),
+             update_action,
+             highlighted: UpdateSelection::UpdateNow,
+             selection: None,
+@@ -189,12 +194,19 @@ impl WidgetRef for &UpdatePromptScreen {
+         Clear.render(area, buf);
+         let mut column = ColumnRenderable::new();
+ 
+-        let update_command = self.update_action.command_str();
++        // The fork's installer action is a shell script; describe it instead
++        // of printing it. Upstream's retained variants keep their command.
++        let update_now = match &self.update_action {
++            UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. } => {
++                "Update now (re-runs the Codex + LHC installer)".to_string()
++            }
++            action => format!("Update now (runs `{}`)", action.command_str()),
++        };
+ 
+         column.push("");
+         column.push(Line::from(vec![
+             "  ✨\u{200A}".bold().cyan(),
+-            "Update available!".bold(),
++            "Codex + LHC update available!".bold(),
+             " ".into(),
+             format!(
+                 "{current} -> {latest}",
+@@ -214,7 +226,7 @@ impl WidgetRef for &UpdatePromptScreen {
+         column.push("");
+         column.push(selection_option_row(
+             0,
+-            format!("Update now (runs `{update_command}`)"),
++            update_now,
+             self.highlighted == UpdateSelection::UpdateNow,
+         ));
+         column.push(selection_option_row(
+@@ -253,10 +265,17 @@ mod tests {
+     use ratatui::widgets::FrameExt;
+ 
+     fn new_prompt() -> UpdatePromptScreen {
++        let store =
++            codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(if cfg!(windows) {
++                r"C:\CodexLHC\packages"
++            } else {
++                "/home/codex/.local/share/codex-lhc"
++            })
++            .expect("store should be absolute");
+         UpdatePromptScreen::new(
+             FrameRequester::test_dummy(),
+-            "9.9.9".into(),
+-            UpdateAction::NpmGlobalLatest,
++            "9.9.9-lhc.1".into(),
++            UpdateAction::LhcUnix { store },
+         )
+     }
+ 
+diff --git a/codex-rs/tui/src/update_versions.rs b/codex-rs/tui/src/update_versions.rs
+index 29ff04369b..c429786b3b 100644
+--- a/codex-rs/tui/src/update_versions.rs
++++ b/codex-rs/tui/src/update_versions.rs
+@@ -1,13 +1,17 @@
++use codex_install_context::parse_lhc_release;
++
++/// Compare fork releases (`major.minor.patch[-lhc.revision]`, bare revision 0).
+ pub(crate) fn is_newer(latest: &str, current: &str) -> Option<bool> {
+-    match (parse_version(latest), parse_version(current)) {
++    match (parse_lhc_release(latest), parse_lhc_release(current)) {
+         (Some(l), Some(c)) => Some(l > c),
+         _ => None,
+     }
+ }
+ 
++/// Fork releases are tagged `v<release>`.
+ pub(crate) fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
+     latest_tag_name
+-        .strip_prefix("rust-v")
++        .strip_prefix('v')
+         .map(str::to_owned)
+         .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
+ }
+@@ -32,14 +36,29 @@ mod tests {
+     #[test]
+     fn extracts_version_from_latest_tag() {
+         assert_eq!(
+-            extract_version_from_latest_tag("rust-v1.5.0").expect("failed to parse version"),
++            extract_version_from_latest_tag("v0.153.3-lhc.1").expect("failed to parse version"),
++            "0.153.3-lhc.1"
++        );
++        assert_eq!(
++            extract_version_from_latest_tag("v1.5.0").expect("failed to parse version"),
+             "1.5.0"
+         );
+     }
+ 
+     #[test]
+-    fn latest_tag_without_prefix_is_invalid() {
+-        assert!(extract_version_from_latest_tag("v1.5.0").is_err());
++    fn latest_tag_without_v_prefix_is_invalid() {
++        for tag in ["rust-v1.5.0", "1.5.0"] {
++            assert!(extract_version_from_latest_tag(tag).is_err(), "{tag:?}");
++        }
++    }
++
++    #[test]
++    fn fork_revision_and_upstream_base_increases_are_newer() {
++        assert_eq!(is_newer("0.153.3-lhc.1", "0.153.3"), Some(true));
++        assert_eq!(is_newer("0.153.3-lhc.2", "0.153.3-lhc.1"), Some(true));
++        assert_eq!(is_newer("0.153.4", "0.153.3-lhc.9"), Some(true));
++        assert_eq!(is_newer("0.153.3", "0.153.3-lhc.1"), Some(false));
++        assert_eq!(is_newer("0.153.3-lhc.1", "0.153.3-lhc.1"), Some(false));
+     }
+ 
+     #[test]
+diff --git a/codex-rs/tui/src/updates.rs b/codex-rs/tui/src/updates.rs
+index b801426552..9aeaed950d 100644
+--- a/codex-rs/tui/src/updates.rs
++++ b/codex-rs/tui/src/updates.rs
+@@ -16,6 +16,8 @@ use chrono::Utc;
+ use codex_http_client::ClientRouteClass;
+ use codex_http_client::HttpClientFactory;
+ use codex_http_client::RouteAwareClientPool;
++use codex_install_context::LHC_LATEST_RELEASE_API_URL;
++use codex_install_context::LHC_RELEASE_VERSION;
+ use codex_login::default_client::default_headers;
+ use serde::Deserialize;
+ use std::path::Path;
+@@ -49,7 +51,7 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
+     }
+ 
+     info.and_then(|info| {
+-        if is_newer(&info.latest_version, CODEX_CLI_VERSION).unwrap_or(false) {
++        if is_newer(&info.latest_version, LHC_RELEASE_VERSION).unwrap_or(false) {
+             Some(info.latest_version)
+         } else {
+             None
+@@ -59,7 +61,9 @@ pub fn get_upgrade_version(config: &Config) -> Option<String> {
+ 
+ // We use the latest version from the cask if installation is via homebrew - homebrew does not immediately pick up the latest release and can lag behind.
+ const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
+-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
++// This fork has one reachable release source; the registry arms below are
++// retained unchanged from upstream but no UpdateAction reaches them.
++const LATEST_RELEASE_URL: &str = LHC_LATEST_RELEASE_API_URL;
+ 
+ #[derive(Deserialize, Debug, Clone)]
+ struct ReleaseInfo {
+@@ -109,9 +113,11 @@ async fn check_for_update(
+             npm_registry::ensure_version_ready(&package_info, &latest_version)?;
+             latest_version
+         }
+-        Some(UpdateAction::StandaloneUnix) | Some(UpdateAction::StandaloneWindows) | None => {
+-            fetch_latest_github_release_version(&client_pool).await?
+-        }
++        Some(UpdateAction::StandaloneUnix)
++        | Some(UpdateAction::StandaloneWindows)
++        | Some(UpdateAction::LhcUnix { .. })
++        | Some(UpdateAction::LhcWindows { .. })
++        | None => fetch_latest_github_release_version(&client_pool).await?,
+     };
+ 
+     // Preserve any previously dismissed version if present.
+diff --git a/codex-rs/tui/src/updates_cache.rs b/codex-rs/tui/src/updates_cache.rs
+index 8ac0776fb1..555d563329 100644
+--- a/codex-rs/tui/src/updates_cache.rs
++++ b/codex-rs/tui/src/updates_cache.rs
+@@ -15,7 +15,9 @@ pub(crate) struct VersionInfo {
+     pub(crate) dismissed_version: Option<String>,
+ }
+ 
+-const VERSION_FILENAME: &str = "version.json";
++/// Fork-owned cache so a CODEX_HOME shared with stock Codex keeps its own
++/// `version.json` untouched.
++const VERSION_FILENAME: &str = "lhc-version.json";
+ 
+ pub(crate) fn version_filepath(config: &Config) -> PathBuf {
+     config.codex_home.join(VERSION_FILENAME).into_path_buf()
+diff --git a/codex-rs/tui/src/updates_cache_tests.rs b/codex-rs/tui/src/updates_cache_tests.rs
+index b10c3f9eae..2761a4f299 100644
+--- a/codex-rs/tui/src/updates_cache_tests.rs
++++ b/codex-rs/tui/src/updates_cache_tests.rs
+@@ -27,3 +27,35 @@ async fn dismiss_version_creates_cache_file_when_missing() {
+         ("999.0.0", Some("999.0.0"))
+     );
+ }
++
++#[tokio::test]
++async fn fork_cache_leaves_stock_version_file_untouched() {
++    let codex_home = tempdir().expect("temp codex home");
++    let stock_file = codex_home.path().join("version.json");
++    let stock_contents =
++        "{\"latest_version\":\"0.1.0\",\"last_checked_at\":\"2026-01-01T00:00:00Z\"}\n";
++    std::fs::write(&stock_file, stock_contents).expect("write stock cache");
++    let config = ConfigBuilder::default()
++        .codex_home(codex_home.path().to_path_buf())
++        .build()
++        .await
++        .expect("load config");
++    let version_file = version_filepath(&config);
++
++    dismiss_version(&config, "0.153.3-lhc.1")
++        .await
++        .expect("dismiss version");
++
++    assert_eq!(version_file, codex_home.path().join("lhc-version.json"));
++    assert_eq!(
++        std::fs::read_to_string(&stock_file).expect("read stock cache"),
++        stock_contents
++    );
++    assert_eq!(
++        read_version_info(&version_file)
++            .expect("read fork cache")
++            .dismissed_version
++            .as_deref(),
++        Some("0.153.3-lhc.1")
++    );
++}

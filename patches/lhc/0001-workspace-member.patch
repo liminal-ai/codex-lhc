@@ -259,10 +259,10 @@ index 8c94f91202..e47bd5e95d 100644
      requested_urls: Mutex<Vec<String>>,
 diff --git a/codex-rs/cli/tests/version.rs b/codex-rs/cli/tests/version.rs
 new file mode 100644
-index 0000000000..9edca52724
+index 0000000000..7533b52d26
 --- /dev/null
 +++ b/codex-rs/cli/tests/version.rs
-@@ -0,0 +1,19 @@
+@@ -0,0 +1,36 @@
 +use std::process::Command;
 +
 +use anyhow::Result;
@@ -278,6 +278,23 @@ index 0000000000..9edca52724
 +    assert_eq!(
 +        String::from_utf8(output.stdout)?,
 +        format!("codex-cli {}\n", env!("CARGO_PKG_VERSION"))
++    );
++    assert_eq!(output.stderr, b"");
++    Ok(())
++}
++
++#[test]
++fn reports_lhc_release_version() -> Result<()> {
++    let home = tempfile::tempdir()?;
++    let output = Command::new(codex_utils_cargo_bin::cargo_bin("codex")?)
++        .env("CODEX_HOME", home.path())
++        .arg("--lhc-version")
++        .output()?;
++
++    assert!(output.status.success());
++    assert_eq!(
++        String::from_utf8(output.stdout)?,
++        format!("{}\n", codex_install_context::LHC_RELEASE_VERSION)
 +    );
 +    assert_eq!(output.stderr, b"");
 +    Ok(())
