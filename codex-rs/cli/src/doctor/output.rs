@@ -529,7 +529,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
         .find(|check| check.category == category)
 }
 
-fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote> {
+fn update_note(check: &DoctorCheck, _report: &DoctorReport) -> Option<DoctorNote> {
     let status = detail::detail_value(check, "latest version status")?;
     if !status.contains("newer version is available") {
         return None;
@@ -538,7 +538,7 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
         .or_else(|| detail::detail_value(check, "cached latest version"))
         .unwrap_or_else(|| "newer version".to_string());
     let dismissed = detail::detail_value(check, "dismissed version");
-    let mut parenthetical = format!("current {}", report.codex_version);
+    let mut parenthetical = format!("current {}", codex_install_context::LHC_RELEASE_VERSION);
     if let Some(dismissed) = dismissed
         && !detail::is_falsy(&dismissed)
     {
@@ -1664,7 +1664,10 @@ Run codex doctor without --summary for detailed diagnostics.
         let rendered = render_human_report(&report, summary_no_color_unicode_options());
 
         assert!(rendered.contains("Notes\n   ↑ updates"));
-        assert!(rendered.contains("0.130.0 available (current 0.0.0, dismissed 0.128.0)"));
+        assert!(rendered.contains(&format!(
+            "0.130.0 available (current {}, dismissed 0.128.0)",
+            codex_install_context::LHC_RELEASE_VERSION
+        )));
         assert!(rendered.contains("⚠ rollouts"));
         assert!(rendered.contains("⚠ sandbox"));
         assert!(rendered.contains("⚠ mcp"));

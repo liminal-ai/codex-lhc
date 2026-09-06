@@ -19,6 +19,10 @@ use codex_http_client::ClientRouteClass;
 use codex_http_client::RouteAwareClientPool;
 use codex_install_context::InstallContext;
 use codex_install_context::InstallMethod;
+use codex_install_context::LHC_INSTALL_DOCS_URL;
+use codex_install_context::LHC_LATEST_RELEASE_API_URL;
+use codex_install_context::LHC_RELEASE_VERSION;
+use codex_install_context::parse_lhc_release;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use http::Method;
 use serde::Deserialize;
@@ -39,8 +43,8 @@ use super::network;
 use super::npm_global_root_check;
 use super::run_command;
 
-const VERSION_FILE_NAME: &str = "version.json";
-const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
+/// The TUI's fork-owned cache; stock `version.json` is not inspected.
+const VERSION_FILE_NAME: &str = "lhc-version.json";
 const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const DESKTOP_UPDATE_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
@@ -65,7 +69,10 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
             "check for update on startup: {}",
             config.check_for_update_on_startup
         ),
-        format!("update action: {}", update_action_label(&install_context)),
+        format!("running fork release: {LHC_RELEASE_VERSION}"),
+        "update action: installer-managed release builds run this executable with `update`"
+            .to_string(),
+        format!("manual update: {LHC_INSTALL_DOCS_URL}"),
     ];
     let version_file = config.codex_home.join(VERSION_FILE_NAME);
     push_cached_version_details(&mut details, &version_file);
@@ -115,7 +122,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
     match fetch_latest_version(&install_context) {
         Ok(latest_version) => {
             details.push(format!("latest version: {latest_version}"));
-            if is_newer(&latest_version, env!("CARGO_PKG_VERSION")) == Some(true) {
+            if is_newer_fork_release(&latest_version) {
                 details.push("latest version status: newer version is available".to_string());
             } else {
                 details.push("latest version status: current version is not older".to_string());
@@ -428,18 +435,6 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
     }
 }
 
-fn update_action_label(context: &InstallContext) -> &'static str {
-    match &context.method {
-        InstallMethod::Npm => "npm install -g @openai/codex",
-        InstallMethod::Bun => "bun install -g @openai/codex",
-        InstallMethod::VitePlus => "vp install -g @openai/codex",
-        InstallMethod::Pnpm => "pnpm add -g @openai/codex",
-        InstallMethod::Brew => "brew upgrade --cask codex",
-        InstallMethod::Standalone { .. } => "standalone installer",
-        InstallMethod::Other => "manual or unknown",
-    }
-}
-
 fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
     match &context.method {
         InstallMethod::Brew => fetch_homebrew_cask_version(),
@@ -458,11 +453,16 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
         tag_name: String,
     }
 
-    let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
-    info.tag_name
-        .strip_prefix("rust-v")
+    let info = http_get_json::<ReleaseInfo>(LHC_LATEST_RELEASE_API_URL)?;
+    release_from_tag(&info.tag_name)
+}
+
+/// Fork releases are tagged `v<release>`.
+fn release_from_tag(tag_name: &str) -> Result<String, String> {
+    tag_name
+        .strip_prefix('v')
         .map(str::to_string)
-        .ok_or_else(|| format!("failed to parse latest tag {}", info.tag_name))
+        .ok_or_else(|| format!("failed to parse latest tag {tag_name}"))
 }
 
 fn fetch_homebrew_cask_version() -> Result<String, String> {
@@ -482,19 +482,13 @@ where
     serde_json::from_str::<T>(&body).map_err(|err| err.to_string())
 }
 
-fn is_newer(latest: &str, current: &str) -> Option<bool> {
-    match (parse_version(latest), parse_version(current)) {
-        (Some(latest), Some(current)) => Some(latest > current),
-        (Some(_), None) | (None, Some(_)) | (None, None) => None,
-    }
-}
-
-fn parse_version(value: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = value.trim().split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch = parts.next()?.parse::<u64>().ok()?;
-    Some((major, minor, patch))
+/// Whether `latest` is a newer fork release than the running one
+/// (`major.minor.patch[-lhc.revision]`, bare revision 0).
+fn is_newer_fork_release(latest: &str) -> bool {
+    matches!(
+        (parse_lhc_release(latest), parse_lhc_release(LHC_RELEASE_VERSION)),
+        (Some(latest), Some(current)) if latest > current
+    )
 }
 
 #[derive(Deserialize)]
@@ -622,34 +616,55 @@ mod tests {
     }
 
     #[test]
-    fn is_newer_compares_plain_semver() {
-        assert_eq!(is_newer("1.2.4", "1.2.3"), Some(true));
-        assert_eq!(is_newer("1.2.3", "1.2.4"), Some(false));
-        assert_eq!(is_newer("1.2.3-beta.1", "1.2.2"), None);
+    fn release_tags_drop_the_fork_prefix() {
+        assert_eq!(
+            release_from_tag("v0.153.3-lhc.1"),
+            Ok("0.153.3-lhc.1".to_string())
+        );
+        assert_eq!(release_from_tag("v0.154.0"), Ok("0.154.0".to_string()));
+        assert!(release_from_tag("rust-v0.153.3").is_err());
     }
 
     #[test]
-    fn update_action_labels_install_contexts() {
+    fn newer_fork_releases_beat_the_running_release_by_revision_or_base() {
+        let (major, minor, patch, revision) =
+            parse_lhc_release(LHC_RELEASE_VERSION).expect("embedded release should parse");
+        let next_revision = format!("{major}.{minor}.{patch}-lhc.{}", revision + 1);
+        let next_base = format!("{major}.{minor}.{}", patch + 1);
+
+        assert!(is_newer_fork_release(&next_revision));
+        assert!(is_newer_fork_release(&next_base));
+        assert!(!is_newer_fork_release(LHC_RELEASE_VERSION));
+        assert!(!is_newer_fork_release(&format!("{major}.{minor}.{patch}")));
+        assert!(!is_newer_fork_release("0.153.3-beta.1"));
+    }
+
+    #[test]
+    fn cached_details_come_from_the_fork_cache_not_the_stock_file() {
+        let codex_home = tempfile::tempdir().expect("temporary Codex home should be created");
+        std::fs::write(
+            codex_home.path().join("version.json"),
+            r#"{"latest_version":"9.9.9","dismissed_version":"9.9.8"}"#,
+        )
+        .expect("stock cache should be written");
+        std::fs::write(
+            codex_home.path().join(VERSION_FILE_NAME),
+            r#"{"latest_version":"0.153.3-lhc.2","last_checked_at":"2026-09-06T00:00:00Z","dismissed_version":"0.153.3-lhc.1"}"#,
+        )
+        .expect("fork cache should be written");
+        let version_file = codex_home.path().join(VERSION_FILE_NAME);
+
+        let mut details = Vec::new();
+        push_cached_version_details(&mut details, &version_file);
+
         assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }),
-            "npm install -g @openai/codex"
-        );
-        assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }),
-            "pnpm add -g @openai/codex"
-        );
-        assert_eq!(
-            update_action_label(&InstallContext {
-                method: InstallMethod::Other,
-                package_layout: None,
-            }),
-            "manual or unknown"
+            details,
+            vec![
+                format!("version cache: {}", version_file.display()),
+                "cached latest version: 0.153.3-lhc.2".to_string(),
+                "last checked at: 2026-09-06T00:00:00Z".to_string(),
+                "dismissed version: 0.153.3-lhc.1".to_string(),
+            ]
         );
     }
 }
