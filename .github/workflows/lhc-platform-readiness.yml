@@ -41,9 +41,7 @@ jobs:
             kind: windows
             target: x86_64-pc-windows-msvc
           - label: windows-aarch64
-            runner:
-              group: ${{ github.event.repository.name }}-runners
-              labels: ${{ github.event.repository.name }}-windows-arm64
+            runner: windows-11-arm
             kind: windows
             target: aarch64-pc-windows-msvc
           - label: macos-aarch64
