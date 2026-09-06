@@ -11,11 +11,12 @@ async fn copied_schema12_preserves_text_ids_and_step_indices() {
     use lhc::OpResult;
     use lhc::shared_tech::storage::open_database;
     let dir = tempdir().expect("tempdir");
+    let seed_dir = tempdir().expect("seed tempdir");
     let tid = "schema12-copy";
     let handle = spawn_capture(
         tid,
         None,
-        Some(dir.path().to_path_buf()),
+        Some(seed_dir.path().to_path_buf()),
         codex_lhc_host::LateBoundCallbacks::seeded(
             codex_lhc_host::lhc_inference_callbacks(false).expect("callbacks"),
         ),
@@ -32,6 +33,35 @@ async fn copied_schema12_preserves_text_ids_and_step_indices() {
     handle.flush().await;
     handle.shutdown().await;
     let source = codex_lhc_host::thread_file_path(dir.path(), tid);
+    let registry_path = dir.path().join("registry.sqlite");
+    for (seed, archive) in [
+        (
+            codex_lhc_host::thread_file_path(seed_dir.path(), tid),
+            source.clone(),
+        ),
+        (
+            seed_dir.path().join("registry.sqlite"),
+            registry_path.clone(),
+        ),
+    ] {
+        std::fs::create_dir_all(archive.parent().expect("archive parent"))
+            .expect("archive directory");
+        let OpResult::Ok { value: seed_db } = open_database(seed.to_str().expect("path")) else {
+            panic!("open seed")
+        };
+        seed_db
+            .prepare("VACUUM INTO ?")
+            .run(&[archive.to_str().expect("path").into()]);
+        seed_db.close();
+    }
+    let OpResult::Ok { value: registry } = open_database(registry_path.to_str().expect("path"))
+    else {
+        panic!("open archive registry")
+    };
+    registry
+        .prepare("UPDATE threads SET file_path = ?")
+        .run(&[source.to_str().expect("path").into()]);
+    registry.close();
     let OpResult::Ok { value: db } = open_database(source.to_str().expect("path")) else {
         panic!("open fixture")
     };
