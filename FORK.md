@@ -322,7 +322,17 @@ byte-identical (accepted under the criterion's semantic arm).
 
 Dated merge accounts, qualification evidence, and conflict resolutions are in
 [the maintenance history](lhc-internal/history/fork-maintenance-through-2026-09-04.md).
-Current upstream base: `patches/lhc/BASE` (`rust-v0.153.3` at this revision).
+Current upstream base: `patches/lhc/BASE` (`rust-v0.153.4` at this revision).
+
+2026-09-06 hotfix sync: merged the exact peeled `rust-v0.153.4` commit
+`3d2ee51ca2` (tag object `042fb41b7c`) onto the maintained branch. Upstream's
+delta from `rust-v0.153.3` was the workspace version, `models-manager/models.json`
+(Astra listed in the bundled picker; async-question guidance qualified by tool
+availability) and the model-selection snapshot. Only `codex-rs/Cargo.toml`
+conflicted (workspace version; upstream's `0.153.4` taken); `models.json`
+auto-merged with the fork's context-window lines intact. `lhc-release/VERSION`
+moved to `0.153.4`, `BASE` to `3d2ee51ca2`, and the eight patches were
+regenerated with `patches/lhc/regenerate.sh`. SDK pin `e9456a6e` unchanged.
 
 **Upstream experimental context management:** intentionally rejected while the
 LHC extension is active. Enabling either `features.context_management.experimental_mode`

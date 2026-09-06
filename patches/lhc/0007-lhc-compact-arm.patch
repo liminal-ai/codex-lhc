@@ -23724,7 +23724,7 @@ index 0000000000..71964bfe7c
 +    }
 +}
 diff --git a/codex-rs/models-manager/models.json b/codex-rs/models-manager/models.json
-index 6c5fc40c4f..ea5fb3f80a 100644
+index 698da6fb7a..4a23c133bf 100644
 --- a/codex-rs/models-manager/models.json
 +++ b/codex-rs/models-manager/models.json
 @@ -196,9 +196,9 @@

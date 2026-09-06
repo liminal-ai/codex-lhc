@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 957c783439..3c967ac6cf 100644
+index 351d1e6cd5..a0ef93eb1b 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
 @@ -75,6 +75,8 @@ members = [

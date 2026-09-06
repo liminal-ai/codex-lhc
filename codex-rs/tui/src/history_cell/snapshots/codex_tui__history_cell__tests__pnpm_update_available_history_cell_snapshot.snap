@@ -3,7 +3,7 @@ source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
 ╭─────────────────────────────────────────────────────────╮
-│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
+│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9       │
 │ Run pnpm add -g @openai/codex to update.                │
 │                                                         │
 │ See full release notes:                                 │

@@ -564,7 +564,7 @@ index bd68c83457..8b2445897c 100644
  
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap
 new file mode 100644
-index 0000000000..f579e8ea9f
+index 0000000000..c6c9c8bacf
 --- /dev/null
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__lhc_unix_update_available_history_cell_snapshot.snap
 @@ -0,0 +1,11 @@
@@ -573,14 +573,14 @@ index 0000000000..f579e8ea9f
 +expression: rendered
 +---
 +╭─────────────────────────────────────────────────────────╮
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9       │
 +│ Run your Codex + LHC command with update to install it. │
 +│                                                         │
 +│ See full release notes:                                 │
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest │
 +╰─────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
-index a9dd9cac78..d424a4fb57 100644
+index a9dd9cac78..401e73436c 100644
 --- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__pnpm_update_available_history_cell_snapshot.snap
 @@ -2,10 +2,10 @@
@@ -595,14 +595,14 @@ index a9dd9cac78..d424a4fb57 100644
 -│ https://github.com/openai/codex/releases/latest │
 -╰─────────────────────────────────────────────────╯
 +╭─────────────────────────────────────────────────────────╮
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9       │
 +│ Run pnpm add -g @openai/codex to update.                │
 +│                                                         │
 +│ See full release notes:                                 │
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest │
 +╰─────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
-index c8f352dbb4..11151ea1d6 100644
+index c8f352dbb4..3f766074b2 100644
 --- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_unix_update_available_history_cell_snapshot.snap
 @@ -3,9 +3,9 @@ source: tui/src/history_cell/tests.rs
@@ -610,7 +610,7 @@ index c8f352dbb4..11151ea1d6 100644
  ---
  ╭─────────────────────────────────────────────────────────────────────────────────────────────────────╮
 -│ ✨ Update available! 0.0.0 -> 9.9.9                                                                 │
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9                                                   │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9                                                   │
  │ Run sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh' to update. │
  │                                                                                                     │
  │ See full release notes:                                                                             │
@@ -618,7 +618,7 @@ index c8f352dbb4..11151ea1d6 100644
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest                                             │
  ╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
-index fb15a05775..cff797ffa5 100644
+index fb15a05775..1d1107f41e 100644
 --- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__standalone_windows_update_available_history_cell_snapshot.snap
 @@ -3,10 +3,10 @@ source: tui/src/history_cell/tests.rs
@@ -626,7 +626,7 @@ index fb15a05775..cff797ffa5 100644
  ---
  ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 -│ ✨ Update available! 0.0.0 -> 9.9.9                                                                        │
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9                                                          │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9                                                          │
  │ Run powershell -ExecutionPolicy Bypass -c '$env:CODEX_NON_INTERACTIVE=1; irm                               │
  │ https://chatgpt.com/codex/install.ps1 | iex' to update.                                                    │
  │                                                                                                            │
@@ -636,7 +636,7 @@ index fb15a05775..cff797ffa5 100644
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
 new file mode 100644
-index 0000000000..42ee77ffb5
+index 0000000000..0839cb3a62
 --- /dev/null
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
 @@ -0,0 +1,11 @@
@@ -645,14 +645,14 @@ index 0000000000..42ee77ffb5
 +expression: rendered
 +---
 +╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1                                            │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1                                            │
 +│ See https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md for installation options. │
 +│                                                                                                    │
 +│ See full release notes:                                                                            │
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest                                            │
 +╰────────────────────────────────────────────────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
-index 1a2df82a9d..e97c306559 100644
+index 1a2df82a9d..7dfcbe551b 100644
 --- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
 @@ -2,10 +2,10 @@
@@ -667,7 +667,7 @@ index 1a2df82a9d..e97c306559 100644
 -│ https://github.com/openai/codex/releases/latest │
 -╰─────────────────────────────────────────────────╯
 +╭─────────────────────────────────────────────────────────╮
-+│ ✨ Codex + LHC update available! 0.153.3 -> 9.9.9       │
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9       │
 +│ Run vp install -g @openai/codex to update.              │
 +│                                                         │
 +│ See full release notes:                                 │
@@ -705,7 +705,7 @@ index ae781fc3a9..a38ad6eaa8 100644
  fn standalone_windows_update_available_history_cell_snapshot() {
      let cell =
 diff --git a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
-index 24d8831c95..3b959a0702 100644
+index 24d8831c95..01b051b939 100644
 --- a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
 +++ b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
 @@ -2,11 +2,12 @@
@@ -715,7 +715,7 @@ index 24d8831c95..3b959a0702 100644
 -  ✨ Update available! 0.0.0 -> 9.9.9
  
 -  Release notes: https://github.com/openai/codex/releases/latest
-+  ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1
++  ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1
  
 -› 1. Update now (runs `npm install -g @openai/codex@latest`)                    
 +  Release notes: https://github.com/liminal-ai/codex-lhc/releases/latest

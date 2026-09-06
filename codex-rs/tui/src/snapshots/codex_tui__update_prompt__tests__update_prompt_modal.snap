@@ -3,7 +3,7 @@ source: tui/src/update_prompt.rs
 expression: terminal.backend()
 ---
 
-  ✨ Codex + LHC update available! 0.153.3 -> 9.9.9-lhc.1
+  ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1
 
   Release notes: https://github.com/liminal-ai/codex-lhc/releases/latest
 
