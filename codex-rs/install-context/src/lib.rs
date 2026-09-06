@@ -21,6 +21,10 @@ const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
 const ZSH_DIRNAME: &str = "zsh";
 static INSTALL_CONTEXT: OnceLock<InstallContext> = OnceLock::new();
 
+mod lhc_release;
+pub use lhc_release::LHC_RELEASE_VERSION;
+pub use lhc_release::parse_lhc_release;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StandalonePlatform {
     Unix,

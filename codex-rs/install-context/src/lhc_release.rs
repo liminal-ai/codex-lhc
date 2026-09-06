@@ -1,0 +1,29 @@
+//! Fork release identity: the `lhc-release/VERSION` value embedded in the binary
+//! and the `major.minor.patch-lhc.revision` ordering used by release lookups.
+
+/// The fork release recorded in `lhc-release/VERSION`, without trailing whitespace.
+pub const LHC_RELEASE_VERSION: &str = include_str!("../../../lhc-release/VERSION").trim_ascii();
+
+/// Parse a fork release (`major.minor.patch-lhc.revision`) or bare upstream
+/// release (`major.minor.patch`, treated as revision 0) into a sortable tuple.
+/// Any other form, including tag prefixes, returns `None`.
+pub fn parse_lhc_release(release: &str) -> Option<(u64, u64, u64, u64)> {
+    let (base, revision) = match release.trim().split_once("-lhc.") {
+        Some((base, revision)) => (base, revision.parse::<u64>().ok()?),
+        None => (release.trim(), 0),
+    };
+    let mut parts = base.split('.').map(str::parse::<u64>);
+    let (major, minor, patch) = (
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    );
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, revision))
+}
+
+#[cfg(test)]
+#[path = "lhc_release_tests.rs"]
+mod tests;

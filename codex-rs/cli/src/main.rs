@@ -124,6 +124,10 @@ struct MultitoolCli {
     #[clap(flatten)]
     interactive: TuiCli,
 
+    /// Print the codex-lhc fork release and exit.
+    #[arg(long = "lhc-version")]
+    lhc_version: bool,
+
     #[clap(subcommand)]
     subcommand: Option<Subcommand>,
 }
@@ -1052,8 +1056,13 @@ async fn cli_main(
         feature_toggles,
         remote,
         mut interactive,
+        lhc_version,
         subcommand,
     } = MultitoolCli::parse();
+    if lhc_version {
+        println!("{}", codex_install_context::LHC_RELEASE_VERSION);
+        return Ok(());
+    }
     // Fold --enable/--disable into config overrides so they flow to all subcommands.
     let toggle_overrides = feature_toggles.to_overrides()?;
     root_config_overrides.raw_overrides.extend(toggle_overrides);
@@ -3019,6 +3028,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            lhc_version: _,
         } = cli;
         interactive
             .shared
@@ -3056,6 +3066,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            lhc_version: _,
         } = cli;
         interactive
             .shared
@@ -3100,6 +3111,7 @@ mod tests {
             subcommand,
             feature_toggles: _,
             remote: _,
+            lhc_version: _,
         } = cli;
 
         let Subcommand::Archive(SessionArchiveCommand {
