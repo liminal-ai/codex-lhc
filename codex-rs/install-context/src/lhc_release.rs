@@ -4,6 +4,14 @@
 /// The fork release recorded in `lhc-release/VERSION`, without trailing whitespace.
 pub const LHC_RELEASE_VERSION: &str = include_str!("../../../lhc-release/VERSION").trim_ascii();
 
+/// The latest-release download URL of the fork's Unix installer.
+pub const LHC_INSTALLER_URL_UNIX: &str =
+    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh";
+
+/// The latest-release download URL of the fork's PowerShell installer.
+pub const LHC_INSTALLER_URL_WINDOWS: &str =
+    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1";
+
 /// Parse a fork release (`major.minor.patch-lhc.revision`) or bare upstream
 /// release (`major.minor.patch`, treated as revision 0) into a sortable tuple.
 /// Any other form, including tag prefixes, returns `None`.

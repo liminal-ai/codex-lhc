@@ -1,12 +1,13 @@
 #[cfg(any(not(debug_assertions), test))]
 use codex_install_context::InstallContext;
+use codex_install_context::LHC_INSTALLER_URL_UNIX;
+use codex_install_context::LHC_INSTALLER_URL_WINDOWS;
+use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(any(not(debug_assertions), test))]
-use codex_install_context::InstallMethod;
-#[cfg(any(not(debug_assertions), test))]
-use codex_install_context::StandalonePlatform;
+use std::ffi::OsStr;
 
 /// Update action the CLI should perform after the TUI exits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateAction {
     /// Update via `npm install -g @openai/codex@latest`.
     NpmGlobalLatest,
@@ -22,58 +23,121 @@ pub enum UpdateAction {
     StandaloneUnix,
     /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
     StandaloneWindows,
+    /// Update via the fork's `install.sh` against the managed package store.
+    /// The installer reads the recorded command name and prefix from the store.
+    LhcUnix { store: AbsolutePathBuf },
+    /// Update via the fork's `install.ps1` against the managed package store.
+    LhcWindows { store: AbsolutePathBuf },
 }
 
 impl UpdateAction {
+    /// The fork updates one install shape only: the running package is
+    /// `<store>/versions/<version>` and the store carries the installer's
+    /// ownership record. Every other install gets manual instructions.
     #[cfg(any(not(debug_assertions), test))]
     pub(crate) fn from_install_context(context: &InstallContext) -> Option<Self> {
-        match &context.method {
-            InstallMethod::Npm => Some(UpdateAction::NpmGlobalLatest),
-            InstallMethod::Bun => Some(UpdateAction::BunGlobalLatest),
-            InstallMethod::VitePlus => Some(UpdateAction::VitePlusGlobalLatest),
-            InstallMethod::Pnpm => Some(UpdateAction::PnpmGlobalLatest),
-            InstallMethod::Brew => Some(UpdateAction::BrewUpgrade),
-            InstallMethod::Standalone { platform, .. } => Some(match platform {
-                StandalonePlatform::Unix => UpdateAction::StandaloneUnix,
-                StandalonePlatform::Windows => UpdateAction::StandaloneWindows,
-            }),
-            InstallMethod::Other => None,
+        let package_dir = &context.package_layout.as_ref()?.package_dir;
+        let versions_dir = package_dir.parent()?;
+        if versions_dir.file_name() != Some(OsStr::new("versions")) {
+            return None;
         }
+        // The layout was canonicalized with std::fs, which on Windows keeps a
+        // verbatim `\\?\` prefix that neither the PowerShell installer nor the
+        // launcher it writes can use.
+        let store = AbsolutePathBuf::from_absolute_path(dunce::simplified(
+            versions_dir.parent()?.as_path(),
+        ))
+        .ok()?;
+        let ownership_record = if cfg!(windows) {
+            ".codex-lhc-managed"
+        } else {
+            "installed-name"
+        };
+        if !store.join(ownership_record).is_file() {
+            return None;
+        }
+        Some(if cfg!(windows) {
+            UpdateAction::LhcWindows { store }
+        } else {
+            UpdateAction::LhcUnix { store }
+        })
     }
 
-    /// Returns the list of command-line arguments for invoking the update.
-    pub fn command_args(self) -> (&'static str, &'static [&'static str]) {
+    /// Returns the command and arguments for invoking the update.
+    pub fn command_args(&self) -> (&'static str, Vec<String>) {
         match self {
-            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
-            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
-            UpdateAction::VitePlusGlobalLatest => ("vp", &["install", "-g", "@openai/codex"]),
-            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
-            UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
+            UpdateAction::NpmGlobalLatest => {
+                ("npm", static_args(&["install", "-g", "@openai/codex"]))
+            }
+            UpdateAction::BunGlobalLatest => {
+                ("bun", static_args(&["install", "-g", "@openai/codex"]))
+            }
+            UpdateAction::VitePlusGlobalLatest => {
+                ("vp", static_args(&["install", "-g", "@openai/codex"]))
+            }
+            UpdateAction::PnpmGlobalLatest => {
+                ("pnpm", static_args(&["add", "-g", "@openai/codex"]))
+            }
+            UpdateAction::BrewUpgrade => ("brew", static_args(&["upgrade", "--cask", "codex"])),
             UpdateAction::StandaloneUnix => (
                 "sh",
-                &[
+                static_args(&[
                     "-c",
                     "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh",
-                ],
+                ]),
             ),
             UpdateAction::StandaloneWindows => (
                 "powershell",
-                &[
+                static_args(&[
                     "-ExecutionPolicy",
                     "Bypass",
                     "-c",
                     "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex",
+                ]),
+            ),
+            // Download to a file first: a failed download then stops the
+            // update instead of piping a partial script into the shell. The
+            // store travels as `$1` so its path is never re-parsed, and the
+            // script avoids single quotes so its shell-quoted display stays
+            // readable.
+            UpdateAction::LhcUnix { store } => (
+                "sh",
+                vec![
+                    "-c".to_string(),
+                    format!(
+                        "f=$(mktemp \"${{TMPDIR:-/tmp}}/codex-lhc-install.XXXXXX\") && curl -fsSL {LHC_INSTALLER_URL_UNIX} -o \"$f\" && sh \"$f\" --install-root \"$1\"; s=$?; rm -f \"$f\"; exit $s"
+                    ),
+                    "sh".to_string(),
+                    store.to_string_lossy().into_owned(),
                 ],
             ),
+            UpdateAction::LhcWindows { store } => {
+                let store = store.to_string_lossy().replace('\'', "''");
+                (
+                    "powershell",
+                    vec![
+                        "-ExecutionPolicy".to_string(),
+                        "Bypass".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "$ErrorActionPreference = 'Stop'; $installer = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-lhc-install-' + [guid]::NewGuid() + '.ps1'); try {{ Invoke-WebRequest '{LHC_INSTALLER_URL_WINDOWS}' -OutFile $installer; & $installer -InstallRoot '{store}' }} finally {{ Remove-Item $installer -Force -ErrorAction SilentlyContinue }}"
+                        ),
+                    ],
+                )
+            }
         }
     }
 
     /// Returns string representation of the command-line arguments for invoking the update.
-    pub fn command_str(self) -> String {
+    pub fn command_str(&self) -> String {
         let (command, args) = self.command_args();
-        shlex::try_join(std::iter::once(command).chain(args.iter().copied()))
+        shlex::try_join(std::iter::once(command).chain(args.iter().map(String::as_str)))
             .unwrap_or_else(|_| format!("{command} {}", args.join(" ")))
     }
+}
+
+fn static_args(args: &[&str]) -> Vec<String> {
+    args.iter().map(ToString::to_string).collect()
 }
 
 #[cfg(not(debug_assertions))]
@@ -82,99 +146,5 @@ pub fn get_update_action() -> Option<UpdateAction> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use codex_utils_absolute_path::AbsolutePathBuf;
-    use pretty_assertions::assert_eq;
-
-    #[test]
-    fn maps_install_context_to_update_action() {
-        let native_release_dir =
-            AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join("native-release"))
-                .expect("temp dir path should be absolute");
-
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Other,
-                package_layout: None,
-            }),
-            None
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Npm,
-                package_layout: None,
-            }),
-            Some(UpdateAction::NpmGlobalLatest)
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Bun,
-                package_layout: None,
-            }),
-            Some(UpdateAction::BunGlobalLatest)
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Pnpm,
-                package_layout: None,
-            }),
-            Some(UpdateAction::PnpmGlobalLatest)
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Brew,
-                package_layout: None,
-            }),
-            Some(UpdateAction::BrewUpgrade)
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Standalone {
-                    platform: StandalonePlatform::Unix,
-                    release_dir: native_release_dir.clone(),
-                    resources_dir: Some(native_release_dir.join("codex-resources")),
-                },
-                package_layout: None,
-            }),
-            Some(UpdateAction::StandaloneUnix)
-        );
-        assert_eq!(
-            UpdateAction::from_install_context(&InstallContext {
-                method: InstallMethod::Standalone {
-                    platform: StandalonePlatform::Windows,
-                    release_dir: native_release_dir.clone(),
-                    resources_dir: Some(native_release_dir.join("codex-resources")),
-                },
-                package_layout: None,
-            }),
-            Some(UpdateAction::StandaloneWindows)
-        );
-    }
-
-    #[test]
-    fn standalone_update_commands_rerun_latest_installer() {
-        assert_eq!(
-            UpdateAction::StandaloneUnix.command_args(),
-            (
-                "sh",
-                &[
-                    "-c",
-                    "curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh"
-                ][..],
-            )
-        );
-        assert_eq!(
-            UpdateAction::StandaloneWindows.command_args(),
-            (
-                "powershell",
-                &[
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-c",
-                    "$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex"
-                ][..],
-            )
-        );
-    }
-}
+#[path = "update_action_tests.rs"]
+mod tests;

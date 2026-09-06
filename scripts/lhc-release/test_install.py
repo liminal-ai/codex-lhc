@@ -104,14 +104,26 @@ class InstallTest(unittest.TestCase):
         self.temp.cleanup()
 
     def run_installer(
-        self, *args: str, path_prefix: str = "", version: str = VERSION
+        self,
+        *args: str,
+        path_prefix: str = "",
+        version: str = VERSION,
+        with_prefix: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        """Run the installer against the fixture store.
+
+        `with_prefix=False` leaves `CODEX_LHC_PREFIX` unset so the installer
+        falls back to the store's recorded prefix, as the CLI update path does.
+        """
         prefix = self.root / "prefix"
         store = self.root / "store"
         env = os.environ.copy()
         env["HOME"] = str(self.root / "home")
         env["PATH"] = f"{path_prefix}{self.root / 'bin'}:/usr/bin:/bin"
-        env["CODEX_LHC_PREFIX"] = str(prefix)
+        if with_prefix:
+            env["CODEX_LHC_PREFIX"] = str(prefix)
+        else:
+            env.pop("CODEX_LHC_PREFIX", None)
         env["CODEX_LHC_INSTALL_ROOT"] = str(store)
         env["CODEX_LHC_REPOSITORY"] = "fixture/repo"
         # Rewrite GitHub download URLs through a tiny curl shim.
@@ -212,6 +224,39 @@ class InstallTest(unittest.TestCase):
         )
         self.assertFalse(stock.is_symlink())
         self.assertTrue((self.root / "prefix/bin/codex-lhc").is_symlink())
+
+    def test_recorded_prefix_is_reused_when_only_the_store_is_given(self) -> None:
+        prefix = self.root / "prefix"
+        store = self.root / "store"
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (store / "installed-prefix").read_text(encoding="utf-8").strip(),
+            str(prefix),
+        )
+        command = prefix / "bin/codex-lhc"
+        command.unlink()
+
+        # Rerun the way the CLI update path does: store only, no prefix or name.
+        result = self.run_installer("--install-root", str(store), with_prefix=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(command.is_symlink())
+        self.assertFalse((self.root / "home/.local").exists())
+
+        # An explicit prefix still wins and is recorded.
+        other = self.root / "other-prefix"
+        result = self.run_installer("--prefix", str(other), with_prefix=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((other / "bin/codex-lhc").is_symlink())
+        self.assertEqual(
+            (store / "installed-prefix").read_text(encoding="utf-8").strip(),
+            str(other),
+        )
+
+        result = self.run_installer("--uninstall", with_prefix=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((other / "bin/codex-lhc").exists())
+        self.assertFalse(store.exists())
 
     def test_custom_name(self) -> None:
         result = self.run_installer("--name", "codex-memory")

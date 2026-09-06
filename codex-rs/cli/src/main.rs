@@ -800,7 +800,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
         | ExitReason::ThreadRemoved => false,
     };
 
-    let update_action = exit_info.update_action;
+    let update_action = exit_info.update_action.clone();
     let color_enabled = supports_color::on(Stream::Stdout).is_some();
     for line in exit_info.format_exit_messages(color_enabled) {
         println!("{line}");
@@ -824,7 +824,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
             let (cmd, args) = action.command_args();
-            let cmd = if action == UpdateAction::StandaloneWindows {
+            let cmd = if matches!(
+                action,
+                UpdateAction::StandaloneWindows | UpdateAction::LhcWindows { .. }
+            ) {
                 // These args contain PowerShell metacharacters, so do not let
                 // PATHEXT select a batch shim for this action.
                 "powershell.exe"
@@ -893,8 +896,19 @@ fn run_update_command() -> anyhow::Result<()> {
     #[cfg(not(debug_assertions))]
     {
         let Some(action) = codex_tui::get_update_action() else {
+            let installer = if cfg!(windows) {
+                format!(
+                    "Invoke-WebRequest {} -OutFile install.ps1; .\\install.ps1",
+                    codex_install_context::LHC_INSTALLER_URL_WINDOWS
+                )
+            } else {
+                format!(
+                    "curl -fsSLO {} && sh install.sh",
+                    codex_install_context::LHC_INSTALLER_URL_UNIX
+                )
+            };
             anyhow::bail!(
-                "Could not detect the Codex installation method. Please update manually: https://developers.openai.com/codex/cli/"
+                "This Codex + LHC binary was not installed by the fork installer, so it cannot update itself. Install or update it manually:\n  {installer}"
             );
         };
         run_update_action(action)

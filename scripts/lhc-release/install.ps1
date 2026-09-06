@@ -11,8 +11,17 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $Repository = if ($env:CODEX_LHC_REPOSITORY) { $env:CODEX_LHC_REPOSITORY } else { "liminal-ai/codex-lhc" }
-if (-not $Prefix) { $Prefix = Join-Path $env:LOCALAPPDATA "CodexLHC" }
-if (-not $InstallRoot) { $InstallRoot = Join-Path $Prefix "packages" }
+$defaultPrefix = Join-Path $env:LOCALAPPDATA "CodexLHC"
+if (-not $InstallRoot) {
+    $InstallRoot = Join-Path $(if ($Prefix) { $Prefix } else { $defaultPrefix }) "packages"
+}
+# Defaults come from the store's own records, so a rerun that names only the
+# store (as the CLI update path does) updates the existing command in place.
+# An explicit parameter or environment value still wins.
+if (-not $Prefix) {
+    $recordedPrefix = Join-Path $InstallRoot "installed-prefix"
+    $Prefix = if (Test-Path $recordedPrefix) { (Get-Content $recordedPrefix -Raw).Trim() } else { $defaultPrefix }
+}
 $BinDir = Join-Path $Prefix "bin"
 
 function Fail([string]$Message) { throw "codex-lhc installer: $Message" }
@@ -87,6 +96,7 @@ try {
     Set-Content $Launcher "@echo off`r`n`"$escaped\bin\codex.exe`" %*" -Encoding Ascii
     Set-Content (Join-Path $InstallRoot "installed-version") $Version
     Set-Content (Join-Path $InstallRoot "installed-name") $Name
+    Set-Content (Join-Path $InstallRoot "installed-prefix") $Prefix
     Write-Host "Installed Codex + LHC v$Version"
     Write-Host "Command: $Launcher"
 } finally {

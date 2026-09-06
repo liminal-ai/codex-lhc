@@ -44,8 +44,11 @@ pub(crate) async fn run_update_prompt_if_needed(
         return Ok(UpdatePromptOutcome::Continue);
     };
 
-    let mut screen =
-        UpdatePromptScreen::new(tui.frame_requester(), latest_version.clone(), update_action);
+    let mut screen = UpdatePromptScreen::new(
+        tui.frame_requester(),
+        latest_version.clone(),
+        update_action.clone(),
+    );
     tui.draw(u16::MAX, |frame| {
         frame.render_widget_ref(&screen, frame.area());
     })?;

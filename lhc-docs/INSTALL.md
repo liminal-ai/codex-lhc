@@ -70,10 +70,12 @@ On Windows:
 .\install.ps1 -Prefix C:\Tools\CodexLHC
 ```
 
-Re-running the installer updates the managed package. The Unix installer
-prints the fork version transition and installed LHC SDK commit. On Linux or
-macOS, an occupied unmanaged command name is refused before the package
-store changes.
+Re-running the installer updates the managed package. Both installers record
+the command name and prefix in the package store, so a rerun that names only
+the store (`--install-root` on Linux or macOS, `-InstallRoot` on Windows)
+updates the existing command in place. The Unix installer prints the fork
+version transition and installed LHC SDK commit. On Linux or macOS, an
+occupied unmanaged command name is refused before the package store changes.
 
 Uninstall an installer-managed command on Linux or macOS:
 
@@ -91,8 +93,11 @@ Uninstall removes only installer-owned packages and command links. It preserves
 Codex configuration and LHC archives.
 
 For published releases, **re-running this fork installer is the supported
-update path**. Do not use upstream's `codex update`: that channel installs
-official OpenAI builds without LHC.
+update path**. The installed command's `update` subcommand and the TUI's
+update prompt download this installer and run it against the managed package
+store; they never run an upstream package manager or installer. A binary that
+the fork installer did not install (for example a source build) gets manual
+instructions pointing at the installer instead.
 
 ## Upgrade and compatibility
 

@@ -1220,6 +1220,18 @@ fn standalone_unix_update_available_history_cell_snapshot() {
     insta::assert_snapshot!(rendered);
 }
 
+#[cfg(unix)]
+#[test]
+fn lhc_unix_update_available_history_cell_snapshot() {
+    let store = AbsolutePathBuf::from_absolute_path("/home/codex/.local/share/codex-lhc")
+        .expect("store should be absolute");
+    let cell =
+        UpdateAvailableHistoryCell::new("9.9.9".to_string(), Some(UpdateAction::LhcUnix { store }));
+    let rendered = render_lines(&cell.display_lines(/*width*/ 110)).join("\n");
+
+    insta::assert_snapshot!(rendered);
+}
+
 #[test]
 fn standalone_windows_update_available_history_cell_snapshot() {
     let cell =

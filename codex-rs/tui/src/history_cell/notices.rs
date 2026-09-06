@@ -26,7 +26,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         use ratatui_macros::line;
         use ratatui_macros::text;
-        let update_instruction = if let Some(update_action) = self.update_action {
+        let update_instruction = if let Some(update_action) = &self.update_action {
             line!["Run ", update_action.command_str().cyan(), " to update."]
         } else {
             line![
@@ -60,7 +60,7 @@ impl HistoryCell for UpdateAvailableHistoryCell {
     }
 
     fn raw_lines(&self) -> Vec<Line<'static>> {
-        let update_instruction = if let Some(update_action) = self.update_action {
+        let update_instruction = if let Some(update_action) = &self.update_action {
             format!("Run {} to update.", update_action.command_str())
         } else {
             "See https://github.com/openai/codex for installation options.".to_string()

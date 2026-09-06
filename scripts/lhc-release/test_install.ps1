@@ -43,6 +43,23 @@ try {
     & "$PSScriptRoot\install.ps1" -Prefix $prefix -InstallRoot $store -Uninstall
     if (Test-Path $default) { throw "default launcher survived uninstall" }
     if (Test-Path $store) { throw "managed store survived uninstall" }
+
+    # The recorded prefix is reused when only -InstallRoot is given, as the
+    # CLI update path does; an explicit -Prefix still wins and is recorded.
+    $recorded = Join-Path $root "recorded-prefix"
+    $launcher = Join-Path $recorded "bin\codex-lhc.cmd"
+    & "$PSScriptRoot\install.ps1" -Version $version -Prefix $recorded -InstallRoot $store -AssetDir $release
+    if ((Get-Content (Join-Path $store "installed-prefix") -Raw).Trim() -ne $recorded) { throw "installed-prefix was not recorded" }
+    Remove-Item $launcher -Force
+    & "$PSScriptRoot\install.ps1" -Version $version -InstallRoot $store -AssetDir $release
+    if (-not (Test-Path $launcher)) { throw "rerun did not reuse the recorded prefix" }
+    $other = Join-Path $root "other-prefix"
+    & "$PSScriptRoot\install.ps1" -Version $version -Prefix $other -InstallRoot $store -AssetDir $release
+    if (-not (Test-Path (Join-Path $other "bin\codex-lhc.cmd"))) { throw "explicit -Prefix was not honored" }
+    if ((Get-Content (Join-Path $store "installed-prefix") -Raw).Trim() -ne $other) { throw "explicit -Prefix was not recorded" }
+    & "$PSScriptRoot\install.ps1" -InstallRoot $store -Uninstall
+    if (Test-Path (Join-Path $other "bin\codex-lhc.cmd")) { throw "launcher in recorded prefix survived uninstall" }
+    if (Test-Path $store) { throw "managed store survived uninstall" }
     Write-Host "Windows installer fixture: PASS"
 } finally {
     if (Test-Path $root) { Remove-Item $root -Recurse -Force }

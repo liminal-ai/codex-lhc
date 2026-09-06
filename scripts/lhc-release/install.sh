@@ -2,7 +2,7 @@
 set -eu
 
 REPO="${CODEX_LHC_REPOSITORY:-liminal-ai/codex-lhc}"
-PREFIX="${CODEX_LHC_PREFIX:-${HOME}/.local}"
+PREFIX="${CODEX_LHC_PREFIX:-}"
 STORE="${CODEX_LHC_INSTALL_ROOT:-${XDG_DATA_HOME:-${HOME}/.local/share}/codex-lhc}"
 VERSION="${CODEX_LHC_VERSION:-}"
 NAME="${CODEX_LHC_NAME:-}"
@@ -18,7 +18,8 @@ Usage: install.sh [OPTIONS]
   --version VERSION    Install a specific release (default: latest)
   --name NAME          Command name (default: codex-lhc for a new install, or the
                        name recorded by an existing managed install)
-  --prefix DIR         Command prefix (default: ~/.local)
+  --prefix DIR         Command prefix (default: ~/.local for a new install, or the
+                       prefix recorded by an existing managed install)
   --install-root DIR   Versioned package storage
   --asset-dir DIR      Install from a validated local candidate directory
   --uninstall          Remove the selected command and managed package store
@@ -53,6 +54,16 @@ case "$STORE" in
   ''|/|"$HOME") die "refusing unsafe install root: $STORE" ;;
 esac
 
+# Defaults come from the store's own records, so a rerun that names only the
+# store (as the CLI update path does) updates the existing command in place.
+# An explicit option or environment value still wins.
+if [ -z "$PREFIX" ]; then
+  if [ -f "$STORE/installed-prefix" ]; then
+    PREFIX=$(cat "$STORE/installed-prefix")
+  else
+    PREFIX="${HOME}/.local"
+  fi
+fi
 BIN_DIR="${PREFIX}/bin"
 if [ -z "$NAME" ]; then
   if [ -f "$STORE/installed-name" ]; then
@@ -167,6 +178,7 @@ fi
 ln -sfn "$STORE/current/bin/codex" "$LINK"
 printf '%s\n' "$VERSION" > "$STORE/installed-version"
 printf '%s\n' "$NAME" > "$STORE/installed-name"
+printf '%s\n' "$PREFIX" > "$STORE/installed-prefix"
 
 lhc_pin=$(sed -n 's/.*"sdkCommit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEST/codex-package.json" | head -1)
 say "Installed Codex + LHC: v${old_version} -> v${VERSION}"

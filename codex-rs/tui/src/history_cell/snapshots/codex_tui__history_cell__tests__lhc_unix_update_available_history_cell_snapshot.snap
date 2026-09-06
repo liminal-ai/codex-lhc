@@ -1,0 +1,13 @@
+---
+source: tui/src/history_cell/tests.rs
+expression: rendered
+---
+╭────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ✨ Update available! 0.153.3 -> 9.9.9                                                                      │
+│ Run sh -c 'f=$(mktemp "${TMPDIR:-/tmp}/codex-lhc-install.XXXXXX") && curl -fsSL                            │
+│ https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh -o "$f" && sh "$f"             │
+│ --install-root "$1"; s=$?; rm -f "$f"; exit $s' sh /home/codex/.local/share/codex-lhc to update.           │
+│                                                                                                            │
+│ See full release notes:                                                                                    │
+│ https://github.com/openai/codex/releases/latest                                                            │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
