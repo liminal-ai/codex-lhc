@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Prove that a bare `codex exec` captures a real turn into LHC."""
+
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -80,7 +82,7 @@ class ResponsesHandler(BaseHTTPRequestHandler):
 
 
 def captured_state(database: Path) -> tuple[list[str], list[str], int]:
-    with sqlite3.connect(database, timeout=1) as connection:
+    with closing(sqlite3.connect(database, timeout=1)) as connection:
         contents = [
             row[0]
             for row in connection.execute(

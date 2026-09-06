@@ -40,6 +40,31 @@
 > install `codex-lhc` and leaves any stock `codex` command alone.
 > Official Codex installers and `openai/codex` releases do **not** include LHC.
 >
+> ### What changes in v0.153.4
+>
+> This update brings the fork to Codex 0.153.4 and improves updates, images,
+> and the summaries used to keep long-running conversations coherent.
+>
+> - **Updates stay with LHC.** New installations use `codex-lhc`, alongside
+>   stock `codex`. Run `codex-lhc update` to update a managed fork installation;
+>   its in-app update prompt and `doctor` advice also use LHC releases.
+>   `--lhc-version` reports the fork release; `--version` reports its Codex base.
+> - **Images can survive history reconstruction and restart.** Image data and
+>   detail settings are restored when that portion of history is retained in
+>   full. Older compressed portions may carry an image placeholder instead.
+> - **History summaries use the intended summarization instructions.** This
+>   fixes a bridge error that could produce replies where summaries belonged.
+>
+> **Upgrade impact:** opening existing LHC history upgrades its storage in
+> place to schema 13. Releases v0.150.2 and earlier cannot reopen migrated
+> threads. If you need the option to return to an older release, preserve a
+> backup of your LHC state before upgrading. See [upgrade details](lhc-docs/INSTALL.md#upgrade-and-compatibility).
+>
+> Upstream's optional experimental context-management mode remains incompatible
+> with LHC and is rejected at startup. Normal LHC use does not require it.
+> [Release notes](lhc-release/notes/v0.153.4.md) describe the remaining changes
+> and qualification coverage.
+>
 > Everything below is upstream's README. Its install commands install stock
 > Codex, not Codex + LHC.
 
