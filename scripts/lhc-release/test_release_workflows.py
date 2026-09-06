@@ -49,7 +49,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("verify_package_archive.py", qualification)
         self.assertIn("--asset-dir", qualification)
         self.assertIn("--uninstall", qualification)
-        self.assertIn("codex-cli $VERSION", qualification)
+        self.assertIn('upstream_version="${VERSION%%-lhc.*}"', qualification)
+        self.assertIn('--lhc-version)" = "$VERSION"', qualification)
+        self.assertIn('--version)" = "codex-cli $upstream_version"', qualification)
+        self.assertNotIn("codex-cli $VERSION", qualification)
         self.assertIn("codex-code-mode-host", qualification)
         self.assertIn("codex-path/rg", qualification)
         self.assertIn("codex-resources/bwrap", qualification)
@@ -73,7 +76,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("LHC_COMPACT_ALGORITHM=legacy", qualification)
         self.assertIn("--mode legacy", qualification)
         self.assertIn("app-server daemon bootstrap", qualification)
+        self.assertIn(
+            '.managedCodexVersion <<<"$bootstrap")" = "$upstream_version"',
+            qualification,
+        )
+        self.assertIn(
+            '.appServerVersion <<<"$bootstrap")" = "$upstream_version"',
+            qualification,
+        )
         self.assertIn('cmp "$package/bin/codex" "$managed"', qualification)
+        self.assertIn("app-server daemon stop", qualification)
         self.assertIn(
             "Preserve installed lifecycle qualification evidence", qualification
         )

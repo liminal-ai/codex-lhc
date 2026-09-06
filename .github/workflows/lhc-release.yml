@@ -145,7 +145,12 @@ jobs:
             --name codex-lhc-seed --prefix "$prefix" --install-root "$store"
           launcher="$prefix/bin/codex-lhc-seed"
           package="$store/versions/$VERSION"
-          test "$("$launcher" --version)" = "codex-cli $VERSION"
+          # The fork release is X.Y.Z or X.Y.Z-lhc.N (validated above); the
+          # binary and daemon report the upstream base while --lhc-version
+          # reports the full fork release.
+          upstream_version="${VERSION%%-lhc.*}"
+          test "$("$launcher" --lhc-version)" = "$VERSION"
+          test "$("$launcher" --version)" = "codex-cli $upstream_version"
           "$package/bin/codex-code-mode-host" --help >/dev/null
           "$package/codex-path/rg" --version >/dev/null
           "$package/codex-resources/bwrap" --version >/dev/null
@@ -158,8 +163,8 @@ jobs:
           bootstrap="$(HOME="$home" CODEX_HOME="$daemon_home" \
             timeout 30 "$launcher" app-server daemon bootstrap)"
           managed="$(jq -r .managedCodexPath <<<"$bootstrap")"
-          test "$(jq -r .managedCodexVersion <<<"$bootstrap")" = "$VERSION"
-          test "$(jq -r .appServerVersion <<<"$bootstrap")" = "$VERSION"
+          test "$(jq -r .managedCodexVersion <<<"$bootstrap")" = "$upstream_version"
+          test "$(jq -r .appServerVersion <<<"$bootstrap")" = "$upstream_version"
           cmp "$package/bin/codex" "$managed"
           HOME="$home" CODEX_HOME="$daemon_home" \
             timeout 30 "$launcher" app-server daemon stop >/dev/null
