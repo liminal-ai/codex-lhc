@@ -49,9 +49,10 @@ async fn copied_schema12_preserves_text_ids_and_step_indices() {
             .iter()
             .any(|m| m.get("step_index") == Some(&json!(7)))
     );
-    db.close();
     let copied = dir.path().join("copied.sqlite");
-    std::fs::copy(&source, &copied).expect("copy legacy archive");
+    db.prepare("VACUUM INTO ?")
+        .run(&[copied.to_str().expect("path").into()]);
+    db.close();
     let OpResult::Ok { value: migrated } =
         lhc::threads::open_thread_database(copied.to_str().expect("path"))
     else {

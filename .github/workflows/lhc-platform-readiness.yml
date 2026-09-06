@@ -29,7 +29,7 @@ jobs:
       matrix:
         include:
           - label: linux-x86_64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-24.04
             kind: unix
             target: x86_64-unknown-linux-gnu
           - label: linux-aarch64
@@ -55,6 +55,11 @@ jobs:
           persist-credentials: false
           submodules: recursive
           fetch-depth: 0
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: matrix.kind == 'windows'
+        with:
+          python-version: "3.13"
 
       - uses: ./.github/actions/setup-ci
         if: matrix.kind != 'windows'
