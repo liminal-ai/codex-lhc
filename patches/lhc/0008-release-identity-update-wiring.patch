@@ -346,7 +346,7 @@ index 68254d10cc..470fe758d8 100644
  )
 diff --git a/codex-rs/install-context/src/lhc_release.rs b/codex-rs/install-context/src/lhc_release.rs
 new file mode 100644
-index 0000000000..9c3767011a
+index 0000000000..3cc82e8b36
 --- /dev/null
 +++ b/codex-rs/install-context/src/lhc_release.rs
 @@ -0,0 +1,48 @@
@@ -365,7 +365,7 @@ index 0000000000..9c3767011a
 +
 +/// The fork's install and update instructions.
 +pub const LHC_INSTALL_DOCS_URL: &str =
-+    "https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md";
++    "https://github.com/liminal-ai/codex-lhc/blob/main/lhc-docs/INSTALL.md";
 +
 +/// The latest-release download URL of the fork's Unix installer.
 +pub const LHC_INSTALLER_URL_UNIX: &str =
@@ -636,7 +636,7 @@ index fb15a05775..1d1107f41e 100644
  ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
 new file mode 100644
-index 0000000000..0839cb3a62
+index 0000000000..39f5d9c403
 --- /dev/null
 +++ b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__unmanaged_update_available_history_cell_snapshot.snap
 @@ -0,0 +1,11 @@
@@ -644,13 +644,13 @@ index 0000000000..0839cb3a62
 +source: tui/src/history_cell/tests.rs
 +expression: rendered
 +---
-+╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
-+│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1                                            │
-+│ See https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md for installation options. │
-+│                                                                                                    │
-+│ See full release notes:                                                                            │
-+│ https://github.com/liminal-ai/codex-lhc/releases/latest                                            │
-+╰────────────────────────────────────────────────────────────────────────────────────────────────────╯
++╭─────────────────────────────────────────────────────────────────────────────────────────────────────╮
++│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1                                             │
++│ See https://github.com/liminal-ai/codex-lhc/blob/main/lhc-docs/INSTALL.md for installation options. │
++│                                                                                                     │
++│ See full release notes:                                                                             │
++│ https://github.com/liminal-ai/codex-lhc/releases/latest                                             │
++╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap b/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
 index 1a2df82a9d..7dfcbe551b 100644
 --- a/codex-rs/tui/src/history_cell/snapshots/codex_tui__history_cell__tests__vite_plus_update_available_history_cell_snapshot.snap
