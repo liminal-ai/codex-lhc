@@ -3,8 +3,9 @@ name: postmerge-ci
 # This is the single entrypoint for main-only CI that is intentionally outside
 # the merge-blocking suite. It keeps the broader postmerge signal in one run.
 on:
-  push:
-    branches: [main]
+  # codex-lhc (2026-09-08): main is this fork's product branch. Upstream's
+  # post-merge suites do not start on their own here; run them by hand.
+  workflow_dispatch:
 
 jobs:
   # Keep reusable workflow calls alphabetized. Each child retains its own

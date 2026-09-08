@@ -147,7 +147,7 @@ source on other architectures.
 ```bash
 git clone --recurse-submodules https://github.com/liminal-ai/codex-lhc.git
 cd codex-lhc
-git checkout lhc   # default branch; the product lives here
+git checkout main  # default branch; the product lives here
 ```
 
 If you already cloned without submodules:

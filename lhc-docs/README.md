@@ -123,8 +123,7 @@ all original provider or UI metadata survived capture.
 
 | Branch or channel | Role |
 |---|---|
-| **`lhc`** (default) | Product: Codex + LHC |
-| **`main`** | Upstream mirror only |
+| **`main`** (default) | Product: Codex + LHC |
 | **Fork releases** | SemVer releases; see [GitHub Releases](https://github.com/liminal-ai/codex-lhc/releases/latest) for the current version |
 
 ## Where to go next

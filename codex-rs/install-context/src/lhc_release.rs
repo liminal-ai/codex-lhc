@@ -13,7 +13,7 @@ pub const LHC_RELEASES_URL: &str = "https://github.com/liminal-ai/codex-lhc/rele
 
 /// The fork's install and update instructions.
 pub const LHC_INSTALL_DOCS_URL: &str =
-    "https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md";
+    "https://github.com/liminal-ai/codex-lhc/blob/main/lhc-docs/INSTALL.md";
 
 /// The latest-release download URL of the fork's Unix installer.
 pub const LHC_INSTALLER_URL_UNIX: &str =

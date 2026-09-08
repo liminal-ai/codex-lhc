@@ -2,10 +2,10 @@
 source: tui/src/history_cell/tests.rs
 expression: rendered
 ---
-╭────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1                                            │
-│ See https://github.com/liminal-ai/codex-lhc/blob/lhc/lhc-docs/INSTALL.md for installation options. │
-│                                                                                                    │
-│ See full release notes:                                                                            │
-│ https://github.com/liminal-ai/codex-lhc/releases/latest                                            │
-╰────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1                                             │
+│ See https://github.com/liminal-ai/codex-lhc/blob/main/lhc-docs/INSTALL.md for installation options. │
+│                                                                                                     │
+│ See full release notes:                                                                             │
+│ https://github.com/liminal-ai/codex-lhc/releases/latest                                             │
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────╯

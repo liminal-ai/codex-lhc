@@ -11,7 +11,8 @@ the adapter captures; it cannot recover host structure discarded during capture
 - **[`lhc-docs/README.md`](lhc-docs/README.md)** — what this fork is and why, for
   humans or agents evaluating it. Start there; this file is the maintenance
   contract. Install and configuration: [`lhc-docs/INSTALL.md`](lhc-docs/INSTALL.md).
-- Fork work lives on **`lhc`** (default branch). `main` tracks upstream.
+- Fork work lives on **`main`** (default branch; since 2026-09-08 — before that
+  `lhc`, with `main` an upstream mirror). The upstream base is `patches/lhc/BASE`.
 - Never run any self-update path on this checkout — it is a git-tracked
   source build.
 - Current law is this file, the touchpoint inventory below, and the enforced
@@ -359,7 +360,7 @@ the tree, so it cannot rot silently again.
 
 ### Procedure
 
-1. Fresh clone of upstream → branch `lhc`.
+1. Fresh clone of upstream → branch `main`.
 2. Restore fork-owned files that are **not** core touchpoints:
    `FORK.md`, `.gitmodules`, `patches/`, `scripts/`, `codex-rs/lhc/`.
 3. Restore the vendored submodule at the pin in §Layout:

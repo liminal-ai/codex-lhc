@@ -10,7 +10,7 @@
 > exact source by ID.
 >
 > Built on [**LHC (Long Horizon Context)**](https://github.com/liminal-ai/long-horizon-context).
-> Product branch **`lhc`**; **`main`** tracks upstream only.
+> Product branch **`main`**; upstream base recorded in `patches/lhc/BASE`.
 >
 > - [**What this fork is**](lhc-docs/README.md) — behavior, LHC concepts, and
 >   the Codex integration.
