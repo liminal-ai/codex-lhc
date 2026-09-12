@@ -97,6 +97,12 @@ rebuilding through the audited maintainer token, then fails unless the public
 tag, release, complete asset set, and downloaded hashes read back exactly.
 `lhc-platform-readiness.yml` independently keeps all five native paths ready.
 
+Release standard (2026-09-12): qualification runs on the exact commit that is
+promoted, not an earlier candidate; at least one live model turn on the shipped
+artifact before promotion (fixture-only burn-ins do not count); a bug fix ships
+only after the bug was reproduced on the pre-fix build, and the release record
+cites the reproduction.
+
 ## LC Adaptive Service Tier
 
 `lc_adaptive_service_tier` is an opt-in cost control for long-context agents.
