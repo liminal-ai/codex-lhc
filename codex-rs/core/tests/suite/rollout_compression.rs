@@ -2,7 +2,6 @@
 
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -11,14 +10,9 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_core::CodexThread;
 use codex_core::TurnInputRequest;
-use codex_core::config::Config;
-use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
-use codex_lhc_host::LhcCaptureSlot;
-use codex_lhc_host::install_with_root;
-use codex_lhc_host::wait_for_handle;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -38,49 +32,18 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
-use tempfile::TempDir;
 use wiremock::MockServer;
 
-fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
-    let mut builder = ExtensionRegistryBuilder::<Config>::new();
-    install_with_root(
-        &mut builder,
-        |config| config.features.enabled(Feature::LhcCapture),
-        root,
-    );
-    Arc::new(builder.build())
-}
-
-async fn wait_lhc_capture(thread: &CodexThread) {
-    let slot = thread
-        .thread_extension_data()
-        .get::<LhcCaptureSlot>()
-        .expect("LhcCaptureSlot");
-    wait_for_handle(&slot, Duration::from_secs(30))
-        .await
-        .expect("LHC capture ready");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native local compact summarizer text on Compacted replacement history"]
 async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let lhc_root = TempDir::new()?;
     let test = test_codex()
         .with_history_mode(ThreadHistoryMode::Paginated)
-        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             config.model_provider.name = "Local compaction test provider".to_string();
-            config
-                .features
-                .enable(Feature::LhcCapture)
-                .expect("enable LHC capture");
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("disable token budget");
-            let _ = config.features.disable(Feature::ContextManagement);
             config
                 .features
                 .disable(Feature::LocalThreadStoreCompression)
@@ -88,7 +51,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         })
         .build_with_auto_env(&server)
         .await?;
-    wait_lhc_capture(&test.codex).await;
     turn(
         &server,
         &test.codex,
@@ -131,7 +93,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             prepared,
         )
         .await?;
-    wait_lhc_capture(&child.thread).await;
     turn(
         &server,
         &test.codex,
@@ -220,7 +181,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             ClientMcpExtensions::default(),
         )
         .await?;
-    wait_lhc_capture(&resumed.thread).await;
     let followup = turn(
         &server,
         &resumed.thread,

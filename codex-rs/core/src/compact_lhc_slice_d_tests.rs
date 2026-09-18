@@ -390,9 +390,6 @@ async fn slice_d_regenerate_and_resume_drill() {
         boundary,
         world_state: None,
         turn_context: None,
-        guardian_history: None,
-        retained_context: None,
-        latest_token_usage_record: None,
         live_identity: None,
     });
     assert!(
@@ -1156,9 +1153,6 @@ async fn slice_d_l2_crash_injection_full_stack() {
         boundary,
         world_state: None,
         turn_context: None,
-        guardian_history: None,
-        retained_context: None,
-        latest_token_usage_record: None,
         live_identity: None,
     });
 
@@ -1382,9 +1376,6 @@ async fn slice_d_l2_empty_edge_cases() {
             boundary,
             world_state: None,
             turn_context: None,
-            guardian_history: None,
-            retained_context: None,
-            latest_token_usage_record: None,
             live_identity: None,
         });
         assert_eq!(compacted_count(&result.items), 1);

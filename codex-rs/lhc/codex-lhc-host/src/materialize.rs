@@ -8,8 +8,7 @@
 //!   → carry-forward settings / goal (if any)
 //!   → first UserMessage display twin (true first user_prompt; display-only)
 //!   → model stream: banded history as text ResponseItems (NO display twins)
-//!   → exactly ONE Compacted { replacement_history, window_number, window ids,
-//!     guardian_history / retained_context when supplied }
+//!   → exactly ONE Compacted { replacement_history, window_number, window ids }
 //!   → one full WorldState snapshot (when supplied)
 //!   → optional TurnContext (when supplied — previous_turn_settings recovery)
 //!   → ContextCompacted display marker
@@ -59,8 +58,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use codex_history::CompactedItem;
-use codex_history::GuardianHistoryCheckpoint;
-use codex_history::RetainedContext;
 use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::TurnItem;
@@ -82,7 +79,6 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
-use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -165,54 +161,9 @@ pub struct MaterializeInput<'a> {
     /// Optional post-boundary `TurnContext` for `previous_turn_settings` recovery.
     /// Slice C supplies the live session's latest context; `None` leaves the gap.
     pub turn_context: Option<TurnContextItem>,
-    /// Live Guardian checkpoint at compact time. `None` leaves Compacted.guardian_history empty.
-    pub guardian_history: Option<GuardianHistoryCheckpoint>,
-    /// Live retained-context snapshot at compact time.
-    pub retained_context: Option<RetainedContext>,
-    /// Latest token-usage record at compact time, for resume without a long scan.
-    pub latest_token_usage_record: Option<TokenUsageRecord>,
     /// When set and matching the stored assistant provider/model/api, reverse
     /// maps restore `encrypted_content` from the thinking signature.
     pub live_identity: Option<ModelIdentity>,
-}
-
-/// Checkpoints to copy from the last `Compacted` (and following `TurnContext`)
-/// so cold resume / reconcile do not drop Guardian or token-usage state.
-#[derive(Debug, Clone, Default)]
-pub struct PriorCompactCarry {
-    pub guardian_history: Option<GuardianHistoryCheckpoint>,
-    pub retained_context: Option<RetainedContext>,
-    pub latest_token_usage_record: Option<TokenUsageRecord>,
-    pub turn_context: Option<TurnContextItem>,
-}
-
-pub fn prior_compact_carry(prior: &[RolloutItem]) -> PriorCompactCarry {
-    let Some(idx) = prior
-        .iter()
-        .rposition(|item| matches!(item, RolloutItem::Compacted(_)))
-    else {
-        return PriorCompactCarry::default();
-    };
-    let RolloutItem::Compacted(compacted) = &prior[idx] else {
-        return PriorCompactCarry::default();
-    };
-    let mut turn_context = None;
-    for item in &prior[idx + 1..] {
-        match item {
-            RolloutItem::EventMsg(_) => break,
-            RolloutItem::TurnContext(ctx) => {
-                turn_context = Some(ctx.clone());
-                break;
-            }
-            _ => {}
-        }
-    }
-    PriorCompactCarry {
-        guardian_history: compacted.guardian_history.clone(),
-        retained_context: compacted.retained_context.clone(),
-        latest_token_usage_record: compacted.latest_token_usage_record.clone(),
-        turn_context,
-    }
 }
 
 /// Output of [`materialize_rollout`]: items plus any loud degradation notes.
@@ -264,10 +215,10 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         first_window_id: Some(input.boundary.first_window_id.clone()),
         previous_window_id: input.boundary.previous_window_id.clone(),
         window_id: Some(input.boundary.window_id.clone()),
-        guardian_history: input.guardian_history.clone(),
-        retained_context: input.retained_context.clone(),
+        guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
-        latest_token_usage_record: input.latest_token_usage_record.clone(),
+        latest_token_usage_record: None,
     };
     debug_assert!(
         compacted

@@ -1244,7 +1244,6 @@ pub async fn materialize_thread_rollout_items(
         }),
     };
 
-    let carry = crate::prior_compact_carry(&prior_generation);
     let mut result = materialize_rollout(&MaterializeInput {
         session_meta,
         thread_view: &surfaces.thread_view,
@@ -1260,10 +1259,7 @@ pub async fn materialize_thread_rollout_items(
             window_id,
         },
         world_state: None,
-        turn_context: carry.turn_context,
-        guardian_history: carry.guardian_history,
-        retained_context: carry.retained_context,
-        latest_token_usage_record: carry.latest_token_usage_record,
+        turn_context: None,
         live_identity,
     });
 

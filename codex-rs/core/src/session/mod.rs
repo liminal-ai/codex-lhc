@@ -1355,12 +1355,6 @@ impl Session {
         state.get_total_token_usage(state.server_reasoning_included())
     }
 
-    pub(crate) async fn latest_token_usage_record(
-        &self,
-    ) -> Option<codex_protocol::protocol::TokenUsageRecord> {
-        self.state.lock().await.latest_token_usage_record.clone()
-    }
-
     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
         let state = self.state.lock().await;
         state.auto_compact_window_snapshot()

@@ -473,6 +473,8 @@ Tests split three ways. The split is the policy, not the failure inventory:
 
 The class-3 set is exact: `scripts/lhc-native-routing-ignored-tests.txt` (`# count:`) plus `scripts/check-lhc-compact-ignores.sh` (tripwire layer 1b). Drift in either direction fails.
 
+Fork-owned surface = codex-lhc-host + the fork's own tests + upstream tests that do not assert native compaction.
+
 ## Compact-continuation MidTurn (LIM-63B)
 
 At `CompactionPhase::MidTurn` (post-sampling seam: provider response complete,
