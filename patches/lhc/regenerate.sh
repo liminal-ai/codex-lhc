@@ -85,6 +85,9 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/compact_remote_trimming.rs \
   codex-rs/core/tests/suite/compact_remote_parity.rs \
   codex-rs/core/tests/suite/compact_resume_fork.rs \
+  codex-rs/core/tests/suite/guardian_history.rs \
+  codex-rs/core/tests/suite/rollout_compression.rs \
+  codex-rs/core/tests/suite/step_settings_compaction.rs \
   codex-rs/core/tests/suite/client.rs \
   codex-rs/core/tests/suite/current_time_reminder.rs \
   codex-rs/core/tests/suite/hooks.rs \

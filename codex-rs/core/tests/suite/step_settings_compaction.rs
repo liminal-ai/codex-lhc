@@ -1,10 +1,38 @@
 //! Compaction checkpoints retain the summary captured after a mid-turn settings update.
 
 use super::*;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
 use codex_history::RolloutItem;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use core_test_support::responses;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 use test_case::test_case;
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+async fn wait_lhc_capture(thread: &CodexThread) {
+    let slot = thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
 
 #[derive(Clone, Copy)]
 enum CompactionMode {
@@ -18,7 +46,7 @@ enum CompactionMode {
 async fn compaction_preserves_updated_summary(mode: CompactionMode) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let mut bodies = vec![
+    let bodies = vec![
         paused_response("pause", "pause-call"),
         sse(vec![
             ev_function_call(
@@ -29,27 +57,24 @@ async fn compaction_preserves_updated_summary(mode: CompactionMode) -> Result<()
             ),
             responses::ev_completed_with_tokens("plan-response", /*total_tokens*/ 330_000),
         ]),
+        sse_completed("done"),
     ];
-    bodies.push(match mode {
-        CompactionMode::Local => sse(vec![
-            responses::ev_assistant_message("summary", "Compacted history"),
-            ev_completed("compact"),
-        ]),
-        CompactionMode::RemoteV2 => sse(vec![
-            json!({"type": "response.output_item.done", "item": {"type": "compaction", "encrypted_content": "encrypted-summary"}}),
-            ev_completed("compact"),
-        ]),
-    });
-    bodies.push(sse_completed("done"));
     let responses = mount_sse_sequence(&server, bodies).await;
+    let lhc_root = TempDir::new()?;
     let test = step_settings_test()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config.model_auto_compact_token_limit = Some(200_000);
             config
                 .features
+                .enable(Feature::LhcCapture)
+                .expect("enable LHC capture");
+            config
+                .features
                 .disable(Feature::TokenBudget)
                 .expect("disable token budget");
+            let _ = config.features.disable(Feature::ContextManagement);
             config.model_provider.name = match mode {
                 CompactionMode::Local => "Local compaction test",
                 CompactionMode::RemoteV2 => "OpenAI",
@@ -58,6 +83,7 @@ async fn compaction_preserves_updated_summary(mode: CompactionMode) -> Result<()
         })
         .build_with_auto_env(&server)
         .await?;
+    wait_lhc_capture(&test.codex).await;
     let pause = start_paused_turn(&test.codex).await?;
     assert_eq!(
         submit_turn_settings(

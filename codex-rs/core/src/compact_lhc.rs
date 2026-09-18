@@ -779,8 +779,8 @@ async fn try_run_mid_turn_arm(
                 build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
             let reference_context_item = match &initial_context_injection {
                 InitialContextInjection::DoNotInject => None,
-                InitialContextInjection::BeforeLastUserMessage { .. } => {
-                    Some(turn_context.to_turn_context_item())
+                InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+                    Some(step_context.to_turn_context_item())
                 }
             };
             // The SDK install already happened; the host rewrite is the atomic
@@ -1343,8 +1343,8 @@ async fn run_mid_turn_forced_boundary_continuation(
             build_compaction_initial_context(sess.as_ref(), &initial_context_injection).await;
         let reference_context_item = match &initial_context_injection {
             InitialContextInjection::DoNotInject => None,
-            InitialContextInjection::BeforeLastUserMessage { .. } => {
-                Some(turn_context.to_turn_context_item())
+            InitialContextInjection::BeforeLastUserMessage { step_context, .. } => {
+                Some(step_context.to_turn_context_item())
             }
         };
 
