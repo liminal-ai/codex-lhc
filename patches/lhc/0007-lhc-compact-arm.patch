@@ -17740,7 +17740,7 @@ index aa828752a3..41922e1a23 100644
      let (release_primary, primary_gate) = tokio::sync::oneshot::channel();
      let (release_fallback, fallback_gate) = tokio::sync::oneshot::channel();
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
-index 5d5fa3a0aa..7de949114a 100644
+index 5d5fa3a0aa..44289f1f50 100644
 --- a/codex-rs/core/src/session/turn.rs
 +++ b/codex-rs/core/src/session/turn.rs
 @@ -8,8 +8,6 @@ use crate::client::ModelClientSession;
@@ -17902,7 +17902,22 @@ index 5d5fa3a0aa..7de949114a 100644
          return Ok(None);
      }
      if crate::guardian::is_basic_session_source(&turn_context.session_source)
-@@ -349,6 +372,8 @@ pub(crate) async fn run_turn(
+@@ -329,11 +352,9 @@ pub(crate) async fn run_turn(
+         )
+         .await
+     {
+-        // Token-budget compaction resets history, which can discard the evidence
+-        // referenced by a pending delta review. Leave budget failures unreusable.
+-        if !matches!(error.details(), CodexErrorDetails::ContextWindowExceeded)
+-            || turn_context.config.features.enabled(Feature::TokenBudget)
+-        {
++        // Native TokenBudget compaction is never reachable under LHC. Context
++        // overflow still goes through run_auto_compact (strict LHC arm).
++        if !matches!(error.details(), CodexErrorDetails::ContextWindowExceeded) {
+             return Err(error);
+         }
+         // Incoming evidence can overflow even below the normal history
+@@ -349,6 +370,8 @@ pub(crate) async fn run_turn(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -17911,7 +17926,7 @@ index 5d5fa3a0aa..7de949114a 100644
          )
          .await?;
          world_state = sess
-@@ -519,6 +544,11 @@ pub(crate) async fn run_turn(
+@@ -519,6 +542,11 @@ pub(crate) async fn run_turn(
              let responses_metadata = sess
                  .responses_metadata(turn_context.as_ref(), CodexResponsesRequestKind::Turn)
                  .await;
@@ -17923,7 +17938,7 @@ index 5d5fa3a0aa..7de949114a 100644
              run_sampling_request(
                  Arc::clone(&sess),
                  Arc::clone(&step_context),
-@@ -538,6 +568,10 @@ pub(crate) async fn run_turn(
+@@ -538,6 +566,10 @@ pub(crate) async fn run_turn(
                  let SamplingRequestResult {
                      needs_follow_up: model_needs_follow_up,
                      last_agent_message: sampling_request_last_agent_message,
@@ -17934,7 +17949,7 @@ index 5d5fa3a0aa..7de949114a 100644
                  } = sampling_request_output;
                  if model_needs_follow_up {
                      sess.input_queue
-@@ -562,6 +596,7 @@ pub(crate) async fn run_turn(
+@@ -562,6 +594,7 @@ pub(crate) async fn run_turn(
                  }
                  .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                  .await;
@@ -17942,7 +17957,7 @@ index 5d5fa3a0aa..7de949114a 100644
                  let needs_follow_up = model_needs_follow_up || has_pending_input;
                  let token_limit_reached = token_status.token_limit_reached;
  
-@@ -610,6 +645,27 @@ pub(crate) async fn run_turn(
+@@ -610,6 +643,27 @@ pub(crate) async fn run_turn(
  
                  // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                  if should_roll_over {
@@ -17970,7 +17985,7 @@ index 5d5fa3a0aa..7de949114a 100644
                      if let Err(err) = run_auto_compact(
                          &sess,
                          Arc::clone(&step_context),
-@@ -621,16 +677,14 @@ pub(crate) async fn run_turn(
+@@ -621,16 +675,14 @@ pub(crate) async fn run_turn(
                          },
                          CompactionReason::ContextLimit,
                          CompactionPhase::MidTurn,
@@ -17992,7 +18007,14 @@ index 5d5fa3a0aa..7de949114a 100644
                      }
                      if run_pending_session_start_hooks(&sess, &turn_context).await {
                          return Ok(None);
-@@ -713,10 +767,6 @@ pub(crate) async fn run_turn(
+@@ -706,17 +758,12 @@ pub(crate) async fn run_turn(
+             Err(err)
+                 if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
+                     && !guardian_budget_compacted
+-                    && !turn_context.config.features.enabled(Feature::TokenBudget)
+                     && sess
+                         .services
+                         .thread_extension_data
                          .get::<crate::guardian::ExhaustedReviewBudget>()
                          .is_some() =>
              {
@@ -18003,7 +18025,7 @@ index 5d5fa3a0aa..7de949114a 100644
                  guardian_budget_compacted = true;
                  sess.services
                      .thread_extension_data
-@@ -732,6 +782,8 @@ pub(crate) async fn run_turn(
+@@ -732,6 +779,8 @@ pub(crate) async fn run_turn(
                      },
                      CompactionReason::ContextLimit,
                      CompactionPhase::MidTurn,
@@ -18012,7 +18034,7 @@ index 5d5fa3a0aa..7de949114a 100644
                  )
                  .await?;
                  can_drain_pending_input = false;
-@@ -740,42 +792,9 @@ pub(crate) async fn run_turn(
+@@ -740,42 +789,9 @@ pub(crate) async fn run_turn(
              Err(err) if matches!(err.details(), CodexErrorDetails::TurnAborted) => {
                  return Err(err);
              }
@@ -18058,7 +18080,7 @@ index 5d5fa3a0aa..7de949114a 100644
          }
      }
  
-@@ -848,6 +867,34 @@ pub(crate) async fn run_hooks_and_record_inputs(
+@@ -848,6 +864,34 @@ pub(crate) async fn run_hooks_and_record_inputs(
      blocked_input && !accepted_user_input
  }
  
@@ -18093,7 +18115,7 @@ index 5d5fa3a0aa..7de949114a 100644
  fn turn_user_input(input: &[TurnInput]) -> Vec<UserInput> {
      input
          .iter()
-@@ -1252,6 +1299,8 @@ async fn run_pre_sampling_compact(
+@@ -1252,6 +1296,8 @@ async fn run_pre_sampling_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ContextLimit,
              CompactionPhase::PreTurn,
@@ -18102,7 +18124,7 @@ index 5d5fa3a0aa..7de949114a 100644
          )
          .await?;
      }
-@@ -1334,6 +1383,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1334,6 +1380,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::CompHashChanged,
              CompactionPhase::PreTurn,
@@ -18111,7 +18133,7 @@ index 5d5fa3a0aa..7de949114a 100644
          )
          .await?;
          return Ok(());
-@@ -1382,6 +1433,8 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1382,6 +1430,8 @@ async fn maybe_run_previous_model_inline_compact(
              InitialContextInjection::DoNotInject,
              CompactionReason::ModelDownshift,
              CompactionPhase::PreTurn,
@@ -18120,7 +18142,7 @@ index 5d5fa3a0aa..7de949114a 100644
          )
          .await?;
      }
-@@ -1393,64 +1446,45 @@ async fn maybe_run_previous_model_inline_compact(
+@@ -1393,64 +1443,45 @@ async fn maybe_run_previous_model_inline_compact(
      skip_all,
      fields(reason = ?reason, phase = ?phase)
  )]
@@ -18216,7 +18238,7 @@ index 5d5fa3a0aa..7de949114a 100644
  }
  
  pub(super) fn collect_explicit_app_ids_from_skill_items(
-@@ -1786,6 +1820,17 @@ pub(crate) async fn built_tools(
+@@ -1786,6 +1817,17 @@ pub(crate) async fn built_tools(
  struct SamplingRequestResult {
      needs_follow_up: bool,
      last_agent_message: Option<String>,
@@ -18234,7 +18256,7 @@ index 5d5fa3a0aa..7de949114a 100644
  }
  
  /// Ephemeral per-response state for streaming a single proposed plan.
-@@ -2435,6 +2480,18 @@ async fn try_run_sampling_request(
+@@ -2435,6 +2477,18 @@ async fn try_run_sampling_request(
          .features
          .enabled(Feature::ConcurrentReasoningSummaries)
          && turn_context.provider.info().is_openai();
@@ -18253,7 +18275,7 @@ index 5d5fa3a0aa..7de949114a 100644
      let mut stream = client_session
          .stream(
              prompt,
-@@ -2446,7 +2503,7 @@ async fn try_run_sampling_request(
+@@ -2446,7 +2500,7 @@ async fn try_run_sampling_request(
              )
              .await,
              step_context.settings.reasoning_summary,
@@ -18262,7 +18284,7 @@ index 5d5fa3a0aa..7de949114a 100644
              responses_metadata,
              &inference_trace,
          )
-@@ -2465,6 +2522,8 @@ async fn try_run_sampling_request(
+@@ -2465,6 +2519,8 @@ async fn try_run_sampling_request(
      let mut should_emit_token_count = false;
      const MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE: usize = 256;
      let mut analytics_tool_call_ids = Vec::new();
@@ -18271,7 +18293,7 @@ index 5d5fa3a0aa..7de949114a 100644
      let reasoning_effort = step_context
          .settings
          .reasoning_effort()
-@@ -2536,7 +2595,8 @@ async fn try_run_sampling_request(
+@@ -2536,7 +2592,8 @@ async fn try_run_sampling_request(
              ResponseEvent::OutputItemDone(mut item) => {
                  assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                  if analytics_tool_call_ids.len() < MAX_ANALYTICS_TOOL_CALL_IDS_PER_RESPONSE {
@@ -18281,7 +18303,7 @@ index 5d5fa3a0aa..7de949114a 100644
                          ResponseItem::FunctionCall { call_id, .. }
                          | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.as_str()),
                          ResponseItem::ToolSearchCall { call_id, .. }
-@@ -2547,10 +2607,35 @@ async fn try_run_sampling_request(
+@@ -2547,10 +2604,35 @@ async fn try_run_sampling_request(
                          }
                          _ => None,
                      };
@@ -18318,7 +18340,7 @@ index 5d5fa3a0aa..7de949114a 100644
                  if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
                      && let Ok(Some(event)) = consumer.finish()
                  {
-@@ -2642,6 +2727,10 @@ async fn try_run_sampling_request(
+@@ -2642,6 +2724,10 @@ async fn try_run_sampling_request(
                      break Ok(SamplingRequestResult {
                          needs_follow_up: true,
                          last_agent_message,
@@ -18329,7 +18351,7 @@ index 5d5fa3a0aa..7de949114a 100644
                      });
                  }
              }
-@@ -2822,6 +2911,10 @@ async fn try_run_sampling_request(
+@@ -2822,6 +2908,10 @@ async fn try_run_sampling_request(
                  break Ok(SamplingRequestResult {
                      needs_follow_up,
                      last_agent_message,
@@ -21333,6 +21355,26 @@ index 53dee6ea97..7493bc904f 100644
 +#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn remote_mid_turn_compact_v2_sends_turn_state_over_websocket() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+diff --git a/codex-rs/core/tests/suite/compact_remote_trimming.rs b/codex-rs/core/tests/suite/compact_remote_trimming.rs
+index 04ed0f552a..fe2beb0474 100644
+--- a/codex-rs/core/tests/suite/compact_remote_trimming.rs
++++ b/codex-rs/core/tests/suite/compact_remote_trimming.rs
+@@ -14,6 +14,7 @@ fn compact_response() -> String {
+     ])
+ }
+ 
++#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn remote_compact_v2_trims_tool_search_output_to_empty_tools_array() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+@@ -69,6 +70,7 @@ async fn remote_compact_v2_trims_tool_search_output_to_empty_tools_array() -> Re
+     Ok(())
+ }
+ 
++#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn remote_compact_v2_trim_estimate_uses_session_base_instructions() -> Result<()> {
      skip_if_no_network!(Ok(()));
 diff --git a/codex-rs/core/tests/suite/compact_resume_fork.rs b/codex-rs/core/tests/suite/compact_resume_fork.rs
 index d937ad13c4..a255c6dd68 100644

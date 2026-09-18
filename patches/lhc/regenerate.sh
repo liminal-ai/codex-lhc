@@ -82,6 +82,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/compact_lhc_image_tests.rs \
   codex-rs/core/tests/suite/compact_lhc_context_management.rs \
   codex-rs/core/tests/suite/compact_remote.rs \
+  codex-rs/core/tests/suite/compact_remote_trimming.rs \
   codex-rs/core/tests/suite/compact_remote_parity.rs \
   codex-rs/core/tests/suite/compact_resume_fork.rs \
   codex-rs/core/tests/suite/client.rs \

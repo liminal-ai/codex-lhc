@@ -14,6 +14,7 @@ fn compact_response() -> String {
     ])
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_trims_tool_search_output_to_empty_tools_array() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -69,6 +70,7 @@ async fn remote_compact_v2_trims_tool_search_output_to_empty_tools_array() -> Re
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_trim_estimate_uses_session_base_instructions() -> Result<()> {
     skip_if_no_network!(Ok(()));

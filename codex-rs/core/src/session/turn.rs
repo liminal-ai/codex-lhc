@@ -352,11 +352,9 @@ pub(crate) async fn run_turn(
         )
         .await
     {
-        // Token-budget compaction resets history, which can discard the evidence
-        // referenced by a pending delta review. Leave budget failures unreusable.
-        if !matches!(error.details(), CodexErrorDetails::ContextWindowExceeded)
-            || turn_context.config.features.enabled(Feature::TokenBudget)
-        {
+        // Native TokenBudget compaction is never reachable under LHC. Context
+        // overflow still goes through run_auto_compact (strict LHC arm).
+        if !matches!(error.details(), CodexErrorDetails::ContextWindowExceeded) {
             return Err(error);
         }
         // Incoming evidence can overflow even below the normal history
@@ -760,7 +758,6 @@ pub(crate) async fn run_turn(
             Err(err)
                 if matches!(err.details(), CodexErrorDetails::ContextWindowExceeded)
                     && !guardian_budget_compacted
-                    && !turn_context.config.features.enabled(Feature::TokenBudget)
                     && sess
                         .services
                         .thread_extension_data
