@@ -1302,10 +1302,23 @@ index 0000000000..25618cc4a1
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 98bfa792b2..a125edb740 100644
+index 98bfa792b2..fd271d8eeb 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1488,6 +1488,9 @@ impl Session {
+@@ -1355,6 +1355,12 @@ impl Session {
+         state.get_total_token_usage(state.server_reasoning_included())
+     }
+ 
++    pub(crate) async fn latest_token_usage_record(
++        &self,
++    ) -> Option<codex_protocol::protocol::TokenUsageRecord> {
++        self.state.lock().await.latest_token_usage_record.clone()
++    }
++
+     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
+         let state = self.state.lock().await;
+         state.auto_compact_window_snapshot()
+@@ -1488,6 +1494,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1315,7 +1328,7 @@ index 98bfa792b2..a125edb740 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info().slug.as_str();
-@@ -1536,6 +1539,8 @@ impl Session {
+@@ -1536,6 +1545,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1324,7 +1337,7 @@ index 98bfa792b2..a125edb740 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3470,6 +3475,27 @@ impl Session {
+@@ -3470,6 +3481,27 @@ impl Session {
          turn_context: &TurnContext,
          model_info: &ModelInfo,
          items: &[ResponseItem],
@@ -1352,7 +1365,7 @@ index 98bfa792b2..a125edb740 100644
      ) {
          let (items, image_preparations) =
              self.prepare_conversation_items_for_history(turn_context, model_info, items);
-@@ -3483,6 +3509,7 @@ impl Session {
+@@ -3483,6 +3515,7 @@ impl Session {
              model_info,
              items,
              image_preparations,
@@ -1360,7 +1373,7 @@ index 98bfa792b2..a125edb740 100644
          )
          .await;
      }
-@@ -3493,6 +3520,7 @@ impl Session {
+@@ -3493,6 +3526,7 @@ impl Session {
          model_info: &ModelInfo,
          mut items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
@@ -1368,7 +1381,7 @@ index 98bfa792b2..a125edb740 100644
      ) {
          // Save the originating history budget for replay.
          // Preserve any existing tool-specific override.
-@@ -3541,7 +3569,7 @@ impl Session {
+@@ -3541,7 +3575,7 @@ impl Session {
          {
              mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
          }
@@ -1377,7 +1390,7 @@ index 98bfa792b2..a125edb740 100644
              .await;
      }
  
-@@ -3822,7 +3850,13 @@ impl Session {
+@@ -3822,7 +3856,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1392,7 +1405,7 @@ index 98bfa792b2..a125edb740 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3920,7 +3954,7 @@ impl Session {
+@@ -3920,7 +3960,7 @@ impl Session {
                  .compaction_model_hash = metadata.compaction_model_hash;
          }
          let mut compacted_item = CompactedItem {
@@ -1401,7 +1414,7 @@ index 98bfa792b2..a125edb740 100644
              replacement_history: Some(items.clone()),
              retained_context: None,
              guardian_history: None,
-@@ -3955,6 +3989,10 @@ impl Session {
+@@ -3955,6 +3995,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1412,7 +1425,7 @@ index 98bfa792b2..a125edb740 100644
          }
  
          let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-@@ -3976,10 +4014,83 @@ impl Session {
+@@ -3976,10 +4020,83 @@ impl Session {
          }
      }
  
@@ -1496,7 +1509,7 @@ index 98bfa792b2..a125edb740 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -4019,7 +4130,42 @@ impl Session {
+@@ -4019,7 +4136,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1540,7 +1553,7 @@ index 98bfa792b2..a125edb740 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -4341,6 +4487,32 @@ impl Session {
+@@ -4341,6 +4493,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1573,7 +1586,7 @@ index 98bfa792b2..a125edb740 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4682,11 +4854,12 @@ impl Session {
+@@ -4682,11 +4860,12 @@ impl Session {
          model_info: &ModelInfo,
          response_item: ResponseItem,
      ) {
@@ -1588,7 +1601,7 @@ index 98bfa792b2..a125edb740 100644
          )
          .await;
  
-@@ -4710,16 +4883,12 @@ impl Session {
+@@ -4710,16 +4889,12 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
@@ -1609,7 +1622,7 @@ index 98bfa792b2..a125edb740 100644
          )
          .await;
          let mut user_message_item = UserMessageItem::new(input);
-@@ -4887,3 +5056,14 @@ mod elicitation_holders_tests;
+@@ -4887,3 +5062,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
