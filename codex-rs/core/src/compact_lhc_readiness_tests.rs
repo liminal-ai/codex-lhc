@@ -98,14 +98,17 @@ async fn seed_bandable(session: &Session, tc: &TurnContext, turns: usize) {
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(&format!("user turn {i} readiness seed {pad}"))],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),

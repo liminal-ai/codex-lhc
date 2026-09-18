@@ -46,6 +46,7 @@ regen 0003-feature-flag.patch \
 regen 0004-session-raw-item-hook.patch \
   codex-rs/core/src/session/mod.rs \
   codex-rs/core/src/session/inject.rs \
+  codex-rs/core/src/session/token_budget.rs \
   codex-rs/core/src/session/lhc_capture_e2e_tests.rs \
   codex-rs/core/src/stream_events_utils.rs \
   codex-rs/core/src/compact.rs

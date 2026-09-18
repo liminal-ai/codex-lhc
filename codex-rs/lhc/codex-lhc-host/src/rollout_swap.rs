@@ -733,6 +733,11 @@ pub fn parse_prior_realtime_items(
             continue;
         }
         let number = index + 1;
+        if let Err(err) = serde_json::from_str::<serde_json::Value>(&line) {
+            return Err(invalid_realtime_authority(format!(
+                "line {number}: malformed JSON: {err}"
+            )));
+        }
         let rollout_line: RolloutLine = parse_rollout_line(&line).map_err(|err| {
             invalid_realtime_authority(format!("line {number}: malformed rollout envelope: {err}"))
         })?;

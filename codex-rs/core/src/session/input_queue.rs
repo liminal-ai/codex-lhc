@@ -505,6 +505,7 @@ mod tests {
                         text_elements: Vec::new(),
                     }],
                     client_id: None,
+                    acceptance_order: None,
                 }],
             )
             .await;

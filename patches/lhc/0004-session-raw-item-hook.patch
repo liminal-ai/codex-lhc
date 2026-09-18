@@ -41,10 +41,10 @@ index b2d0c05673..df0dd92dfa 100644
      }
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..8d1df98816
+index 0000000000..25618cc4a1
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1213 @@
+@@ -0,0 +1,1256 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -78,6 +78,7 @@ index 0000000000..8d1df98816
 +use tempfile::tempdir;
 +
 +use super::Session;
++use super::step_context::StepContext;
 +use super::tests::make_session_and_context;
 +use crate::config::Config;
 +
@@ -133,8 +134,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("e2e human utterance")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -185,8 +188,10 @@ index 0000000000..8d1df98816
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                &turn_context,
++                turn_context.model_info(),
 +                &[text_input(text)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
@@ -247,8 +252,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("core-assigned-id-utterance")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -272,7 +279,11 @@ index 0000000000..8d1df98816
 +        phase: None,
 +        internal_chat_message_metadata_passthrough: None,
 +    }];
-+    let (prepared, _) = session.prepare_conversation_items_for_history(&turn_context, &items);
++    let (prepared, _) = session.prepare_conversation_items_for_history(
++        &turn_context,
++        turn_context.model_info(),
++        &items,
++    );
 +    let prepared = prepared.into_owned();
 +    let id_str = prepared[0]
 +        .id()
@@ -335,8 +346,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("provenance-sensitive")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -365,6 +378,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[host_item],
 +            RawItemProvenance::HostContext,
 +        )
@@ -499,8 +513,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("after-panic-contributor")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -561,7 +577,12 @@ index 0000000000..8d1df98816
 +        phase: None,
 +        internal_chat_message_metadata_passthrough: None,
 +    };
-+    record_completed_response_item(&session, &turn_context, &user_shaped).await;
++    record_completed_response_item(
++        &session,
++        StepContext::for_test(Arc::new(turn_context)).as_ref(),
++        &user_shaped,
++    )
++    .await;
 +
 +    handle.flush().await;
 +    let events = handle.list_events().await.expect("list");
@@ -612,8 +633,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("live turn that must be captured")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -692,6 +715,7 @@ index 0000000000..8d1df98816
 +    let dir = tempdir().expect("tempdir");
 +    let root = dir.path().to_path_buf();
 +    let (mut session, turn_context) = make_session_and_context().await;
++    let turn_context = Arc::new(turn_context);
 +    install_lhc_on_session(&mut session, root).await;
 +
 +    let slot = session
@@ -725,8 +749,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("v5 host facts prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -743,7 +769,12 @@ index 0000000000..8d1df98816
 +        internal_chat_message_metadata_passthrough: None,
 +    };
 +    // Production model-output path (ModelOutput provenance).
-+    record_completed_response_item(&session, &turn_context, &assistant).await;
++    record_completed_response_item(
++        &session,
++        StepContext::for_test(Arc::clone(&turn_context)).as_ref(),
++        &assistant,
++    )
++    .await;
 +
 +    // ResponseEvent::Completed path — TokenUsageContributor fans out last_token_usage.
 +    let per_call = TokenUsage {
@@ -873,8 +904,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("abort path prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -958,8 +991,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("optional facts prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -1062,6 +1097,7 @@ index 0000000000..8d1df98816
 +            previous_window_id: None,
 +            window_id: Some("win-1".into()),
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        }),
@@ -1076,6 +1112,7 @@ index 0000000000..8d1df98816
 +            previous_window_id: Some("win-1".into()),
 +            window_id: Some("win-2".into()),
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        }),
@@ -1134,8 +1171,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("run two tools then finish")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -1171,6 +1210,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[
 +                assistant("a0", "calling both tools"),
 +                call("call-a"),
@@ -1182,6 +1222,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[output("call-a")],
 +            RawItemProvenance::ModelOutput,
 +        )
@@ -1189,6 +1230,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[output("call-b")],
 +            RawItemProvenance::ModelOutput,
 +        )
@@ -1199,6 +1241,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[assistant("a1", "done")],
 +            RawItemProvenance::ModelOutput,
 +        )

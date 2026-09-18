@@ -43,10 +43,25 @@ index 172177cdac..d15eb85309 100644
              let model_context = self
                  .thread_store
 diff --git a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs b/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
-index 8d851ddeef..c3f439137d 100644
+index 8d851ddeef..10bf88e05e 100644
 --- a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
 +++ b/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
-@@ -30,6 +30,55 @@ const THREAD_HINT: &str =
+@@ -1,11 +1,14 @@
+ use std::time::Duration;
+ 
+ use anyhow::Result;
++use app_test_support::ChatGptAuthFixture;
+ use app_test_support::MockResponsesConfig;
+ use app_test_support::TestAppServer;
++use app_test_support::write_chatgpt_auth;
+ use codex_app_server_protocol::ThreadStartParams;
+ use codex_app_server_protocol::TurnStartParams;
+ use codex_app_server_protocol::UserInput;
++use codex_config::types::AuthCredentialsStoreMode;
+ use core_test_support::load_default_config_for_test;
+ use core_test_support::responses;
+ use pretty_assertions::assert_eq;
+@@ -30,6 +33,55 @@ const THREAD_HINT: &str =
      "Recent notes (up to 5, most-recent first):\n- /root/notes/latest.md (2 lines, 14 UTF-8 bytes)";
  const BRIDGE_HINT: &str = "unstructured notes/thread_hint fixture result";
  
@@ -102,7 +117,7 @@ index 8d851ddeef..c3f439137d 100644
  #[test_case(true, 200, THREAD_HINT; "native_hint")]
  #[test_case(true, 200, ""; "no_notes")]
  #[test_case(true, 503, THREAD_HINT; "native_failure_does_not_use_bridge")]
-@@ -115,6 +164,9 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
+@@ -115,6 +167,9 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
      MockResponsesConfig::new(&server.uri())
          .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
          .with_model_provider("openai-custom")
@@ -112,7 +127,7 @@ index 8d851ddeef..c3f439137d 100644
          .with_provider_name("OpenAI")
          .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
          .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
-@@ -331,6 +383,9 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
+@@ -331,6 +386,9 @@ async fn history_notes_and_async_message_emit_control_tool_analytics() -> Result
      )?;
      MockResponsesConfig::new(&server.uri())
          .with_model_provider("openai-custom")
@@ -3463,10 +3478,10 @@ index 0000000000..ec109112a2
 +}
 diff --git a/codex-rs/core/src/compact_lhc_canary_tests.rs b/codex-rs/core/src/compact_lhc_canary_tests.rs
 new file mode 100644
-index 0000000000..20d93ed082
+index 0000000000..e8c030ffa8
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_canary_tests.rs
-@@ -0,0 +1,917 @@
+@@ -0,0 +1,919 @@
 +//! CX-S6 (LIM-106) certification canaries, updated to Story 5 MidTurn law.
 +//!
 +//! Each canary drives a production seam with one real fault. A clean thread's
@@ -3788,6 +3803,7 @@ index 0000000000..20d93ed082
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[
 +                live_call.clone(),
 +                custom_output(protected_id, &format!("{}-CANARY", "tok ".repeat(400))),
@@ -4171,6 +4187,7 @@ index 0000000000..20d93ed082
 +    session
 +        .record_conversation_items_with_provenance(
 +            tc,
++            tc.model_info(),
 +            &items,
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -4386,10 +4403,10 @@ index 0000000000..20d93ed082
 +}
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..954ea1597c
+index 0000000000..71e90a0ce1
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,4782 @@
+@@ -0,0 +1,4798 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -4539,14 +4556,17 @@ index 0000000000..954ea1597c
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&format!("user turn {i} {pad}"))],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -5157,6 +5177,7 @@ index 0000000000..954ea1597c
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[
 +                ResponseItem::FunctionCall {
 +                    id: None,
@@ -6229,6 +6250,7 @@ index 0000000000..954ea1597c
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &pairs,
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -6451,6 +6473,7 @@ index 0000000000..954ea1597c
 +        session
 +            .record_conversation_items_with_provenance(
 +                &tc,
++                tc.model_info(),
 +                &[
 +                    ResponseItem::Reasoning {
 +                        id: Some(codex_protocol::ResponseItemId::from_server(
@@ -7048,6 +7071,7 @@ index 0000000000..954ea1597c
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &pairs,
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -7573,6 +7597,7 @@ index 0000000000..954ea1597c
 +    session
 +        .record_conversation_items_with_provenance(
 +            tc,
++            tc.model_info(),
 +            &items,
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -8196,8 +8221,10 @@ index 0000000000..954ea1597c
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            tc,
++            tc.model_info(),
 +            &[text_input(&format!("long agentic prompt {pad}"))],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -8207,6 +8234,7 @@ index 0000000000..954ea1597c
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[
 +                    ResponseItem::Message {
 +                        id: None,
@@ -8233,6 +8261,7 @@ index 0000000000..954ea1597c
 +        session
 +            .record_conversation_items(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::FunctionCallOutput {
 +                    id: None,
 +                    call_id: Some(call_id),
@@ -8420,6 +8449,7 @@ index 0000000000..954ea1597c
 +        codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
 +        sess.record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[ResponseItem::Message {
 +                id: None,
 +                role: "assistant".into(),
@@ -8620,6 +8650,7 @@ index 0000000000..954ea1597c
 +        codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
 +        sess.record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[ResponseItem::Message {
 +                id: None,
 +                role: "assistant".into(),
@@ -8689,6 +8720,7 @@ index 0000000000..954ea1597c
 +    codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
 +    sess.record_conversation_items_with_provenance(
 +        &tc,
++        tc.model_info(),
 +        &[ResponseItem::Message {
 +            id: None,
 +            role: "assistant".into(),
@@ -8780,6 +8812,7 @@ index 0000000000..954ea1597c
 +    codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
 +    sess.record_conversation_items_with_provenance(
 +        tc,
++        tc.model_info(),
 +        &[ResponseItem::Message {
 +            id: None,
 +            role: "assistant".into(),
@@ -9174,10 +9207,10 @@ index 0000000000..954ea1597c
 +}
 diff --git a/codex-rs/core/src/compact_lhc_readiness_tests.rs b/codex-rs/core/src/compact_lhc_readiness_tests.rs
 new file mode 100644
-index 0000000000..3afcfa11fe
+index 0000000000..d5a30374ff
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_readiness_tests.rs
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,379 @@
 +//! Required-compact readiness proofs (LIM-134).
 +//!
 +//! A PreTurn / Standalone strict compact that is already known to be required
@@ -9278,14 +9311,17 @@ index 0000000000..3afcfa11fe
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&format!("user turn {i} readiness seed {pad}"))],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -9556,10 +9592,10 @@ index 0000000000..3afcfa11fe
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..2c0f2bdb7b
+index 0000000000..cba4b386f0
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1691 @@
+@@ -0,0 +1,1706 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -9698,14 +9734,17 @@ index 0000000000..2c0f2bdb7b
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -9748,6 +9787,7 @@ index 0000000000..2c0f2bdb7b
 +            subagent_history_start_ordinal: None,
 +            history_base: None,
 +            initial_window_id: Uuid::now_v7().to_string(),
++            runtime_workspace_roots: None,
 +            metadata: ThreadPersistenceMetadata {
 +                cwd: Some(config.cwd.to_path_buf()),
 +                model_provider: config.model_provider_id.clone(),
@@ -9819,6 +9859,7 @@ index 0000000000..2c0f2bdb7b
 +        previous_window_id: prev.map(str::to_string),
 +        window_id: Some(window_id.into()),
 +        guardian_history: None,
++        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
 +    })
@@ -10113,14 +10154,17 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &tc,
++            tc.model_info(),
 +            &[text_input(first_prompt)],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[assistant_msg("ack first")],
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -10444,8 +10488,10 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &tc,
++            tc.model_info(),
 +            &[text_input("about to abort this turn")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -10575,8 +10621,10 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &tc,
++            tc.model_info(),
 +            &[text_input(astral)],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -10590,6 +10638,7 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[
 +                ResponseItem::FunctionCall {
 +                    id: None,
@@ -11048,6 +11097,7 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[named_unpaired_output(
 +                codex_protocol::models::FunctionCallOutputBody::Text(
 +                    "parent notification".to_string(),
@@ -11157,6 +11207,7 @@ index 0000000000..2c0f2bdb7b
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &[named_unpaired_output(
 +                codex_protocol::models::FunctionCallOutputBody::ContentItems(vec![
 +                    codex_protocol::models::FunctionCallOutputContentItem::InputText {
@@ -11253,10 +11304,10 @@ index 0000000000..2c0f2bdb7b
 +}
 diff --git a/codex-rs/core/src/compact_lhc_strict_routing_tests.rs b/codex-rs/core/src/compact_lhc_strict_routing_tests.rs
 new file mode 100644
-index 0000000000..218b7e7371
+index 0000000000..544a7d7413
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_strict_routing_tests.rs
-@@ -0,0 +1,474 @@
+@@ -0,0 +1,477 @@
 +//! LIM-142 strict-routing proofs for supported compact behavior that used to
 +//! ride native local / remote / TokenBudget fixtures.
 +//!
@@ -11365,14 +11416,17 @@ index 0000000000..218b7e7371
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -11733,10 +11787,10 @@ index 0000000000..218b7e7371
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..bd01dd180c
+index 0000000000..540cd17e2a
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3654 @@
+@@ -0,0 +1,3676 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -11948,14 +12002,17 @@ index 0000000000..bd01dd180c
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(text)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -11983,14 +12040,17 @@ index 0000000000..bd01dd180c
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -12198,8 +12258,10 @@ index 0000000000..bd01dd180c
 +
 +    sess.record_user_prompt_and_emit_turn_item(
 +        &tc,
++        tc.model_info(),
 +        &[text_input("follow-up after compact")],
-+        None,
++        /*client_id*/ None,
++        /*acceptance_order*/ None,
 +        PersistContext::TurnStart,
 +    )
 +    .await;
@@ -12363,13 +12425,16 @@ index 0000000000..bd01dd180c
 +            for k in 0..20 {
 +                sess.record_user_prompt_and_emit_turn_item(
 +                    &tc,
++                    tc.model_info(),
 +                    &[text_input(&format!("bulk r{round} t{k} {pad}"))],
-+                    None,
++                    /*client_id*/ None,
++                    /*acceptance_order*/ None,
 +                    PersistContext::TurnStart,
 +                )
 +                .await;
 +                sess.record_conversation_items_with_provenance(
 +                    &tc,
++                    tc.model_info(),
 +                    &[ResponseItem::Message {
 +                        id: None,
 +                        role: "assistant".into(),
@@ -12701,6 +12766,7 @@ index 0000000000..bd01dd180c
 +        previous_window_id: None,
 +        window_id: Some("b".into()),
 +        guardian_history: None,
++        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
 +    };
@@ -12773,6 +12839,7 @@ index 0000000000..bd01dd180c
 +        previous_window_id: Some("w1".into()),
 +        window_id: Some("w2".into()),
 +        guardian_history: None,
++        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
 +    };
@@ -13459,6 +13526,7 @@ index 0000000000..bd01dd180c
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        },
@@ -13570,6 +13638,7 @@ index 0000000000..bd01dd180c
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        },
@@ -13579,6 +13648,7 @@ index 0000000000..bd01dd180c
 +        child
 +            .record_conversation_items_with_provenance(
 +                &ctc,
++                ctc.model_info(),
 +                std::slice::from_ref(item),
 +                codex_extension_api::RawItemProvenance::HostContext,
 +            )
@@ -13942,6 +14012,7 @@ index 0000000000..bd01dd180c
 +            subagent_history_start_ordinal: None,
 +            history_base: None,
 +            initial_window_id: Uuid::now_v7().to_string(),
++            runtime_workspace_roots: None,
 +            metadata: ThreadPersistenceMetadata {
 +                cwd: Some(config.cwd.to_path_buf()),
 +                model_provider: config.model_provider_id.clone(),
@@ -14701,6 +14772,7 @@ index 0000000000..bd01dd180c
 +    session
 +        .record_conversation_items_with_provenance(
 +            &tc,
++            tc.model_info(),
 +            &missing_items,
 +            codex_extension_api::RawItemProvenance::ModelOutput,
 +        )
@@ -14741,6 +14813,7 @@ index 0000000000..bd01dd180c
 +        session
 +            .record_conversation_items_with_provenance(
 +                &tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "user".into(),
@@ -15240,6 +15313,7 @@ index 0000000000..bd01dd180c
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        }),
@@ -15284,6 +15358,7 @@ index 0000000000..bd01dd180c
 +        previous_window_id: None,
 +        window_id: None,
 +        guardian_history: None,
++        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
 +    })];
@@ -15357,6 +15432,7 @@ index 0000000000..bd01dd180c
 +        previous_window_id: None,
 +        window_id: None,
 +        guardian_history: None,
++        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
 +    })];
@@ -16663,7 +16739,7 @@ index 55d1f474e5..d8f1a4dbc6 100644
  pub use codex_network_proxy::NetworkDomainPermission;
  pub use codex_network_proxy::NetworkDomainPermissionEntry;
 diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/session/input_queue.rs
-index 3efdb90b0c..ee4cc83c5d 100644
+index 3efdb90b0c..6fde6ba8e7 100644
 --- a/codex-rs/core/src/session/input_queue.rs
 +++ b/codex-rs/core/src/session/input_queue.rs
 @@ -12,6 +12,8 @@ use serde::Deserialize;
@@ -16766,7 +16842,7 @@ index 3efdb90b0c..ee4cc83c5d 100644
  
          activity_rx.changed().await.expect("mailbox update");
          assert_eq!(
-@@ -463,6 +491,31 @@ mod tests {
+@@ -463,6 +491,32 @@ mod tests {
          );
      }
  
@@ -16784,6 +16860,7 @@ index 3efdb90b0c..ee4cc83c5d 100644
 +                        text_elements: Vec::new(),
 +                    }],
 +                    client_id: None,
++                    acceptance_order: None,
 +                }],
 +            )
 +            .await;
@@ -16800,10 +16877,10 @@ index 3efdb90b0c..ee4cc83c5d 100644
          let input_queue = InputQueue::new();
 diff --git a/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
 new file mode 100644
-index 0000000000..400e4b4c25
+index 0000000000..5697c88750
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_band_shape_eval_tests.rs
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,792 @@
 +//! Band-shape model-tolerance harness (Chunk 2a/2b → round 6 / K2).
 +//!
 +//! **Dry-run:** install a real `lhc.compact`-produced body (via the production
@@ -16927,14 +17004,17 @@ index 0000000000..400e4b4c25
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -16954,14 +17034,17 @@ index 0000000000..400e4b4c25
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(&user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -16985,14 +17068,17 @@ index 0000000000..400e4b4c25
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                tc,
++                tc.model_info(),
 +                &[text_input(user)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
 +        session
 +            .record_conversation_items_with_provenance(
 +                tc,
++                tc.model_info(),
 +                &[ResponseItem::Message {
 +                    id: None,
 +                    role: "assistant".into(),
@@ -17224,6 +17310,7 @@ index 0000000000..400e4b4c25
 +                window_number,
 +                window_ids,
 +                compaction_response_id: None,
++                compaction_model_hash: None,
 +            },
 +        )
 +        .await;
@@ -17368,6 +17455,7 @@ index 0000000000..400e4b4c25
 +                window_number,
 +                window_ids,
 +                compaction_response_id: None,
++                compaction_model_hash: None,
 +            },
 +        )
 +        .await;
@@ -17572,6 +17660,7 @@ index 0000000000..400e4b4c25
 +                window_number,
 +                window_ids,
 +                compaction_response_id: None,
++                compaction_model_hash: None,
 +            },
 +        )
 +        .await;
@@ -21323,10 +21412,10 @@ index 9ec46330f7..6ad5cd6ed5 100644
  
 diff --git a/codex-rs/core/tests/suite/lhc_preturn_readiness.rs b/codex-rs/core/tests/suite/lhc_preturn_readiness.rs
 new file mode 100644
-index 0000000000..9f8ad3ddf4
+index 0000000000..e4f19b8d00
 --- /dev/null
 +++ b/codex-rs/core/tests/suite/lhc_preturn_readiness.rs
-@@ -0,0 +1,706 @@
+@@ -0,0 +1,707 @@
 +//! LIM-134 production-path proofs (mapped).
 +//!
 +//! Natural gpt-5.6-sol 350K resumed PreTurn: wait-entry is the lifecycle
@@ -21365,6 +21454,7 @@ index 0000000000..9f8ad3ddf4
 +use codex_protocol::protocol::EventMsg;
 +use codex_protocol::protocol::Op;
 +use codex_protocol::user_input::UserInput;
++use codex_rollout::parse_rollout_line;
 +use core_test_support::responses::ev_assistant_message;
 +use core_test_support::responses::ev_completed;
 +use core_test_support::responses::ev_completed_with_tokens;
@@ -21516,7 +21606,7 @@ index 0000000000..9f8ad3ddf4
 +        return 0;
 +    };
 +    text.lines()
-+        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
++        .filter_map(|line| parse_rollout_line(line).ok())
 +        .filter(|line| match &line.item {
 +            RolloutItem::ResponseItem(envelope) => match &envelope.item {
 +                ResponseItem::Message { role, content, .. } if role == "user" => content

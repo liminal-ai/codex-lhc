@@ -147,14 +147,17 @@ pub(super) async fn seed_turns(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(&format!("user turn {i} {pad}"))],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -765,6 +768,7 @@ async fn mid_turn_pending_tool_branch_preserves_pair_shape() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[
                 ResponseItem::FunctionCall {
                     id: None,
@@ -1837,6 +1841,7 @@ async fn mid_turn_pending_parallel_tools_preserve_reasoning_and_pairs() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &pairs,
             codex_extension_api::RawItemProvenance::ModelOutput,
         )
@@ -2059,6 +2064,7 @@ async fn mid_turn_reload_resume_equivalence_both_branches() {
         session
             .record_conversation_items_with_provenance(
                 &tc,
+                tc.model_info(),
                 &[
                     ResponseItem::Reasoning {
                         id: Some(codex_protocol::ResponseItemId::from_server(
@@ -2656,6 +2662,7 @@ async fn mid_turn_claim_only_preserve_path_recovers_with_stored_identity() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &pairs,
             codex_extension_api::RawItemProvenance::ModelOutput,
         )
@@ -3181,6 +3188,7 @@ pub(super) async fn seed_escalation_history(
     session
         .record_conversation_items_with_provenance(
             tc,
+            tc.model_info(),
             &items,
             codex_extension_api::RawItemProvenance::ModelOutput,
         )
@@ -3804,8 +3812,10 @@ pub(super) async fn seed_stepped_active_turn(
     session
         .record_user_prompt_and_emit_turn_item(
             tc,
+            tc.model_info(),
             &[text_input(&format!("long agentic prompt {pad}"))],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -3815,6 +3825,7 @@ pub(super) async fn seed_stepped_active_turn(
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[
                     ResponseItem::Message {
                         id: None,
@@ -3841,6 +3852,7 @@ pub(super) async fn seed_stepped_active_turn(
         session
             .record_conversation_items(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::FunctionCallOutput {
                     id: None,
                     call_id: Some(call_id),
@@ -4028,6 +4040,7 @@ async fn mid_turn_parts_thread_never_runs_legacy_runtime() {
         codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
         sess.record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[ResponseItem::Message {
                 id: None,
                 role: "assistant".into(),
@@ -4228,6 +4241,7 @@ async fn mid_turn_parts_host_apply_failure_retries_at_later_seam() {
         codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
         sess.record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[ResponseItem::Message {
                 id: None,
                 role: "assistant".into(),
@@ -4297,6 +4311,7 @@ async fn mid_turn_parts_host_apply_failure_retries_at_later_seam() {
     codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
     sess.record_conversation_items_with_provenance(
         &tc,
+        tc.model_info(),
         &[ResponseItem::Message {
             id: None,
             role: "assistant".into(),
@@ -4388,6 +4403,7 @@ async fn advance_one_cycle(
     codex_lhc_host::LhcStepIndex::begin_cycle(tc.extension_data.as_ref());
     sess.record_conversation_items_with_provenance(
         tc,
+        tc.model_info(),
         &[ResponseItem::Message {
             id: None,
             role: "assistant".into(),

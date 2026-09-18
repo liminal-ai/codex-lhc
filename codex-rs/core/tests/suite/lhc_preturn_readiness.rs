@@ -36,6 +36,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
+use codex_rollout::parse_rollout_line;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
@@ -187,7 +188,7 @@ fn native_prompt_count(rollout: &Path, needle: &str) -> usize {
         return 0;
     };
     text.lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| parse_rollout_line(line).ok())
         .filter(|line| match &line.item {
             RolloutItem::ResponseItem(envelope) => match &envelope.item {
                 ResponseItem::Message { role, content, .. } if role == "user" => content
