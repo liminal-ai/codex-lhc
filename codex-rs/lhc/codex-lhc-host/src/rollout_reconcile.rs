@@ -1260,6 +1260,9 @@ pub async fn materialize_thread_rollout_items(
         },
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity,
     });
 

@@ -352,6 +352,9 @@ fn materialize_full(
         boundary: boundary(1),
         world_state: world,
         turn_context,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     })
 }
@@ -2518,6 +2521,18 @@ fn m9_optional_turn_context_emitted_when_provided() {
         i,
         RolloutItem::TurnContext(c) if c.model == "gpt-test"
     )));
+    let ctx_pos = items
+        .iter()
+        .position(|i| matches!(i, RolloutItem::TurnContext(_)))
+        .expect("TurnContext");
+    let event_pos = items
+        .iter()
+        .position(|i| matches!(i, RolloutItem::EventMsg(EventMsg::ContextCompacted(_))))
+        .expect("ContextCompacted");
+    assert!(
+        ctx_pos < event_pos,
+        "TurnContext must precede ContextCompacted for checkpoint recovery"
+    );
 }
 
 // ── M10 synthetic ids ─────────────────────────────────────────────────────
@@ -2823,6 +2838,9 @@ fn identity_match_reemits_encrypted_content() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(identity),
     });
     let reasoning = result
@@ -2884,6 +2902,9 @@ fn identity_mismatch_suppresses_encrypted_content() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(live),
     });
     let enc = result.items.iter().find_map(|it| match it {
@@ -2935,6 +2956,9 @@ fn signature_only_thinking_emits_when_identity_matches() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(identity),
     });
     let reasoning = result.items.iter().find_map(|it| match it {
@@ -3216,6 +3240,9 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
     assert_eq!(
@@ -3252,6 +3279,9 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         boundary: boundary(2),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
     assert_eq!(

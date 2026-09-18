@@ -8,10 +8,11 @@
 //!   → carry-forward settings / goal (if any)
 //!   → first UserMessage display twin (true first user_prompt; display-only)
 //!   → model stream: banded history as text ResponseItems (NO display twins)
-//!   → exactly ONE Compacted { replacement_history, window_number, window ids }
+//!   → exactly ONE Compacted { replacement_history, window_number, window ids,
+//!     guardian_history / retained_context when supplied }
 //!   → one full WorldState snapshot (when supplied)
-//!   → ContextCompacted display marker
 //!   → optional TurnContext (when supplied — previous_turn_settings recovery)
+//!   → ContextCompacted display marker
 //!   → post-boundary: native ResponseItems + lifecycle / TokenCount /
 //!     message-reasoning twins (rollback applied by exclusion, not marker)
 //!   → carry-forward review / patch / MCP / subagent / plan-sleep /
@@ -58,6 +59,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use codex_history::CompactedItem;
+use codex_history::GuardianHistoryCheckpoint;
+use codex_history::RetainedContext;
 use codex_history::RolloutItem;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::TurnItem;
@@ -79,6 +82,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use codex_protocol::protocol::TokenUsageRecord;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -123,7 +127,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "ThreadRolledBack: applied by excluding dropped user turns from the regenerated tail via positional alignment of prior post-boundary user segments to LHC user-prompt turns (no marker emitted). Alignment mismatch falls back to under-exclusion (exclude nothing) with a gap_notes entry — never text-set membership, which over-excludes duplicate prompts. Rolled-back content already compressed into bands remains until the LHC rollback-capture batch lands",
     "Review / patch / MCP / subagent end-events: not in LHC → carry-forward only",
     "ItemCompleted(Plan|Sleep) / InterAgentCommunication{,Metadata}: not regenerable from LHC → carry-forward only",
-    "TurnContextItem / previous_turn_settings: optional input (slice C wires post-boundary TurnContext). Without it, reconstruction leaves previous_turn_settings None and the reverse-scan early-exit at settings+context is disabled",
+    "TurnContextItem / previous_turn_settings: optional input (slice C wires TurnContext after Compacted/WorldState and before ContextCompacted). Without it, reconstruction leaves previous_turn_settings None and the reverse-scan early-exit at settings+context is disabled",
     "Pre-slice-A turns: outcome/timing/provider_usage absent → TurnComplete without timestamps; no TokenCount; cumulative totals undercount",
     "runtime_note shape: restored as user-role Message with stored payload text (no display twin); original host provenance (HostContext vs AgentMessage vs scaffolding) is lost",
     "Fork compact-marker runtime_notes (idempotency key namespace codex:{tid}:compact_marker:…): excluded from model and display streams — fork bookkeeping, not conversation; stay in the LHC record; boundary Compacted is the compact signal. Matched by key segment only (law 6), never note text",
@@ -161,6 +165,12 @@ pub struct MaterializeInput<'a> {
     /// Optional post-boundary `TurnContext` for `previous_turn_settings` recovery.
     /// Slice C supplies the live session's latest context; `None` leaves the gap.
     pub turn_context: Option<TurnContextItem>,
+    /// Live Guardian checkpoint at compact time. `None` leaves Compacted.guardian_history empty.
+    pub guardian_history: Option<GuardianHistoryCheckpoint>,
+    /// Live retained-context snapshot at compact time.
+    pub retained_context: Option<RetainedContext>,
+    /// Latest token-usage record at compact time, for resume without a long scan.
+    pub latest_token_usage_record: Option<TokenUsageRecord>,
     /// When set and matching the stored assistant provider/model/api, reverse
     /// maps restore `encrypted_content` from the thinking signature.
     pub live_identity: Option<ModelIdentity>,
@@ -215,13 +225,10 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         first_window_id: Some(input.boundary.first_window_id.clone()),
         previous_window_id: input.boundary.previous_window_id.clone(),
         window_id: Some(input.boundary.window_id.clone()),
-        // 0.153.3: upstream additions. The LHC boundary carries no guardian
-        // checkpoint or compaction response id; token usage is re-observed
-        // from the live session after the rewrite install.
-        guardian_history: None,
-        retained_context: None,
+        guardian_history: input.guardian_history.clone(),
+        retained_context: input.retained_context.clone(),
         compaction_response_id: None,
-        latest_token_usage_record: None,
+        latest_token_usage_record: input.latest_token_usage_record.clone(),
     };
     debug_assert!(
         compacted
@@ -243,13 +250,15 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
             ),
         }
     }
-    out.push(RolloutItem::EventMsg(EventMsg::ContextCompacted(
-        ContextCompactedEvent {},
-    )));
-
+    // Native compact writes Compacted → WorldState? → TurnContext? → EventMsg.
+    // Recovery scans stop at the first EventMsg after Compacted, so TurnContext
+    // must precede ContextCompacted.
     if let Some(ctx) = input.turn_context.clone() {
         out.push(RolloutItem::TurnContext(ctx));
     }
+    out.push(RolloutItem::EventMsg(EventMsg::ContextCompacted(
+        ContextCompactedEvent {},
+    )));
 
     emit_tail(
         &tail_entries,

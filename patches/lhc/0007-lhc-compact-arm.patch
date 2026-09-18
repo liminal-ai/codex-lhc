@@ -1728,10 +1728,10 @@ index 0000000000..f0a5dc5384
 +mod readiness_tests;
 diff --git a/codex-rs/core/src/compact_lhc/installation.rs b/codex-rs/core/src/compact_lhc/installation.rs
 new file mode 100644
-index 0000000000..3c2e9672a1
+index 0000000000..eaf0269615
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc/installation.rs
-@@ -0,0 +1,724 @@
+@@ -0,0 +1,734 @@
 +//! Host installation coordination: materialize/validate, durable swap, then memory.
 +//!
 +//! The prior rollout remains authoritative until the new generation is proven
@@ -1854,6 +1854,11 @@ index 0000000000..3c2e9672a1
 +        .as_ref()
 +        .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 +
++    let history = sess.clone_history().await;
++    let guardian_history = history.guardian_history_checkpoint();
++    let retained_context = Some(history.retained_context().clone());
++    let latest_token_usage_record = None;
++
 +    // Provisional boundary message (host ids filled after history extract).
 +    let provisional_message = marker.to_durable_writeback_record();
 +    let mut materialize_result = materialize_rollout(&MaterializeInput {
@@ -1871,7 +1876,12 @@ index 0000000000..3c2e9672a1
 +            window_id: window_ids.window_id.to_string(),
 +        },
 +        world_state: world_state_value,
-+        turn_context: reference_context_item.clone(),
++        turn_context: reference_context_item
++            .clone()
++            .or_else(|| Some(turn_context.to_turn_context_item())),
++        guardian_history,
++        retained_context,
++        latest_token_usage_record,
 +        // Live identity from the same label sources capture uses
 +        // (config.model / config.model_provider_id), so same-identity replay
 +        // actually re-emits encrypted reasoning (R2 host gate).
@@ -9592,10 +9602,10 @@ index 0000000000..d5a30374ff
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..cba4b386f0
+index 0000000000..cb41e4270e
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1706 @@
+@@ -0,0 +1,1715 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -9988,6 +9998,9 @@ index 0000000000..cba4b386f0
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
++        guardian_history: None,
++        retained_context: None,
++        latest_token_usage_record: None,
 +        live_identity: None,
 +    });
 +    assert!(
@@ -10751,6 +10764,9 @@ index 0000000000..cba4b386f0
 +        boundary,
 +        world_state: None,
 +        turn_context: None,
++        guardian_history: None,
++        retained_context: None,
++        latest_token_usage_record: None,
 +        live_identity: None,
 +    });
 +
@@ -10974,6 +10990,9 @@ index 0000000000..cba4b386f0
 +            boundary,
 +            world_state: None,
 +            turn_context: None,
++            guardian_history: None,
++            retained_context: None,
++            latest_token_usage_record: None,
 +            live_identity: None,
 +        });
 +        assert_eq!(compacted_count(&result.items), 1);

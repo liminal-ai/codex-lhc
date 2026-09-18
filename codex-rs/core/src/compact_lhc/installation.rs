@@ -120,6 +120,11 @@ pub(super) async fn install_lhc_compact_rewrite(
         .as_ref()
         .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 
+    let history = sess.clone_history().await;
+    let guardian_history = history.guardian_history_checkpoint();
+    let retained_context = Some(history.retained_context().clone());
+    let latest_token_usage_record = None;
+
     // Provisional boundary message (host ids filled after history extract).
     let provisional_message = marker.to_durable_writeback_record();
     let mut materialize_result = materialize_rollout(&MaterializeInput {
@@ -137,7 +142,12 @@ pub(super) async fn install_lhc_compact_rewrite(
             window_id: window_ids.window_id.to_string(),
         },
         world_state: world_state_value,
-        turn_context: reference_context_item.clone(),
+        turn_context: reference_context_item
+            .clone()
+            .or_else(|| Some(turn_context.to_turn_context_item())),
+        guardian_history,
+        retained_context,
+        latest_token_usage_record,
         // Live identity from the same label sources capture uses
         // (config.model / config.model_provider_id), so same-identity replay
         // actually re-emits encrypted reasoning (R2 host gate).
