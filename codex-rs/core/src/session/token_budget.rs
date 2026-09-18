@@ -21,9 +21,11 @@ fn experimental_context_is_eligible(auth_mode: AuthMode, plan_type: Option<PlanT
 pub(super) fn apply_experimental_context(
     config: &mut Config,
     auth: Option<&CodexAuth>,
+    starting_model: &ModelInfo,
 ) -> std::io::Result<()> {
     let provider = &config.model_provider;
     if !config.features.enabled(Feature::ContextManagement)
+        || !starting_model.supports_experimental_context
         || !provider.supports_codex_backend_routes()
         || !provider.requires_openai_auth
         || provider.env_key.is_some()
@@ -187,8 +189,12 @@ pub(super) async fn maybe_record(
                     &config.reminder_message_template,
                     base_window_tokens_remaining,
                 ));
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-                .await;
+            sess.record_conversation_items(
+                turn_context,
+                turn_context.model_info(),
+                std::slice::from_ref(&response_item),
+            )
+            .await;
         }
     }
 
@@ -209,8 +215,36 @@ pub(super) async fn maybe_record(
 
     let response_item =
         ContextualUserFragment::into(crate::context::AutoCompactFallbackPrompt::new(prompt));
-    sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-        .await;
+    sess.record_conversation_items(
+        turn_context,
+        turn_context.model_info(),
+        std::slice::from_ref(&response_item),
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::experimental_context_is_eligible;
+    use codex_protocol::account::PlanType;
+    use codex_protocol::auth::AuthMode;
+
+    #[test]
+    fn experimental_context_requires_eligible_chatgpt_subscription() {
+        for (auth_mode, plan_type, expected) in [
+            (AuthMode::Chatgpt, PlanType::Plus, true),
+            (AuthMode::Chatgpt, PlanType::Pro, true),
+            (AuthMode::Chatgpt, PlanType::ProLite, true),
+            (AuthMode::Chatgpt, PlanType::Free, false),
+            (AuthMode::Chatgpt, PlanType::Enterprise, false),
+            (AuthMode::ApiKey, PlanType::Pro, false),
+        ] {
+            assert_eq!(
+                experimental_context_is_eligible(auth_mode, Some(plan_type)),
+                expected
+            );
+        }
+    }
 }
 
 #[cfg(test)]

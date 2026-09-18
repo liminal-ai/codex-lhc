@@ -200,9 +200,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
         # A Python with tomllib must exist before release identity validation,
         # which imports it via check_version_identity.py.
-        setup_python = (
-            "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
-        )
+        setup_python = "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
         self.assertIn(setup_python, remaining)
         self.assertIn('python-version: "3.13"', remaining)
         self.assertLess(
@@ -222,9 +220,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )[1].split("- name: ", 1)[0]
         self.assertIn("if: matrix.kind == 'windows'", windows_packages)
         command = windows_packages.split("PYTHONPATH=scripts/codex_package", 1)[1]
-        self.assertEqual(
-            len(re.findall(r"test_\w+\.\w+\.test_\w+", command)), 11
-        )
+        self.assertEqual(len(re.findall(r"test_\w+\.\w+\.test_\w+", command)), 11)
 
         # Linux keeps full release-helper discovery, including the musl UAPI
         # helper test and the POSIX installer ARM64 fixture mapping.
@@ -267,8 +263,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         # The shared CI setup is POSIX-only; native Windows supplies its own
         # toolchain through setup-msvc-env.
         self.assertIn(
-            "- uses: ./.github/actions/setup-ci\n        if: matrix.kind != "
-            "'windows'",
+            "- uses: ./.github/actions/setup-ci\n        if: matrix.kind != 'windows'",
             remaining,
         )
         self.assertLess(

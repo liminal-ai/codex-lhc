@@ -11,7 +11,7 @@ index a0223e9d72..c8ac9ec2c1 100644
      "workspace_root_test_launcher.sh.tpl",
  ])
 diff --git a/codex-rs/cli/src/doctor/output.rs b/codex-rs/cli/src/doctor/output.rs
-index d3d7dfd914..ba4914e76f 100644
+index c4c0087259..65e3a5e419 100644
 --- a/codex-rs/cli/src/doctor/output.rs
 +++ b/codex-rs/cli/src/doctor/output.rs
 @@ -529,7 +529,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
@@ -32,7 +32,7 @@ index d3d7dfd914..ba4914e76f 100644
      if let Some(dismissed) = dismissed
          && !detail::is_falsy(&dismissed)
      {
-@@ -1664,7 +1664,10 @@ Run codex doctor without --summary for detailed diagnostics.
+@@ -1657,7 +1657,10 @@ Run codex doctor without --summary for detailed diagnostics.
          let rendered = render_human_report(&report, summary_no_color_unicode_options());
  
          assert!(rendered.contains("Notes\n   ↑ updates"));
@@ -45,10 +45,10 @@ index d3d7dfd914..ba4914e76f 100644
          assert!(rendered.contains("⚠ sandbox"));
          assert!(rendered.contains("⚠ mcp"));
 diff --git a/codex-rs/cli/src/doctor/updates.rs b/codex-rs/cli/src/doctor/updates.rs
-index 08d0d3d276..3fb2cf06c3 100644
+index fbad7d91ce..b96396ff67 100644
 --- a/codex-rs/cli/src/doctor/updates.rs
 +++ b/codex-rs/cli/src/doctor/updates.rs
-@@ -19,6 +19,10 @@ use codex_http_client::ClientRouteClass;
+@@ -14,6 +14,10 @@ use codex_http_client::ClientRouteClass;
  use codex_http_client::RouteAwareClientPool;
  use codex_install_context::InstallContext;
  use codex_install_context::InstallMethod;
@@ -56,12 +56,12 @@ index 08d0d3d276..3fb2cf06c3 100644
 +use codex_install_context::LHC_LATEST_RELEASE_API_URL;
 +use codex_install_context::LHC_RELEASE_VERSION;
 +use codex_install_context::parse_lhc_release;
- #[cfg(any(target_os = "macos", target_os = "windows"))]
  use http::Method;
  use serde::Deserialize;
-@@ -39,8 +43,8 @@ use super::network;
- use super::npm_global_root_check;
- use super::run_command;
+ #[cfg(target_os = "macos")]
+@@ -32,8 +36,8 @@ use super::network;
+ 
+ const MAX_VERSION_RESPONSE_BYTES: usize = 1024 * 1024;
  
 -const VERSION_FILE_NAME: &str = "version.json";
 -const GITHUB_LATEST_RELEASE_URL: &str = "https://api.github.com/repos/openai/codex/releases/latest";
@@ -70,7 +70,7 @@ index 08d0d3d276..3fb2cf06c3 100644
  const HOMEBREW_CASK_API_URL: &str = "https://formulae.brew.sh/api/cask/codex.json";
  #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
  const DESKTOP_UPDATE_URL: &str = "https://persistent.oaistatic.com/codex-app-prod/appcast-x64.xml";
-@@ -65,7 +69,10 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
+@@ -58,7 +62,10 @@ pub(super) async fn updates_check(config: &Config) -> DoctorCheck {
              "check for update on startup: {}",
              config.check_for_update_on_startup
          ),
@@ -82,8 +82,8 @@ index 08d0d3d276..3fb2cf06c3 100644
      ];
      let version_file = config.codex_home.join(VERSION_FILE_NAME);
      push_cached_version_details(&mut details, &version_file);
-@@ -115,7 +122,7 @@ pub(super) fn updates_check(config: &Config) -> DoctorCheck {
-     match fetch_latest_version(&install_context) {
+@@ -78,7 +85,7 @@ pub(super) async fn updates_check(config: &Config) -> DoctorCheck {
+     match fetch_latest_version(&client, &install_context).await {
          Ok(latest_version) => {
              details.push(format!("latest version: {latest_version}"));
 -            if is_newer(&latest_version, env!("CARGO_PKG_VERSION")) == Some(true) {
@@ -91,33 +91,14 @@ index 08d0d3d276..3fb2cf06c3 100644
                  details.push("latest version status: newer version is available".to_string());
              } else {
                  details.push("latest version status: current version is not older".to_string());
-@@ -428,18 +435,6 @@ fn push_cached_version_details(details: &mut Vec<String>, version_file: &Path) {
-     }
- }
- 
--fn update_action_label(context: &InstallContext) -> &'static str {
--    match &context.method {
--        InstallMethod::Npm => "npm install -g @openai/codex",
--        InstallMethod::Bun => "bun install -g @openai/codex",
--        InstallMethod::VitePlus => "vp install -g @openai/codex",
--        InstallMethod::Pnpm => "pnpm add -g @openai/codex",
--        InstallMethod::Brew => "brew upgrade --cask codex",
--        InstallMethod::Standalone { .. } => "standalone installer",
--        InstallMethod::Other => "manual or unknown",
--    }
--}
--
- fn fetch_latest_version(context: &InstallContext) -> Result<String, String> {
-     match &context.method {
-         InstallMethod::Brew => fetch_homebrew_cask_version(),
-@@ -458,11 +453,16 @@ fn fetch_latest_github_release_version() -> Result<String, String> {
+@@ -422,11 +429,16 @@ async fn fetch_latest_github_release_version(
          tag_name: String,
      }
  
--    let info = http_get_json::<ReleaseInfo>(GITHUB_LATEST_RELEASE_URL)?;
+-    let info = http_get_json::<ReleaseInfo>(client, GITHUB_LATEST_RELEASE_URL).await?;
 -    info.tag_name
 -        .strip_prefix("rust-v")
-+    let info = http_get_json::<ReleaseInfo>(LHC_LATEST_RELEASE_API_URL)?;
++    let info = http_get_json::<ReleaseInfo>(client, LHC_LATEST_RELEASE_API_URL).await?;
 +    release_from_tag(&info.tag_name)
 +}
 +
@@ -130,9 +111,9 @@ index 08d0d3d276..3fb2cf06c3 100644
 +        .ok_or_else(|| format!("failed to parse latest tag {tag_name}"))
  }
  
- fn fetch_homebrew_cask_version() -> Result<String, String> {
-@@ -482,19 +482,13 @@ where
-     serde_json::from_str::<T>(&body).map_err(|err| err.to_string())
+ async fn fetch_homebrew_cask_version(client: &RouteAwareClientPool) -> Result<String, String> {
+@@ -470,19 +482,13 @@ where
+     .map_err(|_| "version request timed out".to_string())?
  }
  
 -fn is_newer(latest: &str, current: &str) -> Option<bool> {
@@ -158,7 +139,7 @@ index 08d0d3d276..3fb2cf06c3 100644
  }
  
  #[derive(Deserialize)]
-@@ -622,34 +616,55 @@ mod tests {
+@@ -678,34 +684,55 @@ mod tests {
      }
  
      #[test]
@@ -239,10 +220,10 @@ index 08d0d3d276..3fb2cf06c3 100644
      }
  }
 diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
-index 71d0323735..b71a98548e 100644
+index ee42ceb1e5..8114be1b30 100644
 --- a/codex-rs/cli/src/main.rs
 +++ b/codex-rs/cli/src/main.rs
-@@ -124,6 +124,10 @@ struct MultitoolCli {
+@@ -139,6 +139,10 @@ struct MultitoolCli {
      #[clap(flatten)]
      interactive: TuiCli,
  
@@ -253,7 +234,7 @@ index 71d0323735..b71a98548e 100644
      #[clap(subcommand)]
      subcommand: Option<Subcommand>,
  }
-@@ -796,7 +800,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+@@ -883,7 +887,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
          | ExitReason::ThreadRemoved => false,
      };
  
@@ -262,7 +243,7 @@ index 71d0323735..b71a98548e 100644
      let color_enabled = supports_color::on(Stream::Stdout).is_some();
      for line in exit_info.format_exit_messages(color_enabled) {
          println!("{line}");
-@@ -820,7 +824,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+@@ -907,7 +911,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
          #[cfg(windows)]
          {
              let (cmd, args) = action.command_args();
@@ -274,7 +255,7 @@ index 71d0323735..b71a98548e 100644
                  // These args contain PowerShell metacharacters, so do not let
                  // PATHEXT select a batch shim for this action.
                  "powershell.exe"
-@@ -889,8 +896,19 @@ fn run_update_command() -> anyhow::Result<()> {
+@@ -976,8 +983,19 @@ fn run_update_command() -> anyhow::Result<()> {
      #[cfg(not(debug_assertions))]
      {
          let Some(action) = codex_tui::get_update_action() else {
@@ -295,7 +276,7 @@ index 71d0323735..b71a98548e 100644
              );
          };
          run_update_action(action)
-@@ -1052,8 +1070,13 @@ async fn cli_main(
+@@ -1140,8 +1158,13 @@ async fn cli_main(
          feature_toggles,
          remote,
          mut interactive,
@@ -306,10 +287,10 @@ index 71d0323735..b71a98548e 100644
 +        println!("{}", codex_install_context::LHC_RELEASE_VERSION);
 +        return Ok(());
 +    }
+     reject_unsupported_worktree_for_subcommand(interactive.shared.worktree, &subcommand)?;
      // Fold --enable/--disable into config overrides so they flow to all subcommands.
      let toggle_overrides = feature_toggles.to_overrides()?;
-     root_config_overrides.raw_overrides.extend(toggle_overrides);
-@@ -3019,6 +3042,7 @@ mod tests {
+@@ -3166,6 +3189,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -317,7 +298,7 @@ index 71d0323735..b71a98548e 100644
          } = cli;
          interactive
              .shared
-@@ -3056,6 +3080,7 @@ mod tests {
+@@ -3203,6 +3227,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -325,7 +306,7 @@ index 71d0323735..b71a98548e 100644
          } = cli;
          interactive
              .shared
-@@ -3100,6 +3125,7 @@ mod tests {
+@@ -3247,6 +3272,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -470,7 +451,7 @@ index 39b023805b..f2417680cc 100644
          }
      }
 diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index 4e51d50f7c..38e2861727 100644
+index bcbcd8dc1c..475e36f812 100644
 --- a/codex-rs/tui/src/history_cell/mod.rs
 +++ b/codex-rs/tui/src/history_cell/mod.rs
 @@ -59,6 +59,9 @@ use codex_app_server_protocol::ToolRequestUserInputQuestion;
@@ -484,7 +465,7 @@ index 4e51d50f7c..38e2861727 100644
  use codex_mcp::qualified_mcp_tool_name_prefix;
  use codex_otel::RuntimeMetricsSummary;
 diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
-index bd68c83457..8b2445897c 100644
+index 82e62f07d5..33349c1c00 100644
 --- a/codex-rs/tui/src/history_cell/notices.rs
 +++ b/codex-rs/tui/src/history_cell/notices.rs
 @@ -26,29 +26,35 @@ impl HistoryCell for UpdateAvailableHistoryCell {
@@ -674,10 +655,10 @@ index 1a2df82a9d..7dfcbe551b 100644
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest │
 +╰─────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index ae781fc3a9..a38ad6eaa8 100644
+index 138c9b5b94..543809df83 100644
 --- a/codex-rs/tui/src/history_cell/tests.rs
 +++ b/codex-rs/tui/src/history_cell/tests.rs
-@@ -1220,6 +1220,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
+@@ -1289,6 +1289,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
      insta::assert_snapshot!(rendered);
  }
  
@@ -1458,13 +1439,14 @@ index 688d113487..9ec36be654 100644
      }
  
 diff --git a/codex-rs/tui/src/update_versions.rs b/codex-rs/tui/src/update_versions.rs
-index 29ff04369b..c429786b3b 100644
+index 696290dc34..5b6c3ff83f 100644
 --- a/codex-rs/tui/src/update_versions.rs
 +++ b/codex-rs/tui/src/update_versions.rs
-@@ -1,13 +1,17 @@
+@@ -1,15 +1,19 @@
 +use codex_install_context::parse_lhc_release;
 +
 +/// Compare fork releases (`major.minor.patch[-lhc.revision]`, bare revision 0).
+ #[cfg(any(not(debug_assertions), test))]
  pub(crate) fn is_newer(latest: &str, current: &str) -> Option<bool> {
 -    match (parse_version(latest), parse_version(current)) {
 +    match (parse_lhc_release(latest), parse_lhc_release(current)) {
@@ -1474,6 +1456,7 @@ index 29ff04369b..c429786b3b 100644
  }
  
 +/// Fork releases are tagged `v<release>`.
+ #[cfg(any(not(debug_assertions), test))]
  pub(crate) fn extract_version_from_latest_tag(latest_tag_name: &str) -> anyhow::Result<String> {
      latest_tag_name
 -        .strip_prefix("rust-v")
@@ -1481,7 +1464,7 @@ index 29ff04369b..c429786b3b 100644
          .map(str::to_owned)
          .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
  }
-@@ -32,14 +36,29 @@ mod tests {
+@@ -62,14 +66,29 @@ mod tests {
      #[test]
      fn extracts_version_from_latest_tag() {
          assert_eq!(

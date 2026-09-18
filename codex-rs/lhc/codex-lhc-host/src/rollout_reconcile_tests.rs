@@ -408,7 +408,7 @@ async fn reconcile_stale_regenerates_when_lhc_compact_ahead() {
     let lines = std::fs::read_to_string(&path)
         .expect("read regenerated rollout")
         .lines()
-        .map(|line| serde_json::from_str::<RolloutLine>(line).expect("parse regenerated line"))
+        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse regenerated line"))
         .collect::<Vec<_>>();
     assert_eq!(
         lines.iter().map(|line| line.ordinal).collect::<Vec<_>>(),

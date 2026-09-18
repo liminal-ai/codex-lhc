@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """LIM-140 demo: empty-success scenario shim provider on a fixed port.
 Reuses the scenario-regression script's MockResponsesHandler verbatim."""
+
 import importlib.util
 import threading
 from http.server import ThreadingHTTPServer
 
 spec = importlib.util.spec_from_file_location(
-    "scenario", "/srv/work/wt/codex-lhc-0150-2-qual/scripts/lhc-empty-success-scenario.py"
+    "scenario",
+    "/srv/work/wt/codex-lhc-0150-2-qual/scripts/lhc-empty-success-scenario.py",
 )
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)

@@ -37,7 +37,6 @@ use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_exec_command_call;
 use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::mount_compact_json_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
@@ -256,6 +255,9 @@ async fn token_budget_guidance_precedes_standalone_context_window(
     let guidance_message = "Preserve important state before compaction.";
     let backend_url = format!("{}/backend-api/codex", server.uri());
     let test = test_codex()
+        .with_model_info_override("gpt-5.2", |model| {
+            model.supports_experimental_context = true;
+        })
         .with_auth(CodexAuth::from_external_chatgpt_tokens(
             "header.e30.signature",
             "account-123",
@@ -304,15 +306,17 @@ async fn token_budget_guidance_precedes_standalone_context_window(
     Ok(())
 }
 
-#[test_case("OpenAI", "/backend-api/codex", None, true; "codex_backend")]
-#[test_case("Custom", "/backend-api/codex", None, false; "custom_provider")]
-#[test_case("OpenAI", "/v1", None, false; "non_codex_endpoint")]
-#[test_case("OpenAI", "/backend-api/codex", Some("test-provider-token"), false; "provider_credentials")]
+#[test_case("OpenAI", "/backend-api/codex", None, true, true; "codex_backend")]
+#[test_case("OpenAI", "/backend-api/codex", None, false, false; "unsupported_model")]
+#[test_case("Custom", "/backend-api/codex", None, true, false; "custom_provider")]
+#[test_case("OpenAI", "/v1", None, true, false; "non_codex_endpoint")]
+#[test_case("OpenAI", "/backend-api/codex", Some("test-provider-token"), true, false; "provider_credentials")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn experimental_context_requires_codex_backend(
+async fn experimental_context_requires_capable_model_and_codex_backend(
     provider_name: &'static str,
     base_path: &'static str,
     bearer_token: Option<&'static str>,
+    supports_context: bool,
     expected_enabled: bool,
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -321,6 +325,9 @@ async fn experimental_context_requires_codex_backend(
     let response = mount_sse_once(&server, sse_completed("resp-1")).await;
     let base_url = format!("{}{base_path}", server.uri());
     let test = test_codex()
+        .with_model_info_override("gpt-5.2", move |model| {
+            model.supports_experimental_context = supports_context;
+        })
         .with_auth(CodexAuth::from_external_chatgpt_tokens(
             "header.e30.signature",
             "account-123",
@@ -446,8 +453,10 @@ async fn token_budget_explicit_default_template_overrides_model_defaults() -> Re
     Ok(())
 }
 
+#[test_case(Feature::TokenBudget; "explicit_activation")]
+#[test_case(Feature::ContextManagement; "experimental_activation")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
+async fn token_budget_defaults_follow_the_active_model(activation: Feature) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -456,8 +465,15 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
         vec![sse_completed("resp-1"), sse_completed("resp-2")],
     )
     .await;
+    let backend_url = format!("{}/backend-api/codex", server.uri());
     let test = test_codex()
+        .with_auth(CodexAuth::from_external_chatgpt_tokens(
+            "header.e30.signature",
+            "account-123",
+            Some("plus"),
+        )?)
         .with_model_info_override("gpt-5.2", |model_info| {
+            model_info.supports_experimental_context = true;
             let mut defaults = model_token_budget_config();
             defaults.guidance_message = "Use first-model context-window guidance.".to_string();
             model_info
@@ -476,11 +492,12 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
                 .token_budget = Some(defaults);
         })
         .with_model("gpt-5.2")
-        .with_config(|config| {
+        .with_config(move |config| {
+            config.model_provider.base_url = Some(backend_url);
             config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config
                 .features
-                .enable(Feature::TokenBudget)
+                .enable(activation)
                 .expect("test config should allow token budget");
         })
         .build_with_auto_env(&server)
@@ -508,6 +525,7 @@ async fn token_budget_defaults_follow_the_active_model() -> Result<()> {
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body_json()["model"], "gpt-5.4");
     assert!(requests[0].body_contains_text("Use first-model context-window guidance."));
     assert!(
         requests[1].body_contains_text("Use first-model context-window guidance."),
@@ -1018,10 +1036,10 @@ async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> 
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[test_case(false; "token_budget_only")]
 #[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native start_new_context_window dropping prior messages; LHC window advance is successful_lhc_compact_advances_auto_compact_window and does not use that native arm"]
 async fn token_budget_context_uses_new_window_after_compaction(
     retain_client_developer_messages: bool,
 ) -> Result<()> {
@@ -1040,8 +1058,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
         ],
     )
     .await;
-    let compact = mount_compact_json_once(&server, json!({ "output": [] })).await;
-
     let mut model_provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
     model_provider.base_url = Some(format!("{}/v1", server.uri()));
     model_provider.supports_websockets = false;
@@ -1080,10 +1096,6 @@ async fn token_budget_context_uses_new_window_after_compaction(
 
     let requests = responses.requests();
     assert_eq!(requests.len(), 2);
-    assert!(
-        compact.requests().is_empty(),
-        "token budget compaction should not call server-side compaction"
-    );
 
     let initial_token_budget = token_budget_contexts(&requests[0]);
     assert_eq!(initial_token_budget.len(), 1);
@@ -1143,8 +1155,8 @@ async fn token_budget_context_uses_new_window_after_compaction(
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture runs PreCompact/PostCompact around TokenBudget native compact; live hooks are run_strict_lhc_compact (R15) plus successful_lhc_compact_queues_compact_session_start"]
 async fn token_budget_compaction_runs_compact_hooks() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1193,10 +1205,10 @@ async fn token_budget_compaction_runs_compact_hooks() -> Result<()> {
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[test_case(false; "token_budget_only")]
 #[test_case(true; "with_client_developer_retention")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native mid-turn compact resetting the window before follow-up; live MidTurn is LHC parts/continuation"]
 async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
     retain_client_developer_messages: bool,
 ) -> Result<()> {
@@ -1323,8 +1335,8 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up(
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback using the buffer until new_context"]
 async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1425,8 +1437,8 @@ async fn token_budget_auto_compact_fallback_uses_buffer_until_new_context() -> R
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback rollover after buffer"]
 async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1488,8 +1500,8 @@ async fn token_budget_auto_compact_fallback_rolls_over_after_buffer() -> Result<
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenBudget native compact fallback skipped by new_context; Feature::TokenBudget compact is not a live Codex-LHC route"]
 async fn new_context_tool_skips_auto_compact_fallback() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

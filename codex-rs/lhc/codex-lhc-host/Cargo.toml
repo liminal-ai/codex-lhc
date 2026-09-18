@@ -29,6 +29,7 @@ chrono = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-history = { workspace = true }
 codex-protocol = { workspace = true }
+codex-rollout = { workspace = true }
 codex-utils-output-truncation = { workspace = true }
 lhc = { path = "../vendor/long-horizon-context/packages/lhc-rs" }
 serde = { workspace = true, features = ["derive"] }

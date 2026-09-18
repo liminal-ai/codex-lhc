@@ -90,7 +90,9 @@ def generate(session_id: str, cwd: str) -> list[dict]:
         )
     )
     # Pre-compact content (must NOT leak into dual-format resume history)
-    lines.append(line("response_item", user_msg("pre-compact-user SECRET-SHOULD-NOT-RESUME")))
+    lines.append(
+        line("response_item", user_msg("pre-compact-user SECRET-SHOULD-NOT-RESUME"))
+    )
     lines.append(line("response_item", assistant_msg("pre-compact-asst")))
     # First Compacted (older generation)
     lines.append(

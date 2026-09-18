@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 24d7988b04..cc00a3b1a4 100644
+index 350723936d..2cd3c15473 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -816,6 +816,9 @@
+@@ -851,6 +851,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +12,7 @@ index 24d7988b04..cc00a3b1a4 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -1897,9 +1900,81 @@
+@@ -2004,9 +2007,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -94,7 +94,7 @@ index 24d7988b04..cc00a3b1a4 100644
      "MarketplaceConfig": {
        "additionalProperties": false,
        "properties": {
-@@ -6141,6 +6216,9 @@
+@@ -6376,6 +6451,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -104,7 +104,7 @@ index 24d7988b04..cc00a3b1a4 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -6477,6 +6555,22 @@
+@@ -6724,6 +6802,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -128,12 +128,12 @@ index 24d7988b04..cc00a3b1a4 100644
        "allOf": [
          {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index fdeae5c6f5..b414e0311d 100644
+index 1a31316b79..baab1e2519 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -339,6 +339,9 @@ pub enum Feature {
+@@ -352,6 +352,9 @@ pub enum Feature {
      PreventIdleSleep,
-     /// Enable remote compaction v2 over the normal Responses API.
+     /// Removed compatibility key, still advertised to the Responses API.
      RemoteCompactionV2,
 +    /// Enable LHC long-horizon capture (parallel SQLite record; product default on).
 +    // LHC-HOOK 3/8: feature flag for LHC capture (rollback = flag off).
@@ -141,9 +141,9 @@ index fdeae5c6f5..b414e0311d 100644
      /// Include retained images in the remote compaction context budget.
      CompactionImageBudget,
      /// Retain client-authored developer messages across compacted context windows.
-@@ -1685,6 +1688,19 @@ pub const FEATURES: &[FeatureSpec] = &[
-         stage: Stage::Stable,
-         default_enabled: true,
+@@ -1755,6 +1758,19 @@ pub const FEATURES: &[FeatureSpec] = &[
+         stage: Stage::Removed,
+         default_enabled: false,
      },
 +    // LHC-HOOK 3/8: FeatureSpec for LhcCapture (default ON in the product fork).
 +    FeatureSpec {

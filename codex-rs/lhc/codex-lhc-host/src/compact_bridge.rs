@@ -500,7 +500,8 @@ pub fn classify_coverage(item: &ResponseItem) -> CoverageClass {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::AgentMessage { .. }
-        | ResponseItem::AdditionalTools { .. } => CoverageClass::Required,
+        | ResponseItem::AdditionalTools { .. }
+        | ResponseItem::ConfigurationUpdate { .. } => CoverageClass::Required,
         // Native compact / no-op artifacts — not import targets.
         ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. }
@@ -546,6 +547,7 @@ fn host_item_kind_name(item: &ResponseItem) -> &'static str {
         ResponseItem::WebSearchCall { .. } => "WebSearchCall",
         ResponseItem::ImageGenerationCall { .. } => "ImageGenerationCall",
         ResponseItem::AdditionalTools { .. } => "AdditionalTools",
+        ResponseItem::ConfigurationUpdate { .. } => "ConfigurationUpdate",
         ResponseItem::Compaction { .. } => "Compaction",
         ResponseItem::ContextCompaction { .. } => "ContextCompaction",
         ResponseItem::CompactionTrigger {} => "CompactionTrigger",

@@ -219,6 +219,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         // checkpoint or compaction response id; token usage is re-observed
         // from the live session after the rewrite install.
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     };

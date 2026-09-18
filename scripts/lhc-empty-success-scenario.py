@@ -242,7 +242,9 @@ def evaluate_iteration(
     if "turn.failed" not in types:
         reasons.append("JSONL missing turn.failed")
     if "turn.completed" in types:
-        reasons.append("JSONL contains turn.completed (empty success was not reclassified)")
+        reasons.append(
+            "JSONL contains turn.completed (empty success was not reclassified)"
+        )
 
     messages = failure_messages(events)
     combined = "\n".join([stdout, stderr, *messages])
@@ -279,7 +281,9 @@ def write_iteration_logs(
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "stdout.txt").write_text(stdout, encoding="utf-8")
     (directory / "stderr.txt").write_text(stderr, encoding="utf-8")
-    (directory / "mock-server.log").write_text("\n".join(mock_log) + "\n", encoding="utf-8")
+    (directory / "mock-server.log").write_text(
+        "\n".join(mock_log) + "\n", encoding="utf-8"
+    )
     meta = {
         "iteration": index,
         "passed": passed,
@@ -304,7 +308,9 @@ def run_iteration(
     mock_log: list[str],
 ) -> tuple[bool, str, Path | None]:
     base_url = f"http://127.0.0.1:{server.server_port}/v1"
-    with tempfile.TemporaryDirectory(prefix=f"lim140-empty-success-{index:03d}-") as temp:
+    with tempfile.TemporaryDirectory(
+        prefix=f"lim140-empty-success-{index:03d}-"
+    ) as temp:
         root = Path(temp)
         home = root / "home"
         codex_home = root / "codex-home"
@@ -349,7 +355,9 @@ def run_iteration(
         if keep_logs is not None:
             log_dir = keep_logs / f"iteration-{index:03d}"
         elif not passed:
-            log_dir = Path(tempfile.mkdtemp(prefix=f"lim140-empty-success-fail-{index:03d}-"))
+            log_dir = Path(
+                tempfile.mkdtemp(prefix=f"lim140-empty-success-fail-{index:03d}-")
+            )
         if log_dir is not None:
             write_iteration_logs(
                 log_dir,
