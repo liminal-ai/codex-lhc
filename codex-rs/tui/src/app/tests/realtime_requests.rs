@@ -6,6 +6,7 @@ use crate::app::tests::session_lifecycle_requests::recorded_params;
 use crate::app::tests::session_lifecycle_requests::start_recording_realtime_speech_app_server;
 use crate::app::tests::session_lifecycle_requests::start_recording_remote_app_server;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
+use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::ServerNotification;
@@ -18,6 +19,7 @@ use codex_app_server_protocol::UserInput;
 use codex_protocol::models::MessagePhase;
 use pretty_assertions::assert_eq;
 use std::path::Path;
+use unicode_width::UnicodeWidthStr;
 
 fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
     let cwd = cwd.display().to_string();
@@ -26,7 +28,38 @@ fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
         "{placeholder}{}",
         " ".repeat(cwd.len().saturating_sub(placeholder.len()))
     );
-    rendered.replace(&cwd, &padded_placeholder)
+    let with_cwd = rendered.replace(&cwd, &padded_placeholder);
+    let needle = format!("(v{CODEX_CLI_VERSION})");
+    let had_trailing_newline = with_cwd.ends_with('\n');
+    let mut normalized = with_cwd
+        .lines()
+        .map(|line| {
+            if !line.contains(&needle) {
+                return line.to_string();
+            }
+            let old_width = UnicodeWidthStr::width(line);
+            let replaced = line.replace(&needle, "(v0.0.0)");
+            let new_width = UnicodeWidthStr::width(replaced.as_str());
+            if old_width <= new_width {
+                return replaced;
+            }
+            let pad = old_width - new_width;
+            match replaced.rfind('│') {
+                Some(pipe_idx) => format!(
+                    "{}{}{}",
+                    &replaced[..pipe_idx],
+                    " ".repeat(pad),
+                    &replaced[pipe_idx..]
+                ),
+                None => replaced,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if had_trailing_newline {
+        normalized.push('\n');
+    }
+    normalized
 }
 
 #[test]

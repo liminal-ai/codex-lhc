@@ -20,6 +20,7 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
+use crate::version::CODEX_CLI_VERSION;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
@@ -183,6 +184,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
         .collect()
 }
 
+fn sanitize_cli_version_line(line: String) -> String {
+    let needle = format!("(v{CODEX_CLI_VERSION})");
+    if !line.contains(&needle) {
+        return line;
+    }
+    let old_width = UnicodeWidthStr::width(line.as_str());
+    let replaced = line.replace(&needle, "(v0.0.0)");
+    let new_width = UnicodeWidthStr::width(replaced.as_str());
+    if old_width <= new_width {
+        return replaced;
+    }
+    let pad = old_width - new_width;
+    match replaced.rfind('│') {
+        Some(pipe_idx) => {
+            let mut out = String::with_capacity(replaced.len() + pad);
+            out.push_str(&replaced[..pipe_idx]);
+            out.push_str(&" ".repeat(pad));
+            out.push_str(&replaced[pipe_idx..]);
+            out
+        }
+        None => replaced,
+    }
+}
+
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
     let frame_width = lines
         .iter()
@@ -191,7 +216,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .map(|line| {
-            if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
+            let line = if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
                 (frame_width, line.find("Directory: "), line.rfind('│'))
             {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
@@ -210,7 +235,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                 rebuilt
             } else {
                 line
-            }
+            };
+            sanitize_cli_version_line(line)
         })
         .collect()
 }
