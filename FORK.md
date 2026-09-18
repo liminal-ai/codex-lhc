@@ -329,7 +329,14 @@ byte-identical (accepted under the criterion's semantic arm).
 
 Dated merge accounts, qualification evidence, and conflict resolutions are in
 [the maintenance history](lhc-internal/history/fork-maintenance-through-2026-09-04.md).
-Current upstream base: `patches/lhc/BASE` (`rust-v0.153.4` at this revision).
+Current upstream base: `patches/lhc/BASE` (`rust-v0.155.1` at this revision).
+
+2026-09-18 `rust-v0.155.1` retarget: merged peeled `be2951ea34` (tag object
+`4e21628f9e`) onto the isolated `rust-v0.155.0` LHC tree. Upstream delta from
+`f0a1b8f084` is `5e0d1ef83e` (TUI reasoning-summary default restored to `none`)
+and the `0.155.1` workspace version. Only `codex-rs/Cargo.toml` conflicted
+(workspace version; upstream's `0.155.1` taken). `lhc-release/VERSION` stays
+`0.153.4`. `BASE` to `be2951ea34`. SDK pin `e9456a6e` unchanged.
 
 2026-09-06 hotfix sync: merged the exact peeled `rust-v0.153.4` commit
 `3d2ee51ca2` (tag object `042fb41b7c`) onto the maintained branch. Upstream's
