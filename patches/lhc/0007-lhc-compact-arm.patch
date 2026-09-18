@@ -22566,7 +22566,7 @@ index f955923a2f..5148cfc087 100644
      skip_if_no_network!(Ok(()));
  
 diff --git a/codex-rs/core/tests/suite/rollout_compression.rs b/codex-rs/core/tests/suite/rollout_compression.rs
-index 1ab5986ae2..9a98a3c57f 100644
+index 1ab5986ae2..2dcb3803d2 100644
 --- a/codex-rs/core/tests/suite/rollout_compression.rs
 +++ b/codex-rs/core/tests/suite/rollout_compression.rs
 @@ -2,6 +2,7 @@
@@ -22592,7 +22592,7 @@ index 1ab5986ae2..9a98a3c57f 100644
  use codex_protocol::mcp::ClientMcpExtensions;
  use codex_protocol::protocol::EventMsg;
  use codex_protocol::protocol::Op;
-@@ -32,17 +38,49 @@ use core_test_support::skip_if_no_network;
+@@ -32,17 +38,66 @@ use core_test_support::skip_if_no_network;
  use core_test_support::test_codex::test_codex;
  use core_test_support::wait_for_event;
  use pretty_assertions::assert_eq;
@@ -22624,6 +22624,23 @@ index 1ab5986ae2..9a98a3c57f 100644
      skip_if_no_network!(Ok(()));
  
      let server = start_mock_server().await;
++    // Background LHC derivation shares this provider. Keep a low-priority
++    // catch-all so it cannot consume the prompt-matched turn mocks below.
++    let derivation = sse(vec![
++        ev_response_created("lhc-derivation"),
++        ev_assistant_message("lhc-derivation", "lhc-derivation"),
++        ev_completed("lhc-derivation"),
++    ]);
++    wiremock::Mock::given(wiremock::matchers::method("POST"))
++        .and(wiremock::matchers::path("/v1/responses"))
++        .respond_with(
++            wiremock::ResponseTemplate::new(200)
++                .insert_header("content-type", "text/event-stream")
++                .set_body_string(derivation),
++        )
++        .with_priority(10)
++        .mount(&server)
++        .await;
 +    let lhc_root = TempDir::new()?;
      let test = test_codex()
          .with_history_mode(ThreadHistoryMode::Paginated)
@@ -22642,7 +22659,7 @@ index 1ab5986ae2..9a98a3c57f 100644
              config
                  .features
                  .disable(Feature::LocalThreadStoreCompression)
-@@ -50,6 +88,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
+@@ -50,6 +105,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
          })
          .build_with_auto_env(&server)
          .await?;
@@ -22650,7 +22667,7 @@ index 1ab5986ae2..9a98a3c57f 100644
      turn(
          &server,
          &test.codex,
-@@ -92,6 +131,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
+@@ -92,6 +148,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
              prepared,
          )
          .await?;
@@ -22658,7 +22675,7 @@ index 1ab5986ae2..9a98a3c57f 100644
      turn(
          &server,
          &test.codex,
-@@ -180,6 +220,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
+@@ -180,6 +237,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
              ClientMcpExtensions::default(),
          )
          .await?;
@@ -22666,19 +22683,48 @@ index 1ab5986ae2..9a98a3c57f 100644
      let followup = turn(
          &server,
          &resumed.thread,
-@@ -200,12 +241,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
-             "shared-compression: resumed followup",
+@@ -201,11 +259,22 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
          ],
      );
--    let input = serde_json::to_string(&request.input())?;
+     let input = serde_json::to_string(&request.input())?;
 -    assert!(input.contains("PERSISTED_COMPRESSION_CHECKPOINT"));
 -    assert!(input.contains("INHERITED_COMPRESSION_REPLY"));
 -    assert!(input.contains("CHILD_COMPRESSION_REPLY"));
 -    assert!(!input.contains("POST_FORK_COMPRESSION_REPLY"));
 -    assert!(!input.contains("OBSOLETE_PRE_CHECKPOINT_REPLY"));
++    // Native local compact injects PERSISTED_COMPRESSION_CHECKPOINT as summarizer
++    // text. LHC does not; that exact-native-summary string is LIM-142, not asserted.
++    assert!(
++        input.contains("INHERITED_COMPRESSION_REPLY"),
++        "parent assistant reply after compact must survive child resume"
++    );
++    assert!(
++        input.contains("CHILD_COMPRESSION_REPLY"),
++        "child assistant reply before shutdown must survive compressed resume"
++    );
++    assert!(
++        !input.contains("POST_FORK_COMPRESSION_REPLY"),
++        "parent turns after the fork cutoff must not leak into the child"
++    );
++    // OBSOLETE_PRE_CHECKPOINT_REPLY is pre-compact assistant text. Native compact
++    // evicts it; LHC residue may keep it. Absence is native-only and not asserted.
      assert!(
          !parent_path.exists(),
          "reading the ancestor must not materialize it"
+@@ -221,8 +290,12 @@ async fn turn(
+     prompt: &str,
+     reply: &str,
+ ) -> Result<ResponseMock> {
+-    let mock = mount_sse_once(
++    let prompt_owned = prompt.to_string();
++    let mock = core_test_support::responses::mount_sse_once_match(
+         server,
++        move |request: &wiremock::Request| {
++            String::from_utf8_lossy(&request.body).contains(&prompt_owned)
++        },
+         sse(vec![
+             ev_response_created(prompt),
+             ev_assistant_message("reply", reply),
 diff --git a/codex-rs/core/tests/suite/step_settings_compaction.rs b/codex-rs/core/tests/suite/step_settings_compaction.rs
 index 629f115d3d..f3122850f3 100644
 --- a/codex-rs/core/tests/suite/step_settings_compaction.rs

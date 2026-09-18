@@ -66,6 +66,23 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    // Background LHC derivation shares this provider. Keep a low-priority
+    // catch-all so it cannot consume the prompt-matched turn mocks below.
+    let derivation = sse(vec![
+        ev_response_created("lhc-derivation"),
+        ev_assistant_message("lhc-derivation", "lhc-derivation"),
+        ev_completed("lhc-derivation"),
+    ]);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(derivation),
+        )
+        .with_priority(10)
+        .mount(&server)
+        .await;
     let lhc_root = TempDir::new()?;
     let test = test_codex()
         .with_history_mode(ThreadHistoryMode::Paginated)
@@ -241,6 +258,23 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             "shared-compression: resumed followup",
         ],
     );
+    let input = serde_json::to_string(&request.input())?;
+    // Native local compact injects PERSISTED_COMPRESSION_CHECKPOINT as summarizer
+    // text. LHC does not; that exact-native-summary string is LIM-142, not asserted.
+    assert!(
+        input.contains("INHERITED_COMPRESSION_REPLY"),
+        "parent assistant reply after compact must survive child resume"
+    );
+    assert!(
+        input.contains("CHILD_COMPRESSION_REPLY"),
+        "child assistant reply before shutdown must survive compressed resume"
+    );
+    assert!(
+        !input.contains("POST_FORK_COMPRESSION_REPLY"),
+        "parent turns after the fork cutoff must not leak into the child"
+    );
+    // OBSOLETE_PRE_CHECKPOINT_REPLY is pre-compact assistant text. Native compact
+    // evicts it; LHC residue may keep it. Absence is native-only and not asserted.
     assert!(
         !parent_path.exists(),
         "reading the ancestor must not materialize it"
@@ -256,8 +290,12 @@ async fn turn(
     prompt: &str,
     reply: &str,
 ) -> Result<ResponseMock> {
-    let mock = mount_sse_once(
+    let prompt_owned = prompt.to_string();
+    let mock = core_test_support::responses::mount_sse_once_match(
         server,
+        move |request: &wiremock::Request| {
+            String::from_utf8_lossy(&request.body).contains(&prompt_owned)
+        },
         sse(vec![
             ev_response_created(prompt),
             ev_assistant_message("reply", reply),
