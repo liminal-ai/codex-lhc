@@ -431,6 +431,7 @@ mod tests {
                 git_attribution_base_url: config.chatgpt_base_url.clone(),
                 http_client_factory: config.http_client_factory(),
                 queue_service: None,
+                turn_start_admission: None,
             },
         );
 
