@@ -176,6 +176,45 @@ pub struct MaterializeInput<'a> {
     pub live_identity: Option<ModelIdentity>,
 }
 
+/// Checkpoints to copy from the last `Compacted` (and following `TurnContext`)
+/// so cold resume / reconcile do not drop Guardian or token-usage state.
+#[derive(Debug, Clone, Default)]
+pub struct PriorCompactCarry {
+    pub guardian_history: Option<GuardianHistoryCheckpoint>,
+    pub retained_context: Option<RetainedContext>,
+    pub latest_token_usage_record: Option<TokenUsageRecord>,
+    pub turn_context: Option<TurnContextItem>,
+}
+
+pub fn prior_compact_carry(prior: &[RolloutItem]) -> PriorCompactCarry {
+    let Some(idx) = prior
+        .iter()
+        .rposition(|item| matches!(item, RolloutItem::Compacted(_)))
+    else {
+        return PriorCompactCarry::default();
+    };
+    let RolloutItem::Compacted(compacted) = &prior[idx] else {
+        return PriorCompactCarry::default();
+    };
+    let mut turn_context = None;
+    for item in &prior[idx + 1..] {
+        match item {
+            RolloutItem::EventMsg(_) => break,
+            RolloutItem::TurnContext(ctx) => {
+                turn_context = Some(ctx.clone());
+                break;
+            }
+            _ => {}
+        }
+    }
+    PriorCompactCarry {
+        guardian_history: compacted.guardian_history.clone(),
+        retained_context: compacted.retained_context.clone(),
+        latest_token_usage_record: compacted.latest_token_usage_record.clone(),
+        turn_context,
+    }
+}
+
 /// Output of [`materialize_rollout`]: items plus any loud degradation notes.
 #[derive(Debug, Clone)]
 pub struct MaterializeResult {

@@ -1728,7 +1728,7 @@ index 0000000000..f0a5dc5384
 +mod readiness_tests;
 diff --git a/codex-rs/core/src/compact_lhc/installation.rs b/codex-rs/core/src/compact_lhc/installation.rs
 new file mode 100644
-index 0000000000..eaf0269615
+index 0000000000..bb2132ab1e
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc/installation.rs
 @@ -0,0 +1,734 @@
@@ -1857,7 +1857,7 @@ index 0000000000..eaf0269615
 +    let history = sess.clone_history().await;
 +    let guardian_history = history.guardian_history_checkpoint();
 +    let retained_context = Some(history.retained_context().clone());
-+    let latest_token_usage_record = None;
++    let latest_token_usage_record = sess.latest_token_usage_record().await;
 +
 +    // Provisional boundary message (host ids filled after history extract).
 +    let provisional_message = marker.to_durable_writeback_record();
