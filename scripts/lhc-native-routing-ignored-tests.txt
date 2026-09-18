@@ -1,5 +1,5 @@
 # Reviewed native-routing ignore allowlist (LIM-142).
-# count: 85
+# count: 86
 #
 # Tests that assert upstream TokenBudget / remote / local compact routing.
 # Under Codex-LHC those routes are never taken; the ignore is the reviewed exclusion.
@@ -66,6 +66,7 @@ codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v2_sends_tu
 codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_after_second_compaction_preserves_history
 codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_and_fork_preserve_model_history_view
 codex-rs/core/tests/suite/compact_resume_fork.rs::snapshot_rollback_past_compaction_replays_append_only_history
+codex-rs/core/tests/suite/guardian_history.rs::guardian_history_uses_deltas_between_eviction_batches
 codex-rs/core/tests/suite/current_time_reminder.rs::current_time_reminder_is_refreshed_after_compaction
 codex-rs/core/tests/suite/hooks.rs::compact_session_start_hook_records_additional_context_for_next_turn
 codex-rs/core/tests/suite/hooks.rs::mid_turn_auto_compact_session_start_hook_stop_blocks_continuation

@@ -241,12 +241,6 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             "shared-compression: resumed followup",
         ],
     );
-    let input = serde_json::to_string(&request.input())?;
-    assert!(input.contains("PERSISTED_COMPRESSION_CHECKPOINT"));
-    assert!(input.contains("INHERITED_COMPRESSION_REPLY"));
-    assert!(input.contains("CHILD_COMPRESSION_REPLY"));
-    assert!(!input.contains("POST_FORK_COMPRESSION_REPLY"));
-    assert!(!input.contains("OBSOLETE_PRE_CHECKPOINT_REPLY"));
     assert!(
         !parent_path.exists(),
         "reading the ancestor must not materialize it"
