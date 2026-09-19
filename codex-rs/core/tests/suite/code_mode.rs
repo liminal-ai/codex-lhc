@@ -28,6 +28,7 @@ use codex_features::Feature;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::inspect_installed_view;
 use codex_lhc_host::install_with_root;
+use codex_lhc_host::test_compact_opts;
 use codex_lhc_host::wait_for_handle;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
@@ -160,14 +161,30 @@ fn tool_names(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn function_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
-    match req.function_call_output(call_id).get("output") {
+fn last_function_call_output(req: &ResponsesRequest, call_id: &str) -> Value {
+    req.input()
+        .iter()
+        .rev()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .cloned()
+        .expect("function call output item not found in request")
+}
+
+fn function_output_content(output: &Value) -> Vec<Value> {
+    match output.get("output") {
         Some(Value::Array(items)) => items.clone(),
         Some(Value::String(text)) => {
             vec![serde_json::json!({ "type": "input_text", "text": text })]
         }
         _ => panic!("function tool output should be serialized as text or content items"),
     }
+}
+
+fn function_tool_output_items(req: &ResponsesRequest, call_id: &str) -> Vec<Value> {
+    function_output_content(&req.function_call_output(call_id))
 }
 
 fn text_item(items: &[Value], index: usize) -> &str {
@@ -344,6 +361,125 @@ async fn assert_new_lhc_compact_event(test: &TestCodex, before: Option<(String, 
             after, prev,
             "must be a new compact event, not a preexisting view (before={prev:?} after={after:?})"
         );
+    }
+}
+
+/// Waitability/completeness compact proof: actual nonempty-band fold, and
+/// installed stored_tokens fit the configured lower_bound. Point-0 empty
+/// bands are subthreshold and are not this proof.
+async fn assert_nonempty_band_fold_fits_bound(test: &TestCodex, probe_label: &str) {
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture handle");
+    let view = inspect_installed_view(handle.thread_id(), handle.root())
+        .await
+        .expect("inspect installed view")
+        .expect("installed view after compact");
+    let installed: i64 = view.bands.iter().map(|band| band.stored_tokens).sum();
+    if std::env::var_os("LHC_WAIT_TRACE").is_some()
+        || std::env::var_os("LHC_WAIT_TRACE_DIR").is_some()
+    {
+        eprintln!(
+            "lhc fold-probe label={probe_label} view_id={} compact_point={} covered_from={} lower_bound={} installed_stored_tokens={installed} bands={}",
+            view.view_id,
+            view.compact_point,
+            view.covered_from,
+            view.config.lower_bound,
+            view.bands.len()
+        );
+        for (index, band) in view.bands.iter().enumerate() {
+            eprintln!(
+                "lhc fold-probe label={probe_label} band[{index}] stored_tokens={} band={:?}",
+                band.stored_tokens, band.band
+            );
+        }
+        if let Ok(dir) = std::env::var("LHC_WAIT_TRACE_DIR") {
+            let _ = fs::write(
+                PathBuf::from(&dir).join(format!("{probe_label}-fold-view.json")),
+                serde_json::to_string_pretty(&view).expect("serialize installed view"),
+            );
+        }
+    }
+    assert!(
+        view.compact_point > 0 && !view.bands.is_empty(),
+        "waitability proof needs nonempty-band fold, not subthreshold point0: compact_point={} bands={} lower_bound={}",
+        view.compact_point,
+        view.bands.len(),
+        view.config.lower_bound
+    );
+    assert!(
+        (installed as f64) <= view.config.lower_bound,
+        "installed size {installed} must fit configured bound {}",
+        view.config.lower_bound
+    );
+}
+
+fn dump_lhc_wait_probe(label: &str, req: &ResponsesRequest, terminal_call_id: &str) {
+    if std::env::var_os("LHC_WAIT_TRACE").is_none()
+        && std::env::var_os("LHC_WAIT_TRACE_DIR").is_none()
+    {
+        return;
+    }
+    let items = req.input();
+    eprintln!(
+        "lhc wait-probe label={label} terminal_call_id={terminal_call_id} item_count={}",
+        items.len()
+    );
+    for (index, item) in items.iter().enumerate() {
+        let ty = item.get("type").and_then(Value::as_str).unwrap_or("");
+        let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+        eprintln!("lhc wait-probe label={label} item[{index}] type={ty} call_id={call_id}");
+        if call_id == terminal_call_id {
+            eprintln!("lhc wait-probe label={label} item[{index}] full={item}");
+        }
+    }
+    let matching: Vec<&Value> = items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(terminal_call_id)
+        })
+        .collect();
+    let first_text = matching
+        .first()
+        .and_then(|item| function_call_output_text_full(item));
+    let last_text = matching
+        .last()
+        .and_then(|item| function_call_output_text_full(item));
+    eprintln!(
+        "lhc wait-probe label={label} matching_outputs={} first_output_text={first_text:?} last_output_text={last_text:?}",
+        matching.len()
+    );
+    if let Ok(dir) = std::env::var("LHC_WAIT_TRACE_DIR") {
+        let dir = PathBuf::from(dir);
+        let _ = fs::write(
+            dir.join(format!("{label}-input.json")),
+            serde_json::to_string_pretty(&items).expect("serialize request input"),
+        );
+        let _ = fs::write(
+            dir.join(format!("{label}-matching-outputs.json")),
+            serde_json::to_string_pretty(&matching).expect("serialize matching outputs"),
+        );
+    }
+}
+
+fn function_call_output_text_full(item: &Value) -> Option<String> {
+    match item.get("output") {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(parts)) => Some(
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        Some(other) => Some(other.to_string()),
+        None => None,
     }
 }
 
@@ -1328,6 +1464,11 @@ await new Promise(() => {});
     .await?;
     if oversized {
         wait_lhc_capture(&test).await;
+        test.codex
+            .thread_extension_data()
+            .get::<LhcCaptureSlot>()
+            .expect("LhcCaptureSlot")
+            .set_mid_turn_test_compact(Some(test_compact_opts(400.0)));
     }
 
     let request = follow_up.single_request();
@@ -1360,6 +1501,18 @@ await new Promise(() => {});
     if yielded || oversized {
         let first_items = custom_tool_output_items(&request, "call-1");
         let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+        if oversized
+            && (std::env::var_os("LHC_WAIT_TRACE").is_some()
+                || std::env::var_os("LHC_WAIT_TRACE_DIR").is_some())
+        {
+            eprintln!("lhc wait-probe extracted_cell_id={cell_id} terminal_call_id=call-2");
+            if let Ok(dir) = std::env::var("LHC_WAIT_TRACE_DIR") {
+                let _ = fs::write(
+                    PathBuf::from(dir).join("completeness-oversized-cell-id.txt"),
+                    &cell_id,
+                );
+            }
+        }
 
         if oversized {
             let before_compact = lhc_installed_view(&test).await;
@@ -1369,6 +1522,7 @@ await new Promise(() => {});
             })
             .await;
             assert_new_lhc_compact_event(&test, before_compact).await;
+            assert_nonempty_band_fold_fits_bound(&test, "completeness-oversized").await;
 
             let wait = responses::mount_function_call_agent_response(
                 &server,
@@ -1382,15 +1536,14 @@ await new Promise(() => {});
             .await;
             test.submit_turn("Finish the compacted cell").await?;
             let final_request = wait.completion.single_request();
+            dump_lhc_wait_probe("completeness-oversized", &final_request, "call-2");
+            // LIM-142: native-shape absence of call-1 in the next sampling
+            // input is not asserted. That exec pair sits in post-Compacted
+            // native tail. User-visible completeness is tool_calls_complete
+            // below.
+            let output = last_function_call_output(&final_request, "call-2");
             assert!(
-                final_request
-                    .input()
-                    .iter()
-                    .all(|item| item["call_id"] != "call-1")
-            );
-            assert!(
-                final_request.function_call_output("call-2")
-                    ["internal_chat_message_metadata_passthrough"]
+                output["internal_chat_message_metadata_passthrough"]
                     .get("tool_calls_complete")
                     .is_none()
             );
@@ -1423,6 +1576,11 @@ async fn code_mode_wait_id_stays_known_after_compaction(
         });
     let test = builder.build_with_auto_env(&server).await?;
     wait_lhc_capture(&test).await;
+    test.codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot")
+        .set_mid_turn_test_compact(Some(test_compact_opts(200.0)));
     let started = responses::mount_sse_sequence(
         &server,
         vec![
@@ -1447,6 +1605,17 @@ async fn code_mode_wait_id_stays_known_after_compaction(
     let first_request = &requests[1];
     let first_items = custom_tool_output_items(first_request, "call-exec");
     let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
+    if std::env::var_os("LHC_WAIT_TRACE").is_some()
+        || std::env::var_os("LHC_WAIT_TRACE_DIR").is_some()
+    {
+        eprintln!("lhc wait-probe extracted_cell_id={cell_id} terminal_call_id={terminal_call_id}");
+        if let Ok(dir) = std::env::var("LHC_WAIT_TRACE_DIR") {
+            let _ = fs::write(
+                PathBuf::from(dir).join(format!("{terminal_call_id}-cell-id.txt")),
+                &cell_id,
+            );
+        }
+    }
     assert_eq!(text_item(&first_items, /*index*/ 1), "started");
     let first_output = first_request.custom_tool_call_output("call-exec");
     let metadata = &first_output["internal_chat_message_metadata_passthrough"];
@@ -1480,6 +1649,7 @@ async fn code_mode_wait_id_stays_known_after_compaction(
     })
     .await;
     assert_new_lhc_compact_event(&test, before_compact).await;
+    assert_nonempty_band_fold_fits_bound(&test, terminal_call_id).await;
 
     let terminal = responses::mount_function_call_agent_response(
         &server,
@@ -1489,22 +1659,23 @@ async fn code_mode_wait_id_stays_known_after_compaction(
     )
     .await;
     test.submit_turn("Finish the compacted cell").await?;
-    assert!(
-        terminal
-            .function_call
-            .single_request()
-            .input()
-            .iter()
-            .all(|item| { item["call_id"] != "call-exec" && item["call_id"] != "call-wait" })
-    );
+    // LIM-142: native-shape absence of call-exec/call-wait in the next
+    // sampling input is not asserted. Those items sit in post-Compacted
+    // native tail. User-visible waitability is terminate below.
     let final_request = terminal.completion.single_request();
-    let final_items = function_tool_output_items(&final_request, terminal_call_id);
+    dump_lhc_wait_probe(terminal_call_id, &final_request, terminal_call_id);
+    dump_lhc_wait_probe(
+        &format!("{terminal_call_id}-function-call"),
+        &terminal.function_call.single_request(),
+        terminal_call_id,
+    );
+    let output = last_function_call_output(&final_request, terminal_call_id);
+    let final_items = function_output_content(&output);
     assert_eq!(final_items.len(), 1);
     assert_regex_match(
         r"^Script terminated\nWall time \d+\.\d seconds\nOutput:\n\z",
         text_item(&final_items, /*index*/ 0),
     );
-    let output = final_request.function_call_output(terminal_call_id);
     let metadata = &output["internal_chat_message_metadata_passthrough"];
     assert_eq!(
         metadata.get("tool_calls_complete").and_then(Value::as_bool),

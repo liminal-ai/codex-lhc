@@ -58,6 +58,7 @@ async fn worker_storage_failures_preserve_operation_classification() {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             codex_lhc_host::DerivedProvenance::default(),
             codex_lhc_host::LhcBandPercentages::default(),
+            /*compact_opts*/ None,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -109,6 +110,7 @@ async fn compact_worker_preserves_sdk_cancellation_without_a_cancelled_turn() {
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         codex_lhc_host::DerivedProvenance::default(),
         codex_lhc_host::LhcBandPercentages::default(),
+        /*compact_opts*/ None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await

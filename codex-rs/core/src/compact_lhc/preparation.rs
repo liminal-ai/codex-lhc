@@ -184,6 +184,8 @@ pub(crate) async fn try_run_lhc_compact_arm_with_callbacks_and_cancel(
         Arc::clone(&cancel),
         session_derived,
         configured_band_percentages(turn_context),
+        slot.test_compact_opts_override()
+            .map(codex_lhc_host::sdk_compact_opts_from_host),
         cancellation_token,
     )
     .await
