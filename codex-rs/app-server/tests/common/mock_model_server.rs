@@ -11,6 +11,10 @@ use wiremock::matchers::path_regex;
 
 /// Create a mock server that will provide the responses, in order, for
 /// requests to the `/v1/responses` endpoint.
+///
+/// Exact-count matching excludes LHC derivation (`*:lhc-infer` on `/responses`).
+/// `start_mock_server` already mounts that catch-all; unexpected primary or
+/// Guardian traffic still fails this sequence.
 pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> MockServer {
     let server = responses::start_mock_server().await;
 
@@ -22,6 +26,7 @@ pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> Mo
 
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(seq_responder)
         .expect(num_calls as u64)
         .mount(&server)
@@ -42,6 +47,7 @@ pub async fn create_mock_responses_server_sequence_unchecked(responses: Vec<Stri
 
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(seq_responder)
         .mount(&server)
         .await;
@@ -55,12 +61,28 @@ struct SeqResponder {
 }
 
 impl Respond for SeqResponder {
-    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
         let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-        let response = self
-            .responses
-            .get(call_num)
-            .expect("mock model response should exist");
+        let Some(response) = self.responses.get(call_num) else {
+            let path = request.url.path();
+            let window = request
+                .headers
+                .get("x-codex-window-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let model = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            panic!(
+                "mock model response should exist (call {call_num} of {}; path={path}; model={model:?}; window={window}; lhc_derivation={})",
+                self.responses.len(),
+                responses::is_lhc_derivation_request(request)
+            );
+        };
         responses::sse_response(response.clone())
     }
 }
@@ -75,6 +97,7 @@ pub async fn create_mock_responses_server_repeating_assistant(message: &str) -> 
     ]);
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(responses::sse_response(body))
         .mount(&server)
         .await;

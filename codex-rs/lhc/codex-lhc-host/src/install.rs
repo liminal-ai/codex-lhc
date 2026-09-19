@@ -362,6 +362,20 @@ impl LhcCaptureSlot {
             .clone()
     }
 
+    /// Always-available override for tests: None unless `test-util` compiled this
+    /// host with a compact opts knob. Integration tests unify `test-util` on
+    /// this crate even when `codex-core` itself is not built with that feature.
+    pub fn test_compact_opts_override(&self) -> Option<lhc::compact_continuation::HostCompactOpts> {
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            self.mid_turn_test_compact()
+        }
+        #[cfg(not(any(test, feature = "test-util")))]
+        {
+            None
+        }
+    }
+
     /// Install test-only upper trigger for MidTurn (offline evidence only).
     #[cfg(any(test, feature = "test-util"))]
     pub fn set_mid_turn_test_upper_trigger(&self, upper: Option<i64>) {

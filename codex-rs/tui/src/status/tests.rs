@@ -20,6 +20,7 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_buf;
 use crate::token_usage::TokenUsage;
 use crate::token_usage::TokenUsageInfo;
+use crate::version::CODEX_CLI_VERSION;
 use app_test_support::ChatGptAuthFixture;
 use app_test_support::write_chatgpt_auth;
 use app_test_support::write_models_cache;
@@ -64,6 +65,7 @@ fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
     let now = Local::now();
     let snapshot = RateLimitSnapshotDisplay {
         limit_name: "codex".to_string(),
+        normal_model_slug: None,
         captured_at: now,
         primary: Some(RateLimitWindowDisplay {
             used_percent: 20.0,
@@ -182,6 +184,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
         .collect()
 }
 
+fn sanitize_cli_version_line(line: String) -> String {
+    let needle = format!("(v{CODEX_CLI_VERSION})");
+    if !line.contains(&needle) {
+        return line;
+    }
+    let old_width = UnicodeWidthStr::width(line.as_str());
+    let replaced = line.replace(&needle, "(v0.0.0)");
+    let new_width = UnicodeWidthStr::width(replaced.as_str());
+    if old_width <= new_width {
+        return replaced;
+    }
+    let pad = old_width - new_width;
+    match replaced.rfind('│') {
+        Some(pipe_idx) => {
+            let mut out = String::with_capacity(replaced.len() + pad);
+            out.push_str(&replaced[..pipe_idx]);
+            out.push_str(&" ".repeat(pad));
+            out.push_str(&replaced[pipe_idx..]);
+            out
+        }
+        None => replaced,
+    }
+}
+
 fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
     let frame_width = lines
         .iter()
@@ -190,7 +216,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
     lines
         .into_iter()
         .map(|line| {
-            if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
+            let line = if let (Some(frame_width), Some(dir_pos), Some(pipe_idx)) =
                 (frame_width, line.find("Directory: "), line.rfind('│'))
             {
                 let prefix = &line[..dir_pos + "Directory: ".len()];
@@ -209,7 +235,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                 rebuilt
             } else {
                 line
-            }
+            };
+            sanitize_cli_version_line(line)
         })
         .collect()
 }
@@ -306,6 +333,7 @@ async fn status_snapshot_includes_reasoning_details() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -356,7 +384,6 @@ async fn status_snapshot_includes_reasoning_details() {
 #[tokio::test]
 async fn status_snapshot_shows_chatgpt_plan_without_email() {
     let temp_home = TempDir::new().expect("temp home");
-    write_models_cache(temp_home.path()).expect("write models cache");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.1-codex-max".to_string());
     config.model_provider_id = "openai".to_string();
@@ -369,6 +396,9 @@ async fn status_snapshot_shows_chatgpt_plan_without_email() {
         AuthCredentialsStoreMode::File,
     )
     .expect("write email-less ChatGPT auth");
+    write_models_cache(temp_home.path())
+        .await
+        .expect("write models cache");
     let mut app_server = crate::start_embedded_app_server_for_picker(&config)
         .await
         .expect("start embedded app server");
@@ -730,15 +760,17 @@ async fn status_snapshot_shows_active_user_defined_profile() {
 }
 
 #[tokio::test]
-async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_link() {
+async fn status_uses_server_provider_id_and_auth_requirement() {
     let temp_home = TempDir::new().expect("temp home");
     let mut config = test_config(&temp_home).await;
     config.model = Some("gpt-5.6-sol".to_string());
+    set_workspace_cwd(&mut config, test_path_buf("/workspace/tests").abs());
     config.model_provider_id = "amazon-bedrock".to_string();
     config.model_provider =
         ModelProviderInfo::create_amazon_bedrock_provider(Some(ModelProviderAwsAuthInfo {
             profile: None,
             region: Some("eu-west-1".to_string()),
+            credential_export: None,
             auth_refresh: None,
         }));
     config.model_provider.base_url =
@@ -749,11 +781,12 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
         .single()
         .expect("timestamp");
     let model_slug = get_model_offline_for_tests(config.model.as_deref());
-    let runtime_base_url = "https://bedrock-mantle.eu-west-1.api.aws/openai/v1";
 
+    config.model_provider.requires_openai_auth = true;
     let (composite, _handle) = new_status_output_with_rate_limits_handle(
         &config,
-        Some(runtime_base_url),
+        /*requires_openai_auth*/ false,
+        Some("server-ollama"),
         /*remote_connection*/ None,
         test_status_account_display().as_ref(),
         /*token_info*/ None,
@@ -770,31 +803,21 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
         "<none>".to_string(),
         /*refreshing_rate_limits*/ false,
     );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120)).join("\n");
-
-    assert!(
-        rendered.contains(&format!("Amazon Bedrock - {runtime_base_url}")),
-        "expected /status to render runtime Bedrock URL, got: {rendered}"
-    );
-    assert!(
-        !rendered.contains("bedrock-mantle.us-east-1"),
-        "expected /status to ignore configured Bedrock base URL, got: {rendered}"
-    );
-    assert!(
-        !rendered.contains("https://chatgpt.com/codex/settings/usage"),
-        "expected /status to hide ChatGPT usage link for Bedrock, got: {rendered}"
-    );
+    let rendered =
+        sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
+    assert_snapshot!("status_server_auth_not_required", rendered);
 
     config.model_provider_id = "openai-proxy".to_string();
     config.model_provider = ModelProviderInfo {
         name: "OpenAI Proxy".to_string(),
         base_url: Some("https://openai-proxy.example/v1".to_string()),
-        requires_openai_auth: true,
+        requires_openai_auth: false,
         ..ModelProviderInfo::default()
     };
     let (composite, _handle) = new_status_output_with_rate_limits_handle(
         &config,
-        /*runtime_model_provider_base_url*/ None,
+        /*requires_openai_auth*/ true,
+        Some("server-openai"),
         /*remote_connection*/ None,
         test_status_account_display().as_ref(),
         /*token_info*/ None,
@@ -811,12 +834,9 @@ async fn status_model_provider_uses_bedrock_runtime_base_url_and_gates_usage_lin
         "<none>".to_string(),
         /*refreshing_rate_limits*/ false,
     );
-    let rendered = render_lines(&composite.display_lines(/*width*/ 120)).join("\n");
-
-    assert!(
-        rendered.contains("https://chatgpt.com/codex/settings/usage"),
-        "expected /status to show ChatGPT usage link for OpenAI-auth proxy, got: {rendered}"
-    );
+    let rendered =
+        sanitize_directory(render_lines(&composite.display_lines(/*width*/ 120))).join("\n");
+    assert_snapshot!("status_server_auth_required", rendered);
 
     let wide_destinations: Vec<String> = composite
         .display_hyperlink_lines(/*width*/ 120)
@@ -1010,6 +1030,7 @@ async fn status_snapshot_includes_monthly_limit() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 12,
             window_duration_mins: Some(43_200),
@@ -1074,6 +1095,7 @@ async fn status_snapshot_includes_enterprise_monthly_credit_limit() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -1152,6 +1174,7 @@ async fn status_snapshot_uses_generic_limit_labels_for_unsupported_windows() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 35,
             window_duration_mins: Some(2 * 60),
@@ -1210,6 +1233,7 @@ async fn status_snapshot_shows_unlimited_credits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1262,6 +1286,7 @@ async fn status_snapshot_shows_positive_credits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1323,6 +1348,7 @@ async fn status_snapshot_shows_available_credits_without_display_balance() {
         let snapshot = RateLimitSnapshot {
             limit_id: None,
             limit_name: None,
+            normal_model_slug: None,
             primary: None,
             secondary: None,
             credits: Some(CreditsSnapshot {
@@ -1374,6 +1400,7 @@ async fn status_snapshot_respects_unlimited_without_has_credits_flag() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: Some(CreditsSnapshot {
@@ -1484,6 +1511,7 @@ async fn status_snapshot_truncates_in_narrow_terminal() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -1640,7 +1668,8 @@ async fn status_snapshot_uses_default_reasoning_when_config_empty() {
     let token_info = token_info_for(&model_slug, &config, &usage);
     let (composite, _) = new_status_output_with_rate_limits_handle(
         &config,
-        /*runtime_model_provider_base_url*/ None,
+        /*requires_openai_auth*/ true,
+        /*model_provider_id*/ None,
         Some(&remote_connection),
         account_display.as_ref(),
         Some(&token_info),
@@ -1688,6 +1717,7 @@ async fn status_snapshot_shows_refreshing_limits_notice() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 45,
             window_duration_mins: Some(300),
@@ -1749,7 +1779,8 @@ async fn transcript_overlay_remeasures_status_after_rate_limit_refresh() {
 
     let (status, handle) = new_status_output_with_rate_limits_handle(
         &config,
-        /*runtime_model_provider_base_url*/ None,
+        /*requires_openai_auth*/ true,
+        /*model_provider_id*/ None,
         /*remote_connection*/ None,
         /*account_display*/ None,
         /*token_info*/ None,
@@ -1778,6 +1809,7 @@ async fn transcript_overlay_remeasures_status_after_rate_limit_refresh() {
     handle.finish_rate_limit_refresh(
         &[RateLimitSnapshotDisplay {
             limit_name: "spark".to_string(),
+            normal_model_slug: None,
             captured_at: now,
             primary: Some(RateLimitWindowDisplay {
                 used_percent: 45.0,
@@ -1840,6 +1872,7 @@ async fn status_snapshot_includes_credits_and_limits() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 45,
             window_duration_mins: Some(300),
@@ -1908,6 +1941,7 @@ async fn status_snapshot_shows_unavailable_limits_message() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -1967,6 +2001,7 @@ async fn status_snapshot_treats_refreshing_empty_limits_as_unavailable() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: None,
         secondary: None,
         credits: None,
@@ -2032,6 +2067,7 @@ async fn status_snapshot_shows_stale_limits_message() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 72,
             window_duration_mins: Some(300),
@@ -2101,6 +2137,7 @@ async fn status_snapshot_cached_limits_hide_credits_without_flag() {
     let snapshot = RateLimitSnapshot {
         limit_id: None,
         limit_name: None,
+        normal_model_slug: None,
         primary: Some(RateLimitWindow {
             used_percent: 60,
             window_duration_mins: Some(300),

@@ -121,14 +121,17 @@ async fn seed_distinctive_bandable(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(user)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -148,14 +151,17 @@ async fn seed_distinctive_bandable(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(&user)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -179,14 +185,17 @@ async fn seed_distinctive_bandable(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(user)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -418,6 +427,7 @@ async fn lhc_band_shape_eval_dry_run_installs_and_dumps() {
                 window_number,
                 window_ids,
                 compaction_response_id: None,
+                compaction_model_hash: None,
             },
         )
         .await;
@@ -562,6 +572,7 @@ async fn lhc_band_shape_eval_live() {
                 window_number,
                 window_ids,
                 compaction_response_id: None,
+                compaction_model_hash: None,
             },
         )
         .await;
@@ -766,6 +777,7 @@ async fn replace_compacted_history_clears_prefill_for_threshold_untrip() {
                 window_number,
                 window_ids,
                 compaction_response_id: None,
+                compaction_model_hash: None,
             },
         )
         .await;

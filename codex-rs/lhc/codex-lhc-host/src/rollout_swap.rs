@@ -77,6 +77,7 @@ use codex_history::RolloutItem;
 use codex_history::RolloutLine;
 use codex_history::RolloutOrdinalState;
 use codex_protocol::models::ResponseItem;
+use codex_rollout::parse_rollout_line;
 use serde::Serialize;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -297,7 +298,7 @@ pub fn strict_read_generation(path: &Path) -> Result<Vec<StrictRow>, String> {
             return Err(format!("line {number}: blank line"));
         }
         // The typed decode validates the envelope types and the item shape…
-        let typed = serde_json::from_str::<RolloutLine>(line)
+        let typed = parse_rollout_line(line)
             .map_err(|err| format!("line {number}: not a rollout line: {err}"))?;
         chrono::DateTime::parse_from_rfc3339(&typed.timestamp)
             .map_err(|err| format!("line {number}: timestamp is not RFC 3339: {err}"))?;
@@ -687,11 +688,7 @@ pub fn parse_rollout_items(path: &Path) -> std::io::Result<Vec<RolloutItem>> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        match serde_json::from_value::<RolloutLine>(value) {
+        match parse_rollout_line(&line) {
             Ok(rollout_line) => items.push(rollout_line.item),
             Err(_) => continue,
         }
@@ -736,10 +733,12 @@ pub fn parse_prior_realtime_items(
             continue;
         }
         let number = index + 1;
-        let value: serde_json::Value = serde_json::from_str(&line).map_err(|err| {
-            invalid_realtime_authority(format!("line {number}: malformed JSON: {err}"))
-        })?;
-        let rollout_line: RolloutLine = serde_json::from_value(value).map_err(|err| {
+        if let Err(err) = serde_json::from_str::<serde_json::Value>(&line) {
+            return Err(invalid_realtime_authority(format!(
+                "line {number}: malformed JSON: {err}"
+            )));
+        }
+        let rollout_line: RolloutLine = parse_rollout_line(&line).map_err(|err| {
             invalid_realtime_authority(format!("line {number}: malformed rollout envelope: {err}"))
         })?;
         match rollout_line.item {

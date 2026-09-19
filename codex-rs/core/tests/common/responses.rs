@@ -1079,15 +1079,7 @@ where
 fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/(responses|guardian)$"))
-        .and(response_mock.clone());
-    (mock, response_mock)
-}
-
-fn compact_mock() -> (MockBuilder, ResponseMock) {
-    let response_mock = ResponseMock::new();
-    let mock = Mock::given(method("POST"))
-        .and(path_regex(".*/responses/compact$"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1116,119 +1108,6 @@ where
 pub async fn mount_sse_once(server: &MockServer, body: String) -> ResponseMock {
     let (mock, response_mock) = base_mock();
     mock.respond_with(sse_response(body))
-        .up_to_n_times(1)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_json_once(server: &MockServer, body: serde_json::Value) -> ResponseMock {
-    mount_compact_response_once(
-        server,
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/json")
-            .set_body_json(body),
-    )
-    .await
-}
-
-/// Mount a `/responses/compact` mock that mirrors the default remote compaction shape:
-/// keep user+developer messages from the request, drop assistant/tool artifacts, and append one
-/// compaction item carrying the provided summary text.
-pub async fn mount_compact_user_history_with_summary_once(
-    server: &MockServer,
-    summary_text: &str,
-) -> ResponseMock {
-    mount_compact_user_history_with_summary_sequence(server, vec![summary_text.to_string()]).await
-}
-
-/// Same as [`mount_compact_user_history_with_summary_once`], but for multiple compact calls.
-/// Each incoming compact request receives the next summary text in order.
-pub async fn mount_compact_user_history_with_summary_sequence(
-    server: &MockServer,
-    summary_texts: Vec<String>,
-) -> ResponseMock {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    #[derive(Debug)]
-    struct UserHistorySummaryResponder {
-        num_calls: AtomicUsize,
-        summary_texts: Vec<String>,
-    }
-
-    impl Respond for UserHistorySummaryResponder {
-        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
-            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-            let summary_text = self
-                .summary_texts
-                .get(call_num)
-                .expect("missing summary text for compact request");
-            let body_bytes = decode_body_bytes(
-                &request.body,
-                request
-                    .headers
-                    .get("content-encoding")
-                    .and_then(|value| value.to_str().ok()),
-            );
-            let body_json: Value =
-                serde_json::from_slice(&body_bytes).expect("failed to parse compact request body");
-            let mut output = body_json
-                .get("input")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                // TODO(ccunningham): Update this mock to match future compaction model behavior:
-                // return user/developer/assistant messages since the last compaction item, then
-                // append a single newest compaction item.
-                // Match current remote compaction behavior: keep user/developer messages and
-                // omit assistant/tool history entries.
-                .filter(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("message")
-                        && matches!(
-                            item.get("role").and_then(Value::as_str),
-                            Some("user") | Some("developer")
-                        )
-                })
-                .collect::<Vec<Value>>();
-            let compaction_turn_id = body_json["client_metadata"]["turn_id"].as_str();
-            // Match Responses API: generated compaction items inherit the compact request turn.
-            let mut compaction_item = serde_json::json!({
-                "type": "compaction",
-                "encrypted_content": summary_text,
-            });
-            if let Some(turn_id) = compaction_turn_id {
-                compaction_item["internal_chat_message_metadata_passthrough"] =
-                    serde_json::json!({ "turn_id": turn_id });
-            }
-            output.push(compaction_item);
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(serde_json::json!({ "output": output }))
-        }
-    }
-
-    let num_calls = summary_texts.len();
-    let responder = UserHistorySummaryResponder {
-        num_calls: AtomicUsize::new(0),
-        summary_texts,
-    };
-    let (mock, response_mock) = compact_mock();
-    mock.respond_with(responder)
-        .up_to_n_times(num_calls as u64)
-        .expect(num_calls as u64)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-pub async fn mount_compact_response_once(
-    server: &MockServer,
-    response: ResponseTemplate,
-) -> ResponseMock {
-    let (mock, response_mock) = compact_mock();
-    mock.respond_with(response)
         .up_to_n_times(1)
         .mount(server)
         .await;
@@ -1293,6 +1172,7 @@ pub async fn start_mock_server() -> MockServer {
 
     // Provide a default `/models` response so tests remain hermetic when the client queries it.
     let _ = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
+    mount_lhc_derivation_catchall(&server).await;
 
     server
 }
@@ -1541,10 +1421,84 @@ pub async fn mount_function_call_agent_response(
     }
 }
 
+/// True when a POST is LHC live derivation (`window_id` `*:lhc-infer`).
+/// Does not match Guardian/classifier paths or ordinary turn/Guardian sampling.
+pub fn is_lhc_derivation_request(request: &wiremock::Request) -> bool {
+    let path = request.url.path();
+    if !path.ends_with("/responses") || path.contains("guardian") {
+        return false;
+    }
+    request
+        .headers
+        .get("x-codex-window-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|window| window.contains("lhc-infer"))
+        || serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .is_some_and(|body| {
+                body.get("client_metadata")
+                    .and_then(|metadata| metadata.get("x-codex-window-id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|window| window.contains("lhc-infer"))
+            })
+}
+
+struct LhcDerivationMatcher;
+
+impl Match for LhcDerivationMatcher {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        is_lhc_derivation_request(request)
+    }
+}
+
+/// Matches ordinary `/v1/responses` sampling, not LHC derivation.
+pub struct ExcludeLhcDerivation;
+
+impl Match for ExcludeLhcDerivation {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !is_lhc_derivation_request(request)
+    }
+}
+
+/// Low-priority mock for LHC derivation POSTs to `/v1/responses` only.
+/// Guardian and classifier traffic is not covered. One-shot `mount_sse_once*`
+/// mocks still see compact/derivation if that is the request under test.
+/// Exact-count sequences exclude derivation so extra primary/Guardian calls fail.
+pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
+    let derivation = sse(vec![
+        ev_response_created("lhc-derivation"),
+        ev_assistant_message("lhc-derivation", "lhc-derivation"),
+        ev_completed("lhc-derivation"),
+    ]);
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(LhcDerivationMatcher)
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(derivation),
+        )
+        .with_priority(10)
+        .mount(server)
+        .await;
+}
+
 /// Mounts a sequence of SSE response bodies and serves them in order for each
 /// POST to `/v1/responses`. Panics if more requests are received than bodies
 /// provided. Also asserts the exact number of expected calls.
 pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    mount_sse_sequence_match(server, TrueMatcher, bodies).await
+}
+
+/// Like [`mount_sse_sequence`], but only consumes requests that match `matcher`.
+pub async fn mount_sse_sequence_match<M>(
+    server: &MockServer,
+    matcher: M,
+    bodies: Vec<String>,
+) -> ResponseMock
+where
+    M: Match + Send + Sync + 'static,
+{
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1573,7 +1527,14 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
         responses: bodies,
     };
 
-    let (mock, response_mock) = base_mock();
+    // Exclude derivation *before* ResponseMock records. Matchers short-circuit,
+    // so recording first would count `*:lhc-infer` POSTs against exact sequences.
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(ExcludeLhcDerivation)
+        .and(response_mock.clone())
+        .and(matcher);
     mock.respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
@@ -1581,6 +1542,14 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
         .await;
 
     response_mock
+}
+
+struct TrueMatcher;
+
+impl Match for TrueMatcher {
+    fn matches(&self, _: &wiremock::Request) -> bool {
+        true
+    }
 }
 
 /// Mounts a sequence of responses for each POST to `/v1/responses`.
@@ -1613,46 +1582,11 @@ pub async fn mount_response_sequence(
         responses,
     };
 
-    let (mock, response_mock) = base_mock();
-    mock.respond_with(responder)
-        .up_to_n_times(num_calls as u64)
-        .expect(num_calls as u64)
-        .mount(server)
-        .await;
-    response_mock
-}
-
-/// Mounts a sequence of responses for each POST to `/v1/responses/compact`.
-/// Panics if more requests are received than responses provided.
-pub async fn mount_compact_response_sequence(
-    server: &MockServer,
-    responses: Vec<ResponseTemplate>,
-) -> ResponseMock {
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    struct SeqResponder {
-        num_calls: AtomicUsize,
-        responses: Vec<ResponseTemplate>,
-    }
-
-    impl Respond for SeqResponder {
-        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-            let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-            self.responses
-                .get(call_num)
-                .expect("missing response for compact call")
-                .clone()
-        }
-    }
-
-    let num_calls = responses.len();
-    let responder = SeqResponder {
-        num_calls: AtomicUsize::new(0),
-        responses,
-    };
-
-    let (mock, response_mock) = compact_mock();
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(ExcludeLhcDerivation)
+        .and(response_mock.clone());
     mock.respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)

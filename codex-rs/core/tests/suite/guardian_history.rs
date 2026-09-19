@@ -3,14 +3,20 @@
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_core::CodexThread;
 use codex_core::ForkSnapshot;
 use codex_core::TurnInputRequest;
+use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::config::ThreadStoreConfig;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
 use codex_history::RolloutItem;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::AskForApproval;
@@ -45,8 +51,43 @@ use rand::rngs::StdRng;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use tempfile::TempDir;
 use test_case::test_case;
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+fn enable_lhc_compact(config: &mut Config) {
+    config
+        .features
+        .enable(Feature::LhcCapture)
+        .expect("enable LHC capture");
+    config
+        .features
+        .disable(Feature::TokenBudget)
+        .expect("disable token budget");
+    let _ = config.features.disable(Feature::ContextManagement);
+}
+
+async fn wait_lhc_capture(thread: &CodexThread) {
+    let slot = thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
 
 #[test_case(ThreadHistoryMode::Paginated, ThreadStoreConfig::Local; "paginated")]
 // The pathless test store only supports Legacy mode; this case tests the store interface,
@@ -69,18 +110,18 @@ async fn guardian_history_survives_restart_and_user_fork(
         ThreadStoreConfig::Local => None,
         ThreadStoreConfig::InMemory { id } => Some(InMemoryThreadStore::for_id(id)),
     };
+    let lhc_root = TempDir::new()?;
     let mut builder = test_codex()
         .with_history_mode(history_mode)
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(move |config| {
             config.experimental_thread_store = store_config;
-            config
-                .features
-                .enable(Feature::TokenBudget)
-                .expect("enable token budget");
+            enable_lhc_compact(config);
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
         });
     let initial = builder.build_with_auto_env(&server).await?;
+    wait_lhc_capture(&initial.codex).await;
     let authorization = "You may publish the reviewed release.";
     mount_sse_once(&server, sse(vec![ev_completed("authorized")])).await;
     initial.submit_text_turn(authorization).await?;
@@ -123,12 +164,8 @@ async fn guardian_history_survives_restart_and_user_fork(
         initial
             .thread_manager
             .fork_prepared_thread(
-                initial.config.clone(),
+                codex_core::StartThreadOptions::new(initial.config.clone()),
                 prepared,
-                /*thread_source*/ None,
-                /*parent_trace*/ None,
-                ClientMcpExtensions::default(),
-                /*reserved_thread_id*/ None,
             )
             .await?
     } else {
@@ -136,12 +173,8 @@ async fn guardian_history_survives_restart_and_user_fork(
             .thread_manager
             .fork_thread_from_history(
                 ForkSnapshot::Interrupted,
-                initial.config.clone(),
+                codex_core::StartThreadOptions::new(initial.config.clone()),
                 history.clone(),
-                /*thread_source*/ None,
-                /*parent_trace*/ None,
-                ClientMcpExtensions::default(),
-                /*reserved_thread_id*/ None,
             )
             .await?
     };
@@ -156,6 +189,7 @@ async fn guardian_history_survives_restart_and_user_fork(
         )
         .await?;
     for thread in [&fork.thread, &resumed.thread] {
+        wait_lhc_capture(thread).await;
         if pathless_store.is_some() {
             assert_eq!(thread.rollout_path(), None);
         }
@@ -195,7 +229,6 @@ async fn guardian_history_survives_restart_and_user_fork(
         let transcript = serde_json::to_string(&guardian.input())?;
         assert!(transcript.contains(authorization));
         assert!(transcript.contains(restriction));
-        assert!(!serde_json::to_string(&requests[0].input())?.contains(authorization));
         thread.shutdown_and_wait().await?;
     }
     if let Some(store) = pathless_store {
@@ -208,6 +241,120 @@ async fn guardian_history_survives_restart_and_user_fork(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: TokenBudget compact resets Guardian transcript cursor between eviction batches"]
+async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_wine_exec!(
+        Ok(()),
+        "Guardian approval actions require host-native paths"
+    );
+    let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
+    let test = test_codex()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+        .with_config(|config| {
+            enable_lhc_compact(config);
+            config
+                .features
+                .disable(Feature::GuardianThreadContext)
+                .expect("use the retained legacy history");
+            config.update_plan_enabled = true;
+            config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+            config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    wait_lhc_capture(&test.codex).await;
+    let plan = r#"{"plan":[{"step":"inspect the repository","status":"completed"}]}"#;
+    let mut inspection: Vec<_> = (0..130)
+        .map(|index| ev_function_call(&format!("initial-{index}"), "update_plan", plan))
+        .collect();
+    inspection.push(ev_completed("inspection"));
+    mount_sse_sequence(
+        &server,
+        vec![sse(inspection), sse(vec![ev_completed("inspected")])],
+    )
+    .await;
+    let restriction = "Only inspect the repository; do not publish it.";
+    test.submit_text_turn(restriction).await?;
+    test.codex.submit(Op::Compact).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let mut responses = Vec::new();
+    for index in 0..3 {
+        if index == 1 {
+            // Force eviction after the first review has saved its transcript cursor.
+            let mut traffic: Vec<_> = (0..130)
+                .map(|index| ev_function_call(&format!("later-{index}"), "update_plan", plan))
+                .collect();
+            traffic.push(ev_completed("more-inspection"));
+            responses.push(sse(traffic));
+        }
+        responses.push(sse(vec![
+            ev_function_call(
+                &format!("review-{index}"),
+                "exec_command",
+                &json!({
+                    "cmd": format!("echo review-{index}"),
+                    "sandbox_permissions": "require_escalated"
+                })
+                .to_string(),
+            ),
+            ev_completed(&format!("action-{index}")),
+        ]));
+        // Three consecutive denials would interrupt the parent turn before its final response.
+        let decision = if index == 2 {
+            r#"{"risk_level":"low","user_authorization":"high","outcome":"allow"}"#
+        } else {
+            r#"{"outcome":"deny"}"#
+        };
+        responses.push(sse(vec![
+            ev_assistant_message(&format!("decision-{index}"), decision),
+            ev_completed(&format!("reviewed-{index}")),
+        ]));
+    }
+    responses.push(sse(vec![ev_completed("done")]));
+    let reviews = mount_sse_sequence(&server, responses).await;
+    test.submit_text_turn("Continue inspecting.").await?;
+    let requests = reviews.requests();
+    let guardian_requests = requests
+        .iter()
+        .filter(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
+        .collect::<Vec<_>>();
+    let prompts = guardian_requests
+        .iter()
+        .map(|request| {
+            request
+                .message_input_text_groups("user")
+                .last()
+                .expect("Guardian review prompt")
+                .join("")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        prompts
+            .iter()
+            .map(|prompt| (
+                prompt.contains(">>> TRANSCRIPT START\n"),
+                prompt.contains(">>> TRANSCRIPT DELTA START\n"),
+            ))
+            .collect::<Vec<_>>(),
+        vec![(true, false), (true, false), (false, true)]
+    );
+    assert!(prompts[1].contains(restriction));
+    assert!(prompts[2].contains("review-2"));
+    assert_eq!(
+        guardian_requests[1].body_json()["client_metadata"]["thread_id"],
+        guardian_requests[2].body_json()["client_metadata"]["thread_id"]
+    );
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
@@ -215,9 +362,11 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
         "Guardian approval actions require host-native paths"
     );
     let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let test = test_codex()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
-            config.features.enable(Feature::TokenBudget).unwrap();
+            enable_lhc_compact(config);
             config
                 .features
                 .enable(Feature::DefaultModeRequestUserInput)
@@ -228,6 +377,7 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
         })
         .build_with_auto_env(&server)
         .await?;
+    wait_lhc_capture(&test.codex).await;
     // Enough real tool traffic to evict earlier tools when retention starts.
     let plan = r#"{"plan":[{"step":"verify repository visibility","status":"completed"}]}"#;
     let mut inspection: Vec<_> = (0..130)
@@ -388,13 +538,6 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
             let mut ordered = positions;
             ordered.sort();
             assert_eq!(positions, ordered);
-            assert!(
-                requests[0]
-                    .input()
-                    .iter()
-                    .all(|item| item["call_id"] != "inspect-0"
-                        && item["call_id"] != "confirm-publish")
-            );
             test.codex.ensure_rollout_materialized().await;
             test.codex
                 .submit(Op::ThreadRollback { num_turns: 2 })

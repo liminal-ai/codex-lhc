@@ -469,6 +469,7 @@ pub(super) async fn produce_lhc_compact_on_thread(
     cancel: Arc<AtomicBool>,
     session_derived: DerivedProvenance,
     percentages: LhcBandPercentages,
+    compact_opts: Option<codex_lhc_host::CompactOpts>,
     turn_cancel: &CancellationToken,
 ) -> Result<LhcCompactResult, CompactWorkerError> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -491,6 +492,7 @@ pub(super) async fn produce_lhc_compact_on_thread(
                         Some(cancel_thread),
                         &session_derived,
                         percentages,
+                        compact_opts,
                     )
                     .await
                     .map_err(CompactWorkerError::from)

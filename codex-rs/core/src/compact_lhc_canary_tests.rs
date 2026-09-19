@@ -319,6 +319,7 @@ async fn canary_unprovable_graft_installs_the_lhc_pair_not_the_exact_pair() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[
                 live_call.clone(),
                 custom_output(protected_id, &format!("{}-CANARY", "tok ".repeat(400))),
@@ -702,6 +703,7 @@ async fn seed_oversized_protected_pair(
     session
         .record_conversation_items_with_provenance(
             tc,
+            tc.model_info(),
             &items,
             codex_extension_api::RawItemProvenance::ModelOutput,
         )

@@ -58,6 +58,7 @@ async fn worker_storage_failures_preserve_operation_classification() {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             codex_lhc_host::DerivedProvenance::default(),
             codex_lhc_host::LhcBandPercentages::default(),
+            /*compact_opts*/ None,
             &tokio_util::sync::CancellationToken::new(),
         )
         .await
@@ -109,6 +110,7 @@ async fn compact_worker_preserves_sdk_cancellation_without_a_cancelled_turn() {
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
         codex_lhc_host::DerivedProvenance::default(),
         codex_lhc_host::LhcBandPercentages::default(),
+        /*compact_opts*/ None,
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
@@ -209,14 +211,17 @@ async fn seed_conversation_small(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(text)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -244,14 +249,17 @@ async fn seed_conversation_bandable(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(&user)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -459,8 +467,10 @@ async fn law2_token_count_drops_and_threshold_does_not_retrigger() {
 
     sess.record_user_prompt_and_emit_turn_item(
         &tc,
+        tc.model_info(),
         &[text_input("follow-up after compact")],
-        None,
+        /*client_id*/ None,
+        /*acceptance_order*/ None,
         PersistContext::TurnStart,
     )
     .await;
@@ -624,13 +634,16 @@ async fn production_many_compacts_marker_bounded_body_not_growing() {
             for k in 0..20 {
                 sess.record_user_prompt_and_emit_turn_item(
                     &tc,
+                    tc.model_info(),
                     &[text_input(&format!("bulk r{round} t{k} {pad}"))],
-                    None,
+                    /*client_id*/ None,
+                    /*acceptance_order*/ None,
                     PersistContext::TurnStart,
                 )
                 .await;
                 sess.record_conversation_items_with_provenance(
                     &tc,
+                    tc.model_info(),
                     &[ResponseItem::Message {
                         id: None,
                         role: "assistant".into(),
@@ -962,6 +975,7 @@ fn band_body_replacement_history_byte_equal() {
         previous_window_id: None,
         window_id: Some("b".into()),
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     };
@@ -1034,6 +1048,7 @@ fn shape_risk_consumers_see_band_replacement() {
         previous_window_id: Some("w1".into()),
         window_id: Some("w2".into()),
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     };
@@ -1720,6 +1735,7 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         },
@@ -1831,6 +1847,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         },
@@ -1840,6 +1857,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
         child
             .record_conversation_items_with_provenance(
                 &ctc,
+                ctc.model_info(),
                 std::slice::from_ref(item),
                 codex_extension_api::RawItemProvenance::HostContext,
             )
@@ -2203,6 +2221,7 @@ async fn attach_rollout_for_slice_c(session: &mut Session) -> std::path::PathBuf
             subagent_history_start_ordinal: None,
             history_base: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
@@ -2962,6 +2981,7 @@ async fn queue_loss_imports_missing_tool_and_reasoning() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &missing_items,
             codex_extension_api::RawItemProvenance::ModelOutput,
         )
@@ -3002,6 +3022,7 @@ async fn hard_failure_preserves_history_and_writes_no_native_compacted() {
         session
             .record_conversation_items_with_provenance(
                 &tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "user".into(),
@@ -3501,6 +3522,7 @@ fn grafted_pair_survives_patch_materialized_history_ids() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -3545,6 +3567,7 @@ fn empty_install_history_keeps_prior_body() {
         previous_window_id: None,
         window_id: None,
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     })];
@@ -3618,6 +3641,7 @@ fn degraded_drops_keep_rollout_and_installed_body_identical() {
         previous_window_id: None,
         window_id: None,
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     })];

@@ -136,14 +136,17 @@ async fn seed_conversation_bandable(
         session
             .record_user_prompt_and_emit_turn_item(
                 tc,
+                tc.model_info(),
                 &[text_input(&user)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
         session
             .record_conversation_items_with_provenance(
                 tc,
+                tc.model_info(),
                 &[ResponseItem::Message {
                     id: None,
                     role: "assistant".into(),
@@ -186,6 +189,7 @@ pub(super) async fn attach_rollout(session: &mut Session) -> std::path::PathBuf 
             subagent_history_start_ordinal: None,
             history_base: None,
             initial_window_id: Uuid::now_v7().to_string(),
+            runtime_workspace_roots: None,
             metadata: ThreadPersistenceMetadata {
                 cwd: Some(config.cwd.to_path_buf()),
                 model_provider: config.model_provider_id.clone(),
@@ -257,6 +261,7 @@ fn compacted(
         previous_window_id: prev.map(str::to_string),
         window_id: Some(window_id.into()),
         guardian_history: None,
+        retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
     })
@@ -385,6 +390,9 @@ async fn slice_d_regenerate_and_resume_drill() {
         boundary,
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
     assert!(
@@ -551,14 +559,17 @@ async fn slice_d_display_consumers_on_rebuilt_file() {
     session
         .record_user_prompt_and_emit_turn_item(
             &tc,
+            tc.model_info(),
             &[text_input(first_prompt)],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[assistant_msg("ack first")],
             codex_extension_api::RawItemProvenance::ModelOutput,
         )
@@ -882,8 +893,10 @@ async fn slice_d_l2_mid_turn_abort_then_rewrite() {
     session
         .record_user_prompt_and_emit_turn_item(
             &tc,
+            tc.model_info(),
             &[text_input("about to abort this turn")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -1013,8 +1026,10 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
     session
         .record_user_prompt_and_emit_turn_item(
             &tc,
+            tc.model_info(),
             &[text_input(astral)],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -1028,6 +1043,7 @@ async fn slice_d_l2_adversarial_corpus_round_trip() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[
                 ResponseItem::FunctionCall {
                     id: None,
@@ -1140,6 +1156,9 @@ async fn slice_d_l2_crash_injection_full_stack() {
         boundary,
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
 
@@ -1363,6 +1382,9 @@ async fn slice_d_l2_empty_edge_cases() {
             boundary,
             world_state: None,
             turn_context: None,
+            guardian_history: None,
+            retained_context: None,
+            latest_token_usage_record: None,
             live_identity: None,
         });
         assert_eq!(compacted_count(&result.items), 1);
@@ -1486,6 +1508,7 @@ async fn slice_d_named_unpaired_function_output_survives_generation_rewrite() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[named_unpaired_output(
                 codex_protocol::models::FunctionCallOutputBody::Text(
                     "parent notification".to_string(),
@@ -1595,6 +1618,7 @@ async fn slice_d_unrepresentable_unpaired_output_refuses_before_install() {
     session
         .record_conversation_items_with_provenance(
             &tc,
+            tc.model_info(),
             &[named_unpaired_output(
                 codex_protocol::models::FunctionCallOutputBody::ContentItems(vec![
                     codex_protocol::models::FunctionCallOutputContentItem::InputText {

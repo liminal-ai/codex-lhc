@@ -493,6 +493,22 @@ pub fn map_item(
                 None => Vec::new(),
             }
         }
+        ResponseItem::ConfigurationUpdate { reasoning } => {
+            let text = format!(
+                "configuration_update {}",
+                serde_json::to_string(reasoning).unwrap_or_else(|_| "{}".into())
+            );
+            vec![text_event(
+                thread_id,
+                sid,
+                &digest,
+                occ,
+                "runtime_note",
+                ACTOR_SYSTEM,
+                &text,
+                Some("configuration_update"),
+            )]
+        }
         ResponseItem::Other => Vec::new(),
     }
 }

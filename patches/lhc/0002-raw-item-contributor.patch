@@ -1,8 +1,8 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index ebb180755e..cf7d485081 100644
+index 89480df2f1..a6344991b7 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
-@@ -16,6 +16,7 @@ mod approval_review;
+@@ -15,6 +15,7 @@ mod approval_review;
  mod context;
  mod mcp;
  mod prompt;
@@ -10,7 +10,7 @@ index ebb180755e..cf7d485081 100644
  mod skill_invocation;
  mod thread_lifecycle;
  mod tool_lifecycle;
-@@ -34,6 +35,9 @@ pub use mcp::SelectedPluginIdentity;
+@@ -35,6 +36,9 @@ pub use mcp::SelectedPluginIdentity;
  pub use mcp::SelectedPluginSnapshot;
  pub use prompt::PromptFragment;
  pub use prompt::PromptSlot;
@@ -134,10 +134,10 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index a8ba8f1f20..2587bd442e 100644
+index 3daadfe87a..6cb9fd216c 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
-@@ -57,6 +57,9 @@ pub use contributors::McpToolSource;
+@@ -63,6 +63,9 @@ pub use contributors::McpToolSource;
  pub use contributors::PreviousWorldStateSection;
  pub use contributors::PromptFragment;
  pub use contributors::PromptSlot;
@@ -148,18 +148,18 @@ index a8ba8f1f20..2587bd442e 100644
  pub use contributors::SelectedPluginIdentity;
  pub use contributors::SelectedPluginSnapshot;
 diff --git a/codex-rs/ext/extension-api/src/registry.rs b/codex-rs/ext/extension-api/src/registry.rs
-index 8a8ae707ef..0670ba2ddb 100644
+index dddd8b8ab0..5cda5196d8 100644
 --- a/codex-rs/ext/extension-api/src/registry.rs
 +++ b/codex-rs/ext/extension-api/src/registry.rs
-@@ -13,6 +13,7 @@ use crate::ExtensionEventSink;
- use crate::ExtensionMetrics;
+@@ -6,6 +6,7 @@ use crate::ContextContributor;
+ use crate::ExtensionEventSink;
  use crate::McpServerContributor;
  use crate::NoopExtensionEventSink;
 +use crate::RawItemContributor;
  use crate::SkillInvocationContributor;
  use crate::ThreadLifecycleContributor;
  use crate::TokenUsageContributor;
-@@ -44,6 +45,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
+@@ -39,6 +40,7 @@ impl<C: Sync> Default for ExtensionRegistryBuilder<C> {
                  tool_contributors: Vec::new(),
                  tool_lifecycle_contributors: Vec::new(),
                  turn_item_contributors: Vec::new(),
@@ -180,7 +180,7 @@ index 8a8ae707ef..0670ba2ddb 100644
      /// Finishes construction and returns the immutable registry.
      pub fn build(self) -> ExtensionRegistry<C> {
          self.registry
-@@ -157,6 +165,8 @@ pub struct ExtensionRegistry<C: Sync> {
+@@ -158,6 +166,8 @@ pub struct ExtensionRegistry<C: Sync> {
      tool_contributors: Vec<Arc<dyn ToolContributor>>,
      tool_lifecycle_contributors: Vec<Arc<dyn ToolLifecycleContributor>>,
      turn_item_contributors: Vec<Arc<dyn TurnItemContributor>>,
@@ -189,7 +189,7 @@ index 8a8ae707ef..0670ba2ddb 100644
      approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
  }
  
-@@ -270,6 +280,12 @@ impl<C: Sync> ExtensionRegistry<C> {
+@@ -254,6 +264,12 @@ impl<C: Sync> ExtensionRegistry<C> {
      pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
          &self.turn_item_contributors
      }
@@ -203,10 +203,10 @@ index 8a8ae707ef..0670ba2ddb 100644
  
  /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 2612414262..1d0f001581 100644
+index 7c1dbee345..5fb1a5edc0 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-@@ -1672,6 +1672,7 @@ impl GoalExtensionHarness {
+@@ -1746,6 +1746,7 @@ impl GoalExtensionHarness {
                      turn_id,
                      collaboration_mode: &collaboration_mode,
                      token_usage_at_turn_start: usage,
@@ -214,7 +214,7 @@ index 2612414262..1d0f001581 100644
                      session_store: &self.session_store,
                      thread_store: &self.thread_store,
                      turn_store: &turn_store,
-@@ -1685,6 +1686,8 @@ impl GoalExtensionHarness {
+@@ -1759,6 +1760,8 @@ impl GoalExtensionHarness {
          for contributor in self.registry.turn_lifecycle_contributors() {
              contributor
                  .on_turn_stop(TurnStopInput {

@@ -46,6 +46,7 @@ regen 0003-feature-flag.patch \
 regen 0004-session-raw-item-hook.patch \
   codex-rs/core/src/session/mod.rs \
   codex-rs/core/src/session/inject.rs \
+  codex-rs/core/src/session/token_budget.rs \
   codex-rs/core/src/session/lhc_capture_e2e_tests.rs \
   codex-rs/core/src/stream_events_utils.rs \
   codex-rs/core/src/compact.rs
@@ -63,6 +64,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/src/compact_lhc/workers.rs \
   codex-rs/core/src/compact_lhc/installation.rs \
   codex-rs/core/src/compact_lhc.rs \
+  codex-rs/core/src/guardian/review_session.rs \
   codex-rs/core/src/compact_lhc_worker_error.rs \
   codex-rs/core/src/compact_lhc_tests.rs \
   codex-rs/core/src/compact_lhc_strict_routing_tests.rs \
@@ -81,8 +83,12 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/compact_lhc_image_tests.rs \
   codex-rs/core/tests/suite/compact_lhc_context_management.rs \
   codex-rs/core/tests/suite/compact_remote.rs \
+  codex-rs/core/tests/suite/compact_remote_trimming.rs \
   codex-rs/core/tests/suite/compact_remote_parity.rs \
   codex-rs/core/tests/suite/compact_resume_fork.rs \
+  codex-rs/core/tests/suite/guardian_history.rs \
+  codex-rs/core/tests/suite/rollout_compression.rs \
+  codex-rs/core/tests/suite/step_settings_compaction.rs \
   codex-rs/core/tests/suite/client.rs \
   codex-rs/core/tests/suite/current_time_reminder.rs \
   codex-rs/core/tests/suite/hooks.rs \
@@ -97,8 +103,12 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/window_headers.rs \
   codex-rs/core/tests/suite/model_switching.rs \
   codex-rs/core/tests/suite/mod.rs \
+  codex-rs/core/tests/common/responses.rs \
+  codex-rs/core/tests/suite/code_mode.rs \
   codex-rs/core/src/session/turn.rs \
   codex-rs/core/src/session/session.rs \
+  codex-rs/core/src/session/step_settings.rs \
+  codex-rs/core/src/session/step_settings_tests.rs \
   codex-rs/core/src/session/tests.rs \
   codex-rs/core/src/session/input_queue.rs \
   codex-rs/core/src/session/lhc_band_shape_eval_tests.rs \
@@ -141,7 +151,9 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/thread-store/src/local/thread_history_materialization.rs \
   codex-rs/thread-store/src/local/thread_history_materialization_tests.rs \
   codex-rs/app-server/src/request_processors/thread_processor.rs \
-  codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
+  codex-rs/app-server/tests/common/mock_model_server.rs \
+  codex-rs/app-server/tests/suite/v2/history_notes_extension.rs \
+  codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs
 
 # Release identity and update wiring (maintenance slices 01-06): the embedded
 # fork release, CLI/TUI update execution through the fork installer, fork
@@ -163,6 +175,8 @@ regen 0008-release-identity-update-wiring.patch \
   codex-rs/tui/src/updates_cache.rs \
   codex-rs/tui/src/updates_cache_tests.rs \
   codex-rs/tui/src/app/exit_summary.rs \
+  codex-rs/tui/src/app/tests/realtime_requests.rs \
+  codex-rs/tui/src/status/tests.rs \
   codex-rs/tui/src/history_cell/mod.rs \
   codex-rs/tui/src/history_cell/notices.rs \
   codex-rs/tui/src/history_cell/tests.rs \

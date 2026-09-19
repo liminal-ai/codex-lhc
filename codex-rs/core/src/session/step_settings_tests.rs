@@ -507,3 +507,35 @@ async fn model_resolution_preserves_startup_overrides_and_instruction_provenance
         );
     }
 }
+
+#[tokio::test]
+async fn step_overrides_preserve_configured_catalog_windows() {
+    let slug = "gpt-5.6-luna";
+    let mut luna = model_info_from_slug(slug);
+    luna.context_window = Some(20_000);
+    luna.max_context_window = Some(20_000);
+    luna.auto_compact_token_limit = None;
+    let catalog = ModelsResponse { models: vec![luna] };
+    let models_manager = StaticModelsManager::new(/*auth_manager*/ None, catalog.clone());
+    let mut config = test_config().await;
+    config.model = Some(slug.to_string());
+    config.model_catalog = Some(catalog);
+    let overrides = ModelInfoOverrides::from(config.to_models_manager_config());
+    let mut settings = configured_settings();
+    settings.collaboration_mode = settings.collaboration_mode.with_updates(
+        Some(slug.to_string()),
+        /*effort*/ None,
+        /*developer_instructions*/ None,
+    );
+
+    let resolved = settings
+        .resolve_model_info(
+            &models_manager,
+            &overrides,
+            /*personality_enabled*/ false,
+        )
+        .await;
+    assert_eq!(resolved.context_window, Some(20_000));
+    assert_eq!(resolved.max_context_window, Some(20_000));
+    assert_eq!(resolved.auto_compact_token_limit, None);
+}

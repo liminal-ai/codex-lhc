@@ -302,6 +302,11 @@ impl Session {
         input: Vec<TurnInput>,
         task: T,
     ) {
+        // Inherited or recovered roots are applied before task start. Otherwise this
+        // task owns its turn, including background work. Later mail cannot change it.
+        turn_context
+            .turn_metadata_state
+            .set_root_turn_id(turn_context.sub_id.clone());
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
         let span_name = task.span_name();
@@ -318,20 +323,13 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&turn_context.sub_id);
+        codex_guardian_reviewer::ReviewDenials::clear_turn(
+            &self.services.thread_extension_data,
+            &turn_context.sub_id,
+        )
+        .await;
 
-        let (pending_items, start_options) = self.input_queue.drain_mailbox_input_items().await;
-        if turn_context.turn_metadata_state.root_turn_id().is_none()
-            && let Some(root_turn_id) = start_options.root_turn_id
-        {
-            turn_context
-                .turn_metadata_state
-                .set_root_turn_id(root_turn_id);
-        }
+        let (pending_items, _) = self.input_queue.drain_mailbox_input_items().await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
             let turn = active.get_or_insert_with(ActiveTurn::default);
@@ -683,6 +681,7 @@ impl Session {
         run_hooks_and_record_inputs(
             self,
             &turn_context,
+            &turn_context.capture_current_model_info(),
             &pending_input,
             PersistContext::Standard,
         )
@@ -906,11 +905,11 @@ impl Session {
             }
         };
         self.send_event(turn_context.as_ref(), event).await;
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&turn_context.sub_id);
+        codex_guardian_reviewer::ReviewDenials::clear_turn(
+            &self.services.thread_extension_data,
+            &turn_context.sub_id,
+        )
+        .await;
 
         let cleared_active_turn = {
             let mut active = self.active_turn.lock().await;
@@ -1031,6 +1030,7 @@ impl Session {
         {
             self.record_conversation_items(
                 task.turn_context.as_ref(),
+                task.turn_context.model_info(),
                 std::slice::from_ref(&marker),
             )
             .await;
@@ -1069,11 +1069,11 @@ impl Session {
             duration_ms,
         });
         self.send_event(task.turn_context.as_ref(), event).await;
-        self.services
-            .guardian_rejection_circuit_breaker
-            .lock()
-            .await
-            .clear_turn(&task.turn_context.sub_id);
+        codex_guardian_reviewer::ReviewDenials::clear_turn(
+            &self.services.thread_extension_data,
+            &task.turn_context.sub_id,
+        )
+        .await;
         // Regular items were flushed before this terminal event was appended; buffering
         // thread writers may not flush it without another explicit barrier.
         if let Err(err) = self.flush_rollout().await {

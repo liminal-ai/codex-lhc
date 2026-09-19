@@ -31,6 +31,7 @@ use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
 use super::Session;
+use super::step_context::StepContext;
 use super::tests::make_session_and_context;
 use crate::config::Config;
 
@@ -86,8 +87,10 @@ async fn e2e_user_prompt_reaches_lhc_record() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("e2e human utterance")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -138,8 +141,10 @@ async fn e2e_item_order_preserved_across_records() {
         session
             .record_user_prompt_and_emit_turn_item(
                 &turn_context,
+                turn_context.model_info(),
                 &[text_input(text)],
-                None,
+                /*client_id*/ None,
+                /*acceptance_order*/ None,
                 PersistContext::TurnStart,
             )
             .await;
@@ -200,8 +205,10 @@ async fn e2e_core_id_assignment_is_restart_stable() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("core-assigned-id-utterance")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -225,7 +232,11 @@ async fn e2e_core_id_assignment_is_restart_stable() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }];
-    let (prepared, _) = session.prepare_conversation_items_for_history(&turn_context, &items);
+    let (prepared, _) = session.prepare_conversation_items_for_history(
+        &turn_context,
+        turn_context.model_info(),
+        &items,
+    );
     let prepared = prepared.into_owned();
     let id_str = prepared[0]
         .id()
@@ -288,8 +299,10 @@ async fn e2e_user_prompt_provenance_is_required() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("provenance-sensitive")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -318,6 +331,7 @@ async fn e2e_user_prompt_provenance_is_required() {
     session
         .record_conversation_items_with_provenance(
             &turn_context,
+            turn_context.model_info(),
             &[host_item],
             RawItemProvenance::HostContext,
         )
@@ -452,8 +466,10 @@ async fn e2e_panicking_raw_item_contributor_is_contained() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("after-panic-contributor")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -514,7 +530,12 @@ async fn e2e_model_output_path_does_not_tag_user_role_as_user_prompt() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     };
-    record_completed_response_item(&session, &turn_context, &user_shaped).await;
+    record_completed_response_item(
+        &session,
+        StepContext::for_test(Arc::new(turn_context)).as_ref(),
+        &user_shaped,
+    )
+    .await;
 
     handle.flush().await;
     let events = handle.list_events().await.expect("list");
@@ -565,8 +586,10 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("live turn that must be captured")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -645,6 +668,7 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
     let dir = tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
     let (mut session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
     install_lhc_on_session(&mut session, root).await;
 
     let slot = session
@@ -678,8 +702,10 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("v5 host facts prompt")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -696,7 +722,12 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
         internal_chat_message_metadata_passthrough: None,
     };
     // Production model-output path (ModelOutput provenance).
-    record_completed_response_item(&session, &turn_context, &assistant).await;
+    record_completed_response_item(
+        &session,
+        StepContext::for_test(Arc::clone(&turn_context)).as_ref(),
+        &assistant,
+    )
+    .await;
 
     // ResponseEvent::Completed path — TokenUsageContributor fans out last_token_usage.
     let per_call = TokenUsage {
@@ -826,8 +857,10 @@ async fn e2e_v5_host_facts_abort_with_reason() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("abort path prompt")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -911,8 +944,10 @@ async fn e2e_v5_turn_end_without_host_facts_still_records() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("optional facts prompt")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -1015,6 +1050,7 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
             previous_window_id: None,
             window_id: Some("win-1".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -1029,6 +1065,7 @@ async fn slice_d_dual_format_old_appended_via_production_resume() {
             previous_window_id: Some("win-1".into()),
             window_id: Some("win-2".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -1087,8 +1124,10 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     session
         .record_user_prompt_and_emit_turn_item(
             &turn_context,
+            turn_context.model_info(),
             &[text_input("run two tools then finish")],
-            None,
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
             PersistContext::TurnStart,
         )
         .await;
@@ -1124,6 +1163,7 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     session
         .record_conversation_items_with_provenance(
             &turn_context,
+            turn_context.model_info(),
             &[
                 assistant("a0", "calling both tools"),
                 call("call-a"),
@@ -1135,6 +1175,7 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     session
         .record_conversation_items_with_provenance(
             &turn_context,
+            turn_context.model_info(),
             &[output("call-a")],
             RawItemProvenance::ModelOutput,
         )
@@ -1142,6 +1183,7 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     session
         .record_conversation_items_with_provenance(
             &turn_context,
+            turn_context.model_info(),
             &[output("call-b")],
             RawItemProvenance::ModelOutput,
         )
@@ -1152,6 +1194,7 @@ async fn e2e_f2_sequential_cycle_stamps_and_intact_parallel_tool_pairs() {
     session
         .record_conversation_items_with_provenance(
             &turn_context,
+            turn_context.model_info(),
             &[assistant("a1", "done")],
             RawItemProvenance::ModelOutput,
         )

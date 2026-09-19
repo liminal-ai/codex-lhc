@@ -262,7 +262,15 @@ Failure before the final rename leaves `P` untouched and authoritative —
 loud `tracing::error`, session continues, next compact retries. **No append
 fallback path.** In-memory history installed at compact equals
 `Compacted.replacement_history` (bands) + post-boundary native
-`ResponseItem`s — the same split resume rebuilds from the rewritten file.
+`ResponseItem`s + grafted MidTurn protected tool pairs — the same split
+resume rebuilds from the rewritten file. Blanket post-hoc pruning of
+native-tail tool items is not accepted. Native-shape tests that forbid
+pre-compact `call_id`s in the next sampling input may enter LIM-142 only
+when evidence places those items in retained tail, with that exact reason.
+
+Guardian image admission remains the vanilla per-item 10k cap (no extra
+reservation). Operator `model_catalog` windows must survive turn-context
+re-resolve (`ModelInfoOverrides` carries the catalog).
 
 Implementation: pure swap in `codex-lhc-host::rollout_swap`; materializer
 wiring in `core/src/compact_lhc/installation.rs`; reopen on `RolloutRecorder` +
@@ -329,7 +337,14 @@ byte-identical (accepted under the criterion's semantic arm).
 
 Dated merge accounts, qualification evidence, and conflict resolutions are in
 [the maintenance history](lhc-internal/history/fork-maintenance-through-2026-09-04.md).
-Current upstream base: `patches/lhc/BASE` (`rust-v0.153.4` at this revision).
+Current upstream base: `patches/lhc/BASE` (`rust-v0.155.1` at this revision).
+
+2026-09-18 `rust-v0.155.1` retarget: merged peeled `be2951ea34` (tag object
+`4e21628f9e`) onto the isolated `rust-v0.155.0` LHC tree. Upstream delta from
+`f0a1b8f084` is `5e0d1ef83e` (TUI reasoning-summary default restored to `none`)
+and the `0.155.1` workspace version. Only `codex-rs/Cargo.toml` conflicted
+(workspace version; upstream's `0.155.1` taken). `lhc-release/VERSION` stays
+`0.153.4`. `BASE` to `be2951ea34`. SDK pin `e9456a6e` unchanged.
 
 2026-09-06 hotfix sync: merged the exact peeled `rust-v0.153.4` commit
 `3d2ee51ca2` (tag object `042fb41b7c`) onto the maintained branch. Upstream's
@@ -472,6 +487,34 @@ Tests split three ways. The split is the policy, not the failure inventory:
 3. **False-premise native-routing integration coverage.** Tests whose owned assertion is that a normal entry point issues native local summarization, remote `/responses/compact`, or TokenBudget compaction. Each carries `#[ignore = "codex-lhc LIM-142 strict-lhc-routing: …"]` naming that native artifact. When the old fixture also named a supported invariant, the reason points at the active LHC owner; the ignore is only for the native-request premise.
 
 The class-3 set is exact: `scripts/lhc-native-routing-ignored-tests.txt` (`# count:`) plus `scripts/check-lhc-compact-ignores.sh` (tripwire layer 1b). Drift in either direction fails.
+
+Fork-owned surface = codex-lhc-host + the fork's own tests + upstream tests that do not assert native compaction.
+
+## Sandbox gate (bwrap / userns)
+
+Linux sandbox tests need unprivileged user namespaces. Do **not** change
+`kernel.apparmor_restrict_unprivileged_userns` on a shared build host.
+
+The reusable gate is dispatch-only `.github/workflows/lhc-sandbox-tests.yml`
+(`ubuntu-24.04`, `dtolnay/rust-toolchain` 1.95.0 and `taiki-e/install-action`
+nextest 0.9.103 as in `rust-ci`; it does **not** call `setup-ci`, which would
+unconditionally write AppArmor 0). On the runner VM it prints
+`kernel.apparmor_restrict_unprivileged_userns` and runs `sudo sysctl -w …=0`
+only when the current value is `1`. `cargo nextest list` is JSON identity
+compare of binary-id + test name against `scripts/lhc-sandbox-tests.tsv`
+(no `--retries` on list). The nextest `-E` filter uses `binary_id(=)` with
+the TSV package::binary ID, not `binary()`, which cannot match those IDs.
+`cargo nextest run` uses `--retries 0`. Verifier,
+build, and run logs upload even when the run step never starts.
+
+Do not invoke that workflow by pushing from a writer seat. Reed dispatches
+after reviewing branch+SHA.
+
+Standing per-sync requirement: Reed dispatches that workflow on the
+**candidate** SHA. The hosted 60 must be green. A candidate failure that
+passes on vanilla (same runner) is a fork-caused blocker; no ignores and no
+baseline excuse. Frozen-fork failures that also fail on the candidate remain
+fork-caused when vanilla passes.
 
 ## Compact-continuation MidTurn (LIM-63B)
 

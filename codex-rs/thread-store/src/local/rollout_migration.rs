@@ -412,7 +412,7 @@ impl LocalThreadStore {
                 && options.mode == RolloutMigrationMode::Apply
                 && let Some(thread_id) = thread_id
             {
-                let _writer_guard = match self.writer_lock_coordinator.acquire(thread_id) {
+                let _writer_guard = match self.acquire_writer_lock(thread_id) {
                     Ok(guard) => guard,
                     Err(ThreadStoreError::Conflict { message }) => {
                         return Ok(Some(skipped_busy_outcome(
@@ -536,7 +536,7 @@ impl LocalThreadStore {
         }
 
         let _live_writer_guard = self.live_writer_locks.lock(thread_id).await;
-        let _writer_guard = match self.writer_lock_coordinator.acquire(thread_id) {
+        let _writer_guard = match self.acquire_writer_lock(thread_id) {
             Ok(guard) => guard,
             Err(ThreadStoreError::Conflict { message }) => {
                 return Ok(Some(skipped_busy_outcome(
@@ -1004,7 +1004,7 @@ impl LocalThreadStore {
         legacy_names: &HashMap<ThreadId, String>,
         limiter: &mut RolloutMigrationRateLimiter,
     ) -> ThreadStoreResult<PathBuf> {
-        let _writer_guard = self.writer_lock_coordinator.acquire(thread_id)?;
+        let _writer_guard = self.acquire_writer_lock(thread_id)?;
         let decompressed_path = rollout_path_is_compressed(rollout_path)
             .then(|| decompressed_staged_rollout_path(rollout_path))
             .transpose()?;

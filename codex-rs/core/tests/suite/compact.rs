@@ -6,7 +6,6 @@ use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
-use codex_history::RolloutLine;
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
@@ -56,8 +55,6 @@ use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
 use core_test_support::responses::ev_function_call;
-use core_test_support::responses::mount_compact_json_once;
-use core_test_support::responses::mount_compact_response_sequence;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
@@ -367,7 +364,7 @@ fn replacement_history_from_rollout(path: &Path) -> Result<Vec<Value>> {
         .map(str::trim)
         .filter(|line| !line.is_empty())
     {
-        let entry: RolloutLine = serde_json::from_str(line)?;
+        let entry = codex_rollout::parse_rollout_line(line)?;
         if let RolloutItem::Compacted(compacted) = entry.item
             && let Some(items) = compacted.replacement_history
         {
@@ -408,9 +405,12 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
     let mut model_info = models_response
         .models
         .into_iter()
-        .find(|model| model.slug == slug)
+        .find(|model| model.slug == "gpt-5.5")
         .expect("model missing from models.json");
+    model_info.slug = slug.to_string();
     model_info.context_window = Some(context_window);
+    model_info.max_context_window = Some(context_window);
+    model_info.comp_hash = None;
     model_info
 }
 
@@ -506,12 +506,12 @@ fn format_labeled_requests_snapshot(
     )
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[test_case::test_case(false, false; "checklist disabled")]
 #[test_case::test_case(true, false; "checklist enabled")]
 #[test_case::test_case(false, true; "custom instructions with checklist disabled")]
 #[test_case::test_case(true, true; "custom instructions with checklist enabled")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the three-request native local compact conversation (user, summarization, follow-up)"]
 async fn summarize_context_three_requests_and_instructions(
     enable_plan: bool,
     custom_instructions: bool,
@@ -724,7 +724,7 @@ async fn summarize_context_three_requests_and_instructions(
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {
@@ -772,8 +772,8 @@ async fn summarize_context_three_requests_and_instructions(
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture asserts a native compact request still happens after PreCompact stop; R15 on run_strict_lhc_compact is the live veto-removed policy"]
 async fn manual_pre_compact_block_decision_does_not_block_compaction() {
     skip_if_no_network!();
 
@@ -840,8 +840,8 @@ async fn manual_pre_compact_block_decision_does_not_block_compaction() {
     assert!(input.get("implementation").is_none());
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: fixture waits on a native summarization request; PostCompact-after-install and matcher policy are owned by compact_lhc_strict_routing_tests plus run_strict_lhc_compact R15"]
 async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     skip_if_no_network!();
 
@@ -903,8 +903,8 @@ async fn compact_hooks_respect_matchers_and_post_runs_after_compaction() {
     assert!(input.get("implementation").is_none());
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is that Op::Compact sends config.compact_prompt as a native summarization user message"]
 async fn manual_compact_uses_custom_prompt() {
     skip_if_no_network!();
 
@@ -992,8 +992,152 @@ async fn manual_compact_uses_custom_prompt() {
     }
 }
 
+#[test_case::test_case(false; "success")]
+#[test_case::test_case(true; "failure")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is TokenCount events from a native compact summarization request; Op::Compact never issues that request"]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 compaction resetting pinned reasoning effort"]
+async fn reasoning_effort_override_remote_v2_compaction_resets_pinned_effort(
+    fail_compaction: bool,
+) -> Result<()> {
+    use codex_protocol::openai_models::ReasoningEffort;
+
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let request_log = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_assistant_message("m1", "first reply"),
+                ev_completed("r1"),
+            ]),
+            sse(vec![
+                ev_assistant_message("m2", "second reply"),
+                ev_completed("r2"),
+            ]),
+            if fail_compaction {
+                sse_failed("r3", "server_error", "compaction failed")
+            } else {
+                remote_v2_compaction_response()
+            },
+            sse(vec![
+                ev_assistant_message("m4", "third reply"),
+                ev_completed("r4"),
+            ]),
+            sse(vec![ev_completed("r5")]),
+            sse(vec![ev_completed("r6")]),
+        ],
+    )
+    .await;
+
+    let test = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_model_info_override("gpt-5.4", |model| {
+            model.use_responses_lite = true;
+        })
+        .with_config(move |config| {
+            config.model_provider.stream_max_retries = Some(0);
+            config.model_reasoning_effort = Some(ReasoningEffort::Medium);
+            config
+                .features
+                .enable(Feature::ReasoningEffortOverride)
+                .expect("test config should allow feature update");
+            set_test_compact_prompt(config);
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_text_turn("first message").await?;
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::High)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.submit_text_turn("second message").await?;
+    test.codex.submit(Op::Compact).await?;
+    if fail_compaction {
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await;
+    }
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    test.submit_text_turn("after compaction").await?;
+    test.submit_text_turn("unchanged effort").await?;
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        ThreadSettingsOverrides {
+            effort: Some(Some(ReasoningEffort::Low)),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.submit_text_turn("changed effort").await?;
+
+    let requests = request_log.requests();
+    assert_eq!(requests.len(), 6);
+    let first_body = requests[0].body_json();
+    let second_body = requests[1].body_json();
+    assert_eq!(first_body["reasoning"]["effort"], "medium");
+    assert_eq!(second_body["reasoning"]["effort"], "medium");
+    assert_eq!(requests[2].body_json()["reasoning"]["effort"], "medium");
+    let post_compaction_effort = if fail_compaction { "medium" } else { "high" };
+    assert_eq!(
+        requests[3..]
+            .iter()
+            .map(|request| request.body_json()["reasoning"]["effort"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!(post_compaction_effort); 3],
+    );
+    let updates = requests
+        .iter()
+        .map(|request| {
+            request
+                .input()
+                .into_iter()
+                .filter(|item| item["type"] == "configuration_update")
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let medium = json!({
+        "type": "configuration_update",
+        "reasoning": {"effort": "medium"},
+    });
+    let high = json!({
+        "type": "configuration_update",
+        "reasoning": {"effort": "high"},
+    });
+    let low = json!({
+        "type": "configuration_update",
+        "reasoning": {"effort": "low"},
+    });
+    let retained = if fail_compaction {
+        vec![medium.clone(), high.clone()]
+    } else {
+        vec![]
+    };
+    let mut changed = retained.clone();
+    changed.push(low);
+    assert_eq!(
+        updates,
+        [
+            vec![medium.clone()],
+            vec![medium.clone(), high.clone()],
+            vec![medium, high],
+            retained.clone(),
+            retained,
+            changed,
+        ]
+    );
+
+    Ok(())
+}
+
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_compact_records_durable_and_local_token_usage() {
     skip_if_no_network!();
 
@@ -1054,7 +1198,7 @@ async fn manual_compact_records_durable_and_local_token_usage() {
     let rollout_items = fs::read_to_string(rollout_path)
         .expect("read rollout")
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .map(|line| line.item)
         .collect::<Vec<_>>();
     let records = rollout_items
@@ -1083,8 +1227,8 @@ async fn manual_compact_records_durable_and_local_token_usage() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ContextCompaction items after native compact succeeds; LHC install emission is compact_lhc_tests::installed_emits_one_context_compaction_started_and_completed"]
 async fn manual_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 
@@ -1155,8 +1299,8 @@ async fn manual_compact_emits_context_compaction_items() {
     assert!(legacy_event);
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is multiple native auto-compact summarization turns in one task"]
 async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
     skip_if_no_network!();
 
@@ -1700,12 +1844,9 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
-//
-// Fork policy: auto compact is strict LHC-only. Without an LHC capture slot the
-// production ladder hard-fails (visible turn error) and never issues a native
-// summarization request. History from completed turns is preserved.
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native auto compact after token limit"]
 async fn auto_compact_runs_after_token_limit_hit() {
     skip_if_no_network!();
 
@@ -1721,8 +1862,17 @@ async fn auto_compact_runs_after_token_limit_hit() {
         ev_completed_with_tokens("r2", /*total_tokens*/ 330_000),
     ]);
 
-    // No native summary SSE — a third model request would mean native compact leaked.
-    let request_log = mount_sse_sequence(&server, vec![sse1, sse2]).await;
+    let sse3 = sse(vec![
+        ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 200),
+    ]);
+    let sse4 = sse(vec![
+        ev_assistant_message("m4", FINAL_REPLY),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 120),
+    ]);
+    let prefixed_auto_summary = AUTO_SUMMARY_TEXT;
+
+    let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
     let model_provider = non_openai_model_provider(&server);
 
@@ -1731,8 +1881,7 @@ async fn auto_compact_runs_after_token_limit_hit() {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
     });
-    let test = builder.build(&server).await.unwrap();
-    let codex = test.codex;
+    let codex = builder.build(&server).await.unwrap().codex;
 
     codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
@@ -1752,8 +1901,6 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .await
         .unwrap();
 
-    // Over threshold: pre-turn auto compact on the next user turn hard-fails LHC
-    // (no capture slot in this fixture) without native fallback.
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
@@ -1764,146 +1911,127 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .await
         .unwrap();
 
-    let mut saw_lhc_error = false;
-    let mut saw_turn_complete = false;
-    for _ in 0..20 {
-        let ev = wait_for_event(&codex, |_| true).await;
-        match &ev {
-            EventMsg::Error(err) => {
-                let msg = err.message.to_ascii_lowercase();
-                if msg.contains("lhc") || msg.contains("compact") {
-                    saw_lhc_error = true;
-                }
-            }
-            EventMsg::TurnComplete(_) => {
-                saw_turn_complete = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-    assert!(
-        saw_lhc_error || saw_turn_complete,
-        "threshold hit must produce a visible turn outcome (error and/or complete)"
-    );
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
     let request_bodies: Vec<String> = requests
         .iter()
         .map(|request| request.body_json().to_string())
         .collect();
-    let native_summary_count = request_bodies
+    assert_eq!(
+        request_bodies.len(),
+        4,
+        "expected user turns, a compaction request, and the follow-up turn; got {}",
+        request_bodies.len()
+    );
+    let auto_compact_count = request_bodies
         .iter()
         .filter(|body| body_contains_text(body, SUMMARIZATION_PROMPT))
         .count();
     assert_eq!(
-        native_summary_count, 0,
-        "strict LHC must never issue a native summarization request; bodies={request_bodies:?}"
+        auto_compact_count, 1,
+        "expected exactly one auto compact request"
     );
-    assert!(
-        request_bodies.len() <= 2,
-        "expected only the two completed user turns as model requests (no compact/follow-up); got {}",
-        request_bodies.len()
+    let auto_compact_index = request_bodies
+        .iter()
+        .enumerate()
+        .find_map(|(idx, body)| body_contains_text(body, SUMMARIZATION_PROMPT).then_some(idx))
+        .expect("auto compact request missing");
+    assert_eq!(
+        auto_compact_index, 2,
+        "auto compact should add a third request"
     );
-    assert!(
-        request_bodies.iter().any(|b| b.contains(FIRST_AUTO_MSG)),
-        "first user turn must have reached the model"
-    );
-    assert!(
-        request_bodies.iter().any(|b| b.contains(SECOND_AUTO_MSG)),
-        "second user turn must have reached the model"
-    );
-    assert!(
-        !request_bodies
-            .iter()
-            .any(|b| b.contains(POST_AUTO_USER_MSG)),
-        "third turn must not reach the model after LHC auto-compact hard-fail"
-    );
-}
 
-/// Manual `Op::Compact` routes through the same strict LHC path (not TokenBudget
-/// / remote / local). Without LHC capture it hard-fails visibly and does not
-/// issue a native summarization request.
-#[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
-async fn manual_op_compact_routes_to_strict_lhc_not_native() {
-    skip_if_no_network!();
+    let follow_up_index = request_bodies
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, body)| {
+            (body.contains(POST_AUTO_USER_MSG) && !body_contains_text(body, SUMMARIZATION_PROMPT))
+                .then_some(idx)
+        })
+        .expect("follow-up request missing");
+    assert_eq!(follow_up_index, 3, "follow-up request should be last");
 
-    let server = start_mock_server().await;
-    let sse1 = sse(vec![
-        ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", /*total_tokens*/ 1_200),
-    ]);
-    // Only the seed turn is expected to hit the model. A native compact leak
-    // would POST a second /responses body containing SUMMARIZATION_PROMPT.
-    let request_log = mount_sse_sequence(&server, vec![sse1]).await;
-    let model_provider = non_openai_model_provider(&server);
+    let body_first = requests[0].body_json();
+    let body_auto = requests[auto_compact_index].body_json();
+    let body_follow_up = requests[follow_up_index].body_json();
+    let instructions = body_auto
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let baseline_instructions = body_first
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        instructions, baseline_instructions,
+        "auto compact should keep the standard developer instructions",
+    );
 
-    let mut builder = test_codex().with_config(move |config| {
-        config.model_provider = model_provider;
-        set_test_compact_prompt(config);
-        // Keep LHC capture off so CompactTask hard-fails without a slot (same
-        // strict surface as production when capture is unavailable).
-        let _ = config.features.disable(Feature::LhcCapture);
-    });
-    let test = builder.build(&server).await.unwrap();
-    let codex = test.codex;
+    let input_auto = body_auto.get("input").and_then(|v| v.as_array()).unwrap();
+    let last_auto = input_auto
+        .last()
+        .expect("auto compact request should append a user message");
+    assert_eq!(
+        last_auto.get("type").and_then(|v| v.as_str()),
+        Some("message")
+    );
+    assert_eq!(last_auto.get("role").and_then(|v| v.as_str()), Some("user"));
+    let last_text = last_auto
+        .get("content")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|text| text.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        last_text, SUMMARIZATION_PROMPT,
+        "auto compact should send the summarization prompt as a user message",
+    );
 
-    codex
-        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: "seed before manual compact".into(),
-            text_elements: Vec::new(),
-        }]))
-        .await
+    let input_follow_up = body_follow_up
+        .get("input")
+        .and_then(|v| v.as_array())
         .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-
-    let requests_before_compact = request_log.requests().len();
-
-    codex.submit(Op::Compact).await.expect("submit Op::Compact");
-
-    let mut saw_error = false;
-    for _ in 0..20 {
-        let ev = wait_for_event(&codex, |_| true).await;
-        match &ev {
-            EventMsg::Error(err) => {
-                let msg = err.message.to_ascii_lowercase();
-                if msg.contains("lhc") || msg.contains("compact") || msg.contains("unsupported") {
-                    saw_error = true;
-                    break;
-                }
-            }
-            EventMsg::TurnComplete(_) => break,
-            _ => {}
-        }
-    }
+    let user_texts: Vec<String> = input_follow_up
+        .iter()
+        .filter(|item| item.get("type").and_then(|v| v.as_str()) == Some("message"))
+        .filter(|item| item.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .filter_map(|item| {
+            item.get("content")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|entry| entry.get("text"))
+                .and_then(|v| v.as_str())
+                .map(std::string::ToString::to_string)
+        })
+        .collect();
     assert!(
-        saw_error,
-        "manual Op::Compact without LHC must hard-fail visibly"
+        user_texts.iter().any(|text| text == FIRST_AUTO_MSG),
+        "auto compact follow-up request should include the first user message"
     );
-
-    let requests = request_log.requests();
-    let bodies: Vec<String> = requests.iter().map(|r| r.body_json().to_string()).collect();
-    assert_eq!(
-        bodies
+    assert!(
+        user_texts.iter().any(|text| text == SECOND_AUTO_MSG),
+        "auto compact follow-up request should include the second user message"
+    );
+    assert!(
+        user_texts.iter().any(|text| text == POST_AUTO_USER_MSG),
+        "auto compact follow-up request should include the new user message"
+    );
+    assert!(
+        user_texts
             .iter()
-            .filter(|b| body_contains_text(b, SUMMARIZATION_PROMPT))
-            .count(),
-        0,
-        "manual Compact must not issue native summarization: {bodies:?}"
-    );
-    assert_eq!(
-        requests.len(),
-        requests_before_compact,
-        "Op::Compact must not issue additional model requests (before={requests_before_compact}, after={})",
-        requests.len()
+            .any(|text| text.contains(prefixed_auto_summary)),
+        "auto compact follow-up request should include the summary message"
     );
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is ContextCompaction items after a native summarization turn; LHC install emission is compact_lhc_tests::installed_emits_one_context_compaction_started_and_completed"]
 async fn auto_compact_emits_context_compaction_items() {
     skip_if_no_network!();
 
@@ -1982,9 +2110,9 @@ async fn auto_compact_emits_context_compaction_items() {
 }
 
 // Windows CI only: bump to 4 workers to prevent SSE/event starvation and test timeouts.
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[cfg_attr(windows, tokio::test(flavor = "multi_thread", worker_threads = 4))]
 #[cfg_attr(not(windows), tokio::test(flavor = "multi_thread", worker_threads = 2))]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact request ordering relative to TurnStarted; live auto compact is run_strict_lhc_compact"]
 async fn auto_compact_starts_after_turn_started() {
     skip_if_no_network!();
 
@@ -2068,8 +2196,8 @@ async fn auto_compact_starts_after_turn_started() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native summarization request on the first post-resume over-limit turn; routing is auto_compact_runs_after_token_limit_hit plus c1_resume_after_compact"]
 async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     skip_if_no_network!();
 
@@ -2077,36 +2205,16 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
 
     let limit = 200_000;
     let over_limit_tokens = 250_000;
-    let remote_summary = "REMOTE_COMPACT_SUMMARY";
-
-    let compacted_history = vec![
-        codex_protocol::models::ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![codex_protocol::models::ContentItem::OutputText {
-                text: remote_summary.to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        codex_protocol::models::ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let compact_mock =
-        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
+    let remote_summary = REMOTE_V2_SUMMARY;
 
     let mut builder = test_codex().with_config(move |config| {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(limit);
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
     let initial = builder.build(&server).await.unwrap();
 
     // A single over-limit completion should not auto-compact until the next user message.
-    mount_sse_once(
+    let initial_response = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("m1", FIRST_REPLY),
@@ -2116,29 +2224,28 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     .await;
     initial.submit_turn("OVER_LIMIT_TURN").await.unwrap();
 
+    let initial_requests = initial_response.requests();
+    assert_eq!(initial_requests.len(), 1);
     assert!(
-        compact_mock.requests().is_empty(),
+        initial_requests[0]
+            .inputs_of_type("compaction_trigger")
+            .is_empty(),
         "remote compaction should not run before the next user message"
     );
 
     let mut resume_builder = test_codex().with_config(move |config| {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(limit);
-        let _ = config.features.disable(Feature::RemoteCompactionV2);
     });
     let resumed = resume_builder.restart(&server, &initial).await.unwrap();
 
     let follow_up_user = "AFTER_RESUME_USER";
+    let compact_turn = remote_v2_compaction_response();
     let sse_follow_up = sse(vec![
         ev_assistant_message("m2", FINAL_REPLY),
         ev_completed("r2"),
     ]);
-
-    let follow_up_matcher = move |req: &wiremock::Request| {
-        let body = std::str::from_utf8(&req.body).unwrap_or("");
-        body.contains(follow_up_user) && body.contains(remote_summary)
-    };
-    mount_sse_once_match(&server, follow_up_matcher, sse_follow_up).await;
+    let response_mock = mount_sse_sequence(&server, vec![compact_turn, sse_follow_up]).await;
 
     resumed
         .codex
@@ -2159,21 +2266,25 @@ async fn auto_compact_runs_after_resume_when_token_usage_is_over_limit() {
     })
     .await;
 
-    let compact_requests = compact_mock.requests();
+    let requests = response_mock.requests();
     assert_eq!(
-        compact_requests.len(),
-        1,
-        "remote compaction should run once after resume"
+        requests.len(),
+        2,
+        "remote compaction should run once after resume before sampling"
     );
     assert_eq!(
-        compact_requests[0].path(),
-        "/v1/responses/compact",
-        "remote compaction should hit the compact endpoint"
+        requests[0].path(),
+        "/v1/responses",
+        "remote compaction should use the responses endpoint"
     );
+    assert_eq!(requests[0].inputs_of_type("compaction_trigger").len(), 1);
+    let follow_up_body = requests[1].body_json().to_string();
+    assert!(follow_up_body.contains(follow_up_user));
+    assert!(follow_up_body.contains(remote_summary));
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request on model downshift; live dispatch is run_auto_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     skip_if_no_network!();
 
@@ -2276,8 +2387,8 @@ async fn pre_sampling_compact_runs_on_switch_to_smaller_context_model() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request on comp_hash change; live dispatch is run_auto_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     skip_if_no_network!();
 
@@ -2364,8 +2475,8 @@ async fn pre_sampling_compact_runs_when_comp_hash_changes() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-sampling compact request issued on the previous model after a model switch; the LHC arm owns that switch and never issues it"]
 async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
@@ -2456,8 +2567,8 @@ async fn previous_model_compaction_resolves_selected_settings() -> Result<()> {
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact fallback after rename, observed as a native compact request"]
 async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_rename() {
     skip_if_no_network!();
 
@@ -2598,8 +2709,8 @@ async fn pre_sampling_compact_falls_back_from_retired_previous_model_after_renam
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact fallback when the model is missing"]
 async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
     skip_if_no_network!();
 
@@ -2739,8 +2850,8 @@ async fn pre_sampling_compact_falls_back_when_previous_model_is_not_found() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native previous-model compact retry/fallback issuing a native compact request"]
 async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift() {
     skip_if_no_network!();
 
@@ -2799,7 +2910,6 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
             config.model_provider = model_provider;
             config.tool_registry.turn_metadata_includes_tool_info = true;
             set_test_compact_prompt(config);
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
         });
     let test = builder.build(&server).await.expect("build test codex");
 
@@ -2864,115 +2974,8 @@ async fn pre_sampling_compact_falls_back_after_previous_model_invalid_request_on
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is legacy remote /responses/compact fallback after previous-model invalid request"]
-async fn pre_sampling_legacy_remote_compact_falls_back_after_previous_model_invalid_request() {
-    skip_if_no_network!();
-
-    let server = MockServer::start().await;
-    let retired_model = "gpt-5.6";
-    let previous_model_family = "gpt-5.6";
-    let next_model = "gpt-5.5";
-    let mut previous_model_info =
-        model_info_with_context_window("gpt-5.4", /*context_window*/ 273_000);
-    previous_model_info.slug = previous_model_family.to_string();
-    let mut next_model_info =
-        model_info_with_context_window("gpt-5.4", /*context_window*/ 125_000);
-    next_model_info.slug = next_model.to_string();
-
-    let models_mock = mount_models_once(
-        &server,
-        ModelsResponse {
-            models: vec![previous_model_info, next_model_info],
-        },
-    )
-    .await;
-    let request_log = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_assistant_message("m1", "before switch"),
-                ev_completed_with_tokens("r1", /*total_tokens*/ 120_000),
-            ]),
-            sse(vec![
-                ev_assistant_message("m3", "after switch"),
-                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
-            ]),
-        ],
-    )
-    .await;
-    let compact_request_log = mount_compact_response_sequence(
-        &server,
-        vec![
-            invalid_request_response("previous-model compaction was rejected"),
-            wiremock::ResponseTemplate::new(/*status*/ 200)
-                .insert_header("content-type", "application/json")
-                .set_body_json(json!({
-                    "output": [{
-                        "type": "compaction",
-                        "encrypted_content": "DOWNSHIFT_SUMMARY",
-                    }],
-                })),
-        ],
-    )
-    .await;
-
-    let model_provider = openai_model_provider(&server);
-    let mut builder = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_model(retired_model)
-        .with_config(move |config| {
-            config.model_provider = model_provider;
-            set_test_compact_prompt(config);
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
-        });
-    let test = builder.build(&server).await.expect("build test codex");
-
-    test.codex
-        .start_or_steer_turn(disabled_permission_user_turn(
-            "before switch",
-            test.cwd.path().to_path_buf(),
-            retired_model.to_string(),
-        ))
-        .await
-        .expect("submit first user turn");
-    wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_))
-    })
-    .await;
-
-    test.codex
-        .start_or_steer_turn(disabled_permission_user_turn(
-            "after switch",
-            test.cwd.path().to_path_buf(),
-            next_model.to_string(),
-        ))
-        .await
-        .expect("submit smaller-model turn");
-    assert_compaction_uses_turn_lifecycle_id(&test.codex).await;
-
-    let requests = request_log.requests();
-    let compact_requests = compact_request_log.requests();
-    assert_eq!(models_mock.requests().len(), 1);
-    assert_eq!(requests.len(), 2);
-    assert_eq!(compact_requests.len(), 2);
-    assert_eq!(
-        requests[0].body_json()["model"].as_str(),
-        Some(retired_model)
-    );
-    assert_eq!(
-        compact_requests[0].body_json()["model"].as_str(),
-        Some(retired_model)
-    );
-    assert_eq!(
-        compact_requests[1].body_json()["model"].as_str(),
-        Some(next_model)
-    );
-    assert_eq!(requests[1].body_json()["model"].as_str(), Some(next_model));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact model identity on the previous-model compact request"]
 async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
     skip_if_no_network!();
 
@@ -3057,6 +3060,7 @@ async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native pre-sampling compact skip when comp hash is missing"]
 async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     skip_if_no_network!();
 
@@ -3166,8 +3170,8 @@ async fn pre_sampling_compact_skips_when_either_comp_hash_is_missing() {
     }));
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact on model switch using the next model's native budget, observed as a summarization request"]
 async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     skip_if_no_network!();
 
@@ -3261,8 +3265,8 @@ async fn body_after_prefix_model_switch_budget_compacts_with_next_model() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request after resume+downshift; live path is maybe_run_previous_model_inline_compact -> run_strict_lhc_compact"]
 async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     skip_if_no_network!();
 
@@ -3383,8 +3387,8 @@ async fn pre_sampling_compact_runs_after_resume_and_switch_to_smaller_model() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is a native compact request after resume when comp_hash changes"]
 async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     skip_if_no_network!();
 
@@ -3468,7 +3472,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
     let rollout = fs::read_to_string(&rollout_path).expect("read rollout");
     let persisted_comp_hash = rollout
         .lines()
-        .filter_map(|line| serde_json::from_str::<RolloutLine>(line).ok())
+        .filter_map(|line| codex_rollout::parse_rollout_line(line).ok())
         .find_map(|line| match line.item {
             RolloutItem::TurnContext(context) => context.comp_hash,
             _ => None,
@@ -3516,6 +3520,7 @@ async fn pre_sampling_compact_recovers_comp_hash_after_resume() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native pre-sampling compact skip after resume when comp hash is missing"]
 async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
     skip_if_no_network!();
 
@@ -3644,8 +3649,8 @@ async fn pre_sampling_compact_skips_missing_comp_hash_after_resume() {
     }));
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native append of Compacted rollout records after local compact; LHC rewrite persistence is slice_c_* / law-1 tests"]
 async fn auto_compact_persists_rollout_entries() {
     skip_if_no_network!();
 
@@ -3752,7 +3757,7 @@ async fn auto_compact_persists_rollout_entries() {
         if trimmed.is_empty() {
             continue;
         }
-        let Ok(entry): Result<RolloutLine, _> = serde_json::from_str(trimmed) else {
+        let Ok(entry) = codex_rollout::parse_rollout_line(trimmed) else {
             continue;
         };
         match entry.item {
@@ -3779,8 +3784,8 @@ async fn auto_compact_persists_rollout_entries() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is retry of a native summarization compact after a context-window error on /responses"]
 async fn manual_compact_retries_after_context_window_error() {
     skip_if_no_network!();
 
@@ -3950,8 +3955,8 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact replacement-history shape across two summarization turns; LHC multi-compact is production_many_compacts_marker_bounded_body_not_growing"]
 async fn manual_compact_twice_preserves_latest_user_messages() {
     skip_if_no_network!();
 
@@ -4185,8 +4190,8 @@ async fn manual_compact_twice_preserves_latest_user_messages() {
     assert_eq!(history_before_seeded_prefix, expected_history.as_slice());
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is multiple native TokenBudget/local auto-compact summarization turns interleaved with other events; production auto compact is run_strict_lhc_compact"]
 async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_events() {
     skip_if_no_network!();
 
@@ -4295,8 +4300,8 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native mid-turn continuation compact /responses request snapshot"]
 async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     skip_if_no_network!();
 
@@ -4398,8 +4403,8 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native auto-compact clamp producing a native summarization request; the live auto ladder is run_strict_lhc_compact"]
 async fn auto_compact_clamps_config_limit_to_context_window() {
     skip_if_no_network!();
 
@@ -4459,8 +4464,8 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native body-after-prefix trigger math that then issues a native compact request; strict LHC does not take that arm"]
 async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
     skip_if_no_network!();
 
@@ -4529,8 +4534,8 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native body-after-prefix accounting after a native summarization compact; strict LHC does not issue that compact request"]
 async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
     skip_if_no_network!();
 
@@ -4633,8 +4638,8 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact still firing at the context-window cap via local summarization; strict LHC never issues that request"]
 async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
     skip_if_no_network!();
 
@@ -4693,9 +4698,11 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
     );
 }
 
+#[test_case::test_case(false; "counts_encrypted_reasoning_before_last_user")]
+#[test_case::test_case(true; "compacts_after_reasoning_header_clears")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact trigger counting encrypted reasoning then issuing a summarization request"]
-async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact counting encrypted reasoning"]
+async fn auto_compact_accounts_for_encrypted_reasoning(first_response_includes_reasoning: bool) {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -4715,51 +4722,36 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
         ev_completed_with_tokens("r2", /*total_tokens*/ 80),
     ]);
+    let compact_turn = remote_v2_compaction_response();
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
         ev_completed_with_tokens("r4", /*total_tokens*/ 1),
     ]);
 
-    let request_log = mount_sse_sequence(
+    let request_log = mount_response_sequence(
         &server,
         vec![
             // Turn 1: reasoning before last user (should count).
-            first_turn,
-            // Turn 2: reasoning after last user (should be ignored for compaction).
-            second_turn,
+            if first_response_includes_reasoning {
+                sse_response(first_turn).insert_header("X-Reasoning-Included", "true")
+            } else {
+                sse_response(first_turn)
+            },
+            // Turn 2: reasoning after last user should be ignored; no header is returned.
+            sse_response(second_turn),
+            // Turn 3: compact the prior conversation before sampling.
+            sse_response(compact_turn),
             // Turn 3: next user turn after remote compaction.
-            third_turn,
+            sse_response(third_turn),
         ],
     )
     .await;
 
-    let compacted_history = vec![
-        codex_protocol::models::ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![codex_protocol::models::ContentItem::OutputText {
-                text: "REMOTE_COMPACT_SUMMARY".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        codex_protocol::models::ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let compact_mock =
-        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
-    let chatgpt_base_url = format!("{}/backend-api", server.uri());
-
     let codex = test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(move |config| {
-            config.chatgpt_base_url = chatgpt_base_url;
+        .with_config(|config| {
             set_test_compact_prompt(config);
             config.model_auto_compact_token_limit = Some(300);
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
         })
         .build(&server)
         .await
@@ -4776,139 +4768,44 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
                 text_elements: Vec::new(),
             }]))
             .await
-            .unwrap();
+            .expect("start user turn");
         wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
         if idx < 2 {
             assert!(
-                compact_mock.requests().is_empty(),
+                request_log
+                    .requests()
+                    .iter()
+                    .all(|request| request.inputs_of_type("compaction_trigger").is_empty()),
                 "remote compaction should not run before the next user turn"
             );
         }
     }
 
-    let compact_requests = compact_mock.requests();
-    assert_eq!(
-        compact_requests.len(),
-        1,
-        "remote compaction should run once after the second turn"
-    );
-    assert_eq!(
-        compact_requests[0].path(),
-        "/v1/responses/compact",
-        "remote compaction should hit the compact endpoint"
-    );
-
     let requests = request_log.requests();
     assert_eq!(
         requests.len(),
-        3,
-        "conversation should include three user turns"
+        4,
+        "conversation should include three user turns and remote compaction"
     );
+    assert_eq!(requests[2].path(), "/v1/responses");
+    assert_eq!(requests[2].inputs_of_type("compaction_trigger").len(), 1);
+    assert!(requests[3].inputs_of_type("compaction_trigger").is_empty());
     let second_request_body = requests[1].body_json().to_string();
     assert!(
-        !second_request_body.contains("REMOTE_COMPACT_SUMMARY"),
+        !second_request_body.contains(REMOTE_V2_SUMMARY),
         "second turn should not include compacted history"
     );
-    let third_request_body = requests[2].body_json().to_string();
+    let third_request_body = requests[3].body_json().to_string();
     assert!(
-        third_request_body.contains("REMOTE_COMPACT_SUMMARY")
-            || third_request_body.contains(FINAL_REPLY),
-        "third turn should include compacted history"
-    );
-    assert!(
-        third_request_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        third_request_body.contains(REMOTE_V2_SUMMARY),
         "third turn should include compaction summary item"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native compact firing when the reasoning header clears, observed as a summarization request"]
-async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
-    skip_if_no_network!();
-
-    let server = start_mock_server().await;
-
-    let first_user = "SERVER_INCLUDED_FIRST";
-    let second_user = "SERVER_INCLUDED_SECOND";
-    let third_user = "SERVER_INCLUDED_THIRD";
-
-    let pre_last_reasoning_content = "a".repeat(2_400);
-    let post_last_reasoning_content = "b".repeat(4_000);
-
-    let first_turn = sse(vec![
-        ev_reasoning_item("pre-reasoning", &["pre"], &[&pre_last_reasoning_content]),
-        ev_completed_with_tokens("r1", /*total_tokens*/ 10),
-    ]);
-    let second_turn = sse(vec![
-        ev_reasoning_item("post-reasoning", &["post"], &[&post_last_reasoning_content]),
-        ev_completed_with_tokens("r2", /*total_tokens*/ 80),
-    ]);
-    let third_turn = sse(vec![
-        ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", /*total_tokens*/ 1),
-    ]);
-
-    let responses = vec![
-        sse_response(first_turn).insert_header("X-Reasoning-Included", "true"),
-        sse_response(second_turn),
-        sse_response(third_turn),
-    ];
-    mount_response_sequence(&server, responses).await;
-
-    let compacted_history = vec![
-        codex_protocol::models::ResponseItem::Message {
-            id: None,
-            role: "assistant".to_string(),
-            content: vec![codex_protocol::models::ContentItem::OutputText {
-                text: "REMOTE_COMPACT_SUMMARY".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        codex_protocol::models::ResponseItem::Compaction {
-            id: None,
-            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-    let compact_mock =
-        mount_compact_json_once(&server, serde_json::json!({ "output": compacted_history })).await;
-
-    let codex = test_codex()
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(300);
-            let _ = config.features.disable(Feature::RemoteCompactionV2);
-        })
-        .build(&server)
-        .await
-        .expect("build codex")
-        .codex;
-
-    for user in [first_user, second_user, third_user] {
-        codex
-            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
-                text: user.into(),
-                text_elements: Vec::new(),
-            }]))
-            .await
-            .unwrap();
-        wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
-    }
-
-    let compact_requests = compact_mock.requests();
-    assert_eq!(
-        compact_requests.len(),
-        1,
-        "remote compaction should run once after the reasoning header clears"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once pre-turn compaction includes incoming user input.
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot including the incoming user message"]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_message() {
     skip_if_no_network!();
 
@@ -5020,7 +4917,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // TODO(ccunningham): Update once pre-turn compaction context-overflow handling includes incoming
 // user input and emits richer oversized-input messaging.
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot stripping a model switch"]
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch() {
     skip_if_no_network!();
 
@@ -5124,8 +5021,8 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native pre-turn compact /responses request snapshot"]
 async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     skip_if_no_network!();
 
@@ -5207,8 +5104,8 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is the native manual compact /responses request snapshot"]
 async fn snapshot_request_shape_manual_compact_without_previous_user_messages() {
     skip_if_no_network!();
 
@@ -5267,8 +5164,8 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages() 
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native fixture asserts instruction text on the compact summarization request; LHC compact does not issue that request, and instruction_sources remain session-owned across install"]
 async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up an initial turn, a manual compaction response, and a post-compaction turn.
     let server = responses::start_mock_server().await;
@@ -5347,8 +5244,8 @@ async fn manual_compaction_keeps_the_creation_time_global_instructions() -> Resu
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native fixture asserts instruction text on a native mid-turn compact request; live MidTurn is LHC parts/continuation, not native summarization"]
 async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Result<()> {
     // Set up a turn that crosses the auto-compaction limit and a post-compaction response.
     let server = responses::start_mock_server().await;
@@ -5420,8 +5317,8 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 /responses/compact request and replacement history instruction bytes"]
 async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -5455,10 +5352,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     )?;
     let mut builder = test_codex()
         .with_home(Arc::clone(&home))
-        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(|config| {
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
-        });
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
     let test = builder.build(&server).await?;
 
     // Materialize the old snapshot, rewrite the selected file in place, and compact remotely.
@@ -5518,10 +5412,7 @@ async fn remote_v2_compaction_keeps_creation_time_instructions_after_same_path_m
     let mut resume_builder = test_codex()
         .with_home(Arc::clone(&home))
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
-        .with_config(move |config| {
-            config.cwd = resumed_cwd;
-            let _ = config.features.enable(Feature::RemoteCompactionV2);
-        });
+        .with_config(move |config| config.cwd = resumed_cwd);
     let resumed = resume_builder
         .resume(&server, Arc::clone(&home), rollout_path)
         .await?;

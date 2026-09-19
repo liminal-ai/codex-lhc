@@ -500,7 +500,8 @@ pub fn classify_coverage(item: &ResponseItem) -> CoverageClass {
         | ResponseItem::WebSearchCall { .. }
         | ResponseItem::ImageGenerationCall { .. }
         | ResponseItem::AgentMessage { .. }
-        | ResponseItem::AdditionalTools { .. } => CoverageClass::Required,
+        | ResponseItem::AdditionalTools { .. }
+        | ResponseItem::ConfigurationUpdate { .. } => CoverageClass::Required,
         // Native compact / no-op artifacts — not import targets.
         ResponseItem::Compaction { .. }
         | ResponseItem::ContextCompaction { .. }
@@ -546,6 +547,7 @@ fn host_item_kind_name(item: &ResponseItem) -> &'static str {
         ResponseItem::WebSearchCall { .. } => "WebSearchCall",
         ResponseItem::ImageGenerationCall { .. } => "ImageGenerationCall",
         ResponseItem::AdditionalTools { .. } => "AdditionalTools",
+        ResponseItem::ConfigurationUpdate { .. } => "ConfigurationUpdate",
         ResponseItem::Compaction { .. } => "Compaction",
         ResponseItem::ContextCompaction { .. } => "ContextCompaction",
         ResponseItem::CompactionTrigger {} => "CompactionTrigger",
@@ -919,8 +921,18 @@ pub async fn produce_lhc_compact_with_provenance(
         cancel,
         session_derived,
         LhcBandPercentages::default(),
+        /*compact_opts*/ None,
     )
     .await
+}
+
+pub fn sdk_compact_opts_from_host(host: lhc::compact_continuation::HostCompactOpts) -> CompactOpts {
+    CompactOpts {
+        profile: host.profile,
+        params: host.params,
+        signal: None,
+        compact_point_upper_bound: None,
+    }
 }
 
 pub async fn produce_lhc_compact_with_provenance_and_percentages(
@@ -932,6 +944,7 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     session_derived: &DerivedProvenance,
     percentages: LhcBandPercentages,
+    compact_opts: Option<CompactOpts>,
 ) -> Result<LhcCompactResult, LhcCompactUnavailable> {
     check_cancel(cancel.as_deref())?;
 
@@ -1021,7 +1034,10 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
     let receipt = match session
         .lhc
         .thread_view
-        .compact(session.thread_ref.clone(), percentages.compact_opts())
+        .compact(
+            session.thread_ref.clone(),
+            compact_opts.unwrap_or_else(|| percentages.compact_opts()),
+        )
         .await
     {
         OpResult::Ok { value } => value,
@@ -1422,6 +1438,7 @@ mod tests {
                 detailed: 30.0,
                 brief: 40.0,
             },
+            /*compact_opts*/ None,
         )
         .await
         .expect("custom compact");

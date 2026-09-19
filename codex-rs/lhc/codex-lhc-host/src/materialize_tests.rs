@@ -2,15 +2,21 @@
 
 use super::*;
 use crate::ModelIdentity;
+use crate::prior_compact_carry;
+use codex_history::GuardianHistoryCheckpoint;
+use codex_history::RetainedContext;
 use codex_protocol::ResponseItemId;
+use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::protocol::ThreadRolledBackEvent;
+use codex_protocol::protocol::TokenUsageRecord;
 use lhc::messages::Block;
 use lhc::messages::MessageKind;
 use lhc::shared_tech::view::SessionAssistantMessage;
@@ -352,6 +358,9 @@ fn materialize_full(
         boundary: boundary(1),
         world_state: world,
         turn_context,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     })
 }
@@ -490,6 +499,7 @@ fn boundary_record_field_completeness_pinned() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         })]),
@@ -505,6 +515,7 @@ fn boundary_record_field_completeness_pinned() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         })]),
@@ -520,6 +531,7 @@ fn boundary_record_field_completeness_pinned() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         })]),
@@ -2336,9 +2348,11 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
             permission_profile: PermissionProfile::workspace_write(),
             active_permission_profile: None,
             cwd,
+            runtime_workspace_roots: None,
             reasoning_effort: None,
             reasoning_summary: None,
             personality: None,
+            disabled_plugin_ids: Vec::new(),
             collaboration_mode: CollaborationMode {
                 mode: ModeKind::Default,
                 settings: Settings {
@@ -2362,6 +2376,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
             previous_window_id: None,
             window_id: None,
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -2512,6 +2527,91 @@ fn m9_optional_turn_context_emitted_when_provided() {
         i,
         RolloutItem::TurnContext(c) if c.model == "gpt-test"
     )));
+    let ctx_pos = items
+        .iter()
+        .position(|i| matches!(i, RolloutItem::TurnContext(_)))
+        .expect("TurnContext");
+    let event_pos = items
+        .iter()
+        .position(|i| matches!(i, RolloutItem::EventMsg(EventMsg::ContextCompacted(_))))
+        .expect("ContextCompacted");
+    assert!(
+        ctx_pos < event_pos,
+        "TurnContext must precede ContextCompacted for checkpoint recovery"
+    );
+}
+
+#[test]
+fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize() {
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![band_entry("b")],
+    };
+    let guardian = GuardianHistoryCheckpoint(vec![ResponseItem::Message {
+        id: None,
+        role: "user".into(),
+        content: vec![codex_protocol::models::ContentItem::InputText {
+            text: "You may publish the reviewed release.".into(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    }]);
+    let retained = RetainedContext::default();
+    let usage = TokenUsageRecord {
+        thread_id: ThreadId::from_string("11111111-1111-7111-8111-111111111111")
+            .expect("thread id"),
+        turn_id: "turn".into(),
+        session_id: SessionId::new(),
+        root_turn_id: "root".into(),
+        response_id: "resp".into(),
+        usage: Default::default(),
+        turn_token_usage: Default::default(),
+        thread_token_usage: Default::default(),
+    };
+    let first = materialize_rollout(&MaterializeInput {
+        session_meta: empty_meta(),
+        thread_view: &view,
+        messages: &[],
+        turns: &[],
+        prior_generation: &[],
+        prior_realtime_items: &[],
+        boundary: boundary(1),
+        world_state: None,
+        turn_context: None,
+        guardian_history: Some(guardian.clone()),
+        retained_context: Some(retained.clone()),
+        latest_token_usage_record: Some(usage.clone()),
+        live_identity: None,
+    });
+    let compacted = find_compacted(&first.items);
+    assert_eq!(compacted.guardian_history, Some(guardian.clone()));
+    assert_eq!(compacted.retained_context, Some(retained.clone()));
+    assert_eq!(compacted.latest_token_usage_record, Some(usage.clone()));
+
+    let carry = prior_compact_carry(&first.items);
+    assert_eq!(carry.guardian_history, Some(guardian.clone()));
+    assert_eq!(carry.retained_context, Some(retained.clone()));
+    assert_eq!(carry.latest_token_usage_record, Some(usage.clone()));
+
+    let second = materialize_rollout(&MaterializeInput {
+        session_meta: empty_meta(),
+        thread_view: &view,
+        messages: &[],
+        turns: &[],
+        prior_generation: &first.items,
+        prior_realtime_items: &[],
+        boundary: boundary(2),
+        world_state: None,
+        turn_context: carry.turn_context,
+        guardian_history: carry.guardian_history,
+        retained_context: carry.retained_context,
+        latest_token_usage_record: carry.latest_token_usage_record,
+        live_identity: None,
+    });
+    let compacted2 = find_compacted(&second.items);
+    assert_eq!(compacted2.guardian_history, Some(guardian));
+    assert_eq!(compacted2.retained_context, Some(retained));
+    assert_eq!(compacted2.latest_token_usage_record, Some(usage));
 }
 
 // ── M10 synthetic ids ─────────────────────────────────────────────────────
@@ -2817,6 +2917,9 @@ fn identity_match_reemits_encrypted_content() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(identity),
     });
     let reasoning = result
@@ -2878,6 +2981,9 @@ fn identity_mismatch_suppresses_encrypted_content() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(live),
     });
     let enc = result.items.iter().find_map(|it| match it {
@@ -2929,6 +3035,9 @@ fn signature_only_thinking_emits_when_identity_matches() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: Some(identity),
     });
     let reasoning = result.items.iter().find_map(|it| match it {
@@ -3210,6 +3319,9 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         boundary: boundary(1),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
     assert_eq!(
@@ -3246,6 +3358,9 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         boundary: boundary(2),
         world_state: None,
         turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
         live_identity: None,
     });
     assert_eq!(

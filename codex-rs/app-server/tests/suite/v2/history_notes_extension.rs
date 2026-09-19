@@ -165,6 +165,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
 
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
+        .with_root_config(&format!("chatgpt_base_url = \"{}\"", server.uri()))
         .with_model_provider("openai-custom")
         // Exercise the inherited notes extension independently of the LHC product,
         // which rejects its native-reset mode at thread startup.
@@ -177,11 +178,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             server.uri(),
         ))
         .write(codex_home.path())?;
-    write_chatgpt_auth(
-        codex_home.path(),
-        ChatGptAuthFixture::new("access-chatgpt"),
-        AuthCredentialsStoreMode::File,
-    )?;
+    mount_analytics_capture(&server, codex_home.path()).await?;
 
     let mut app_server = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -195,7 +192,7 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
     timeout(
         Duration::from_secs(10),
         app_server.start_turn_and_wait_for_completion(TurnStartParams {
-            thread_id: thread.id,
+            thread_id: thread.id.clone(),
             input: vec![UserInput::Text {
                 text: "inspect history and notes".to_string(),
                 text_elements: Vec::new(),
@@ -269,6 +266,22 @@ async fn app_server_uses_configured_notes_backend_for_context_window_hints(
             && item["namespace"] == "notes"
             && item["name"] == "thread_hint"
     }));
+
+    if use_history_notes_extension {
+        let event = wait_for_matching_analytics_event(&server, DEFAULT_READ_TIMEOUT, |event| {
+            event["event_type"] == "codex_thread_hint_status"
+                && event["event_params"]["thread_id"] == thread.id
+        })
+        .await?;
+        assert_eq!(
+            event["event_params"]["status"],
+            if hint_status == 200 {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+    }
 
     Ok(())
 }

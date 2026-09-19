@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 351d1e6cd5..a0ef93eb1b 100644
+index 64304afb51..d6bcf7d5f5 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -75,6 +75,8 @@ members = [
+@@ -77,6 +77,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,7 +11,7 @@ index 351d1e6cd5..a0ef93eb1b 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -224,6 +226,8 @@ codex-hooks = { path = "hooks" }
+@@ -231,6 +233,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }
@@ -21,11 +21,11 @@ index 351d1e6cd5..a0ef93eb1b 100644
  codex-login = { path = "login" }
  codex-message-history = { path = "message-history" }
 diff --git a/codex-rs/app-server-daemon/README.md b/codex-rs/app-server-daemon/README.md
-index ac512a8037..3bca82e377 100644
+index 7707b9e9a4..9432fdd0ae 100644
 --- a/codex-rs/app-server-daemon/README.md
 +++ b/codex-rs/app-server-daemon/README.md
-@@ -36,13 +36,17 @@ running app-server version when applicable.
- For a new remote machine:
+@@ -78,23 +78,20 @@ running.
+ For a new Linux or macOS machine:
  
  ```sh
 -curl -fsSL https://chatgpt.com/codex/install.sh | sh
@@ -35,31 +35,43 @@ index ac512a8037..3bca82e377 100644
  $HOME/.codex/packages/standalone/current/codex app-server daemon bootstrap --remote-control
  ```
  
--`bootstrap` requires the standalone managed install. It records the daemon
--settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
--pidfile-backed detached process, and launches a detached updater loop.
+-On Windows, use a non-elevated PowerShell terminal whose host allows breakaway:
 +`bootstrap` requires the standalone managed install of **this fork**. Fresh
 +`CODEX_HOME` trees seed the running Codex-LHC binary instead of downloading
 +stock Codex. It records the daemon settings under
 +`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed
 +detached process, and launches a detached updater loop.
  
+-```powershell
+-irm https://chatgpt.com/codex/install.ps1 | iex
+-$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+-& "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
+-```
+-
+-`bootstrap` requires the standalone managed install. It records the daemon
+-settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+-pidfile-backed detached process. It launches a detached updater loop when
+-automatic updates are enabled, the installer selected the stable `latest`
+-channel, and the managed binary supports the updater command.
++On Windows, use a non-elevated PowerShell terminal whose host allows breakaway,
++then bootstrap from this fork's managed standalone install (never stock Codex).
+ 
  ## Installation and update cases
  
 diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index c90978803d..258fdbe96f 100644
+index ccb1be9717..54eff090ef 100644
 --- a/codex-rs/app-server-daemon/src/lib.rs
 +++ b/codex-rs/app-server-daemon/src/lib.rs
-@@ -21,6 +21,8 @@ use codex_utils_home_dir::find_codex_home;
+@@ -26,6 +26,8 @@ use codex_utils_home_dir::find_codex_home;
  use managed_install::managed_codex_bin;
- #[cfg(unix)]
+ #[cfg(any(unix, windows))]
  use managed_install::managed_codex_version;
 +#[cfg(unix)]
 +use managed_install::seed_managed_codex_from_running_fork;
  use serde::Serialize;
  use settings::DaemonSettings;
- use tokio::time::sleep;
-@@ -669,12 +671,20 @@ impl Daemon {
+ use settings::MAX_SHUTDOWN_GRACE_SECONDS;
+@@ -874,6 +876,14 @@ impl Daemon {
              return Ok(());
          }
  
@@ -72,11 +84,16 @@ index c90978803d..258fdbe96f 100644
 +        }
 +
          let managed_codex_path = self.managed_codex_bin.display();
+         let install_command = if cfg!(windows) {
+             "irm https://chatgpt.com/codex/install.ps1 | iex"
+@@ -881,10 +891,10 @@ impl Daemon {
+             "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+         };
          Err(anyhow!(
 -            "managed standalone Codex install not found at {managed_codex_path}\n\n\
 -             This command requires the standalone install managed by the Codex installer, because \
 -             the daemon starts and updates app-server from that fixed path.\n\n\
--             Install it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\n\
+-             Install it with:\n  {install_command}\n\n\
 +            "managed standalone Codex-LHC install not found at {managed_codex_path}\n\n\
 +             Isolated remote-control homes must use this fork's bytes, never stock Codex.\n\
 +             Seed the running `codex`/`codex-lhc` binary, or install from the fork release:\n  \
@@ -84,7 +101,7 @@ index c90978803d..258fdbe96f 100644
               Then rerun the command you just tried."
          ))
      }
-@@ -910,8 +920,9 @@ mod tests {
+@@ -1092,8 +1102,9 @@ mod tests {
  
      #[test]
      fn restart_decision_preserves_forced_refreshes() {
@@ -95,7 +112,7 @@ index c90978803d..258fdbe96f 100644
          };
  
          assert_eq!(
-@@ -919,14 +930,18 @@ mod tests {
+@@ -1101,14 +1112,18 @@ mod tests {
                  restart_decision(
                      RestartMode::IfVersionChanged,
                      Some(&current_info),
@@ -117,11 +134,11 @@ index c90978803d..258fdbe96f 100644
                      RestartMode::Always,
                      /*info*/ None,
 diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
-index d5ad85b986..5192220cc9 100644
+index b7b57f7f68..f0a6f87fe1 100644
 --- a/codex-rs/app-server-daemon/src/managed_install.rs
 +++ b/codex-rs/app-server-daemon/src/managed_install.rs
-@@ -24,6 +24,57 @@ pub(crate) fn managed_codex_bin(codex_home: &Path) -> PathBuf {
-         .join(managed_codex_file_name())
+@@ -91,6 +91,58 @@ pub(crate) async fn supports_daemon_update_loop(codex_bin: &Path) -> bool {
+     .is_ok_and(|result| result.is_ok_and(|status| status.success()))
  }
  
 +/// Copy the currently running fork binary into an isolated `CODEX_HOME`
@@ -175,9 +192,10 @@ index d5ad85b986..5192220cc9 100644
 +    Ok(())
 +}
 +
- #[cfg(unix)]
++#[cfg(unix)]
  pub(crate) async fn resolved_managed_codex_bin(codex_bin: &Path) -> Result<PathBuf> {
      fs::canonicalize(codex_bin).await.with_context(|| {
+         format!(
 diff --git a/codex-rs/app-server-daemon/src/managed_install_tests.rs b/codex-rs/app-server-daemon/src/managed_install_tests.rs
 index 93caa468e4..426bde996b 100644
 --- a/codex-rs/app-server-daemon/src/managed_install_tests.rs
@@ -223,24 +241,30 @@ index 93caa468e4..426bde996b 100644
 +    assert_ne!(managed, source);
 +}
 diff --git a/codex-rs/app-server-daemon/src/update_loop.rs b/codex-rs/app-server-daemon/src/update_loop.rs
-index 76fd94837d..6b4b0b149c 100644
+index 2fe7850df4..505489004b 100644
 --- a/codex-rs/app-server-daemon/src/update_loop.rs
 +++ b/codex-rs/app-server-daemon/src/update_loop.rs
-@@ -54,7 +54,8 @@ const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
- #[cfg(unix)]
- const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+@@ -43,9 +43,13 @@ pub(crate) use manual_update::request as request_manual_update;
+ const INITIAL_UPDATE_DELAY: Duration = Duration::from_secs(5 * 60);
+ const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
  #[cfg(unix)]
 -const INSTALL_URL: &str = "https://chatgpt.com/codex/install.sh";
++const UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
++#[cfg(unix)]
 +const INSTALL_URL: &str =
 +    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh";
+ #[cfg(windows)]
+-const INSTALL_URL: &str = "https://chatgpt.com/codex/install.ps1";
++const INSTALL_URL: &str =
++    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1";
  
- #[cfg(unix)]
  pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
+     let http = RouteAwareClientPool::new_without_request_logging(
 diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
-index 8c94f91202..e47bd5e95d 100644
+index ff2b177b86..d9e30e9404 100644
 --- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
 +++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
-@@ -62,6 +62,16 @@ async fn installer_fetch_rejects_non_success_status() {
+@@ -49,6 +49,16 @@ async fn installer_fetch_rejects_non_success_status() {
      assert_eq!(http.requested_urls(), vec![INSTALL_URL.to_string()]);
  }
  

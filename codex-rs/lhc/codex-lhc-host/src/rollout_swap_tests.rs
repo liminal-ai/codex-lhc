@@ -11,6 +11,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::parse_rollout_line;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
 
@@ -55,6 +56,7 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
             previous_window_id: None,
             window_id: Some("win-1".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -70,7 +72,7 @@ fn rollout_lines(path: &Path) -> Vec<RolloutLine> {
     std::fs::read_to_string(path)
         .expect("read rollout")
         .lines()
-        .map(|line| serde_json::from_str(line).expect("parse rollout line"))
+        .map(|line| parse_rollout_line(line).expect("parse rollout line"))
         .collect()
 }
 
@@ -344,6 +346,7 @@ fn history_from_materialized_is_bands_plus_native_tail() {
             previous_window_id: None,
             window_id: Some("w".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -406,6 +409,7 @@ fn dual_format_history_picks_newest_compacted_only() {
             previous_window_id: None,
             window_id: Some("w1".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -419,6 +423,7 @@ fn dual_format_history_picks_newest_compacted_only() {
             previous_window_id: Some("w1".into()),
             window_id: Some("w2".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -460,6 +465,7 @@ fn fl4_model_context_estimate_like_for_like() {
             previous_window_id: None,
             window_id: Some("w".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),
@@ -518,6 +524,7 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
             previous_window_id: None,
             window_id: Some("w".into()),
             guardian_history: None,
+            retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
         }),

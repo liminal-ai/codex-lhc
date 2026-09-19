@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 49306c357c..038510350a 100644
+index 55cc1718ba..ac8930683b 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -69,6 +69,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+@@ -70,6 +70,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
  /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
  /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
  /// initial context into the replacement history just above the last real user message.
@@ -13,48 +13,38 @@ index 49306c357c..038510350a 100644
  pub(crate) enum InitialContextInjection {
      BeforeLastUserMessage {
          world_state: Arc<WorldState>,
-@@ -763,8 +767,13 @@ async fn drain_to_completed(
+@@ -796,10 +800,12 @@ async fn drain_to_completed(
          };
          match event {
              Ok(ResponseEvent::OutputItemDone(item)) => {
--                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
--                    .await;
+-                sess.record_conversation_items(
 +                // LHC-HOOK: compaction model output is ModelOutput (not HostContext default).
 +                sess.record_conversation_items_with_provenance(
-+                    turn_context,
-+                    std::slice::from_ref(&item),
+                     turn_context,
+                     turn_context.model_info(),
+                     std::slice::from_ref(&item),
 +                    codex_extension_api::RawItemProvenance::ModelOutput,
-+                )
-+                .await;
+                 )
+                 .await;
              }
-             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
-                 sess.set_server_reasoning_included(included).await;
 diff --git a/codex-rs/core/src/session/inject.rs b/codex-rs/core/src/session/inject.rs
-index 6c103f266c..adb512bb80 100644
+index b2d0c05673..df0dd92dfa 100644
 --- a/codex-rs/core/src/session/inject.rs
 +++ b/codex-rs/core/src/session/inject.rs
-@@ -138,8 +138,13 @@ impl Session {
-                 }
-             }));
-         }
--        self.record_prepared_conversation_items(turn_context, annotated_items, image_preparations)
--            .await;
-+        self.record_prepared_conversation_items(
-+            turn_context,
-+            annotated_items,
-+            image_preparations,
+@@ -147,6 +147,7 @@ impl Session {
+             model_info,
+             annotated_items,
+             image_preparations,
 +            codex_extension_api::RawItemProvenance::HostContext,
-+        )
-+        .await;
+         )
+         .await;
      }
- 
-     /// Injects items into active work, or records them without starting a turn.
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..8d1df98816
+index 0000000000..25618cc4a1
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1213 @@
+@@ -0,0 +1,1256 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -88,6 +78,7 @@ index 0000000000..8d1df98816
 +use tempfile::tempdir;
 +
 +use super::Session;
++use super::step_context::StepContext;
 +use super::tests::make_session_and_context;
 +use crate::config::Config;
 +
@@ -143,8 +134,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("e2e human utterance")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -195,8 +188,10 @@ index 0000000000..8d1df98816
 +        session
 +            .record_user_prompt_and_emit_turn_item(
 +                &turn_context,
++                turn_context.model_info(),
 +                &[text_input(text)],
-+                None,
++                /*client_id*/ None,
++                /*acceptance_order*/ None,
 +                PersistContext::TurnStart,
 +            )
 +            .await;
@@ -257,8 +252,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("core-assigned-id-utterance")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -282,7 +279,11 @@ index 0000000000..8d1df98816
 +        phase: None,
 +        internal_chat_message_metadata_passthrough: None,
 +    }];
-+    let (prepared, _) = session.prepare_conversation_items_for_history(&turn_context, &items);
++    let (prepared, _) = session.prepare_conversation_items_for_history(
++        &turn_context,
++        turn_context.model_info(),
++        &items,
++    );
 +    let prepared = prepared.into_owned();
 +    let id_str = prepared[0]
 +        .id()
@@ -345,8 +346,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("provenance-sensitive")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -375,6 +378,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[host_item],
 +            RawItemProvenance::HostContext,
 +        )
@@ -509,8 +513,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("after-panic-contributor")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -571,7 +577,12 @@ index 0000000000..8d1df98816
 +        phase: None,
 +        internal_chat_message_metadata_passthrough: None,
 +    };
-+    record_completed_response_item(&session, &turn_context, &user_shaped).await;
++    record_completed_response_item(
++        &session,
++        StepContext::for_test(Arc::new(turn_context)).as_ref(),
++        &user_shaped,
++    )
++    .await;
 +
 +    handle.flush().await;
 +    let events = handle.list_events().await.expect("list");
@@ -622,8 +633,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("live turn that must be captured")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -702,6 +715,7 @@ index 0000000000..8d1df98816
 +    let dir = tempdir().expect("tempdir");
 +    let root = dir.path().to_path_buf();
 +    let (mut session, turn_context) = make_session_and_context().await;
++    let turn_context = Arc::new(turn_context);
 +    install_lhc_on_session(&mut session, root).await;
 +
 +    let slot = session
@@ -735,8 +749,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("v5 host facts prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -753,7 +769,12 @@ index 0000000000..8d1df98816
 +        internal_chat_message_metadata_passthrough: None,
 +    };
 +    // Production model-output path (ModelOutput provenance).
-+    record_completed_response_item(&session, &turn_context, &assistant).await;
++    record_completed_response_item(
++        &session,
++        StepContext::for_test(Arc::clone(&turn_context)).as_ref(),
++        &assistant,
++    )
++    .await;
 +
 +    // ResponseEvent::Completed path — TokenUsageContributor fans out last_token_usage.
 +    let per_call = TokenUsage {
@@ -883,8 +904,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("abort path prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -968,8 +991,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("optional facts prompt")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -1072,6 +1097,7 @@ index 0000000000..8d1df98816
 +            previous_window_id: None,
 +            window_id: Some("win-1".into()),
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        }),
@@ -1086,6 +1112,7 @@ index 0000000000..8d1df98816
 +            previous_window_id: Some("win-1".into()),
 +            window_id: Some("win-2".into()),
 +            guardian_history: None,
++            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
 +        }),
@@ -1144,8 +1171,10 @@ index 0000000000..8d1df98816
 +    session
 +        .record_user_prompt_and_emit_turn_item(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[text_input("run two tools then finish")],
-+            None,
++            /*client_id*/ None,
++            /*acceptance_order*/ None,
 +            PersistContext::TurnStart,
 +        )
 +        .await;
@@ -1181,6 +1210,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[
 +                assistant("a0", "calling both tools"),
 +                call("call-a"),
@@ -1192,6 +1222,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[output("call-a")],
 +            RawItemProvenance::ModelOutput,
 +        )
@@ -1199,6 +1230,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[output("call-b")],
 +            RawItemProvenance::ModelOutput,
 +        )
@@ -1209,6 +1241,7 @@ index 0000000000..8d1df98816
 +    session
 +        .record_conversation_items_with_provenance(
 +            &turn_context,
++            turn_context.model_info(),
 +            &[assistant("a1", "done")],
 +            RawItemProvenance::ModelOutput,
 +        )
@@ -1269,10 +1302,23 @@ index 0000000000..8d1df98816
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 91300365bb..00c5de0bf5 100644
+index 98bfa792b2..fd271d8eeb 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1424,6 +1424,9 @@ impl Session {
+@@ -1355,6 +1355,12 @@ impl Session {
+         state.get_total_token_usage(state.server_reasoning_included())
+     }
+ 
++    pub(crate) async fn latest_token_usage_record(
++        &self,
++    ) -> Option<codex_protocol::protocol::TokenUsageRecord> {
++        self.state.lock().await.latest_token_usage_record.clone()
++    }
++
+     pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
+         let state = self.state.lock().await;
+         state.auto_compact_window_snapshot()
+@@ -1488,6 +1494,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1282,7 +1328,7 @@ index 91300365bb..00c5de0bf5 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info().slug.as_str();
-@@ -1466,6 +1469,8 @@ impl Session {
+@@ -1536,6 +1545,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1291,15 +1337,16 @@ index 91300365bb..00c5de0bf5 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3351,6 +3356,25 @@ impl Session {
-         &self,
+@@ -3470,6 +3481,27 @@ impl Session {
          turn_context: &TurnContext,
+         model_info: &ModelInfo,
          items: &[ResponseItem],
 +    ) {
 +        // Default provenance for generic call sites: HostContext (fail toward
 +        // synthetic, never invent user_prompt). Typed paths pass explicitly.
 +        self.record_conversation_items_with_provenance(
 +            turn_context,
++            model_info,
 +            items,
 +            codex_extension_api::RawItemProvenance::HostContext,
 +        )
@@ -1312,36 +1359,29 @@ index 91300365bb..00c5de0bf5 100644
 +    pub(crate) async fn record_conversation_items_with_provenance(
 +        &self,
 +        turn_context: &TurnContext,
++        model_info: &ModelInfo,
 +        items: &[ResponseItem],
 +        provenance: codex_extension_api::RawItemProvenance,
      ) {
          let (items, image_preparations) =
-             self.prepare_conversation_items_for_history(turn_context, items);
-@@ -3359,8 +3383,13 @@ impl Session {
-             .into_iter()
-             .map(ResponseItemEnvelope::new)
-             .collect();
--        self.record_prepared_conversation_items(turn_context, items, image_preparations)
--            .await;
-+        self.record_prepared_conversation_items(
-+            turn_context,
-+            items,
-+            image_preparations,
+             self.prepare_conversation_items_for_history(turn_context, model_info, items);
+@@ -3483,6 +3515,7 @@ impl Session {
+             model_info,
+             items,
+             image_preparations,
 +            provenance,
-+        )
-+        .await;
+         )
+         .await;
      }
- 
-     async fn record_prepared_conversation_items(
-@@ -3368,6 +3397,7 @@ impl Session {
-         turn_context: &TurnContext,
-         items: Vec<ResponseItemEnvelope>,
+@@ -3493,6 +3526,7 @@ impl Session {
+         model_info: &ModelInfo,
+         mut items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
 +        provenance: codex_extension_api::RawItemProvenance,
      ) {
-         let response_items = items
-             .iter()
-@@ -3400,7 +3430,7 @@ impl Session {
+         // Save the originating history budget for replay.
+         // Preserve any existing tool-specific override.
+@@ -3541,7 +3575,7 @@ impl Session {
          {
              mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
          }
@@ -1350,7 +1390,7 @@ index 91300365bb..00c5de0bf5 100644
              .await;
      }
  
-@@ -3675,7 +3705,13 @@ impl Session {
+@@ -3822,7 +3856,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1365,16 +1405,16 @@ index 91300365bb..00c5de0bf5 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3760,7 +3796,7 @@ impl Session {
-             Self::assign_missing_response_item_id(&mut envelope.item);
+@@ -3920,7 +3960,7 @@ impl Session {
+                 .compaction_model_hash = metadata.compaction_model_hash;
          }
          let mut compacted_item = CompactedItem {
 -            message: metadata.message,
 +            message: metadata.message.clone(),
              replacement_history: Some(items.clone()),
+             retained_context: None,
              guardian_history: None,
-             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
-@@ -3792,6 +3828,10 @@ impl Session {
+@@ -3955,6 +3995,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1385,7 +1425,7 @@ index 91300365bb..00c5de0bf5 100644
          }
  
          let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-@@ -3813,10 +3853,83 @@ impl Session {
+@@ -3976,10 +4020,83 @@ impl Session {
          }
      }
  
@@ -1469,7 +1509,7 @@ index 91300365bb..00c5de0bf5 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -3856,7 +3969,42 @@ impl Session {
+@@ -4019,7 +4136,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1513,7 +1553,7 @@ index 91300365bb..00c5de0bf5 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -4170,6 +4318,32 @@ impl Session {
+@@ -4341,6 +4493,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1546,40 +1586,43 @@ index 91300365bb..00c5de0bf5 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4505,9 +4679,13 @@ impl Session {
-         turn_context: &TurnContext,
+@@ -4682,11 +4860,12 @@ impl Session {
+         model_info: &ModelInfo,
          response_item: ResponseItem,
      ) {
 -        // Add to conversation history and persist response item to rollout.
--        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
--            .await;
+-        self.record_conversation_items(
 +        // LHC-HOOK: model-output provenance for raw-item capture.
 +        self.record_conversation_items_with_provenance(
-+            turn_context,
-+            std::slice::from_ref(&response_item),
+             turn_context,
+             model_info,
+             std::slice::from_ref(&response_item),
 +            codex_extension_api::RawItemProvenance::ModelOutput,
-+        )
-+        .await;
+         )
+         .await;
  
-         // Derive a turn item and emit lifecycle events if applicable.
-         if let Some(item) = parse_turn_item(&response_item) {
-@@ -4527,8 +4705,13 @@ impl Session {
+@@ -4710,16 +4889,12 @@ impl Session {
          // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
          // those spans, and `record_response_item_and_emit_turn_item` would drop them.
          let response_item = self.response_item_from_user_input(input.to_vec());
--        self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
--            .await;
+-        self.record_annotated_conversation_items(
 +        // LHC-HOOK: user-prompt provenance — the only real human-input path.
 +        self.record_conversation_items_with_provenance(
-+            turn_context,
+             turn_context,
+             model_info,
+-            vec![ResponseItemEnvelope {
+-                item: response_item,
+-                metadata: acceptance_order.map(|order| CodexHarnessMetadata {
+-                    user_input_order: Some(order),
+-                    ..Default::default()
+-                }),
+-            }],
 +            std::slice::from_ref(&response_item),
 +            codex_extension_api::RawItemProvenance::UserPrompt,
-+        )
-+        .await;
+         )
+         .await;
          let mut user_message_item = UserMessageItem::new(input);
-         user_message_item.client_id = client_id;
-         let turn_item = TurnItem::UserMessage(user_message_item);
-@@ -4694,3 +4877,14 @@ mod elicitation_holders_tests;
+@@ -4887,3 +5062,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
@@ -1595,22 +1638,20 @@ index 91300365bb..00c5de0bf5 100644
 +#[path = "lhc_band_shape_eval_tests.rs"]
 +mod lhc_band_shape_eval_tests;
 diff --git a/codex-rs/core/src/stream_events_utils.rs b/codex-rs/core/src/stream_events_utils.rs
-index a75dbe2af8..ef0c24c0ab 100644
+index 285e85fa14..fc6deda0d0 100644
 --- a/codex-rs/core/src/stream_events_utils.rs
 +++ b/codex-rs/core/src/stream_events_utils.rs
-@@ -95,8 +95,13 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
-     item: &ResponseItem,
+@@ -97,10 +97,12 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
      finalized_facts: Option<&FinalizedTurnItemFacts>,
  ) {
--    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
--        .await;
+     let turn_context = &step_context.turn;
+-    sess.record_conversation_items(
 +    // LHC-HOOK: model stream output is ModelOutput (not the generic HostContext default).
 +    sess.record_conversation_items_with_provenance(
-+        turn_context,
-+        std::slice::from_ref(item),
+         turn_context,
+         &step_context.settings.model_info,
+         std::slice::from_ref(item),
 +        codex_extension_api::RawItemProvenance::ModelOutput,
-+    )
-+    .await;
+     )
+     .await;
      let defers_mailbox_delivery = finalized_facts.map_or_else(
-         || {
-             completed_item_defers_mailbox_delivery_to_next_turn(

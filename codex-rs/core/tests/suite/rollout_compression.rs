@@ -2,6 +2,7 @@
 
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -10,9 +11,14 @@ use anyhow::Context;
 use anyhow::Result;
 use codex_core::CodexThread;
 use codex_core::TurnInputRequest;
+use codex_core::config::Config;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_history::InitialHistory;
 use codex_history::ResumedHistory;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -32,17 +38,66 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 use wiremock::MockServer;
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+async fn wait_lhc_capture(thread: &CodexThread) {
+    let slot = thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    // Background LHC derivation shares this provider. Keep a low-priority
+    // catch-all so it cannot consume the prompt-matched turn mocks below.
+    let derivation = sse(vec![
+        ev_response_created("lhc-derivation"),
+        ev_assistant_message("lhc-derivation", "lhc-derivation"),
+        ev_completed("lhc-derivation"),
+    ]);
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(derivation),
+        )
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    let lhc_root = TempDir::new()?;
     let test = test_codex()
         .with_history_mode(ThreadHistoryMode::Paginated)
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             config.model_provider.name = "Local compaction test provider".to_string();
+            config
+                .features
+                .enable(Feature::LhcCapture)
+                .expect("enable LHC capture");
+            config
+                .features
+                .disable(Feature::TokenBudget)
+                .expect("disable token budget");
+            let _ = config.features.disable(Feature::ContextManagement);
             config
                 .features
                 .disable(Feature::LocalThreadStoreCompression)
@@ -50,6 +105,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         })
         .build_with_auto_env(&server)
         .await?;
+    wait_lhc_capture(&test.codex).await;
     turn(
         &server,
         &test.codex,
@@ -88,14 +144,11 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
     let child = test
         .thread_manager
         .fork_prepared_thread(
-            test.config.clone(),
+            codex_core::StartThreadOptions::new(test.config.clone()),
             prepared,
-            /*thread_source*/ None,
-            /*parent_trace*/ None,
-            ClientMcpExtensions::default(),
-            /*reserved_thread_id*/ None,
         )
         .await?;
+    wait_lhc_capture(&child.thread).await;
     turn(
         &server,
         &test.codex,
@@ -184,6 +237,7 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
             ClientMcpExtensions::default(),
         )
         .await?;
+    wait_lhc_capture(&resumed.thread).await;
     let followup = turn(
         &server,
         &resumed.thread,
@@ -205,11 +259,22 @@ async fn compressed_shared_fork_resume_preserves_checkpoint_and_frozen_history()
         ],
     );
     let input = serde_json::to_string(&request.input())?;
-    assert!(input.contains("PERSISTED_COMPRESSION_CHECKPOINT"));
-    assert!(input.contains("INHERITED_COMPRESSION_REPLY"));
-    assert!(input.contains("CHILD_COMPRESSION_REPLY"));
-    assert!(!input.contains("POST_FORK_COMPRESSION_REPLY"));
-    assert!(!input.contains("OBSOLETE_PRE_CHECKPOINT_REPLY"));
+    // Native local compact injects PERSISTED_COMPRESSION_CHECKPOINT as summarizer
+    // text. LHC does not; that exact-native-summary string is LIM-142, not asserted.
+    assert!(
+        input.contains("INHERITED_COMPRESSION_REPLY"),
+        "parent assistant reply after compact must survive child resume"
+    );
+    assert!(
+        input.contains("CHILD_COMPRESSION_REPLY"),
+        "child assistant reply before shutdown must survive compressed resume"
+    );
+    assert!(
+        !input.contains("POST_FORK_COMPRESSION_REPLY"),
+        "parent turns after the fork cutoff must not leak into the child"
+    );
+    // OBSOLETE_PRE_CHECKPOINT_REPLY is pre-compact assistant text. Native compact
+    // evicts it; LHC residue may keep it. Absence is native-only and not asserted.
     assert!(
         !parent_path.exists(),
         "reading the ancestor must not materialize it"
@@ -225,8 +290,12 @@ async fn turn(
     prompt: &str,
     reply: &str,
 ) -> Result<ResponseMock> {
-    let mock = mount_sse_once(
+    let prompt_owned = prompt.to_string();
+    let mock = core_test_support::responses::mount_sse_once_match(
         server,
+        move |request: &wiremock::Request| {
+            String::from_utf8_lossy(&request.body).contains(&prompt_owned)
+        },
         sse(vec![
             ev_response_created(prompt),
             ev_assistant_message("reply", reply),
