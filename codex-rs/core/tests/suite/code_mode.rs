@@ -315,9 +315,7 @@ async fn wait_lhc_capture(test: &TestCodex) {
         .expect("LHC capture ready");
 }
 
-/// Installed LHC view is the compact receipt. `None` (including
-/// continued-without-compact) is not survival after compact.
-async fn assert_lhc_compact_installed(test: &TestCodex) {
+async fn lhc_installed_view(test: &TestCodex) -> Option<(String, i64)> {
     let slot = test
         .codex
         .thread_extension_data()
@@ -326,16 +324,27 @@ async fn assert_lhc_compact_installed(test: &TestCodex) {
     let handle = wait_for_handle(&slot, Duration::from_secs(30))
         .await
         .expect("LHC capture handle");
-    let view = inspect_installed_view(handle.thread_id(), handle.root())
+    inspect_installed_view(handle.thread_id(), handle.root())
         .await
         .expect("inspect installed view")
-        .expect(
-            "LHC compact must install a view; continued-without-compact is not proof of compact",
-        );
-    assert!(
-        !view.view_id.is_empty(),
-        "installed LHC view must have a view id: {view:?}"
+        .map(|view| (view.view_id, view.compact_point))
+}
+
+/// Require a **new** compact event. A preexisting installed view is not proof.
+async fn assert_new_lhc_compact_event(test: &TestCodex, before: Option<(String, i64)>) {
+    let after = lhc_installed_view(test).await.expect(
+        "LHC compact must install a view; continued-without-compact is not proof of compact",
     );
+    assert!(
+        !after.0.is_empty(),
+        "installed LHC view must have a view id: {after:?}"
+    );
+    if let Some(prev) = before {
+        assert_ne!(
+            after, prev,
+            "must be a new compact event, not a preexisting view (before={prev:?} after={after:?})"
+        );
+    }
 }
 
 async fn run_unavailable_code_mode_turn(
@@ -1353,12 +1362,13 @@ await new Promise(() => {});
         let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
 
         if oversized {
+            let before_compact = lhc_installed_view(&test).await;
             test.codex.submit(Op::Compact).await?;
             wait_for_event(&test.codex, |event| {
                 matches!(event, EventMsg::TurnComplete(_))
             })
             .await;
-            assert_lhc_compact_installed(&test).await;
+            assert_new_lhc_compact_event(&test, before_compact).await;
 
             let wait = responses::mount_function_call_agent_response(
                 &server,
@@ -1463,12 +1473,13 @@ async fn code_mode_wait_id_stays_known_after_compaction(
         cell_id,
     );
 
+    let before_compact = lhc_installed_view(&test).await;
     test.codex.submit(Op::Compact).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    assert_lhc_compact_installed(&test).await;
+    assert_new_lhc_compact_event(&test, before_compact).await;
 
     let terminal = responses::mount_function_call_agent_response(
         &server,
@@ -5751,9 +5762,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .expect("configure MCP servers");
         });
     let test = builder.build_with_auto_env(&server).await?;
-    if reviewer_compaction {
+    let before_compact = if reviewer_compaction {
         wait_lhc_capture(&test).await;
-    }
+        lhc_installed_view(&test).await
+    } else {
+        None
+    };
     wait_for_mcp_server(&test.codex, repl_server).await?;
     let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
     let reviewer_images = images_enabled && (reviewer_constraint.is_none() || reviewer_compaction);
@@ -5932,7 +5946,7 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
         }
     );
     if reviewer_compaction {
-        assert_lhc_compact_installed(&test).await;
+        assert_new_lhc_compact_event(&test, before_compact).await;
         assert!(
             guardian_requests[1]
                 .message_input_texts("user")

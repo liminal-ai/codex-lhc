@@ -43,7 +43,7 @@ index 172177cdac..d15eb85309 100644
              let model_context = self
                  .thread_store
 diff --git a/codex-rs/app-server/tests/common/mock_model_server.rs b/codex-rs/app-server/tests/common/mock_model_server.rs
-index d70736cf50..100babc7af 100644
+index d70736cf50..3fe4e8ca84 100644
 --- a/codex-rs/app-server/tests/common/mock_model_server.rs
 +++ b/codex-rs/app-server/tests/common/mock_model_server.rs
 @@ -11,6 +11,10 @@ use wiremock::matchers::path_regex;
@@ -73,7 +73,41 @@ index d70736cf50..100babc7af 100644
          .respond_with(seq_responder)
          .mount(&server)
          .await;
-@@ -75,6 +81,7 @@ pub async fn create_mock_responses_server_repeating_assistant(message: &str) ->
+@@ -55,12 +61,28 @@ struct SeqResponder {
+ }
+ 
+ impl Respond for SeqResponder {
+-    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
++    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+         let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
+-        let response = self
+-            .responses
+-            .get(call_num)
+-            .expect("mock model response should exist");
++        let Some(response) = self.responses.get(call_num) else {
++            let path = request.url.path();
++            let window = request
++                .headers
++                .get("x-codex-window-id")
++                .and_then(|value| value.to_str().ok())
++                .unwrap_or("");
++            let model = serde_json::from_slice::<serde_json::Value>(&request.body)
++                .ok()
++                .and_then(|body| {
++                    body.get("model")
++                        .and_then(serde_json::Value::as_str)
++                        .map(str::to_string)
++                });
++            panic!(
++                "mock model response should exist (call {call_num} of {}; path={path}; model={model:?}; window={window}; lhc_derivation={})",
++                self.responses.len(),
++                responses::is_lhc_derivation_request(request)
++            );
++        };
+         responses::sse_response(response.clone())
+     }
+ }
+@@ -75,6 +97,7 @@ pub async fn create_mock_responses_server_repeating_assistant(message: &str) ->
      ]);
      Mock::given(method("POST"))
          .and(path_regex(".*/responses$"))
@@ -15859,7 +15893,7 @@ index ffbda1e8e4..b493cd1067 100644
              model_context_window: cfg.model_context_window,
              model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
 diff --git a/codex-rs/core/src/guardian/review_session.rs b/codex-rs/core/src/guardian/review_session.rs
-index 7e0dd0c5e2..c29d6a20de 100644
+index 7e0dd0c5e2..6009ec15f6 100644
 --- a/codex-rs/core/src/guardian/review_session.rs
 +++ b/codex-rs/core/src/guardian/review_session.rs
 @@ -402,15 +402,16 @@ async fn run_review_on_session(
@@ -15888,6 +15922,63 @@ index 7e0dd0c5e2..c29d6a20de 100644
      {
          let compact_submission = run_before_review_deadline(
              deadline,
+@@ -578,13 +579,53 @@ async fn run_review_on_session(
+                             .into();
+                     let prompt_tokens = crate::context_manager::estimate_item_token_count(&prompt);
+                     let base_instructions = review_session.session.get_base_instructions().await;
++                    let total_usage = review_session.session.get_total_token_usage().await;
+                     let history_tokens = reviewer_history
+                         .estimate_token_count_with_base_instructions(&base_instructions)
+                         .unwrap_or(i64::MAX)
+-                        .max(review_session.session.get_total_token_usage().await);
+-                    prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
+-                        && prompt_tokens.saturating_add(history_tokens) <= context_window
++                        .max(total_usage);
++                    let admit = prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
++                        && prompt_tokens.saturating_add(history_tokens) <= context_window;
++                    tracing::info!(
++                        slug = %model_info.slug,
++                        used_fallback = model_info.used_fallback_model_metadata,
++                        resolved_window = ?model_info.resolved_context_window(),
++                        spawn_window = ?params.spawn_config.model_context_window,
++                        effective_percent = model_info.effective_context_window_percent,
++                        applied_window = context_window,
++                        prompt_tokens,
++                        history_tokens,
++                        total_usage,
++                        item_cap = GUARDIAN_MAX_IMAGE_ITEM_TOKENS,
++                        admit,
++                        "guardian image admission"
++                    );
++                    if std::env::var_os("LHC_ADMISSION_TRACE").is_some() {
++                        eprintln!(
++                            "guardian image admission slug={} used_fallback={} resolved_window={:?} spawn_window={:?} percent={} applied_window={} prompt_tokens={} history_tokens={} total_usage={} item_cap={} admit={}",
++                            model_info.slug,
++                            model_info.used_fallback_model_metadata,
++                            model_info.resolved_context_window(),
++                            params.spawn_config.model_context_window,
++                            model_info.effective_context_window_percent,
++                            context_window,
++                            prompt_tokens,
++                            history_tokens,
++                            total_usage,
++                            GUARDIAN_MAX_IMAGE_ITEM_TOKENS,
++                            admit
++                        );
++                    }
++                    admit
+                 } else {
++                    tracing::info!(
++                        slug = %model_info.slug,
++                        used_fallback = model_info.used_fallback_model_metadata,
++                        resolved_window = ?model_info.resolved_context_window(),
++                        spawn_window = ?params.spawn_config.model_context_window,
++                        modalities = ?model_info.input_modalities,
++                        "guardian image admission skipped (no usable window)"
++                    );
+                     false
+                 };
+                 if !admit_images {
 diff --git a/codex-rs/core/src/lc_adaptive_service_tier.rs b/codex-rs/core/src/lc_adaptive_service_tier.rs
 new file mode 100644
 index 0000000000..e8c85ad76c
@@ -19306,7 +19397,7 @@ index 082da177f7..50fe7ebb25 100644
      let server = MockServer::start().await;
      let response_mock = mount_sse_sequence(
 diff --git a/codex-rs/core/tests/suite/code_mode.rs b/codex-rs/core/tests/suite/code_mode.rs
-index 4243ae75da..7f835cfd29 100644
+index 4243ae75da..5584959af2 100644
 --- a/codex-rs/core/tests/suite/code_mode.rs
 +++ b/codex-rs/core/tests/suite/code_mode.rs
 @@ -25,6 +25,10 @@ use codex_extension_api::ToolLifecycleFuture;
@@ -19335,7 +19426,7 @@ index 4243ae75da..7f835cfd29 100644
  use test_case::test_case;
  use tokio::sync::oneshot;
  use wiremock::Mock;
-@@ -288,6 +294,50 @@ async fn run_code_mode_turn_with_builder(
+@@ -288,6 +294,59 @@ async fn run_code_mode_turn_with_builder(
      Ok((test, second_mock))
  }
  
@@ -19360,9 +19451,7 @@ index 4243ae75da..7f835cfd29 100644
 +        .expect("LHC capture ready");
 +}
 +
-+/// Installed LHC view is the compact receipt. `None` (including
-+/// continued-without-compact) is not survival after compact.
-+async fn assert_lhc_compact_installed(test: &TestCodex) {
++async fn lhc_installed_view(test: &TestCodex) -> Option<(String, i64)> {
 +    let slot = test
 +        .codex
 +        .thread_extension_data()
@@ -19371,22 +19460,33 @@ index 4243ae75da..7f835cfd29 100644
 +    let handle = wait_for_handle(&slot, Duration::from_secs(30))
 +        .await
 +        .expect("LHC capture handle");
-+    let view = inspect_installed_view(handle.thread_id(), handle.root())
++    inspect_installed_view(handle.thread_id(), handle.root())
 +        .await
 +        .expect("inspect installed view")
-+        .expect(
-+            "LHC compact must install a view; continued-without-compact is not proof of compact",
-+        );
-+    assert!(
-+        !view.view_id.is_empty(),
-+        "installed LHC view must have a view id: {view:?}"
++        .map(|view| (view.view_id, view.compact_point))
++}
++
++/// Require a **new** compact event. A preexisting installed view is not proof.
++async fn assert_new_lhc_compact_event(test: &TestCodex, before: Option<(String, i64)>) {
++    let after = lhc_installed_view(test).await.expect(
++        "LHC compact must install a view; continued-without-compact is not proof of compact",
 +    );
++    assert!(
++        !after.0.is_empty(),
++        "installed LHC view must have a view id: {after:?}"
++    );
++    if let Some(prev) = before {
++        assert_ne!(
++            after, prev,
++            "must be a new compact event, not a preexisting view (before={prev:?} after={after:?})"
++        );
++    }
 +}
 +
  async fn run_unavailable_code_mode_turn(
      server: &MockServer,
      test: &TestCodex,
-@@ -1228,6 +1278,7 @@ async fn code_mode_tool_call_completeness_is_private_and_opt_in(
+@@ -1228,6 +1287,7 @@ async fn code_mode_tool_call_completeness_is_private_and_opt_in(
      skip_if_no_network!(Ok(()));
  
      let server = responses::start_mock_server().await;
@@ -19394,7 +19494,7 @@ index 4243ae75da..7f835cfd29 100644
      let code = if oversized {
          r#"
  const args = { barrier: { id: "", participants: 1 } };
-@@ -1243,16 +1294,32 @@ await new Promise(() => {});
+@@ -1243,16 +1303,32 @@ await new Promise(() => {});
          r#"await tools.test_sync_tool({}); text("done");"#
      };
      // run_code_mode_turn_with_config enables this feature; production keeps it off by default.
@@ -19431,7 +19531,7 @@ index 4243ae75da..7f835cfd29 100644
  
      let request = follow_up.single_request();
      let first_output = request.custom_tool_call_output("call-1");
-@@ -1286,33 +1353,12 @@ await new Promise(() => {});
+@@ -1286,33 +1362,13 @@ await new Promise(() => {});
          let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
  
          if oversized {
@@ -19449,6 +19549,7 @@ index 4243ae75da..7f835cfd29 100644
 -                ]),
 -            )
 -            .await;
++            let before_compact = lhc_installed_view(&test).await;
              test.codex.submit(Op::Compact).await?;
              wait_for_event(&test.codex, |event| {
                  matches!(event, EventMsg::TurnComplete(_))
@@ -19462,11 +19563,11 @@ index 4243ae75da..7f835cfd29 100644
 -                    .len(),
 -                1
 -            );
-+            assert_lhc_compact_installed(&test).await;
++            assert_new_lhc_compact_event(&test, before_compact).await;
  
              let wait = responses::mount_function_call_agent_response(
                  &server,
-@@ -1354,15 +1400,19 @@ async fn code_mode_wait_id_stays_known_after_compaction(
+@@ -1354,15 +1410,19 @@ async fn code_mode_wait_id_stays_known_after_compaction(
      skip_if_no_network!(Ok(()));
  
      let server = responses::start_mock_server().await;
@@ -19486,7 +19587,7 @@ index 4243ae75da..7f835cfd29 100644
      let started = responses::mount_sse_sequence(
          &server,
          vec![
-@@ -1413,29 +1463,12 @@ async fn code_mode_wait_id_stays_known_after_compaction(
+@@ -1413,29 +1473,13 @@ async fn code_mode_wait_id_stays_known_after_compaction(
          cell_id,
      );
  
@@ -19501,6 +19602,7 @@ index 4243ae75da..7f835cfd29 100644
 -        ]),
 -    )
 -    .await;
++    let before_compact = lhc_installed_view(&test).await;
      test.codex.submit(Op::Compact).await?;
      wait_for_event(&test.codex, |event| {
          matches!(event, EventMsg::TurnComplete(_))
@@ -19513,11 +19615,11 @@ index 4243ae75da..7f835cfd29 100644
 -            .len(),
 -        1,
 -    );
-+    assert_lhc_compact_installed(&test).await;
++    assert_new_lhc_compact_event(&test, before_compact).await;
  
      let terminal = responses::mount_function_call_agent_response(
          &server,
-@@ -5627,7 +5660,6 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+@@ -5627,7 +5671,6 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
      const OTHER_NODE_REPL_RESULT: &str = "ECHOING: guardian-visible-other-tool-result";
      const UNRELATED_RESULT: &str = "ECHOING: guardian-hidden-unrelated-result";
      const PRIVATE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -19525,7 +19627,7 @@ index 4243ae75da..7f835cfd29 100644
      let server = responses::start_mock_server().await;
      let mcp_server_bin = remote_aware_stdio_server_bin()?;
      let reviewer_compaction = reviewer_constraint == Some("compaction");
-@@ -5637,11 +5669,14 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+@@ -5637,11 +5680,14 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
          DynamicImage::new_rgba8(/*w*/ 2049, /*h*/ 32)
              .write_to(&mut large_image, ImageFormat::Png)?;
      }
@@ -19545,7 +19647,7 @@ index 4243ae75da..7f835cfd29 100644
              config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
              config.approvals_reviewer = ApprovalsReviewer::AutoReview;
              if reviewer_constraint.is_some_and(|value| value != "large_prompt") || check_detail {
-@@ -5675,10 +5710,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+@@ -5675,10 +5721,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                  .enable(Feature::CodeMode)
                  .expect("enable Code Mode");
              if reviewer_compaction {
@@ -19560,17 +19662,20 @@ index 4243ae75da..7f835cfd29 100644
              }
              config
                  .features
-@@ -5714,6 +5751,9 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
+@@ -5714,6 +5762,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                  .expect("configure MCP servers");
          });
      let test = builder.build_with_auto_env(&server).await?;
-+    if reviewer_compaction {
++    let before_compact = if reviewer_compaction {
 +        wait_lhc_capture(&test).await;
-+    }
++        lhc_installed_view(&test).await
++    } else {
++        None
++    };
      wait_for_mcp_server(&test.codex, repl_server).await?;
      let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
      let reviewer_images = images_enabled && (reviewer_constraint.is_none() || reviewer_compaction);
-@@ -5789,15 +5829,6 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
+@@ -5789,15 +5843,6 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
                  },
              ]),
          ];
@@ -19586,7 +19691,7 @@ index 4243ae75da..7f835cfd29 100644
          response_bodies.extend([
              sse(vec![
                  ev_assistant_message("guardian-again", r#"{"outcome":"allow"}"#),
-@@ -5901,21 +5932,13 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
+@@ -5901,21 +5946,13 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
          }
      );
      if reviewer_compaction {
@@ -19596,7 +19701,7 @@ index 4243ae75da..7f835cfd29 100644
 -            .collect::<Vec<_>>();
 -        assert_eq!(compact_requests.len(), 1);
 -        let compact_request = compact_requests[0];
-+        assert_lhc_compact_installed(&test).await;
++        assert_new_lhc_compact_event(&test, before_compact).await;
          assert!(
 -            compact_request
 +            guardian_requests[1]

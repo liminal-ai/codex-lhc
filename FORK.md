@@ -502,6 +502,12 @@ build, and run logs upload even when the run step never starts.
 Do not invoke that workflow by pushing from a writer seat. Reed dispatches
 after reviewing branch+SHA.
 
+Standing per-sync requirement: Reed dispatches that workflow on the
+**candidate** SHA. The hosted 60 must be green. A candidate failure that
+passes on vanilla (same runner) is a fork-caused blocker; no ignores and no
+baseline excuse. Frozen-fork failures that also fail on the candidate remain
+fork-caused when vanilla passes.
+
 ## Compact-continuation MidTurn (LIM-63B)
 
 At `CompactionPhase::MidTurn` (post-sampling seam: provider response complete,

@@ -579,13 +579,53 @@ async fn run_review_on_session(
                             .into();
                     let prompt_tokens = crate::context_manager::estimate_item_token_count(&prompt);
                     let base_instructions = review_session.session.get_base_instructions().await;
+                    let total_usage = review_session.session.get_total_token_usage().await;
                     let history_tokens = reviewer_history
                         .estimate_token_count_with_base_instructions(&base_instructions)
                         .unwrap_or(i64::MAX)
-                        .max(review_session.session.get_total_token_usage().await);
-                    prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
-                        && prompt_tokens.saturating_add(history_tokens) <= context_window
+                        .max(total_usage);
+                    let admit = prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
+                        && prompt_tokens.saturating_add(history_tokens) <= context_window;
+                    tracing::info!(
+                        slug = %model_info.slug,
+                        used_fallback = model_info.used_fallback_model_metadata,
+                        resolved_window = ?model_info.resolved_context_window(),
+                        spawn_window = ?params.spawn_config.model_context_window,
+                        effective_percent = model_info.effective_context_window_percent,
+                        applied_window = context_window,
+                        prompt_tokens,
+                        history_tokens,
+                        total_usage,
+                        item_cap = GUARDIAN_MAX_IMAGE_ITEM_TOKENS,
+                        admit,
+                        "guardian image admission"
+                    );
+                    if std::env::var_os("LHC_ADMISSION_TRACE").is_some() {
+                        eprintln!(
+                            "guardian image admission slug={} used_fallback={} resolved_window={:?} spawn_window={:?} percent={} applied_window={} prompt_tokens={} history_tokens={} total_usage={} item_cap={} admit={}",
+                            model_info.slug,
+                            model_info.used_fallback_model_metadata,
+                            model_info.resolved_context_window(),
+                            params.spawn_config.model_context_window,
+                            model_info.effective_context_window_percent,
+                            context_window,
+                            prompt_tokens,
+                            history_tokens,
+                            total_usage,
+                            GUARDIAN_MAX_IMAGE_ITEM_TOKENS,
+                            admit
+                        );
+                    }
+                    admit
                 } else {
+                    tracing::info!(
+                        slug = %model_info.slug,
+                        used_fallback = model_info.used_fallback_model_metadata,
+                        resolved_window = ?model_info.resolved_context_window(),
+                        spawn_window = ?params.spawn_config.model_context_window,
+                        modalities = ?model_info.input_modalities,
+                        "guardian image admission skipped (no usable window)"
+                    );
                     false
                 };
                 if !admit_images {

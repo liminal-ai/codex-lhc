@@ -61,12 +61,28 @@ struct SeqResponder {
 }
 
 impl Respond for SeqResponder {
-    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
         let call_num = self.num_calls.fetch_add(1, Ordering::SeqCst);
-        let response = self
-            .responses
-            .get(call_num)
-            .expect("mock model response should exist");
+        let Some(response) = self.responses.get(call_num) else {
+            let path = request.url.path();
+            let window = request
+                .headers
+                .get("x-codex-window-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("");
+            let model = serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            panic!(
+                "mock model response should exist (call {call_num} of {}; path={path}; model={model:?}; window={window}; lhc_derivation={})",
+                self.responses.len(),
+                responses::is_lhc_derivation_request(request)
+            );
+        };
         responses::sse_response(response.clone())
     }
 }
