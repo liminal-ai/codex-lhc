@@ -1,0 +1,12 @@
+# LHC sandbox COMPARISON-8 inventory. Not the candidate sandbox-60 gate.
+# Exact hosted 35411932669 residuals; all 8 exist on frozen 5a2d42d535 and vanilla f0a1b8f084.
+# count: 8
+# Format: nextest-binary<TAB>test-name
+codex-app-server::all	suite::v2::analytics::remote_unified_plugin_script_emits_measurement_analytics
+codex-app-server::all	suite::v2::analytics::unified_plugin_script_emits_measurement_analytics
+codex-app-server::all	suite::v2::executor_skills::restricted_executor_skill_can_read_permitted_reference
+codex-app-server::all	suite::v2::executor_skills::restricted_executor_skill_rejects_reference_until_permission_approved
+codex-app-server::all	suite::v2::thread_queue::a_new_turn_preserves_queued_messages_until_it_completes
+codex-app-server::all	suite::v2::thread_shell_command::thread_shell_command_timeout_preserves_active_turn
+codex-app-server::all	suite::v2::turn_start::turn_profile_tracks_blocking_tool_and_follow_up_sampling
+codex-app-server::all	suite::v2::turn_start::turn_start_file_change_approval_accept_for_session_persists_v2

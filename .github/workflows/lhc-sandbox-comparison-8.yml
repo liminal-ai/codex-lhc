@@ -1,0 +1,130 @@
+name: LHC sandbox comparison-8
+
+# Comparison-only. Not the candidate sandbox-60 gate.
+# Selects the 8 hosted 35411932669 residuals that exist on this frozen/vanilla root.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lhc-sandbox-comparison-8-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sandbox:
+    name: 8 comparison residuals (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - name: Checkout product source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Prepare sandbox logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/lhc-sandbox"
+          echo "start $(date -u +%Y-%m-%dT%H:%M:%SZ) sha=${GITHUB_SHA} comparison-8" \
+            | tee "${RUNNER_TEMP}/lhc-sandbox/session.log"
+
+      - name: Print and relax runner userns (VM only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/lhc-sandbox/sysctl.log"
+          key=kernel.apparmor_restrict_unprivileged_userns
+          {
+            if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+              current=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)
+            else
+              current=$(sysctl -n "$key" 2>/dev/null || echo missing)
+            fi
+            echo "$key=$current"
+            if [ "$current" = "1" ]; then
+              sudo sysctl -w "$key=0"
+              echo "relaxed $key 1 -> 0 on runner VM"
+            else
+              echo "no sysctl write; current=$current"
+            fi
+          } 2>&1 | tee "$log"
+
+      - name: Install Linux sandbox packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev bubblewrap
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
+
+      - name: Configure Cargo target dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${HOME}/.cache/codex-ci/cargo-target"
+          mkdir -p "$target"
+          echo "CARGO_TARGET_DIR=$target" >> "$GITHUB_ENV"
+          echo "CODEX_REPO_ROOT=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+
+      - name: Build linux sandbox helper
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p codex-linux-sandbox --bin codex-linux-sandbox \
+            2>&1 | tee "${RUNNER_TEMP}/lhc-sandbox/build.log"
+
+      - name: Verify comparison-8 filter
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/check-lhc-sandbox-comparison-8.sh scripts/lhc-sandbox-comparison-8-filter.sh
+          export LHC_SANDBOX_LIST_JSON="${RUNNER_TEMP}/lhc-sandbox/nextest-list.json"
+          LHC_SANDBOX_LIST_ONLY=1 ./scripts/check-lhc-sandbox-comparison-8.sh \
+            2>&1 | tee "${RUNNER_TEMP}/lhc-sandbox/verify.log"
+          ./scripts/check-lhc-sandbox-comparison-8.sh \
+            2>&1 | tee -a "${RUNNER_TEMP}/lhc-sandbox/verify.log"
+
+      - name: Run 8 comparison residuals
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/lhc-sandbox/sandbox-comparison-8.log"
+          filter=$(./scripts/lhc-sandbox-comparison-8-filter.sh)
+          set +e
+          (
+            cd codex-rs
+            cargo nextest run \
+              --no-fail-fast \
+              --retries 0 \
+              -p codex-app-server \
+              -E "$filter"
+          ) 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          echo "COMPARISON_8_EXIT:$status" | tee -a "$log"
+          exit "$status"
+
+      - name: Upload comparison-8 logs
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lhc-sandbox-comparison-8-log
+          path: ${{ runner.temp }}/lhc-sandbox/
+          if-no-files-found: warn
