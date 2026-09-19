@@ -754,8 +754,11 @@ pub(crate) fn construct_model_info_from_candidates(
         find_model_by_longest_prefix(model, &catalog.models)
             .or_else(|| find_model_by_namespaced_suffix(model, &catalog.models))
     });
-    if configured_catalog_model.is_none()
-        && let Ok(bundled) = crate::bundled_models_response()
+    if let Some(configured) = configured_catalog_model {
+        model_info.context_window = configured.context_window;
+        model_info.max_context_window = configured.max_context_window;
+        model_info.auto_compact_token_limit = configured.auto_compact_token_limit;
+    } else if let Ok(bundled) = crate::bundled_models_response()
         && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
             .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
     {

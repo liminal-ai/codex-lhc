@@ -1673,3 +1673,39 @@ async fn configured_model_catalog_windows_are_not_lifted_to_bundled_lhc_defaults
         "fixture compact trigger"
     );
 }
+
+/// Remote/cache candidates can still be the bundled 370k profile. An explicit
+/// `config.model_catalog` window must win so fixture/operator 20k is not a
+/// skip-only no-op against those candidates.
+#[tokio::test]
+async fn configured_model_catalog_windows_override_remote_candidates() {
+    let slug = "gpt-5.6-luna";
+    let mut remote = remote_model(slug, "Remote luna", /*priority*/ 0);
+    remote.context_window = Some(370_000);
+    remote.max_context_window = Some(1_050_000);
+    remote.auto_compact_token_limit = Some(350_000);
+    let mut catalog_model = remote.clone();
+    catalog_model.context_window = Some(20_000);
+    catalog_model.max_context_window = Some(20_000);
+    catalog_model.auto_compact_token_limit = None;
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![remote],
+    });
+    let config = ModelsManagerConfig {
+        model_catalog: Some(ModelsResponse {
+            models: vec![catalog_model],
+        }),
+        ..Default::default()
+    };
+    let model = manager.get_model_info(slug, &config).await;
+    assert_eq!(model.context_window, Some(20_000), "catalog working window");
+    assert_eq!(
+        model.max_context_window,
+        Some(20_000),
+        "catalog capability ceiling"
+    );
+    assert_eq!(
+        model.auto_compact_token_limit, None,
+        "catalog compact trigger"
+    );
+}

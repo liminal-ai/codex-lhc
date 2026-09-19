@@ -15749,6 +15749,27 @@ index ffbda1e8e4..b493cd1067 100644
              review_model,
              model_context_window: cfg.model_context_window,
              model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
+diff --git a/codex-rs/core/src/guardian/review_session.rs b/codex-rs/core/src/guardian/review_session.rs
+index 7e0dd0c5e2..6913b2a403 100644
+--- a/codex-rs/core/src/guardian/review_session.rs
++++ b/codex-rs/core/src/guardian/review_session.rs
+@@ -582,8 +582,15 @@ async fn run_review_on_session(
+                         .estimate_token_count_with_base_instructions(&base_instructions)
+                         .unwrap_or(i64::MAX)
+                         .max(review_session.session.get_total_token_usage().await);
++                    // Cheap image-byte estimates under-count the 10k screenshot
++                    // reservation used by Guardian request budgeting. Charge that
++                    // ceiling against the reviewer window so a 20k fixture cannot
++                    // treat screenshots as free while a 370k window still admits.
+                     prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
+-                        && prompt_tokens.saturating_add(history_tokens) <= context_window
++                        && prompt_tokens
++                            .saturating_add(history_tokens)
++                            .saturating_add(GUARDIAN_MAX_IMAGE_ITEM_TOKENS)
++                            <= context_window
+                 } else {
+                     false
+                 };
 diff --git a/codex-rs/core/src/lc_adaptive_service_tier.rs b/codex-rs/core/src/lc_adaptive_service_tier.rs
 new file mode 100644
 index 0000000000..e8c85ad76c
@@ -23783,7 +23804,7 @@ index 1b5ce2c515..75805e9b45 100644
        "default_reasoning_summary": "none",
        "display_name": "GPT-5.6-Luna",
 diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
-index c7b1a19ad5..b6538dcecd 100644
+index c7b1a19ad5..61fa8580a6 100644
 --- a/codex-rs/models-manager/src/manager.rs
 +++ b/codex-rs/models-manager/src/manager.rs
 @@ -734,7 +734,7 @@ pub(crate) fn construct_model_info_from_candidates(
@@ -23795,7 +23816,7 @@ index c7b1a19ad5..b6538dcecd 100644
          ModelInfo {
              slug: model.to_string(),
              used_fallback_model_metadata: false,
-@@ -743,6 +743,39 @@ pub(crate) fn construct_model_info_from_candidates(
+@@ -743,6 +743,42 @@ pub(crate) fn construct_model_info_from_candidates(
      } else {
          model_info::model_info_from_slug(model)
      };
@@ -23810,8 +23831,11 @@ index c7b1a19ad5..b6538dcecd 100644
 +        find_model_by_longest_prefix(model, &catalog.models)
 +            .or_else(|| find_model_by_namespaced_suffix(model, &catalog.models))
 +    });
-+    if configured_catalog_model.is_none()
-+        && let Ok(bundled) = crate::bundled_models_response()
++    if let Some(configured) = configured_catalog_model {
++        model_info.context_window = configured.context_window;
++        model_info.max_context_window = configured.max_context_window;
++        model_info.auto_compact_token_limit = configured.auto_compact_token_limit;
++    } else if let Ok(bundled) = crate::bundled_models_response()
 +        && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
 +            .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
 +    {
@@ -23836,7 +23860,7 @@ index c7b1a19ad5..b6538dcecd 100644
  }
  
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 1408ad8928..03d6a079a2 100644
+index 1408ad8928..00cfd2b991 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
 @@ -765,8 +765,10 @@ async fn get_model_info_applies_long_context_override_to_bundled_gpt_5_6_models(
@@ -23860,7 +23884,7 @@ index 1408ad8928..03d6a079a2 100644
  
          assert_eq!(model_info, expected);
      }
-@@ -1548,3 +1550,126 @@ fn bundled_models_json_roundtrips() {
+@@ -1548,3 +1550,162 @@ fn bundled_models_json_roundtrips() {
          "bundled models.json should contain at least one model"
      );
  }
@@ -23985,6 +24009,42 @@ index 1408ad8928..03d6a079a2 100644
 +    assert_eq!(
 +        model.auto_compact_token_limit, None,
 +        "fixture compact trigger"
++    );
++}
++
++/// Remote/cache candidates can still be the bundled 370k profile. An explicit
++/// `config.model_catalog` window must win so fixture/operator 20k is not a
++/// skip-only no-op against those candidates.
++#[tokio::test]
++async fn configured_model_catalog_windows_override_remote_candidates() {
++    let slug = "gpt-5.6-luna";
++    let mut remote = remote_model(slug, "Remote luna", /*priority*/ 0);
++    remote.context_window = Some(370_000);
++    remote.max_context_window = Some(1_050_000);
++    remote.auto_compact_token_limit = Some(350_000);
++    let mut catalog_model = remote.clone();
++    catalog_model.context_window = Some(20_000);
++    catalog_model.max_context_window = Some(20_000);
++    catalog_model.auto_compact_token_limit = None;
++    let manager = static_manager_for_tests(ModelsResponse {
++        models: vec![remote],
++    });
++    let config = ModelsManagerConfig {
++        model_catalog: Some(ModelsResponse {
++            models: vec![catalog_model],
++        }),
++        ..Default::default()
++    };
++    let model = manager.get_model_info(slug, &config).await;
++    assert_eq!(model.context_window, Some(20_000), "catalog working window");
++    assert_eq!(
++        model.max_context_window,
++        Some(20_000),
++        "catalog capability ceiling"
++    );
++    assert_eq!(
++        model.auto_compact_token_limit, None,
++        "catalog compact trigger"
 +    );
 +}
 diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs

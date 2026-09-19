@@ -582,8 +582,15 @@ async fn run_review_on_session(
                         .estimate_token_count_with_base_instructions(&base_instructions)
                         .unwrap_or(i64::MAX)
                         .max(review_session.session.get_total_token_usage().await);
+                    // Cheap image-byte estimates under-count the 10k screenshot
+                    // reservation used by Guardian request budgeting. Charge that
+                    // ceiling against the reviewer window so a 20k fixture cannot
+                    // treat screenshots as free while a 370k window still admits.
                     prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
-                        && prompt_tokens.saturating_add(history_tokens) <= context_window
+                        && prompt_tokens
+                            .saturating_add(history_tokens)
+                            .saturating_add(GUARDIAN_MAX_IMAGE_ITEM_TOKENS)
+                            <= context_window
                 } else {
                     false
                 };

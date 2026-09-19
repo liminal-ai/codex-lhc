@@ -64,6 +64,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/src/compact_lhc/workers.rs \
   codex-rs/core/src/compact_lhc/installation.rs \
   codex-rs/core/src/compact_lhc.rs \
+  codex-rs/core/src/guardian/review_session.rs \
   codex-rs/core/src/compact_lhc_worker_error.rs \
   codex-rs/core/src/compact_lhc_tests.rs \
   codex-rs/core/src/compact_lhc_strict_routing_tests.rs \
