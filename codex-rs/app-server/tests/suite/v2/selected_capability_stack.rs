@@ -43,6 +43,7 @@ use core_test_support::responses::ResponsesRequest;
 use core_test_support::stdio_server_bin;
 use pretty_assertions::assert_eq;
 use pretty_assertions::assert_ne;
+use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -301,8 +302,21 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     .await?;
     let fixture = selected_capability_fixture(&responses_server.uri(), &apps_url)?;
 
-    let response_mock = responses::mount_sse_sequence(
+    // Background LHC derivation shares this provider. Keep a low-priority
+    // catch-all so it cannot consume the mock-model turn sequence.
+    responses::mount_lhc_derivation_catchall(&responses_server).await;
+    let response_mock = responses::mount_sse_sequence_match(
         &responses_server,
+        |request: &wiremock::Request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|model| model == "mock-model")
+                })
+                .unwrap_or(false)
+        },
         vec![
             responses::sse(vec![
                 responses::ev_response_created("environment-unavailable"),
@@ -430,7 +444,7 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
         fixture.environment_cwd.clone(),
     )
     .await?;
-    let requests = response_mock.requests();
+    let requests = mock_model_turn_requests(&response_mock);
     assert_eq!(5, requests.len());
     assert_selected_plugin_tools_absent(&requests[4]);
     assert!(
@@ -454,7 +468,7 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume() 
     let resumed_mcp_pid = wait_for_pid_file(&fixture.pid_file).await?;
     assert_ne!(first_mcp_pid, resumed_mcp_pid);
 
-    let requests = response_mock.requests();
+    let requests = mock_model_turn_requests(&response_mock);
     assert_eq!(6, requests.len());
     for request in &requests[1..4] {
         assert_selected_skill_is_injected(request, /*expected_count*/ 1);
@@ -809,6 +823,16 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn(
     apps_server_handle.abort();
     let _ = apps_server_handle.await;
     Ok(())
+}
+
+fn mock_model_turn_requests(response_mock: &responses::ResponseMock) -> Vec<ResponsesRequest> {
+    response_mock
+        .requests()
+        .into_iter()
+        .filter(|request| {
+            request.body_json().get("model").and_then(Value::as_str) == Some("mock-model")
+        })
+        .collect()
 }
 
 struct SelectedCapabilityFixture {

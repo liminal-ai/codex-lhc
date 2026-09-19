@@ -1643,3 +1643,33 @@ fn gpt_5_6_bundled_catalog_uses_lhc_long_context_defaults() {
         );
     }
 }
+
+/// Fixture/operator catalog windows (Guardian image-fallback tests shrink luna
+/// to 20k or None) must not be restored to the bundled 370k LHC default.
+#[tokio::test]
+async fn configured_model_catalog_windows_are_not_lifted_to_bundled_lhc_defaults() {
+    let slug = "gpt-5.6-luna";
+    let mut catalog_model = remote_model(slug, "Fixture luna", /*priority*/ 0);
+    catalog_model.context_window = Some(20_000);
+    catalog_model.max_context_window = Some(20_000);
+    catalog_model.auto_compact_token_limit = None;
+    let catalog = ModelsResponse {
+        models: vec![catalog_model.clone()],
+    };
+    let manager = static_manager_for_tests(catalog.clone());
+    let config = ModelsManagerConfig {
+        model_catalog: Some(catalog),
+        ..Default::default()
+    };
+    let model = manager.get_model_info(slug, &config).await;
+    assert_eq!(model.context_window, Some(20_000), "fixture working window");
+    assert_eq!(
+        model.max_context_window,
+        Some(20_000),
+        "fixture capability ceiling"
+    );
+    assert_eq!(
+        model.auto_compact_token_limit, None,
+        "fixture compact trigger"
+    );
+}

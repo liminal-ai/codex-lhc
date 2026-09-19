@@ -23783,7 +23783,7 @@ index 1b5ce2c515..75805e9b45 100644
        "default_reasoning_summary": "none",
        "display_name": "GPT-5.6-Luna",
 diff --git a/codex-rs/models-manager/src/manager.rs b/codex-rs/models-manager/src/manager.rs
-index c7b1a19ad5..cf2039ef60 100644
+index c7b1a19ad5..b6538dcecd 100644
 --- a/codex-rs/models-manager/src/manager.rs
 +++ b/codex-rs/models-manager/src/manager.rs
 @@ -734,7 +734,7 @@ pub(crate) fn construct_model_info_from_candidates(
@@ -23795,7 +23795,7 @@ index c7b1a19ad5..cf2039ef60 100644
          ModelInfo {
              slug: model.to_string(),
              used_fallback_model_metadata: false,
-@@ -743,6 +743,32 @@ pub(crate) fn construct_model_info_from_candidates(
+@@ -743,6 +743,39 @@ pub(crate) fn construct_model_info_from_candidates(
      } else {
          model_info::model_info_from_slug(model)
      };
@@ -23804,7 +23804,14 @@ index c7b1a19ad5..cf2039ef60 100644
 +    // model's whole capability. Preserve higher working-window and capability
 +    // metadata deliberately shipped by this binary, so runtime overrides remain
 +    // usable after cache refresh. Values stay catalog-driven, never hard-coded.
-+    if let Ok(bundled) = crate::bundled_models_response()
++    // An explicit `config.model_catalog` entry is operator/test intent and must
++    // not be lifted back to the bundled 370k LHC window.
++    let configured_catalog_model = config.model_catalog.as_ref().and_then(|catalog| {
++        find_model_by_longest_prefix(model, &catalog.models)
++            .or_else(|| find_model_by_namespaced_suffix(model, &catalog.models))
++    });
++    if configured_catalog_model.is_none()
++        && let Ok(bundled) = crate::bundled_models_response()
 +        && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
 +            .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
 +    {
@@ -23829,7 +23836,7 @@ index c7b1a19ad5..cf2039ef60 100644
  }
  
 diff --git a/codex-rs/models-manager/src/manager_tests.rs b/codex-rs/models-manager/src/manager_tests.rs
-index 1408ad8928..a08b088a22 100644
+index 1408ad8928..03d6a079a2 100644
 --- a/codex-rs/models-manager/src/manager_tests.rs
 +++ b/codex-rs/models-manager/src/manager_tests.rs
 @@ -765,8 +765,10 @@ async fn get_model_info_applies_long_context_override_to_bundled_gpt_5_6_models(
@@ -23853,7 +23860,7 @@ index 1408ad8928..a08b088a22 100644
  
          assert_eq!(model_info, expected);
      }
-@@ -1548,3 +1550,96 @@ fn bundled_models_json_roundtrips() {
+@@ -1548,3 +1550,126 @@ fn bundled_models_json_roundtrips() {
          "bundled models.json should contain at least one model"
      );
  }
@@ -23949,6 +23956,36 @@ index 1408ad8928..a08b088a22 100644
 +            "{slug}: operator config must be able to opt into the full capability"
 +        );
 +    }
++}
++
++/// Fixture/operator catalog windows (Guardian image-fallback tests shrink luna
++/// to 20k or None) must not be restored to the bundled 370k LHC default.
++#[tokio::test]
++async fn configured_model_catalog_windows_are_not_lifted_to_bundled_lhc_defaults() {
++    let slug = "gpt-5.6-luna";
++    let mut catalog_model = remote_model(slug, "Fixture luna", /*priority*/ 0);
++    catalog_model.context_window = Some(20_000);
++    catalog_model.max_context_window = Some(20_000);
++    catalog_model.auto_compact_token_limit = None;
++    let catalog = ModelsResponse {
++        models: vec![catalog_model.clone()],
++    };
++    let manager = static_manager_for_tests(catalog.clone());
++    let config = ModelsManagerConfig {
++        model_catalog: Some(catalog),
++        ..Default::default()
++    };
++    let model = manager.get_model_info(slug, &config).await;
++    assert_eq!(model.context_window, Some(20_000), "fixture working window");
++    assert_eq!(
++        model.max_context_window,
++        Some(20_000),
++        "fixture capability ceiling"
++    );
++    assert_eq!(
++        model.auto_compact_token_limit, None,
++        "fixture compact trigger"
++    );
 +}
 diff --git a/codex-rs/protocol/src/config_types.rs b/codex-rs/protocol/src/config_types.rs
 index b5ac448ebc..0c10844257 100644

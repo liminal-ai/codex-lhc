@@ -1420,10 +1420,42 @@ pub async fn mount_function_call_agent_response(
     }
 }
 
+/// Background LHC derivation shares the mock `/v1/responses` provider. Mount a
+/// low-priority catch-all so it cannot consume prompt-matched turn mocks.
+pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
+    let derivation = sse(vec![
+        ev_response_created("lhc-derivation"),
+        ev_assistant_message("lhc-derivation", "lhc-derivation"),
+        ev_completed("lhc-derivation"),
+    ]);
+    Mock::given(method("POST"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(derivation),
+        )
+        .with_priority(10)
+        .mount(server)
+        .await;
+}
+
 /// Mounts a sequence of SSE response bodies and serves them in order for each
 /// POST to `/v1/responses`. Panics if more requests are received than bodies
 /// provided. Also asserts the exact number of expected calls.
 pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
+    mount_sse_sequence_match(server, TrueMatcher, bodies).await
+}
+
+/// Like [`mount_sse_sequence`], but only consumes requests that match `matcher`.
+pub async fn mount_sse_sequence_match<M>(
+    server: &MockServer,
+    matcher: M,
+    bodies: Vec<String>,
+) -> ResponseMock
+where
+    M: Match + Send + Sync + 'static,
+{
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
@@ -1453,13 +1485,22 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
     };
 
     let (mock, response_mock) = base_mock();
-    mock.respond_with(responder)
+    mock.and(matcher)
+        .respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)
         .await;
 
     response_mock
+}
+
+struct TrueMatcher;
+
+impl Match for TrueMatcher {
+    fn matches(&self, _: &wiremock::Request) -> bool {
+        true
+    }
 }
 
 /// Mounts a sequence of responses for each POST to `/v1/responses`.

@@ -748,7 +748,14 @@ pub(crate) fn construct_model_info_from_candidates(
     // model's whole capability. Preserve higher working-window and capability
     // metadata deliberately shipped by this binary, so runtime overrides remain
     // usable after cache refresh. Values stay catalog-driven, never hard-coded.
-    if let Ok(bundled) = crate::bundled_models_response()
+    // An explicit `config.model_catalog` entry is operator/test intent and must
+    // not be lifted back to the bundled 370k LHC window.
+    let configured_catalog_model = config.model_catalog.as_ref().and_then(|catalog| {
+        find_model_by_longest_prefix(model, &catalog.models)
+            .or_else(|| find_model_by_namespaced_suffix(model, &catalog.models))
+    });
+    if configured_catalog_model.is_none()
+        && let Ok(bundled) = crate::bundled_models_response()
         && let Some(bundled_model) = find_model_by_longest_prefix(model, &bundled.models)
             .or_else(|| find_model_by_namespaced_suffix(model, &bundled.models))
     {
