@@ -132,6 +132,7 @@ pub(super) async fn install_lhc_compact_rewrite(
         thread_view: &surfaces.thread_view,
         messages: &surfaces.messages,
         turns: &surfaces.turns,
+        events: &surfaces.events,
         prior_generation: &prior_generation,
         prior_realtime_items: &prior_realtime_items,
         boundary: CompactBoundaryMeta {

@@ -1184,6 +1184,7 @@ pub struct MaterializeSurfaces {
     pub thread_view: lhc::shared_tech::view::SessionThreadView,
     pub messages: Vec<lhc::messages::MessageRecord>,
     pub turns: Vec<lhc::turns::TurnRecord>,
+    pub events: Vec<lhc::intake_stream::EventRecord>,
 }
 
 pub async fn read_materialize_surfaces(
@@ -1198,11 +1199,13 @@ pub async fn read_materialize_surfaces(
     let thread_view = session.get_session_thread_view().await?;
     let messages = session.list_messages().await?;
     let turns = session.list_turns().await?;
+    let events = session.list_events().await.unwrap_or_default();
     session.close().await;
     Ok(MaterializeSurfaces {
         thread_view,
         messages,
         turns,
+        events,
     })
 }
 

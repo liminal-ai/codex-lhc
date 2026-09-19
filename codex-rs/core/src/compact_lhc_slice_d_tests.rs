@@ -385,6 +385,7 @@ async fn slice_d_regenerate_and_resume_drill() {
         thread_view: &surfaces.thread_view,
         messages: &surfaces.messages,
         turns: &surfaces.turns,
+        events: &surfaces.events,
         prior_generation: &[], // file gone — pure thread projection
         prior_realtime_items: &[],
         boundary,
@@ -944,6 +945,212 @@ async fn slice_d_l2_mid_turn_abort_then_rewrite() {
     );
 }
 
+/// F2: Esc-interrupt then compact rewrite must keep the host UUID on
+/// `turn_aborted` so resume `thread_history` can own the late exec item.
+#[tokio::test]
+async fn slice_d_f2_interrupt_rewrite_preserves_host_uuid_on_resume() {
+    use std::sync::Mutex;
+
+    use codex_app_server_protocol::TurnStatus;
+    use codex_app_server_protocol::build_turns_from_rollout_items;
+    use codex_extension_api::TurnAbortInput;
+    use codex_extension_api::TurnStartInput;
+    use codex_protocol::items::CommandExecutionItem;
+    use codex_protocol::items::CommandExecutionStatus;
+    use codex_protocol::items::TurnItem;
+    use codex_protocol::parse_command::ParsedCommand;
+    use codex_protocol::protocol::ExecCommandSource;
+    use codex_protocol::protocol::ItemCompletedEvent;
+    use codex_protocol::protocol::TokenUsage;
+    use codex_protocol::protocol::TurnAbortReason;
+    use codex_utils_path_uri::PathUri;
+    use tracing::Event;
+    use tracing::Subscriber;
+    use tracing::field::Field;
+    use tracing::field::Visit;
+    use tracing::span::Attributes;
+    use tracing::span::Id;
+    use tracing::span::Record;
+
+    let _swap = hold_swap_clean();
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root.clone()).await;
+    let rollout_path = attach_rollout(&mut session).await;
+
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("handle");
+
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+    assert!(
+        handle.drain_settled(Duration::from_secs(120)).await,
+        "bandable seed must settle before the interrupted turn"
+    );
+
+    let host_turn = "01a0ba7a-dcef-72e0-9e69-e7ba32988a2e";
+    let collaboration_mode = tc.collaboration_mode();
+    let token_usage_at_start = TokenUsage::default();
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_start(TurnStartInput {
+                turn_id: host_turn,
+                collaboration_mode: &collaboration_mode,
+                token_usage_at_turn_start: &token_usage_at_start,
+                started_at: Some(1_789_835_009),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: tc.extension_data.as_ref(),
+            })
+            .await;
+    }
+    session
+        .record_user_prompt_and_emit_turn_item(
+            &tc,
+            tc.model_info(),
+            &[text_input(
+                "Run a shell command that prints BURNIN_SLEEP_STARTED, sleeps, then finishes.",
+            )],
+            /*client_id*/ None,
+            /*acceptance_order*/ None,
+            PersistContext::TurnStart,
+        )
+        .await;
+    for contributor in session.services.extensions.turn_lifecycle_contributors() {
+        contributor
+            .on_turn_abort(TurnAbortInput {
+                reason: TurnAbortReason::Interrupted,
+                started_at: Some(1_789_835_009),
+                completed_at: Some(1_789_835_049),
+                session_store: &session.services.session_extension_data,
+                thread_store: &session.services.thread_extension_data,
+                turn_store: tc.extension_data.as_ref(),
+            })
+            .await;
+    }
+    handle.flush().await;
+
+    let sess = Arc::new(session);
+    let attempt = run_arm_deterministic(&sess, &tc, /*manual*/ true).await;
+    assert!(
+        matches!(attempt, LhcCompactAttempt::Installed { .. }),
+        "rewrite after interrupt must install: {attempt:?}"
+    );
+
+    let items = parse_rollout_items(&rollout_path).expect("parse rewritten rollout");
+    let aborted: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::TurnAborted(ev)) => ev.turn_id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        aborted,
+        vec![host_turn.to_string()],
+        "exactly one turn_aborted and it must be the host UUID, not tN"
+    );
+
+    let exec_id = "exec-a4f4bf7f-ee62-4956-b69e-0e1f4ba4b11c";
+    let mut resumed = items;
+    resumed.push(RolloutItem::EventMsg(EventMsg::ItemCompleted(
+        ItemCompletedEvent {
+            thread_id: sess.thread_id,
+            turn_id: host_turn.into(),
+            item: TurnItem::CommandExecution(CommandExecutionItem {
+                id: exec_id.into(),
+                plugin_id: None,
+                script_path: None,
+                process_id: Some("43332".into()),
+                command: vec!["/bin/bash".into(), "-lc".into(), "sleep 90".into()],
+                cwd: PathUri::parse("file:///tmp").expect("cwd uri"),
+                parsed_cmd: vec![ParsedCommand::Unknown {
+                    cmd: "sleep 90".into(),
+                }],
+                source: ExecCommandSource::UnifiedExecStartup,
+                interaction_input: None,
+                status: CommandExecutionStatus::Completed,
+                stdout: Some("BURNIN_SLEEP_FINISHED\n".into()),
+                stderr: Some(String::new()),
+                aggregated_output: Some("BURNIN_SLEEP_FINISHED\n".into()),
+                exit_code: Some(0),
+                duration: None,
+                formatted_output: Some("BURNIN_SLEEP_FINISHED\n".into()),
+            }),
+            started_at_ms: Some(1_789_835_037_839),
+            completed_at_ms: 1_789_835_127_706,
+        },
+    )));
+
+    struct DropCapture {
+        msgs: std::sync::Arc<Mutex<Vec<String>>>,
+    }
+    impl Subscriber for DropCapture {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+        }
+        fn new_span(&self, _span: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+        fn event(&self, event: &Event<'_>) {
+            struct Msg(String);
+            impl Visit for Msg {
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+            }
+            let mut msg = Msg(String::new());
+            event.record(&mut msg);
+            if msg.0.contains("dropping turn-scoped item") {
+                self.msgs.lock().unwrap().push(msg.0);
+            }
+        }
+        fn enter(&self, _span: &Id) {}
+        fn exit(&self, _span: &Id) {}
+    }
+
+    let drops = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let cap = DropCapture {
+        msgs: std::sync::Arc::clone(&drops),
+    };
+    let turns = tracing::subscriber::with_default(cap, || build_turns_from_rollout_items(&resumed));
+    let drops = drops.lock().unwrap().clone();
+    assert!(
+        drops.is_empty(),
+        "zero dropping-turn-scoped-item warnings, got {drops:?}"
+    );
+
+    let interrupted: Vec<_> = turns
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Interrupted)
+        .collect();
+    assert_eq!(interrupted.len(), 1, "one interrupted turn after resume");
+    assert_eq!(interrupted[0].id, host_turn);
+    assert!(
+        interrupted[0].items.iter().any(|item| match item {
+            codex_app_server_protocol::ThreadItem::CommandExecution { id, .. } => id == exec_id,
+            _ => false,
+        }),
+        "late exec item must belong to the UUID turn"
+    );
+}
+
 /// 4. Prior ThreadRolledBack markers → applied-not-carried through regeneration.
 #[tokio::test]
 async fn slice_d_l2_rollback_markers_applied_not_carried() {
@@ -1151,6 +1358,7 @@ async fn slice_d_l2_crash_injection_full_stack() {
         thread_view: &surfaces.thread_view,
         messages: &surfaces.messages,
         turns: &surfaces.turns,
+        events: &surfaces.events,
         prior_generation: &prior,
         prior_realtime_items: &[],
         boundary,
@@ -1377,6 +1585,7 @@ async fn slice_d_l2_empty_edge_cases() {
             thread_view: &surfaces.thread_view,
             messages: &surfaces.messages,
             turns: &surfaces.turns,
+            events: &surfaces.events,
             prior_generation: &prior,
             prior_realtime_items: &[],
             boundary,

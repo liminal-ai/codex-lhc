@@ -1250,6 +1250,7 @@ pub async fn materialize_thread_rollout_items(
         thread_view: &surfaces.thread_view,
         messages: &surfaces.messages,
         turns: &surfaces.turns,
+        events: &surfaces.events,
         prior_generation: &prior_generation,
         prior_realtime_items: &prior_realtime_items,
         boundary: CompactBoundaryMeta {

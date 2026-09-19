@@ -54,6 +54,8 @@
 //!
 //! See [`CAPTURE_GAPS`]. Missing host facts degrade honestly.
 
+use crate::host_turn_ids::display_turn_id;
+use crate::host_turn_ids::host_turn_id_map;
 use crate::mapping::ModelIdentity;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -121,7 +123,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "AdditionalTools / Compaction / ContextCompaction: runtime_note stored text only; CompactionTrigger never captured",
     "Legacy image markers and InputAudio remain text; schema-13 user/tool images restore from full blocks, compressed or missing images remain placeholders",
     "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage; usage on rolled-back turns is excluded from the projected cumulative (those turns are out of the tail)",
-    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only)",
+    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID when a turn_end key or prior TurnStarted UUID maps the SDK t{n} label (F2); otherwise the synthetic label is kept",
     "TurnAbortReason enum: coarse map from outcome_reason string; unknown → Interrupted",
     "ThreadSettingsApplied / ThreadGoalUpdated: not in LHC → carry-forward only",
     "ThreadRolledBack: applied by excluding dropped user turns from the regenerated tail via positional alignment of prior post-boundary user segments to LHC user-prompt turns (no marker emitted). Alignment mismatch falls back to under-exclusion (exclude nothing) with a gap_notes entry — never text-set membership, which over-excludes duplicate prompts. Rolled-back content already compressed into bands remains until the LHC rollback-capture batch lands",
@@ -152,6 +154,8 @@ pub struct MaterializeInput<'a> {
     pub thread_view: &'a SessionThreadView,
     pub messages: &'a [MessageRecord],
     pub turns: &'a [TurnRecord],
+    /// Archive events; `turn_end` idempotency keys carry the host UUID.
+    pub events: &'a [lhc::intake_stream::EventRecord],
     pub prior_generation: &'a [RolloutItem],
     /// Prior-generation paginated `RealtimeItem` rows that are eligible to
     /// survive the rewrite — non-inherited only (ordinal at or after the
@@ -232,6 +236,7 @@ pub struct MaterializeResult {
 pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     let messages_by_id = index_messages(input.messages);
     let turns_by_id = index_turns(input.turns);
+    let host_ids = host_turn_id_map(input.turns, input.events, input.prior_generation);
     let (rolled_back_turns, mut gap_notes) =
         rolled_back_turn_ids(input.prior_generation, input.messages, input.turns);
     let mut refusals: Vec<String> = Vec::new();
@@ -304,6 +309,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         &messages_by_id,
         &turns_by_id,
         input.turns,
+        &host_ids,
         &usage_totals,
         &rolled_back_turns,
         input.live_identity.as_ref(),
@@ -825,6 +831,7 @@ fn emit_tail(
     messages_by_id: &HashMap<String, &MessageRecord>,
     turns_by_id: &HashMap<String, &TurnRecord>,
     all_turns: &[TurnRecord],
+    host_ids: &HashMap<String, String>,
     usage_totals: &HashMap<String, (TokenUsage, TokenUsage)>,
     rolled_back_turns: &HashSet<String>,
     live_identity: Option<&ModelIdentity>,
@@ -859,6 +866,7 @@ fn emit_tail(
                 maybe_open_turn(
                     msg.turn_id.as_str(),
                     turns_by_id,
+                    host_ids,
                     &mut opened,
                     &mut closed,
                     &mut pending_images,
@@ -1050,6 +1058,7 @@ fn emit_tail(
                 maybe_close_turn_if_last(
                     msg,
                     turns_by_id,
+                    host_ids,
                     &mut closed,
                     &opened,
                     &mut pending_images,
@@ -1076,7 +1085,7 @@ fn emit_tail(
     remaining.sort_by_key(|t| t.turn_order);
     for turn in remaining {
         flush_pending_images_for_turn(&turn.turn_id, &mut pending_images, out);
-        emit_turn_end(turn, out);
+        emit_turn_end(turn, host_ids, out);
         closed.insert(turn.turn_id.clone());
     }
 }
@@ -1204,6 +1213,7 @@ fn entry_message_ids(entry: &SessionThreadViewEntry) -> Vec<String> {
 fn maybe_open_turn(
     turn_id: &str,
     turns_by_id: &HashMap<String, &TurnRecord>,
+    host_ids: &HashMap<String, String>,
     opened: &mut HashSet<String>,
     closed: &mut HashSet<String>,
     pending_images: &mut HashMap<String, PendingImage>,
@@ -1237,7 +1247,7 @@ fn maybe_open_turn(
     for id in to_close {
         if let Some(turn) = turns_by_id.get(id.as_str()) {
             flush_pending_images_for_turn(&id, pending_images, out);
-            emit_turn_end(turn, out);
+            emit_turn_end(turn, host_ids, out);
             closed.insert(id);
         }
     }
@@ -1247,7 +1257,7 @@ fn maybe_open_turn(
     let started_at = turn.and_then(|t| t.started_at.as_deref().and_then(iso_to_unix_secs));
     out.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
         TurnStartedEvent {
-            turn_id: turn_id.to_string(),
+            turn_id: display_turn_id(turn_id, host_ids),
             trace_id: None,
             started_at,
             model_context_window: None,
@@ -1259,6 +1269,7 @@ fn maybe_open_turn(
 fn maybe_close_turn_if_last(
     msg: &MessageRecord,
     turns_by_id: &HashMap<String, &TurnRecord>,
+    host_ids: &HashMap<String, String>,
     closed: &mut HashSet<String>,
     opened: &HashSet<String>,
     pending_images: &mut HashMap<String, PendingImage>,
@@ -1282,11 +1293,15 @@ fn maybe_close_turn_if_last(
         return;
     }
     flush_pending_images_for_turn(&turn.turn_id, pending_images, out);
-    emit_turn_end(turn, out);
+    emit_turn_end(turn, host_ids, out);
     closed.insert(turn.turn_id.clone());
 }
 
-fn emit_turn_end(turn: &TurnRecord, out: &mut Vec<RolloutItem>) {
+fn emit_turn_end(
+    turn: &TurnRecord,
+    host_ids: &HashMap<String, String>,
+    out: &mut Vec<RolloutItem>,
+) {
     let started_at = turn.started_at.as_deref().and_then(iso_to_unix_secs);
     let ended_at = turn.ended_at.as_deref().and_then(iso_to_unix_secs);
     let duration_ms = match (started_at, ended_at) {
@@ -1294,12 +1309,13 @@ fn emit_turn_end(turn: &TurnRecord, out: &mut Vec<RolloutItem>) {
         _ => None,
     };
 
+    let turn_id = display_turn_id(&turn.turn_id, host_ids);
     match turn.outcome {
         Some(TurnOutcome::Aborted) => {
             let reason = map_abort_reason(turn.outcome_reason.as_deref());
             out.push(RolloutItem::EventMsg(EventMsg::TurnAborted(
                 TurnAbortedEvent {
-                    turn_id: Some(turn.turn_id.clone()),
+                    turn_id: Some(turn_id),
                     reason,
                     started_at,
                     completed_at: ended_at,
@@ -1310,7 +1326,7 @@ fn emit_turn_end(turn: &TurnRecord, out: &mut Vec<RolloutItem>) {
         Some(TurnOutcome::Completed) | None => {
             out.push(RolloutItem::EventMsg(EventMsg::TurnComplete(
                 TurnCompleteEvent {
-                    turn_id: turn.turn_id.clone(),
+                    turn_id,
                     last_agent_message: None,
                     error: None,
                     started_at,

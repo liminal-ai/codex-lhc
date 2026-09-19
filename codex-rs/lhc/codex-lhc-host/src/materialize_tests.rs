@@ -353,6 +353,7 @@ fn materialize_full(
         thread_view: &view,
         messages,
         turns,
+        events: &[],
         prior_generation: prior,
         prior_realtime_items: &[],
         boundary: boundary(1),
@@ -2573,6 +2574,7 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         thread_view: &view,
         messages: &[],
         turns: &[],
+        events: &[],
         prior_generation: &[],
         prior_realtime_items: &[],
         boundary: boundary(1),
@@ -2598,6 +2600,7 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         thread_view: &view,
         messages: &[],
         turns: &[],
+        events: &[],
         prior_generation: &first.items,
         prior_realtime_items: &[],
         boundary: boundary(2),
@@ -2719,6 +2722,97 @@ fn aborted_turn_regenerates_turn_aborted_from_v5_outcome() {
             if e.turn_id.as_deref() == Some("t1")
                 && e.reason == TurnAbortReason::Interrupted
     )));
+}
+
+#[test]
+fn rewrite_preserves_host_uuid_on_aborted_turn_from_turn_end_key() {
+    let host = "01a0ba7a-dcef-72e0-9e69-e7ba32988a2e";
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("band"),
+            user_tail("m1", "sleep"),
+            assistant_text_tail("m2", "running", None),
+        ],
+    };
+    let messages = [
+        msg("m1", "t1", MessageKind::UserPrompt, 1, "sleep", None),
+        msg("m2", "t1", MessageKind::AssistantText, 2, "running", None),
+    ];
+    let turns = [turn(
+        "t1",
+        1,
+        &["m1", "m2"],
+        Some(TurnOutcome::Aborted),
+        Some("interrupted"),
+        Some("2026-07-01T12:00:00.000Z"),
+        Some("2026-07-01T12:00:02.000Z"),
+    )];
+    let events = [lhc::intake_stream::EventRecord::TurnEnd {
+        idempotency_key: crate::turn_end_key("t", host, "aborted"),
+        actor: crate::mapping::ACTOR_ASSISTANT.into(),
+        harness: crate::mapping::HARNESS.into(),
+        payload: lhc::intake_stream::TurnEndPayload {
+            outcome: Some(TurnOutcome::Aborted),
+            outcome_reason: Some("interrupted".into()),
+            started_at: Some("2026-07-01T12:00:00.000Z".into()),
+            ended_at: Some("2026-07-01T12:00:02.000Z".into()),
+        },
+        event_order: 15,
+        recorded_at: "2026-07-01T12:00:02.000Z".into(),
+    }];
+    let items = materialize_rollout(&MaterializeInput {
+        session_meta: empty_meta(),
+        thread_view: &view,
+        messages: &messages,
+        turns: &turns,
+        events: &events,
+        prior_generation: &[],
+        prior_realtime_items: &[],
+        boundary: boundary(1),
+        world_state: None,
+        turn_context: None,
+        guardian_history: None,
+        retained_context: None,
+        latest_token_usage_record: None,
+        live_identity: None,
+    })
+    .items;
+    let aborted: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            RolloutItem::EventMsg(EventMsg::TurnAborted(e)) => e.turn_id.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(aborted, vec![host]);
+    assert!(items.iter().any(|i| matches!(
+        i,
+        RolloutItem::EventMsg(EventMsg::TurnStarted(e)) if e.turn_id == host
+    )));
+    assert!(!items.iter().any(|i| matches!(
+        i,
+        RolloutItem::EventMsg(EventMsg::TurnAborted(e))
+            if e.turn_id.as_deref() == Some("t1")
+    )));
+}
+
+#[test]
+fn turn_end_key_round_trips_host_uuid_not_synthetic_label() {
+    let host = "01a0ba7a-dcef-72e0-9e69-e7ba32988a2e";
+    let key = crate::turn_end_key("thread", host, "aborted");
+    assert_eq!(
+        crate::host_turn_ids::parse_host_turn_id_from_turn_end_key(&key),
+        Some(host.into())
+    );
+    assert!(crate::host_turn_ids::is_synthetic_lhc_turn_id("t11"));
+    assert!(!crate::host_turn_ids::is_synthetic_lhc_turn_id(host));
+    assert_eq!(
+        crate::host_turn_ids::parse_host_turn_id_from_turn_end_key(&crate::turn_end_key(
+            "thread", "t11", "aborted"
+        )),
+        None
+    );
 }
 
 // ── pre-slice-A ───────────────────────────────────────────────────────────
@@ -2912,6 +3006,7 @@ fn identity_match_reemits_encrypted_content() {
         thread_view: &view,
         messages: &messages,
         turns: &turns,
+        events: &[],
         prior_generation: &[],
         prior_realtime_items: &[],
         boundary: boundary(1),
@@ -2976,6 +3071,7 @@ fn identity_mismatch_suppresses_encrypted_content() {
         thread_view: &view,
         messages: &[],
         turns: &[],
+        events: &[],
         prior_generation: &[],
         prior_realtime_items: &[],
         boundary: boundary(1),
@@ -3030,6 +3126,7 @@ fn signature_only_thinking_emits_when_identity_matches() {
         thread_view: &view,
         messages: &[],
         turns: &[],
+        events: &[],
         prior_generation: &[],
         prior_realtime_items: &[],
         boundary: boundary(1),
@@ -3314,6 +3411,7 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         thread_view: &view,
         messages: &messages,
         turns: &turns,
+        events: &[],
         prior_generation: &[],
         prior_realtime_items: &prior_realtime,
         boundary: boundary(1),
@@ -3353,6 +3451,7 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         },
         messages: &messages,
         turns: &turns,
+        events: &[],
         prior_generation: &first.items,
         prior_realtime_items: &carried,
         boundary: boundary(2),

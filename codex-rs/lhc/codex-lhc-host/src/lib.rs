@@ -10,6 +10,7 @@ mod capture;
 mod compact_bridge;
 mod compact_continuation;
 mod gating;
+mod host_turn_ids;
 mod idempotency;
 mod image_blocks;
 mod inference;
