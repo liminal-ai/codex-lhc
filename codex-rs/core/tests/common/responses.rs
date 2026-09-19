@@ -1527,10 +1527,15 @@ where
         responses: bodies,
     };
 
-    let (mock, response_mock) = base_mock();
-    mock.and(ExcludeLhcDerivation)
-        .and(matcher)
-        .respond_with(responder)
+    // Exclude derivation *before* ResponseMock records. Matchers short-circuit,
+    // so recording first would count `*:lhc-infer` POSTs against exact sequences.
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(ExcludeLhcDerivation)
+        .and(response_mock.clone())
+        .and(matcher);
+    mock.respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)
@@ -1577,9 +1582,12 @@ pub async fn mount_response_sequence(
         responses,
     };
 
-    let (mock, response_mock) = base_mock();
-    mock.and(ExcludeLhcDerivation)
-        .respond_with(responder)
+    let response_mock = ResponseMock::new();
+    let mock = Mock::given(method("POST"))
+        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(ExcludeLhcDerivation)
+        .and(response_mock.clone());
+    mock.respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)

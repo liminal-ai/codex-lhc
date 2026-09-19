@@ -402,15 +402,16 @@ async fn run_review_on_session(
         Err(outcome) => return (outcome, false, analytics_result),
     }
 
-    if params.spawn_config.features.enabled(Feature::TokenBudget)
-        && crate::session::context_window::context_window_token_status_for_model(
-            review_session.session.as_ref(),
-            &params.spawn_config,
-            params.parent_context.turn(),
-            &model_info,
-        )
-        .await
-        .token_limit_reached
+    if crate::session::context_window::context_window_token_status_for_model(
+        review_session.session.as_ref(),
+        &params.spawn_config,
+        params.parent_context.turn(),
+        &model_info,
+    )
+    .await
+    .token_limit_reached
+        && (params.spawn_config.features.enabled(Feature::TokenBudget)
+            || params.spawn_config.features.enabled(Feature::LhcCapture))
     {
         let compact_submission = run_before_review_deadline(
             deadline,

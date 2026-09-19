@@ -25,6 +25,10 @@ use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::inspect_installed_view;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use codex_login::CodexAuth;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::codex_apps_mcp_server_config;
@@ -108,12 +112,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::oneshot;
 use wiremock::Mock;
@@ -286,6 +292,50 @@ async fn run_code_mode_turn_with_builder(
 
     test.submit_turn(prompt).await?;
     Ok((test, second_mock))
+}
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+async fn wait_lhc_capture(test: &TestCodex) {
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
+
+/// Installed LHC view is the compact receipt. `None` (including
+/// continued-without-compact) is not survival after compact.
+async fn assert_lhc_compact_installed(test: &TestCodex) {
+    let slot = test
+        .codex
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture handle");
+    let view = inspect_installed_view(handle.thread_id(), handle.root())
+        .await
+        .expect("inspect installed view")
+        .expect(
+            "LHC compact must install a view; continued-without-compact is not proof of compact",
+        );
+    assert!(
+        !view.view_id.is_empty(),
+        "installed LHC view must have a view id: {view:?}"
+    );
 }
 
 async fn run_unavailable_code_mode_turn(
@@ -1228,6 +1278,7 @@ async fn code_mode_tool_call_completeness_is_private_and_opt_in(
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let code = if oversized {
         r#"
 const args = { barrier: { id: "", participants: 1 } };
@@ -1243,16 +1294,32 @@ await new Promise(() => {});
         r#"await tools.test_sync_tool({}); text("done");"#
     };
     // run_code_mode_turn_with_config enables this feature; production keeps it off by default.
-    let (test, follow_up) =
-        run_code_mode_turn_with_config(&server, "Record a nested tool call", code, move |config| {
+    let mut builder = test_codex().with_model("test-gpt-5.1-codex");
+    if oversized {
+        builder = builder.with_extensions(lhc_extensions(lhc_root.path().to_path_buf()));
+    }
+    let (test, follow_up) = run_code_mode_turn_with_builder(
+        &server,
+        "Record a nested tool call",
+        code,
+        builder.with_config(move |config| {
+            let _ = config.features.enable(Feature::CodeMode);
+            let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
+            if oversized {
+                let _ = config.features.enable(Feature::LhcCapture);
+            }
             if !metadata_enabled {
                 config
                     .features
                     .disable(Feature::ExecutedToolCallMetadata)
                     .expect("tool call metadata should be disabled");
             }
-        })
-        .await?;
+        }),
+    )
+    .await?;
+    if oversized {
+        wait_lhc_capture(&test).await;
+    }
 
     let request = follow_up.single_request();
     let first_output = request.custom_tool_call_output("call-1");
@@ -1286,33 +1353,12 @@ await new Promise(() => {});
         let cell_id = extract_running_cell_id(text_item(&first_items, /*index*/ 0));
 
         if oversized {
-            let compact = responses::mount_sse_once(
-                &server,
-                responses::sse(vec![
-                    serde_json::json!({
-                        "type": "response.output_item.done",
-                        "item": {
-                            "type": "compaction",
-                            "encrypted_content": "compacted history",
-                        },
-                    }),
-                    responses::ev_completed("resp-compact"),
-                ]),
-            )
-            .await;
             test.codex.submit(Op::Compact).await?;
             wait_for_event(&test.codex, |event| {
                 matches!(event, EventMsg::TurnComplete(_))
             })
             .await;
-
-            assert_eq!(
-                compact
-                    .single_request()
-                    .inputs_of_type("compaction_trigger")
-                    .len(),
-                1
-            );
+            assert_lhc_compact_installed(&test).await;
 
             let wait = responses::mount_function_call_agent_response(
                 &server,
@@ -1354,15 +1400,19 @@ async fn code_mode_wait_id_stays_known_after_compaction(
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let mut builder = test_codex()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_model("test-gpt-5.1-codex")
         .with_config(|config| {
             let _ = config.features.enable(Feature::CodeMode);
             let _ = config.features.enable(Feature::CodeModeHost);
             let _ = config.features.enable(Feature::ExecutedToolCallMetadata);
+            let _ = config.features.enable(Feature::LhcCapture);
             config.code_mode.disable_in_process_fallback = true;
         });
     let test = builder.build_with_auto_env(&server).await?;
+    wait_lhc_capture(&test).await;
     let started = responses::mount_sse_sequence(
         &server,
         vec![
@@ -1413,29 +1463,12 @@ async fn code_mode_wait_id_stays_known_after_compaction(
         cell_id,
     );
 
-    let compact = responses::mount_sse_once(
-        &server,
-        sse(vec![
-            serde_json::json!({
-                "type": "response.output_item.done",
-                "item": {"type": "compaction", "encrypted_content": "compacted history"},
-            }),
-            ev_completed("resp-compact"),
-        ]),
-    )
-    .await;
     test.codex.submit(Op::Compact).await?;
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    assert_eq!(
-        compact
-            .single_request()
-            .inputs_of_type("compaction_trigger")
-            .len(),
-        1,
-    );
+    assert_lhc_compact_installed(&test).await;
 
     let terminal = responses::mount_function_call_agent_response(
         &server,
@@ -5627,7 +5660,6 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
     const OTHER_NODE_REPL_RESULT: &str = "ECHOING: guardian-visible-other-tool-result";
     const UNRELATED_RESULT: &str = "ECHOING: guardian-hidden-unrelated-result";
     const PRIVATE_IMAGE: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
-    const COMPACTION_SUMMARY: &str = "Guardian browser evidence summary";
     let server = responses::start_mock_server().await;
     let mcp_server_bin = remote_aware_stdio_server_bin()?;
     let reviewer_compaction = reviewer_constraint == Some("compaction");
@@ -5637,11 +5669,14 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
         DynamicImage::new_rgba8(/*w*/ 2049, /*h*/ 32)
             .write_to(&mut large_image, ImageFormat::Png)?;
     }
-    let mut builder = test_codex()
-        .with_model_info_override("gpt-5.5", move |model| {
-            model.node_repl_auto_review_required = auto_review_required
-        })
-        .with_config(move |config| {
+    let lhc_root = TempDir::new()?;
+    let mut builder = test_codex().with_model_info_override("gpt-5.5", move |model| {
+        model.node_repl_auto_review_required = auto_review_required
+    });
+    if reviewer_compaction {
+        builder = builder.with_extensions(lhc_extensions(lhc_root.path().to_path_buf()));
+    }
+    builder = builder.with_config(move |config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config.approvals_reviewer = ApprovalsReviewer::AutoReview;
             if reviewer_constraint.is_some_and(|value| value != "large_prompt") || check_detail {
@@ -5675,10 +5710,12 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .enable(Feature::CodeMode)
                 .expect("enable Code Mode");
             if reviewer_compaction {
+                // LHC forbids TokenBudget together with an LHC capture slot.
+                // Overflow still submits Op::Compact when LhcCapture is on.
                 config
                     .features
-                    .enable(Feature::TokenBudget)
-                    .expect("enable token budget");
+                    .enable(Feature::LhcCapture)
+                    .expect("enable LHC capture");
             }
             config
                 .features
@@ -5714,6 +5751,9 @@ async fn code_mode_node_repl_text_evidence_is_visible_only_to_guardian(
                 .expect("configure MCP servers");
         });
     let test = builder.build_with_auto_env(&server).await?;
+    if reviewer_compaction {
+        wait_lhc_capture(&test).await;
+    }
     wait_for_mcp_server(&test.codex, repl_server).await?;
     let images_enabled = auto_review_required || (enhanced_transcripts && transcript_images);
     let reviewer_images = images_enabled && (reviewer_constraint.is_none() || reviewer_compaction);
@@ -5789,15 +5829,6 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
                 },
             ]),
         ];
-        if reviewer_compaction {
-            response_bodies.push(sse(vec![
-                serde_json::json!({
-                    "type": "response.output_item.done",
-                    "item": {"type": "compaction", "encrypted_content": COMPACTION_SUMMARY},
-                }),
-                ev_completed("resp-guardian-compact"),
-            ]));
-        }
         response_bodies.extend([
             sse(vec![
                 ev_assistant_message("guardian-again", r#"{"outcome":"allow"}"#),
@@ -5901,21 +5932,13 @@ await tools.exec_command({ cmd: "printf second", sandbox_permissions: "require_e
         }
     );
     if reviewer_compaction {
-        let compact_requests = requests
-            .iter()
-            .filter(|request| !request.inputs_of_type("compaction_trigger").is_empty())
-            .collect::<Vec<_>>();
-        assert_eq!(compact_requests.len(), 1);
-        let compact_request = compact_requests[0];
+        assert_lhc_compact_installed(&test).await;
         assert!(
-            compact_request
+            guardian_requests[1]
                 .message_input_texts("user")
                 .concat()
-                .contains(NODE_REPL_DOM_MIDDLE)
-        );
-        assert_eq!(
-            guardian_requests[1].inputs_of_type("compaction")[0]["encrypted_content"],
-            COMPACTION_SUMMARY
+                .contains(NODE_REPL_DOM_MIDDLE),
+            "Guardian REPL evidence must survive LHC compact"
         );
         for request in &guardian_requests {
             assert!(!request.has_content_kinds(&["token_budget.context_window"]));
