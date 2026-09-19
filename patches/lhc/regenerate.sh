@@ -64,7 +64,6 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/src/compact_lhc/workers.rs \
   codex-rs/core/src/compact_lhc/installation.rs \
   codex-rs/core/src/compact_lhc.rs \
-  codex-rs/core/src/guardian/review_session.rs \
   codex-rs/core/src/compact_lhc_worker_error.rs \
   codex-rs/core/src/compact_lhc_tests.rs \
   codex-rs/core/src/compact_lhc_strict_routing_tests.rs \
@@ -103,6 +102,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/window_headers.rs \
   codex-rs/core/tests/suite/model_switching.rs \
   codex-rs/core/tests/suite/mod.rs \
+  codex-rs/core/tests/common/responses.rs \
   codex-rs/core/src/session/turn.rs \
   codex-rs/core/src/session/session.rs \
   codex-rs/core/src/session/tests.rs \
@@ -147,7 +147,9 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/thread-store/src/local/thread_history_materialization.rs \
   codex-rs/thread-store/src/local/thread_history_materialization_tests.rs \
   codex-rs/app-server/src/request_processors/thread_processor.rs \
-  codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
+  codex-rs/app-server/tests/common/mock_model_server.rs \
+  codex-rs/app-server/tests/suite/v2/history_notes_extension.rs \
+  codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs
 
 # Release identity and update wiring (maintenance slices 01-06): the embedded
 # fork release, CLI/TUI update execution through the fork installer, fork

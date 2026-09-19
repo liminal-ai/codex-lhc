@@ -42,6 +42,45 @@ index 172177cdac..d15eb85309 100644
          if matches!(stored_thread.history_mode, ThreadHistoryMode::Paginated) {
              let model_context = self
                  .thread_store
+diff --git a/codex-rs/app-server/tests/common/mock_model_server.rs b/codex-rs/app-server/tests/common/mock_model_server.rs
+index d70736cf50..100babc7af 100644
+--- a/codex-rs/app-server/tests/common/mock_model_server.rs
++++ b/codex-rs/app-server/tests/common/mock_model_server.rs
+@@ -11,6 +11,10 @@ use wiremock::matchers::path_regex;
+ 
+ /// Create a mock server that will provide the responses, in order, for
+ /// requests to the `/v1/responses` endpoint.
++///
++/// Exact-count matching excludes LHC derivation (`*:lhc-infer` on `/responses`).
++/// `start_mock_server` already mounts that catch-all; unexpected primary or
++/// Guardian traffic still fails this sequence.
+ pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> MockServer {
+     let server = responses::start_mock_server().await;
+ 
+@@ -22,6 +26,7 @@ pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> Mo
+ 
+     Mock::given(method("POST"))
+         .and(path_regex(".*/responses$"))
++        .and(responses::ExcludeLhcDerivation)
+         .respond_with(seq_responder)
+         .expect(num_calls as u64)
+         .mount(&server)
+@@ -42,6 +47,7 @@ pub async fn create_mock_responses_server_sequence_unchecked(responses: Vec<Stri
+ 
+     Mock::given(method("POST"))
+         .and(path_regex(".*/responses$"))
++        .and(responses::ExcludeLhcDerivation)
+         .respond_with(seq_responder)
+         .mount(&server)
+         .await;
+@@ -75,6 +81,7 @@ pub async fn create_mock_responses_server_repeating_assistant(message: &str) ->
+     ]);
+     Mock::given(method("POST"))
+         .and(path_regex(".*/responses$"))
++        .and(responses::ExcludeLhcDerivation)
+         .respond_with(responses::sse_response(body))
+         .mount(&server)
+         .await;
 diff --git a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs b/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
 index 8d851ddeef..10bf88e05e 100644
 --- a/codex-rs/app-server/tests/suite/v2/history_notes_extension.rs
@@ -137,6 +176,76 @@ index 8d851ddeef..10bf88e05e 100644
          .with_provider_name("OpenAI")
          .with_provider_base_url(&format!("{}/backend-api/codex", server.uri()))
          .with_provider_config("supports_websockets = false\nrequires_openai_auth = true")
+diff --git a/codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs b/codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs
+index cff3e76733..89c5573ba2 100644
+--- a/codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs
++++ b/codex-rs/app-server/tests/suite/v2/selected_capability_stack.rs
+@@ -43,6 +43,7 @@ use core_test_support::responses::ResponsesRequest;
+ use core_test_support::stdio_server_bin;
+ use pretty_assertions::assert_eq;
+ use pretty_assertions::assert_ne;
++use serde_json::Value;
+ use serde_json::json;
+ use tempfile::TempDir;
+ use test_case::test_case;
+@@ -301,8 +302,21 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume()
+     .await?;
+     let fixture = selected_capability_fixture(&responses_server.uri(), &apps_url)?;
+ 
+-    let response_mock = responses::mount_sse_sequence(
++    // Background LHC derivation shares this provider. Keep a low-priority
++    // catch-all so it cannot consume the mock-model turn sequence.
++    responses::mount_lhc_derivation_catchall(&responses_server).await;
++    let response_mock = responses::mount_sse_sequence_match(
+         &responses_server,
++        |request: &wiremock::Request| {
++            serde_json::from_slice::<serde_json::Value>(&request.body)
++                .ok()
++                .and_then(|body| {
++                    body.get("model")
++                        .and_then(serde_json::Value::as_str)
++                        .map(|model| model == "mock-model")
++                })
++                .unwrap_or(false)
++        },
+         vec![
+             responses::sse(vec![
+                 responses::ev_response_created("environment-unavailable"),
+@@ -430,7 +444,7 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume()
+         fixture.environment_cwd.clone(),
+     )
+     .await?;
+-    let requests = response_mock.requests();
++    let requests = mock_model_turn_requests(&response_mock);
+     assert_eq!(5, requests.len());
+     assert_selected_plugin_tools_absent(&requests[4]);
+     assert!(
+@@ -454,7 +468,7 @@ async fn selected_capability_stack_tracks_environment_availability_and_resume()
+     let resumed_mcp_pid = wait_for_pid_file(&fixture.pid_file).await?;
+     assert_ne!(first_mcp_pid, resumed_mcp_pid);
+ 
+-    let requests = response_mock.requests();
++    let requests = mock_model_turn_requests(&response_mock);
+     assert_eq!(6, requests.len());
+     for request in &requests[1..4] {
+         assert_selected_skill_is_injected(request, /*expected_count*/ 1);
+@@ -811,6 +825,16 @@ async fn selected_capabilities_become_available_between_samples_in_one_turn(
+     Ok(())
+ }
+ 
++fn mock_model_turn_requests(response_mock: &responses::ResponseMock) -> Vec<ResponsesRequest> {
++    response_mock
++        .requests()
++        .into_iter()
++        .filter(|request| {
++            request.body_json().get("model").and_then(Value::as_str) == Some("mock-model")
++        })
++        .collect()
++}
++
+ struct SelectedCapabilityFixture {
+     codex_home: TempDir,
+     _plugin: TempDir,
 diff --git a/codex-rs/config/src/config_toml.rs b/codex-rs/config/src/config_toml.rs
 index 7bf981482f..b97db5381b 100644
 --- a/codex-rs/config/src/config_toml.rs
@@ -15749,27 +15858,6 @@ index ffbda1e8e4..b493cd1067 100644
              review_model,
              model_context_window: cfg.model_context_window,
              model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
-diff --git a/codex-rs/core/src/guardian/review_session.rs b/codex-rs/core/src/guardian/review_session.rs
-index 7e0dd0c5e2..6913b2a403 100644
---- a/codex-rs/core/src/guardian/review_session.rs
-+++ b/codex-rs/core/src/guardian/review_session.rs
-@@ -582,8 +582,15 @@ async fn run_review_on_session(
-                         .estimate_token_count_with_base_instructions(&base_instructions)
-                         .unwrap_or(i64::MAX)
-                         .max(review_session.session.get_total_token_usage().await);
-+                    // Cheap image-byte estimates under-count the 10k screenshot
-+                    // reservation used by Guardian request budgeting. Charge that
-+                    // ceiling against the reviewer window so a 20k fixture cannot
-+                    // treat screenshots as free while a 370k window still admits.
-                     prompt_tokens <= GUARDIAN_MAX_IMAGE_ITEM_TOKENS
--                        && prompt_tokens.saturating_add(history_tokens) <= context_window
-+                        && prompt_tokens
-+                            .saturating_add(history_tokens)
-+                            .saturating_add(GUARDIAN_MAX_IMAGE_ITEM_TOKENS)
-+                            <= context_window
-                 } else {
-                     false
-                 };
 diff --git a/codex-rs/core/src/lc_adaptive_service_tier.rs b/codex-rs/core/src/lc_adaptive_service_tier.rs
 new file mode 100644
 index 0000000000..e8c85ad76c
@@ -19034,6 +19122,135 @@ index 7fc5f3ac72..735d8f7773 100644
  fn stored_thread_to_initial_history(
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
+diff --git a/codex-rs/core/tests/common/responses.rs b/codex-rs/core/tests/common/responses.rs
+index f22e511f65..499c087ef5 100644
+--- a/codex-rs/core/tests/common/responses.rs
++++ b/codex-rs/core/tests/common/responses.rs
+@@ -1080,6 +1080,7 @@ fn base_mock() -> (MockBuilder, ResponseMock) {
+     let response_mock = ResponseMock::new();
+     let mock = Mock::given(method("POST"))
+         .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
++        .and(ExcludeLhcDerivation)
+         .and(response_mock.clone());
+     (mock, response_mock)
+ }
+@@ -1172,6 +1173,7 @@ pub async fn start_mock_server() -> MockServer {
+ 
+     // Provide a default `/models` response so tests remain hermetic when the client queries it.
+     let _ = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
++    mount_lhc_derivation_catchall(&server).await;
+ 
+     server
+ }
+@@ -1420,10 +1422,83 @@ pub async fn mount_function_call_agent_response(
+     }
+ }
+ 
++/// True when a POST is LHC live derivation (`window_id` `*:lhc-infer`).
++/// Does not match Guardian/classifier paths or ordinary turn/Guardian sampling.
++pub fn is_lhc_derivation_request(request: &wiremock::Request) -> bool {
++    let path = request.url.path();
++    if !path.ends_with("/responses") || path.contains("guardian") {
++        return false;
++    }
++    request
++        .headers
++        .get("x-codex-window-id")
++        .and_then(|value| value.to_str().ok())
++        .is_some_and(|window| window.contains("lhc-infer"))
++        || serde_json::from_slice::<Value>(&request.body)
++            .ok()
++            .is_some_and(|body| {
++                body.get("client_metadata")
++                    .and_then(|metadata| metadata.get("x-codex-window-id"))
++                    .and_then(Value::as_str)
++                    .is_some_and(|window| window.contains("lhc-infer"))
++            })
++}
++
++struct LhcDerivationMatcher;
++
++impl Match for LhcDerivationMatcher {
++    fn matches(&self, request: &wiremock::Request) -> bool {
++        is_lhc_derivation_request(request)
++    }
++}
++
++/// Matches ordinary `/v1/responses` sampling, not LHC derivation.
++pub struct ExcludeLhcDerivation;
++
++impl Match for ExcludeLhcDerivation {
++    fn matches(&self, request: &wiremock::Request) -> bool {
++        !is_lhc_derivation_request(request)
++    }
++}
++
++/// Low-priority mock for LHC derivation POSTs to `/v1/responses` only.
++/// Guardian and classifier traffic is not covered; unexpected primary calls
++/// still fail their exact-count sequence mocks.
++pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
++    let derivation = sse(vec![
++        ev_response_created("lhc-derivation"),
++        ev_assistant_message("lhc-derivation", "lhc-derivation"),
++        ev_completed("lhc-derivation"),
++    ]);
++    Mock::given(method("POST"))
++        .and(path_regex(".*/responses$"))
++        .and(LhcDerivationMatcher)
++        .respond_with(
++            ResponseTemplate::new(200)
++                .insert_header("content-type", "text/event-stream")
++                .set_body_string(derivation),
++        )
++        .with_priority(10)
++        .mount(server)
++        .await;
++}
++
+ /// Mounts a sequence of SSE response bodies and serves them in order for each
+ /// POST to `/v1/responses`. Panics if more requests are received than bodies
+ /// provided. Also asserts the exact number of expected calls.
+ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> ResponseMock {
++    mount_sse_sequence_match(server, TrueMatcher, bodies).await
++}
++
++/// Like [`mount_sse_sequence`], but only consumes requests that match `matcher`.
++pub async fn mount_sse_sequence_match<M>(
++    server: &MockServer,
++    matcher: M,
++    bodies: Vec<String>,
++) -> ResponseMock
++where
++    M: Match + Send + Sync + 'static,
++{
+     use std::sync::atomic::AtomicUsize;
+     use std::sync::atomic::Ordering;
+ 
+@@ -1453,7 +1528,8 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
+     };
+ 
+     let (mock, response_mock) = base_mock();
+-    mock.respond_with(responder)
++    mock.and(matcher)
++        .respond_with(responder)
+         .up_to_n_times(num_calls as u64)
+         .expect(num_calls as u64)
+         .mount(server)
+@@ -1462,6 +1538,14 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
+     response_mock
+ }
+ 
++struct TrueMatcher;
++
++impl Match for TrueMatcher {
++    fn matches(&self, _: &wiremock::Request) -> bool {
++        true
++    }
++}
++
+ /// Mounts a sequence of responses for each POST to `/v1/responses`.
+ /// Panics if more requests are received than responses provided.
+ pub async fn mount_response_sequence(
 diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
 index 082da177f7..50fe7ebb25 100644
 --- a/codex-rs/core/tests/suite/client.rs

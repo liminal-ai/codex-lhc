@@ -11,6 +11,10 @@ use wiremock::matchers::path_regex;
 
 /// Create a mock server that will provide the responses, in order, for
 /// requests to the `/v1/responses` endpoint.
+///
+/// Exact-count matching excludes LHC derivation (`*:lhc-infer` on `/responses`).
+/// `start_mock_server` already mounts that catch-all; unexpected primary or
+/// Guardian traffic still fails this sequence.
 pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> MockServer {
     let server = responses::start_mock_server().await;
 
@@ -22,6 +26,7 @@ pub async fn create_mock_responses_server_sequence(responses: Vec<String>) -> Mo
 
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(seq_responder)
         .expect(num_calls as u64)
         .mount(&server)
@@ -42,6 +47,7 @@ pub async fn create_mock_responses_server_sequence_unchecked(responses: Vec<Stri
 
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(seq_responder)
         .mount(&server)
         .await;
@@ -75,6 +81,7 @@ pub async fn create_mock_responses_server_repeating_assistant(message: &str) -> 
     ]);
     Mock::given(method("POST"))
         .and(path_regex(".*/responses$"))
+        .and(responses::ExcludeLhcDerivation)
         .respond_with(responses::sse_response(body))
         .mount(&server)
         .await;

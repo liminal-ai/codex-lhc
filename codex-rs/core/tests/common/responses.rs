@@ -1080,6 +1080,7 @@ fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
         .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(ExcludeLhcDerivation)
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1172,6 +1173,7 @@ pub async fn start_mock_server() -> MockServer {
 
     // Provide a default `/models` response so tests remain hermetic when the client queries it.
     let _ = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
+    mount_lhc_derivation_catchall(&server).await;
 
     server
 }
@@ -1420,8 +1422,48 @@ pub async fn mount_function_call_agent_response(
     }
 }
 
-/// Background LHC derivation shares the mock `/v1/responses` provider. Mount a
-/// low-priority catch-all so it cannot consume prompt-matched turn mocks.
+/// True when a POST is LHC live derivation (`window_id` `*:lhc-infer`).
+/// Does not match Guardian/classifier paths or ordinary turn/Guardian sampling.
+pub fn is_lhc_derivation_request(request: &wiremock::Request) -> bool {
+    let path = request.url.path();
+    if !path.ends_with("/responses") || path.contains("guardian") {
+        return false;
+    }
+    request
+        .headers
+        .get("x-codex-window-id")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|window| window.contains("lhc-infer"))
+        || serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .is_some_and(|body| {
+                body.get("client_metadata")
+                    .and_then(|metadata| metadata.get("x-codex-window-id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|window| window.contains("lhc-infer"))
+            })
+}
+
+struct LhcDerivationMatcher;
+
+impl Match for LhcDerivationMatcher {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        is_lhc_derivation_request(request)
+    }
+}
+
+/// Matches ordinary `/v1/responses` sampling, not LHC derivation.
+pub struct ExcludeLhcDerivation;
+
+impl Match for ExcludeLhcDerivation {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        !is_lhc_derivation_request(request)
+    }
+}
+
+/// Low-priority mock for LHC derivation POSTs to `/v1/responses` only.
+/// Guardian and classifier traffic is not covered; unexpected primary calls
+/// still fail their exact-count sequence mocks.
 pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
     let derivation = sse(vec![
         ev_response_created("lhc-derivation"),
@@ -1429,7 +1471,8 @@ pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
         ev_completed("lhc-derivation"),
     ]);
     Mock::given(method("POST"))
-        .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
+        .and(path_regex(".*/responses$"))
+        .and(LhcDerivationMatcher)
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
