@@ -19123,18 +19123,10 @@ index 7fc5f3ac72..735d8f7773 100644
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
 diff --git a/codex-rs/core/tests/common/responses.rs b/codex-rs/core/tests/common/responses.rs
-index f22e511f65..499c087ef5 100644
+index f22e511f65..03a100396b 100644
 --- a/codex-rs/core/tests/common/responses.rs
 +++ b/codex-rs/core/tests/common/responses.rs
-@@ -1080,6 +1080,7 @@ fn base_mock() -> (MockBuilder, ResponseMock) {
-     let response_mock = ResponseMock::new();
-     let mock = Mock::given(method("POST"))
-         .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
-+        .and(ExcludeLhcDerivation)
-         .and(response_mock.clone());
-     (mock, response_mock)
- }
-@@ -1172,6 +1173,7 @@ pub async fn start_mock_server() -> MockServer {
+@@ -1172,6 +1172,7 @@ pub async fn start_mock_server() -> MockServer {
  
      // Provide a default `/models` response so tests remain hermetic when the client queries it.
      let _ = mount_models_once(&server, ModelsResponse { models: Vec::new() }).await;
@@ -19142,7 +19134,7 @@ index f22e511f65..499c087ef5 100644
  
      server
  }
-@@ -1420,10 +1422,83 @@ pub async fn mount_function_call_agent_response(
+@@ -1420,10 +1421,84 @@ pub async fn mount_function_call_agent_response(
      }
  }
  
@@ -19186,8 +19178,9 @@ index f22e511f65..499c087ef5 100644
 +}
 +
 +/// Low-priority mock for LHC derivation POSTs to `/v1/responses` only.
-+/// Guardian and classifier traffic is not covered; unexpected primary calls
-+/// still fail their exact-count sequence mocks.
++/// Guardian and classifier traffic is not covered. One-shot `mount_sse_once*`
++/// mocks still see compact/derivation if that is the request under test.
++/// Exact-count sequences exclude derivation so extra primary/Guardian calls fail.
 +pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
 +    let derivation = sse(vec![
 +        ev_response_created("lhc-derivation"),
@@ -19226,17 +19219,18 @@ index f22e511f65..499c087ef5 100644
      use std::sync::atomic::AtomicUsize;
      use std::sync::atomic::Ordering;
  
-@@ -1453,7 +1528,8 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
+@@ -1453,7 +1528,9 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
      };
  
      let (mock, response_mock) = base_mock();
 -    mock.respond_with(responder)
-+    mock.and(matcher)
++    mock.and(ExcludeLhcDerivation)
++        .and(matcher)
 +        .respond_with(responder)
          .up_to_n_times(num_calls as u64)
          .expect(num_calls as u64)
          .mount(server)
-@@ -1462,6 +1538,14 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
+@@ -1462,6 +1539,14 @@ pub async fn mount_sse_sequence(server: &MockServer, bodies: Vec<String>) -> Res
      response_mock
  }
  
@@ -19251,6 +19245,16 @@ index f22e511f65..499c087ef5 100644
  /// Mounts a sequence of responses for each POST to `/v1/responses`.
  /// Panics if more requests are received than responses provided.
  pub async fn mount_response_sequence(
+@@ -1493,7 +1578,8 @@ pub async fn mount_response_sequence(
+     };
+ 
+     let (mock, response_mock) = base_mock();
+-    mock.respond_with(responder)
++    mock.and(ExcludeLhcDerivation)
++        .respond_with(responder)
+         .up_to_n_times(num_calls as u64)
+         .expect(num_calls as u64)
+         .mount(server)
 diff --git a/codex-rs/core/tests/suite/client.rs b/codex-rs/core/tests/suite/client.rs
 index 082da177f7..50fe7ebb25 100644
 --- a/codex-rs/core/tests/suite/client.rs

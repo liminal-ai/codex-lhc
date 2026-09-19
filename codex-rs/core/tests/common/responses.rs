@@ -1080,7 +1080,6 @@ fn base_mock() -> (MockBuilder, ResponseMock) {
     let response_mock = ResponseMock::new();
     let mock = Mock::given(method("POST"))
         .and(path_regex(".*/(responses|guardian|guardian-classifier)$"))
-        .and(ExcludeLhcDerivation)
         .and(response_mock.clone());
     (mock, response_mock)
 }
@@ -1462,8 +1461,9 @@ impl Match for ExcludeLhcDerivation {
 }
 
 /// Low-priority mock for LHC derivation POSTs to `/v1/responses` only.
-/// Guardian and classifier traffic is not covered; unexpected primary calls
-/// still fail their exact-count sequence mocks.
+/// Guardian and classifier traffic is not covered. One-shot `mount_sse_once*`
+/// mocks still see compact/derivation if that is the request under test.
+/// Exact-count sequences exclude derivation so extra primary/Guardian calls fail.
 pub async fn mount_lhc_derivation_catchall(server: &MockServer) {
     let derivation = sse(vec![
         ev_response_created("lhc-derivation"),
@@ -1528,7 +1528,8 @@ where
     };
 
     let (mock, response_mock) = base_mock();
-    mock.and(matcher)
+    mock.and(ExcludeLhcDerivation)
+        .and(matcher)
         .respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
@@ -1577,7 +1578,8 @@ pub async fn mount_response_sequence(
     };
 
     let (mock, response_mock) = base_mock();
-    mock.respond_with(responder)
+    mock.and(ExcludeLhcDerivation)
+        .respond_with(responder)
         .up_to_n_times(num_calls as u64)
         .expect(num_calls as u64)
         .mount(server)
