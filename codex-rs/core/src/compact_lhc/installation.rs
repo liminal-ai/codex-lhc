@@ -242,50 +242,6 @@ pub(super) async fn install_lhc_compact_rewrite(
         }
     }
 
-    // Vanilla `/compact` replacement is user messages + summary: no pre-compact
-    // function/custom/local-shell calls. LHC full-fidelity residue otherwise
-    // keeps those call_ids in the next sampling request. Apply only to manual
-    // compact; MidTurn must keep live tool pairs. Protected ids still survive
-    // if a manual compact carries a validation spec.
-    let kept_mask: Vec<bool> = if manual {
-        let protected: std::collections::HashSet<&str> = host_validation
-            .as_ref()
-            .map(|spec| {
-                spec.protected_tool_call_ids
-                    .iter()
-                    .map(String::as_str)
-                    .collect()
-            })
-            .unwrap_or_default();
-        install_history
-            .iter()
-            .map(|item| match sampling_tool_call_id(item) {
-                Some(call_id) if !protected.contains(call_id) => false,
-                _ => true,
-            })
-            .collect()
-    } else {
-        vec![true; install_history.len()]
-    };
-    if kept_mask.iter().any(|keep| !keep) {
-        let before = install_history.len();
-        drop_materialized_items(&mut materialize_result.items, &kept_mask);
-        let mut keep = kept_mask.iter();
-        install_history.retain(|_| *keep.next().unwrap_or(&true));
-        info!(
-            target: "codex_core::compact_lhc",
-            manual,
-            body_items_before = before,
-            body_items_after = install_history.len(),
-            "LHC compact dropped unprotected pre-compact tool items from the sampling body"
-        );
-        if install_history.is_empty() {
-            return Ok(kept_prior_body_attempt(
-                "dropping pre-compact tool items emptied the body; prior body kept",
-            ));
-        }
-    }
-
     // Size is diagnostic only. Structural host-validation still runs below.
     let install_tokens = estimate_response_items_tokens(&install_history);
     info!(target: "codex_core::compact_lhc",
@@ -698,29 +654,6 @@ pub(super) async fn install_lhc_compact_rewrite(
         body: expected_body,
         marker,
     })
-}
-
-fn sampling_tool_call_id(item: &ResponseItem) -> Option<&str> {
-    match item {
-        ResponseItem::FunctionCall { call_id, .. }
-        | ResponseItem::CustomToolCall { call_id, .. }
-        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
-        ResponseItem::FunctionCallOutput { call_id, .. }
-        | ResponseItem::LocalShellCall { call_id, .. }
-        | ResponseItem::ToolSearchCall { call_id, .. }
-        | ResponseItem::ToolSearchOutput { call_id, .. } => call_id.as_deref(),
-        ResponseItem::AdditionalTools { .. }
-        | ResponseItem::Message { .. }
-        | ResponseItem::AgentMessage { .. }
-        | ResponseItem::Reasoning { .. }
-        | ResponseItem::WebSearchCall { .. }
-        | ResponseItem::ImageGenerationCall { .. }
-        | ResponseItem::Compaction { .. }
-        | ResponseItem::ContextCompaction { .. }
-        | ResponseItem::ConfigurationUpdate { .. }
-        | ResponseItem::CompactionTrigger { .. }
-        | ResponseItem::Other => None,
-    }
 }
 
 /// Apply the degrade ladder's keep mask to the materialized rollout items so
