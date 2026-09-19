@@ -10,8 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/lhc-release/check_version_identity.py"
-UPSTREAM_VERSION = "0.153.4"
-FORK_RELEASE = "0.153.4-lhc.1"
+UPSTREAM_VERSION = (ROOT / "lhc-release/VERSION").read_text(encoding="utf-8").strip()
+FORK_RELEASE = f"{UPSTREAM_VERSION}-lhc.1"
 WORKSPACE_CLI = "version.workspace = true"
 
 

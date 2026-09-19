@@ -13,6 +13,8 @@
 #   1.  grep count of LHC-HOOK sentinels in core vs EXPECTED_HOOKS below
 #   1b. scripts/check-lhc-compact-ignores.sh — exact reviewed native-routing
 #       ignore allowlist (LIM-142); drift fails
+#   1c. python3 -m unittest discover scripts/lhc-release (release helper
+#       identity/installer tests; catches VERSION drift before dispatch)
 #   2a. cargo check -p codex-core -p codex-app-server -p codex-extension-api
 #       (the crates that *carry* the hooks — not just the adapter)
 #   2a1. build the real codex CLI, run bare `codex exec`, and require a thread
@@ -98,6 +100,16 @@ fi
 if scripts/check-lhc-compact-ignores.sh; then
   :
 else
+  fail=1
+fi
+
+# ── Layer 1c: release helpers (VERSION identity, POSIX installer) ─────
+if python3 -m unittest discover scripts/lhc-release \
+    >"$lhc_log_dir/lhc-release-helpers.log" 2>&1; then
+  echo "ok release-helpers: python3 -m unittest discover scripts/lhc-release"
+else
+  echo "TRIPWIRE release-helpers: scripts/lhc-release unittest failed:"
+  tail -80 "$lhc_log_dir/lhc-release-helpers.log"
   fail=1
 fi
 
