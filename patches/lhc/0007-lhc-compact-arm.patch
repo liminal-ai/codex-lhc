@@ -17958,6 +17958,86 @@ index 1f2a4b0517..16395f203e 100644
                  code_mode_service: crate::tools::code_mode::CodeModeService::new(
                      Arc::clone(&code_mode_session_provider),
                      &config.code_mode,
+diff --git a/codex-rs/core/src/session/step_settings.rs b/codex-rs/core/src/session/step_settings.rs
+index 87d8d1d10e..07b34b8642 100644
+--- a/codex-rs/core/src/session/step_settings.rs
++++ b/codex-rs/core/src/session/step_settings.rs
+@@ -14,6 +14,7 @@ use codex_protocol::config_types::ReasoningSummary;
+ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
+ use codex_protocol::config_types::ServiceTier;
+ use codex_protocol::openai_models::ModelInfo;
++use codex_protocol::openai_models::ModelsResponse;
+ use codex_protocol::openai_models::ReasoningEffort;
+ use codex_protocol::protocol::AskForApproval;
+ use std::sync::Arc;
+@@ -189,6 +190,9 @@ pub(crate) struct ModelInfoOverrides {
+     pub(crate) auto_compact_token_limit: Option<i64>,
+     pub(crate) tool_output_token_limit: Option<usize>,
+     pub(crate) base_instructions: Option<String>,
++    /// Operator/test `config.model_catalog` must survive turn-context re-resolve.
++    /// Dropping it lets the bundled 370k overlay lift a smaller catalog window.
++    pub(crate) model_catalog: Option<ModelsResponse>,
+ }
+ 
+ impl From<ModelsManagerConfig> for ModelInfoOverrides {
+@@ -198,6 +202,7 @@ impl From<ModelsManagerConfig> for ModelInfoOverrides {
+             auto_compact_token_limit: config.model_auto_compact_token_limit,
+             tool_output_token_limit: config.tool_output_token_limit,
+             base_instructions: config.base_instructions,
++            model_catalog: config.model_catalog,
+         }
+     }
+ }
+@@ -215,8 +220,7 @@ impl ModelInfoOverrides {
+             base_instructions: self.base_instructions.clone(),
+             personality,
+             personality_enabled,
+-            // The models manager already owns its catalog.
+-            model_catalog: None,
++            model_catalog: self.model_catalog.clone(),
+         }
+     }
+ }
+diff --git a/codex-rs/core/src/session/step_settings_tests.rs b/codex-rs/core/src/session/step_settings_tests.rs
+index ba04038947..b79c41d2d6 100644
+--- a/codex-rs/core/src/session/step_settings_tests.rs
++++ b/codex-rs/core/src/session/step_settings_tests.rs
+@@ -507,3 +507,35 @@ async fn model_resolution_preserves_startup_overrides_and_instruction_provenance
+         );
+     }
+ }
++
++#[tokio::test]
++async fn step_overrides_preserve_configured_catalog_windows() {
++    let slug = "gpt-5.6-luna";
++    let mut luna = model_info_from_slug(slug);
++    luna.context_window = Some(20_000);
++    luna.max_context_window = Some(20_000);
++    luna.auto_compact_token_limit = None;
++    let catalog = ModelsResponse { models: vec![luna] };
++    let models_manager = StaticModelsManager::new(/*auth_manager*/ None, catalog.clone());
++    let mut config = test_config().await;
++    config.model = Some(slug.to_string());
++    config.model_catalog = Some(catalog);
++    let overrides = ModelInfoOverrides::from(config.to_models_manager_config());
++    let mut settings = configured_settings();
++    settings.collaboration_mode = settings.collaboration_mode.with_updates(
++        Some(slug.to_string()),
++        /*effort*/ None,
++        /*developer_instructions*/ None,
++    );
++
++    let resolved = settings
++        .resolve_model_info(
++            &models_manager,
++            &overrides,
++            /*personality_enabled*/ false,
++        )
++        .await;
++    assert_eq!(resolved.context_window, Some(20_000));
++    assert_eq!(resolved.max_context_window, Some(20_000));
++    assert_eq!(resolved.auto_compact_token_limit, None);
++}
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
 index aa828752a3..41922e1a23 100644
 --- a/codex-rs/core/src/session/tests.rs

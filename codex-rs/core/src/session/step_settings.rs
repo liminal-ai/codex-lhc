@@ -14,6 +14,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ModelInfo;
+use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use std::sync::Arc;
@@ -189,6 +190,9 @@ pub(crate) struct ModelInfoOverrides {
     pub(crate) auto_compact_token_limit: Option<i64>,
     pub(crate) tool_output_token_limit: Option<usize>,
     pub(crate) base_instructions: Option<String>,
+    /// Operator/test `config.model_catalog` must survive turn-context re-resolve.
+    /// Dropping it lets the bundled 370k overlay lift a smaller catalog window.
+    pub(crate) model_catalog: Option<ModelsResponse>,
 }
 
 impl From<ModelsManagerConfig> for ModelInfoOverrides {
@@ -198,6 +202,7 @@ impl From<ModelsManagerConfig> for ModelInfoOverrides {
             auto_compact_token_limit: config.model_auto_compact_token_limit,
             tool_output_token_limit: config.tool_output_token_limit,
             base_instructions: config.base_instructions,
+            model_catalog: config.model_catalog,
         }
     }
 }
@@ -215,8 +220,7 @@ impl ModelInfoOverrides {
             base_instructions: self.base_instructions.clone(),
             personality,
             personality_enabled,
-            // The models manager already owns its catalog.
-            model_catalog: None,
+            model_catalog: self.model_catalog.clone(),
         }
     }
 }

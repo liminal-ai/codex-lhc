@@ -107,6 +107,8 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/code_mode.rs \
   codex-rs/core/src/session/turn.rs \
   codex-rs/core/src/session/session.rs \
+  codex-rs/core/src/session/step_settings.rs \
+  codex-rs/core/src/session/step_settings_tests.rs \
   codex-rs/core/src/session/tests.rs \
   codex-rs/core/src/session/input_queue.rs \
   codex-rs/core/src/session/lhc_band_shape_eval_tests.rs \
