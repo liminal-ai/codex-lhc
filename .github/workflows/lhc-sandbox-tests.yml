@@ -1,0 +1,112 @@
+name: LHC sandbox tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lhc-sandbox-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sandbox:
+    name: 60 sandbox tests (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: codex-rs
+    env:
+      RUST_MIN_STACK: "8388608"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Checkout product source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Print and relax runner userns (VM only)
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          key=kernel.apparmor_restrict_unprivileged_userns
+          if [ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            current=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)
+          else
+            current=$(sysctl -n "$key" 2>/dev/null || echo missing)
+          fi
+          echo "$key=$current"
+          if [ "$current" = "1" ]; then
+            sudo sysctl -w "$key=0"
+            echo "relaxed $key 1 -> 0 on runner VM"
+          else
+            echo "no sysctl write; current=$current"
+          fi
+
+      - uses: ./.github/actions/setup-ci
+
+      - name: Install Linux sandbox packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev bubblewrap
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
+
+      - name: Build linux sandbox helper
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p codex-linux-sandbox --bin codex-linux-sandbox
+
+      - name: Verify reviewed 60-name filter
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/check-lhc-sandbox-tests.sh scripts/lhc-sandbox-filter.sh
+          LHC_SANDBOX_LIST_ONLY=1 ./scripts/check-lhc-sandbox-tests.sh
+          ./scripts/check-lhc-sandbox-tests.sh
+
+      - name: Run 60 sandbox tests
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/lhc-sandbox"
+          log="${RUNNER_TEMP}/lhc-sandbox/sandbox-60.log"
+          filter=$(./scripts/lhc-sandbox-filter.sh)
+          set +e
+          (
+            cd codex-rs
+            cargo nextest run \
+              --no-fail-fast \
+              --retries 0 \
+              -p codex-core \
+              -p codex-app-server \
+              -p codex-cli \
+              -E "$filter"
+          ) 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          echo "SANDBOX_60_EXIT:$status" | tee -a "$log"
+          exit "$status"
+
+      - name: Upload sandbox log
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: lhc-sandbox-60-log
+          path: ${{ runner.temp }}/lhc-sandbox/sandbox-60.log
+          if-no-files-found: warn

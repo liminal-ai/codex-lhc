@@ -482,6 +482,23 @@ The class-3 set is exact: `scripts/lhc-native-routing-ignored-tests.txt` (`# cou
 
 Fork-owned surface = codex-lhc-host + the fork's own tests + upstream tests that do not assert native compaction.
 
+## Sandbox gate (bwrap / userns)
+
+Linux sandbox tests need unprivileged user namespaces. Do **not** change
+`kernel.apparmor_restrict_unprivileged_userns` on a shared build host.
+
+The reusable gate is dispatch-only `.github/workflows/lhc-sandbox-tests.yml`
+(`ubuntu-24.04`, same checkout / `setup-ci` / `dtolnay/rust-toolchain` 1.95.0 /
+`taiki-e/install-action` nextest pins as `rust-ci`). On the runner VM it prints
+`kernel.apparmor_restrict_unprivileged_userns` and runs `sudo sysctl -w …=0`
+only when the current value is `1`. It then runs `cargo nextest` with
+`--retries 0` on the exact 60 names in `scripts/lhc-sandbox-tests.tsv`
+(`scripts/check-lhc-sandbox-tests.sh` fails on missing or extra selected
+tests) and uploads the log even on failure.
+
+Do not invoke that workflow by pushing from a writer seat. Reed dispatches
+after reviewing branch+SHA.
+
 ## Compact-continuation MidTurn (LIM-63B)
 
 At `CompactionPhase::MidTurn` (post-sampling seam: provider response complete,
