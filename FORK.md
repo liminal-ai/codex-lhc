@@ -262,7 +262,15 @@ Failure before the final rename leaves `P` untouched and authoritative —
 loud `tracing::error`, session continues, next compact retries. **No append
 fallback path.** In-memory history installed at compact equals
 `Compacted.replacement_history` (bands) + post-boundary native
-`ResponseItem`s — the same split resume rebuilds from the rewritten file.
+`ResponseItem`s + grafted MidTurn protected tool pairs — the same split
+resume rebuilds from the rewritten file. Blanket post-hoc pruning of
+native-tail tool items is not accepted. Native-shape tests that forbid
+pre-compact `call_id`s in the next sampling input may enter LIM-142 only
+when evidence places those items in retained tail, with that exact reason.
+
+Guardian image admission remains the vanilla per-item 10k cap (no extra
+reservation). Operator `model_catalog` windows must survive turn-context
+re-resolve (`ModelInfoOverrides` carries the catalog).
 
 Implementation: pure swap in `codex-lhc-host::rollout_swap`; materializer
 wiring in `core/src/compact_lhc/installation.rs`; reopen on `RolloutRecorder` +
