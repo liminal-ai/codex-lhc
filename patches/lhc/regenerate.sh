@@ -168,6 +168,8 @@ regen 0008-release-identity-update-wiring.patch \
   codex-rs/tui/src/updates_cache.rs \
   codex-rs/tui/src/updates_cache_tests.rs \
   codex-rs/tui/src/app/exit_summary.rs \
+  codex-rs/tui/src/app/tests/realtime_requests.rs \
+  codex-rs/tui/src/status/tests.rs \
   codex-rs/tui/src/history_cell/mod.rs \
   codex-rs/tui/src/history_cell/notices.rs \
   codex-rs/tui/src/history_cell/tests.rs \
