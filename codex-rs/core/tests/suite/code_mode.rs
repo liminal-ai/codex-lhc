@@ -25,6 +25,8 @@ use codex_extension_api::ToolLifecycleFuture;
 use codex_extension_api::ToolStartInput;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
+use codex_history::RolloutItem;
+use codex_lhc_host::CompactMarker;
 use codex_lhc_host::LhcCaptureSlot;
 use codex_lhc_host::estimate_response_items_tokens;
 use codex_lhc_host::history_from_materialized_items;
@@ -382,6 +384,19 @@ fn applicable_sampling_body_budget(config: &Config) -> i64 {
         .expect("test model must have an auto-compact or context-window budget")
 }
 
+fn compact_marker_from_rollout(items: &[RolloutItem]) -> CompactMarker {
+    items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            RolloutItem::Compacted(compacted) => {
+                CompactMarker::parse_durable_writeback_record(&compacted.message)
+            }
+            _ => None,
+        })
+        .expect("compacted rollout must carry durable CompactMarker")
+}
+
 /// Waitability/completeness compact proof: actual nonempty-band fold, plus
 /// full materialized sampling body (bands + native tail + graft) against the
 /// configured auto-compact / context-window budget. Band stored_tokens alone
@@ -407,19 +422,23 @@ async fn assert_nonempty_band_fold_and_sampling_body_fits_budget(
         .rollout_path()
         .expect("rollout path after compact");
     let rollout_items = parse_rollout_items(&rollout_path).expect("parse compacted rollout");
+    let marker = compact_marker_from_rollout(&rollout_items);
     let sampling_body = history_from_materialized_items(&rollout_items);
     let sampling_tokens = estimate_response_items_tokens(&sampling_body);
+    let band_tokens: i64 = view.bands.iter().map(|band| band.stored_tokens).sum();
     let budget = applicable_sampling_body_budget(&test.config);
     if std::env::var_os("LHC_WAIT_TRACE").is_some()
         || std::env::var_os("LHC_WAIT_TRACE_DIR").is_some()
     {
         eprintln!(
-            "lhc fold-probe label={probe_label} view_id={} compact_point={} covered_from={} lower_bound={} bands={} sampling_items={} sampling_tokens={sampling_tokens} budget={budget}",
+            "lhc fold-probe label={probe_label} view_id={} compact_point={} covered_from={} lower_bound={} bands={} band_tokens={band_tokens} receipt_total_tokens={} receipt_tail_tokens={} sampling_items={} sampling_tokens={sampling_tokens} budget={budget}",
             view.view_id,
             view.compact_point,
             view.covered_from,
             view.config.lower_bound,
             view.bands.len(),
+            marker.total_tokens,
+            marker.tail_tokens,
             sampling_body.len()
         );
         for (index, band) in view.bands.iter().enumerate() {
@@ -446,10 +465,14 @@ async fn assert_nonempty_band_fold_and_sampling_body_fits_budget(
                 serde_json::to_string_pretty(&serde_json::json!({
                     "sampling_items": sampling_body.len(),
                     "sampling_tokens": sampling_tokens,
+                    "receipt_total_tokens": marker.total_tokens,
+                    "receipt_tail_tokens": marker.tail_tokens,
+                    "band_tokens": band_tokens,
                     "budget": budget,
                     "compact_point": view.compact_point,
                     "bands": view.bands.len(),
                     "lower_bound": view.config.lower_bound,
+                    "lower_bound_is_target_not_cap": true,
                 }))
                 .expect("serialize sampling account"),
             );
@@ -462,9 +485,22 @@ async fn assert_nonempty_band_fold_and_sampling_body_fits_budget(
         view.bands.len(),
         view.config.lower_bound
     );
+    assert_eq!(
+        marker.total_tokens,
+        band_tokens + marker.tail_tokens,
+        "CompactMarker total_tokens is bands+tail, not bands alone: total={} tail={} band_tokens={band_tokens}",
+        marker.total_tokens,
+        marker.tail_tokens
+    );
+    // SDK lower_bound is the compact target, not the total installed-body cap.
+    assert!(
+        marker.total_tokens <= budget,
+        "receipt total_tokens (bands+tail) {} must fit configured total budget {budget}",
+        marker.total_tokens
+    );
     assert!(
         sampling_tokens <= budget,
-        "full sampling body (bands+tail+graft) {sampling_tokens} must fit configured budget {budget}"
+        "full sampling body (bands+tail+graft) {sampling_tokens} must fit configured total budget {budget}"
     );
 }
 
