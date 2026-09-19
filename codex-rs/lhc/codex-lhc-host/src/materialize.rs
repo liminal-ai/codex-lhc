@@ -56,6 +56,7 @@
 
 use crate::host_turn_ids::display_turn_id;
 use crate::host_turn_ids::host_turn_id_map;
+use crate::host_turn_ids::is_synthetic_lhc_turn_id;
 use crate::mapping::ModelIdentity;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -123,7 +124,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "AdditionalTools / Compaction / ContextCompaction: runtime_note stored text only; CompactionTrigger never captured",
     "Legacy image markers and InputAudio remain text; schema-13 user/tool images restore from full blocks, compressed or missing images remain placeholders",
     "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage; usage on rolled-back turns is excluded from the projected cumulative (those turns are out of the tail)",
-    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID when a closing turn_end key, the live compact-arm host turn, or a 1:1 remaining prior TurnStarted UUID maps the SDK t{n} label (F2); otherwise the synthetic label is kept (prefer unknown over wrong)",
+    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID only from a closing turn_end key or the capture-bound live turn (F2); otherwise the synthetic label is kept and rewrite warns (proven binding or unknown)",
     "TurnAbortReason enum: coarse map from outcome_reason string; unknown → Interrupted",
     "ThreadSettingsApplied / ThreadGoalUpdated: not in LHC → carry-forward only",
     "ThreadRolledBack: applied by excluding dropped user turns from the regenerated tail via positional alignment of prior post-boundary user segments to LHC user-prompt turns (no marker emitted). Alignment mismatch falls back to under-exclusion (exclude nothing) with a gap_notes entry — never text-set membership, which over-excludes duplicate prompts. Rolled-back content already compressed into bands remains until the LHC rollback-capture batch lands",
@@ -243,10 +244,17 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     let host_ids = host_turn_id_map(
         input.turns,
         input.events,
-        input.prior_generation,
         input.current_host_turn_id,
         input.current_lhc_turn_id,
     );
+    for turn in input.turns {
+        if is_synthetic_lhc_turn_id(&turn.turn_id) && !host_ids.contains_key(&turn.turn_id) {
+            tracing::warn!(
+                lhc_turn_id = %turn.turn_id,
+                "LHC rewrite leaving synthetic turn id unmapped"
+            );
+        }
+    }
     let (rolled_back_turns, mut gap_notes) =
         rolled_back_turn_ids(input.prior_generation, input.messages, input.turns);
     let mut refusals: Vec<String> = Vec::new();
