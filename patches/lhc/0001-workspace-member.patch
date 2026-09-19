@@ -134,10 +134,10 @@ index ccb1be9717..54eff090ef 100644
                      RestartMode::Always,
                      /*info*/ None,
 diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
-index b7b57f7f68..f0a6f87fe1 100644
+index b7b57f7f68..e2d4c7a7b8 100644
 --- a/codex-rs/app-server-daemon/src/managed_install.rs
 +++ b/codex-rs/app-server-daemon/src/managed_install.rs
-@@ -91,6 +91,58 @@ pub(crate) async fn supports_daemon_update_loop(codex_bin: &Path) -> bool {
+@@ -91,6 +91,57 @@ pub(crate) async fn supports_daemon_update_loop(codex_bin: &Path) -> bool {
      .is_ok_and(|result| result.is_ok_and(|status| status.success()))
  }
  
@@ -192,7 +192,6 @@ index b7b57f7f68..f0a6f87fe1 100644
 +    Ok(())
 +}
 +
-+#[cfg(unix)]
  pub(crate) async fn resolved_managed_codex_bin(codex_bin: &Path) -> Result<PathBuf> {
      fs::canonicalize(codex_bin).await.with_context(|| {
          format!(

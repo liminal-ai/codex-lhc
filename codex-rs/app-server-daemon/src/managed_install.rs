@@ -142,7 +142,6 @@ pub(crate) fn seed_managed_codex_from_running_fork(managed_codex_bin: &Path) -> 
     Ok(())
 }
 
-#[cfg(unix)]
 pub(crate) async fn resolved_managed_codex_bin(codex_bin: &Path) -> Result<PathBuf> {
     fs::canonicalize(codex_bin).await.with_context(|| {
         format!(
