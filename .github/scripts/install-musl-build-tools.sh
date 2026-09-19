@@ -285,6 +285,12 @@ if [[ "${TARGET}" == "aarch64-unknown-linux-musl" ]]; then
   # BoringSSL enables -Wframe-larger-than=25344 under clang and treats warnings as errors.
   cflags="${cflags} -Wno-error=frame-larger-than"
   cxxflags="${cxxflags} -Wno-error=frame-larger-than"
+  # ubuntu-24.04-arm musl-gcc links host glibc libgcc.a. Outline LSE init
+  # (lse-init.o) references a glibc-only symbol, so jemalloc's C11/__atomic
+  # configure probes fail at link. Keep lse-init.o out of every C object.
+  # rustc uses compiler-builtins and is unaffected.
+  cflags="${cflags} -mno-outline-atomics"
+  cxxflags="${cxxflags} -mno-outline-atomics"
 fi
 
 # Compile through the selected target compiler before exporting it. -idirafter
