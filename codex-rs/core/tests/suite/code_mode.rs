@@ -26,8 +26,11 @@ use codex_extension_api::ToolStartInput;
 use codex_features::CurrentTimeSource;
 use codex_features::Feature;
 use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::estimate_response_items_tokens;
+use codex_lhc_host::history_from_materialized_items;
 use codex_lhc_host::inspect_installed_view;
 use codex_lhc_host::install_with_root;
+use codex_lhc_host::parse_rollout_items;
 use codex_lhc_host::test_compact_opts;
 use codex_lhc_host::wait_for_handle;
 use codex_login::CodexAuth;
@@ -364,10 +367,29 @@ async fn assert_new_lhc_compact_event(test: &TestCodex, before: Option<(String, 
     }
 }
 
-/// Waitability/completeness compact proof: actual nonempty-band fold, and
-/// installed stored_tokens fit the configured lower_bound. Point-0 empty
-/// bands are subthreshold and are not this proof.
-async fn assert_nonempty_band_fold_fits_bound(test: &TestCodex, probe_label: &str) {
+fn applicable_sampling_body_budget(config: &Config) -> i64 {
+    let catalog_model = config.model.as_deref().and_then(|slug| {
+        config
+            .model_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.models.iter().find(|model| model.slug == slug))
+    });
+    config
+        .model_auto_compact_token_limit
+        .or_else(|| catalog_model.and_then(|model| model.auto_compact_token_limit()))
+        .or(config.model_context_window)
+        .or_else(|| catalog_model.and_then(|model| model.context_window))
+        .expect("test model must have an auto-compact or context-window budget")
+}
+
+/// Waitability/completeness compact proof: actual nonempty-band fold, plus
+/// full materialized sampling body (bands + native tail + graft) against the
+/// configured auto-compact / context-window budget. Band stored_tokens alone
+/// are not that full-body proof. Point-0 empty bands are subthreshold.
+async fn assert_nonempty_band_fold_and_sampling_body_fits_budget(
+    test: &TestCodex,
+    probe_label: &str,
+) {
     let slot = test
         .codex
         .thread_extension_data()
@@ -380,28 +402,56 @@ async fn assert_nonempty_band_fold_fits_bound(test: &TestCodex, probe_label: &st
         .await
         .expect("inspect installed view")
         .expect("installed view after compact");
-    let installed: i64 = view.bands.iter().map(|band| band.stored_tokens).sum();
+    let rollout_path = test
+        .codex
+        .rollout_path()
+        .expect("rollout path after compact");
+    let rollout_items = parse_rollout_items(&rollout_path).expect("parse compacted rollout");
+    let sampling_body = history_from_materialized_items(&rollout_items);
+    let sampling_tokens = estimate_response_items_tokens(&sampling_body);
+    let budget = applicable_sampling_body_budget(&test.config);
     if std::env::var_os("LHC_WAIT_TRACE").is_some()
         || std::env::var_os("LHC_WAIT_TRACE_DIR").is_some()
     {
         eprintln!(
-            "lhc fold-probe label={probe_label} view_id={} compact_point={} covered_from={} lower_bound={} installed_stored_tokens={installed} bands={}",
+            "lhc fold-probe label={probe_label} view_id={} compact_point={} covered_from={} lower_bound={} bands={} sampling_items={} sampling_tokens={sampling_tokens} budget={budget}",
             view.view_id,
             view.compact_point,
             view.covered_from,
             view.config.lower_bound,
-            view.bands.len()
+            view.bands.len(),
+            sampling_body.len()
         );
         for (index, band) in view.bands.iter().enumerate() {
             eprintln!(
-                "lhc fold-probe label={probe_label} band[{index}] stored_tokens={} band={:?}",
+                "lhc fold-probe label={probe_label} band[{index}] stored_tokens={} band={:?} (band target only; not full sampling body)",
                 band.stored_tokens, band.band
             );
         }
+        for (index, item) in sampling_body.iter().enumerate() {
+            eprintln!("lhc fold-probe label={probe_label} sampling[{index}] {item:?}");
+        }
         if let Ok(dir) = std::env::var("LHC_WAIT_TRACE_DIR") {
+            let dir = PathBuf::from(dir);
             let _ = fs::write(
-                PathBuf::from(&dir).join(format!("{probe_label}-fold-view.json")),
+                dir.join(format!("{probe_label}-fold-view.json")),
                 serde_json::to_string_pretty(&view).expect("serialize installed view"),
+            );
+            let _ = fs::write(
+                dir.join(format!("{probe_label}-sampling-body.json")),
+                serde_json::to_string_pretty(&sampling_body).expect("serialize sampling body"),
+            );
+            let _ = fs::write(
+                dir.join(format!("{probe_label}-sampling-account.json")),
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "sampling_items": sampling_body.len(),
+                    "sampling_tokens": sampling_tokens,
+                    "budget": budget,
+                    "compact_point": view.compact_point,
+                    "bands": view.bands.len(),
+                    "lower_bound": view.config.lower_bound,
+                }))
+                .expect("serialize sampling account"),
             );
         }
     }
@@ -413,9 +463,8 @@ async fn assert_nonempty_band_fold_fits_bound(test: &TestCodex, probe_label: &st
         view.config.lower_bound
     );
     assert!(
-        (installed as f64) <= view.config.lower_bound,
-        "installed size {installed} must fit configured bound {}",
-        view.config.lower_bound
+        sampling_tokens <= budget,
+        "full sampling body (bands+tail+graft) {sampling_tokens} must fit configured budget {budget}"
     );
 }
 
@@ -1522,7 +1571,11 @@ await new Promise(() => {});
             })
             .await;
             assert_new_lhc_compact_event(&test, before_compact).await;
-            assert_nonempty_band_fold_fits_bound(&test, "completeness-oversized").await;
+            assert_nonempty_band_fold_and_sampling_body_fits_budget(
+                &test,
+                "completeness-oversized",
+            )
+            .await;
 
             let wait = responses::mount_function_call_agent_response(
                 &server,
@@ -1649,7 +1702,7 @@ async fn code_mode_wait_id_stays_known_after_compaction(
     })
     .await;
     assert_new_lhc_compact_event(&test, before_compact).await;
-    assert_nonempty_band_fold_fits_bound(&test, terminal_call_id).await;
+    assert_nonempty_band_fold_and_sampling_body_fits_budget(&test, terminal_call_id).await;
 
     let terminal = responses::mount_function_call_agent_response(
         &server,
