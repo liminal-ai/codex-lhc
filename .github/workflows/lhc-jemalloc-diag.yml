@@ -1,6 +1,5 @@
-# Dispatch-only: compare jemalloc musl configure on ubuntu-24.04-arm.
-# Attempt A = lhc-release.yml musl tools + CFLAGS. Attempt B = apt musl-tools
-# and CC=musl-gcc with no CFLAGS. No product build. Reed dispatches.
+# Dispatch-only: jemalloc musl configure on ubuntu-24.04-arm, plus a fast
+# Windows cargo check of codex-app-server-daemon. Reed dispatches.
 name: LHC jemalloc musl diag
 
 on:
@@ -14,7 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET: aarch64-unknown-linux-musl
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
@@ -23,6 +21,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     continue-on-error: true
+    env:
+      TARGET: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -121,6 +121,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 90
     continue-on-error: true
+    env:
+      TARGET: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -187,3 +189,33 @@ jobs:
           name: jemalloc-diag-attempt-b
           path: ${{ runner.temp }}/jemalloc-b/
           if-no-files-found: warn
+
+  windows-daemon-check:
+    name: cargo check app-server-daemon (windows-x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 1
+      - name: Configure Windows build paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $targetDir = Join-Path $env:RUNNER_TEMP "codex-target"
+          New-Item $targetDir -ItemType Directory -Force | Out-Null
+          "CARGO_TARGET_DIR=$targetDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: ./.github/actions/setup-msvc-env
+        with:
+          target: x86_64-pc-windows-msvc
+      - name: cargo check -p codex-app-server-daemon
+        working-directory: codex-rs
+        shell: bash
+        run: cargo check -p codex-app-server-daemon --target x86_64-pc-windows-msvc
