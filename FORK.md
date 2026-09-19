@@ -488,13 +488,14 @@ Linux sandbox tests need unprivileged user namespaces. Do **not** change
 `kernel.apparmor_restrict_unprivileged_userns` on a shared build host.
 
 The reusable gate is dispatch-only `.github/workflows/lhc-sandbox-tests.yml`
-(`ubuntu-24.04`, same checkout / `setup-ci` / `dtolnay/rust-toolchain` 1.95.0 /
-`taiki-e/install-action` nextest pins as `rust-ci`). On the runner VM it prints
+(`ubuntu-24.04`, `dtolnay/rust-toolchain` 1.95.0 and `taiki-e/install-action`
+nextest 0.9.103 as in `rust-ci`; it does **not** call `setup-ci`, which would
+unconditionally write AppArmor 0). On the runner VM it prints
 `kernel.apparmor_restrict_unprivileged_userns` and runs `sudo sysctl -w …=0`
-only when the current value is `1`. It then runs `cargo nextest` with
-`--retries 0` on the exact 60 names in `scripts/lhc-sandbox-tests.tsv`
-(`scripts/check-lhc-sandbox-tests.sh` fails on missing or extra selected
-tests) and uploads the log even on failure.
+only when the current value is `1`. `cargo nextest list` is JSON identity
+compare of binary-id + test name against `scripts/lhc-sandbox-tests.tsv`
+(no `--retries` on list). `cargo nextest run` uses `--retries 0`. Verifier,
+build, and run logs upload even when the run step never starts.
 
 Do not invoke that workflow by pushing from a writer seat. Reed dispatches
 after reviewing branch+SHA.

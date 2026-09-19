@@ -1,7 +1,7 @@
 #!/bin/sh
 # Verify the reviewed sandbox gate list: exactly 60 unique binary/name pairs,
-# and (when cargo nextest can list) that the selected set matches with no
-# missing or extra tests.
+# and (when cargo nextest can list) that JSON identities match with no
+# missing or extra tests. Do not pass --retries to `nextest list`.
 set -eu
 ROOT=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 LIST="$ROOT/scripts/lhc-sandbox-tests.tsv"
@@ -53,58 +53,67 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 0
 fi
 
-filter=$(printf '%s\n' "$data" | awk -F '\t' '
-  {
-    gsub(/"/, "\\\"", $1)
-    gsub(/"/, "\\\"", $2)
-    term = "(binary(\"" $1 "\") & test(=\"" $2 "\"))"
-    if (NR == 1) out = term
-    else out = out " + " term
-  }
-  END { print out }
-')
-
+filter=$("$ROOT/scripts/lhc-sandbox-filter.sh")
+json_out=${LHC_SANDBOX_LIST_JSON:-}
 cd "$ROOT/codex-rs"
-listed=$(
-  cargo nextest list \
-    -p codex-core \
-    -p codex-app-server \
-    -p codex-cli \
-    --retries 0 \
-    -E "$filter"
-)
-
-selected=$(printf '%s\n' "$listed" | awk '
-  /^[^[:space:]].*:$/ { next }
-  /^[[:space:]]+/ {
-    sub(/^[[:space:]]+/, "")
-    if ($0 != "") print
-  }
-' | sort)
-
-expected_names=$(printf '%s\n' "$data" | awk -F '\t' '{print $2}' | sort)
-selected_count=$(printf '%s\n' "$selected" | grep -c . || true)
-if [ "$selected_count" != "$EXPECTED" ]; then
-  echo "nextest selected $selected_count tests, expected $EXPECTED" >&2
-  echo "--- expected ---" >&2
-  printf '%s\n' "$expected_names" >&2
-  echo "--- selected ---" >&2
-  printf '%s\n' "$selected" >&2
-  exit 1
+list_tmp=$(mktemp)
+trap 'rm -f "$list_tmp"' EXIT
+# nextest list rejects --retries; identity compare uses JSON binary-id + test name.
+set +e
+cargo nextest list \
+  -p codex-core \
+  -p codex-app-server \
+  -p codex-cli \
+  --message-format json \
+  -E "$filter" >"$list_tmp"
+list_status=$?
+set -e
+if [ -n "$json_out" ]; then
+  cp "$list_tmp" "$json_out"
+fi
+if [ "$list_status" != "0" ]; then
+  echo "cargo nextest list failed with status $list_status" >&2
+  exit "$list_status"
 fi
 
-exp_tmp=$(mktemp)
-got_tmp=$(mktemp)
-trap 'rm -f "$exp_tmp" "$got_tmp"' EXIT
-printf '%s\n' "$expected_names" >"$exp_tmp"
-printf '%s\n' "$selected" >"$got_tmp"
-missing=$(comm -23 "$exp_tmp" "$got_tmp" || true)
-extra=$(comm -13 "$exp_tmp" "$got_tmp" || true)
-if [ -n "$missing" ] || [ -n "$extra" ]; then
-  echo "sandbox filter set mismatch" >&2
-  [ -n "$missing" ] && printf 'missing:\n%s\n' "$missing" >&2
-  [ -n "$extra" ] && printf 'extra:\n%s\n' "$extra" >&2
-  exit 1
-fi
+EXPECTED_TSV="$data" python3 - "$list_tmp" "$EXPECTED" <<'PY'
+import json
+import os
+import sys
 
-echo "ok sandbox-filter: $EXPECTED nextest identities match"
+list_path = sys.argv[1]
+expected_n = int(sys.argv[2])
+payload = json.load(open(list_path, encoding="utf-8"))
+suites = payload.get("rust-suites") or {}
+got = set()
+for suite in suites.values():
+    binary = suite.get("binary-id")
+    if not binary:
+        print("list JSON suite missing binary-id", file=sys.stderr)
+        sys.exit(1)
+    for name, meta in (suite.get("testcases") or {}).items():
+        match = (meta or {}).get("filter-match") or {}
+        if match.get("status") != "matches":
+            continue
+        got.add(f"{binary}\t{name}")
+
+expected = {line for line in os.environ["EXPECTED_TSV"].splitlines() if line}
+if len(expected) != expected_n:
+    print(f"internal expected set {len(expected)} != {expected_n}", file=sys.stderr)
+    sys.exit(1)
+missing = sorted(expected - got)
+extra = sorted(got - expected)
+if missing or extra or len(got) != expected_n:
+    print(
+        f"sandbox JSON identity mismatch: listed {len(got)}, expected {expected_n}",
+        file=sys.stderr,
+    )
+    if missing:
+        print("missing:", file=sys.stderr)
+        print("\n".join(missing), file=sys.stderr)
+    if extra:
+        print("extra:", file=sys.stderr)
+        print("\n".join(extra), file=sys.stderr)
+    sys.exit(1)
+print(f"ok sandbox-filter: {expected_n} nextest binary/name identities match")
+PY
