@@ -1,0 +1,189 @@
+# Dispatch-only: compare jemalloc musl configure on ubuntu-24.04-arm.
+# Attempt A = lhc-release.yml musl tools + CFLAGS. Attempt B = apt musl-tools
+# and CC=musl-gcc with no CFLAGS. No product build. Reed dispatches.
+name: LHC jemalloc musl diag
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lhc-jemalloc-diag-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET: aarch64-unknown-linux-musl
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  attempt-a:
+    name: Attempt A (install-musl-build-tools.sh)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install musl build tools
+        run: bash "${GITHUB_WORKSPACE}/.github/scripts/install-musl-build-tools.sh"
+      - name: Normalize accepted a25 GCC frame warning option
+        shell: bash
+        run: |
+          set -euo pipefail
+          invalid_option=-Wno-error=frame-larger-than
+          corrected_option=-Wno-error=frame-larger-than=
+          normalize_flags() {
+            local input="$1"
+            local flag output="" replacements=0
+            local -a flags
+            read -r -a flags <<< "$input"
+            for flag in "${flags[@]}"; do
+              if [[ "$flag" == "$invalid_option" ]]; then
+                flag="$corrected_option"
+                replacements=$((replacements + 1))
+              fi
+              output="${output:+${output} }${flag}"
+            done
+            test "$replacements" -eq 1 || {
+              echo "expected exactly one standalone $invalid_option" >&2
+              exit 1
+            }
+            NORMALIZED_FLAGS="$output"
+          }
+          normalize_flags "$CFLAGS"
+          corrected_cflags="$NORMALIZED_FLAGS"
+          normalize_flags "$CXXFLAGS"
+          corrected_cxxflags="$NORMALIZED_FLAGS"
+          case " $corrected_cflags " in *" $invalid_option "*) exit 1 ;; esac
+          case " $corrected_cxxflags " in *" $invalid_option "*) exit 1 ;; esac
+          printf '%s\n' 'int codex_frame_option_probe(void) { return 0; }' | \
+            "$CC" "$corrected_option" -x c -c \
+              -o "${RUNNER_TEMP}/frame-option-probe.o" -
+          printf 'CFLAGS=%s\nCXXFLAGS=%s\n' \
+            "$corrected_cflags" "$corrected_cxxflags" >> "$GITHUB_ENV"
+      - name: Attempt A cargo build tikv-jemalloc-sys
+        id: build
+        continue-on-error: true
+        shell: bash
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          target_dir="${RUNNER_TEMP}/jemalloc-a-target"
+          mkdir -p "${RUNNER_TEMP}/jemalloc-a" "$target_dir"
+          export CARGO_TARGET_DIR="$target_dir"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          {
+            echo "CC=${CC:-}"
+            echo "CFLAGS=${CFLAGS:-}"
+            echo "CXXFLAGS=${CXXFLAGS:-}"
+            echo "TARGET=${TARGET:-}"
+          } | tee "${RUNNER_TEMP}/jemalloc-a/env.txt"
+          set +e
+          cargo build -p tikv-jemalloc-sys --target aarch64-unknown-linux-musl --release \
+            >"${RUNNER_TEMP}/jemalloc-a/cargo.log" 2>&1
+          status=$?
+          set -e
+          echo "cargo_exit=$status" | tee -a "${RUNNER_TEMP}/jemalloc-a/env.txt"
+          exit "$status"
+      - name: Collect jemalloc config.log
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/jemalloc-a"
+          mkdir -p "$dest"
+          n=0
+          if [ -d "${CARGO_TARGET_DIR:-}" ]; then
+            while IFS= read -r -d '' f; do
+              n=$((n + 1))
+              cp "$f" "$dest/config-${n}.log"
+              echo "$f" >> "$dest/config-log-paths.txt"
+            done < <(find "$CARGO_TARGET_DIR" -name config.log -print0 2>/dev/null || true)
+          fi
+          echo "config_log_count=$n" | tee -a "$dest/env.txt"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: jemalloc-diag-attempt-a
+          path: ${{ runner.temp }}/jemalloc-a/
+          if-no-files-found: warn
+
+  attempt-b:
+    name: Attempt B (apt musl-tools, CC=musl-gcc, no CFLAGS)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: recursive
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install apt musl-tools only
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends musl-tools
+          command -v musl-gcc
+      - name: Attempt B cargo build tikv-jemalloc-sys
+        continue-on-error: true
+        shell: bash
+        working-directory: codex-rs
+        env:
+          CC: musl-gcc
+          CFLAGS: ""
+          CXXFLAGS: ""
+        run: |
+          set -euo pipefail
+          unset CFLAGS CXXFLAGS
+          export CC=musl-gcc
+          target_dir="${RUNNER_TEMP}/jemalloc-b-target"
+          mkdir -p "${RUNNER_TEMP}/jemalloc-b" "$target_dir"
+          export CARGO_TARGET_DIR="$target_dir"
+          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
+          {
+            echo "CC=${CC:-}"
+            echo "CFLAGS=${CFLAGS-<unset>}"
+            echo "CXXFLAGS=${CXXFLAGS-<unset>}"
+          } | tee "${RUNNER_TEMP}/jemalloc-b/env.txt"
+          set +e
+          cargo build -p tikv-jemalloc-sys --target aarch64-unknown-linux-musl --release \
+            >"${RUNNER_TEMP}/jemalloc-b/cargo.log" 2>&1
+          status=$?
+          set -e
+          echo "cargo_exit=$status" | tee -a "${RUNNER_TEMP}/jemalloc-b/env.txt"
+          exit "$status"
+      - name: Collect jemalloc config.log
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/jemalloc-b"
+          mkdir -p "$dest"
+          n=0
+          if [ -d "${CARGO_TARGET_DIR:-}" ]; then
+            while IFS= read -r -d '' f; do
+              n=$((n + 1))
+              cp "$f" "$dest/config-${n}.log"
+              echo "$f" >> "$dest/config-log-paths.txt"
+            done < <(find "$CARGO_TARGET_DIR" -name config.log -print0 2>/dev/null || true)
+          fi
+          echo "config_log_count=$n" | tee -a "$dest/env.txt"
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        if: always()
+        with:
+          name: jemalloc-diag-attempt-b
+          path: ${{ runner.temp }}/jemalloc-b/
+          if-no-files-found: warn
