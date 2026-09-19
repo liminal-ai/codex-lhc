@@ -395,6 +395,8 @@ async fn slice_d_regenerate_and_resume_drill() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     assert!(
         compacted_count(&materialized.items) == 1,
@@ -1368,6 +1370,8 @@ async fn slice_d_l2_crash_injection_full_stack() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
 
     for point in [
@@ -1595,6 +1599,8 @@ async fn slice_d_l2_empty_edge_cases() {
             retained_context: None,
             latest_token_usage_record: None,
             live_identity: None,
+            current_host_turn_id: None,
+            current_lhc_turn_id: None,
         });
         assert_eq!(compacted_count(&result.items), 1);
         atomic_rewrite_rollout(&rollout_path, &result.items).expect("swap zero-tail");

@@ -363,6 +363,8 @@ fn materialize_full(
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     })
 }
 
@@ -2584,6 +2586,8 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         retained_context: Some(retained.clone()),
         latest_token_usage_record: Some(usage.clone()),
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     let compacted = find_compacted(&first.items);
     assert_eq!(compacted.guardian_history, Some(guardian.clone()));
@@ -2610,6 +2614,8 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         retained_context: carry.retained_context,
         latest_token_usage_record: carry.latest_token_usage_record,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     let compacted2 = find_compacted(&second.items);
     assert_eq!(compacted2.guardian_history, Some(guardian));
@@ -2776,6 +2782,8 @@ fn rewrite_preserves_host_uuid_on_aborted_turn_from_turn_end_key() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     })
     .items;
     let aborted: Vec<&str> = items
@@ -3016,6 +3024,8 @@ fn identity_match_reemits_encrypted_content() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: Some(identity),
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     let reasoning = result
         .items
@@ -3081,6 +3091,8 @@ fn identity_mismatch_suppresses_encrypted_content() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: Some(live),
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     let enc = result.items.iter().find_map(|it| match it {
         RolloutItem::ResponseItem(item) => match &item.item {
@@ -3136,6 +3148,8 @@ fn signature_only_thinking_emits_when_identity_matches() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: Some(identity),
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     let reasoning = result.items.iter().find_map(|it| match it {
         RolloutItem::ResponseItem(item) => match &item.item {
@@ -3421,6 +3435,8 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     assert_eq!(
         realtime_ids(&first.items),
@@ -3461,6 +3477,8 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         retained_context: None,
         latest_token_usage_record: None,
         live_identity: None,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
     assert_eq!(
         realtime_ids(&second.items),

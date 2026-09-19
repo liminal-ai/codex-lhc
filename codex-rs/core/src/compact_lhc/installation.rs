@@ -127,6 +127,9 @@ pub(super) async fn install_lhc_compact_rewrite(
 
     // Provisional boundary message (host ids filled after history extract).
     let provisional_message = marker.to_durable_writeback_record();
+    let current_lhc_turn = slot
+        .get()
+        .and_then(|handle| handle.durable_turn_id(&turn_context.sub_id));
     let mut materialize_result = materialize_rollout(&MaterializeInput {
         session_meta,
         thread_view: &surfaces.thread_view,
@@ -161,6 +164,8 @@ pub(super) async fn install_lhc_compact_rewrite(
                 .unwrap_or_else(|| "unknown".to_string()),
             codex_lhc_host::ModelIdentity::RESPONSES_API,
         )),
+        current_host_turn_id: Some(turn_context.sub_id.as_str()),
+        current_lhc_turn_id: current_lhc_turn.as_deref(),
     });
 
     for note in &materialize_result.gap_notes {

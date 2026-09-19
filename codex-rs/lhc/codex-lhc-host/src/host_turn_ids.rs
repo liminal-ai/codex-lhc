@@ -4,8 +4,13 @@
 //! `t{order}` names. Upstream `thread_history` keys turns by the host UUID
 //! (`Event.id`). Resume then drops turn-scoped items and can emit a second
 //! interrupt banner (F2).
+//!
+//! Mapping prefers unknown over a wrong host id: an inert `turn_end` maps
+//! nothing, and the prior-generation suffix is applied only when remaining
+//! unmatched turns and remaining unused host starts correspond one-to-one.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use codex_history::RolloutItem;
 use codex_protocol::protocol::EventMsg;
@@ -47,16 +52,21 @@ pub fn parse_host_turn_id_from_turn_end_key(key: &str) -> Option<String> {
 
 /// LHC `t{n}` → host UUID for rewrite emission.
 ///
-/// Prefer `turn_end` idempotency keys (durable, abort-accurate). Fill remaining
-/// synthetic labels from trailing non-synthetic `TurnStarted` ids in the prior
-/// generation so a mid-turn rewrite before `turn_end` lands still preserves the
-/// live UUID.
+/// 1. `turn_end` keys whose `event_order` equals a turn's `closed_at_event_order`.
+///    An inert `turn_end` (closed no turn) maps nothing.
+/// 2. The live open turn at rewrite, labeled from the compact arm's current
+///    host turn id (and capture binding when present), not from event inference.
+/// 3. Remaining synthetic turns zip remaining unused prior `TurnStarted` UUIDs
+///    only when those two sequences are the same length.
 pub fn host_turn_id_map(
     turns: &[TurnRecord],
     events: &[EventRecord],
     prior: &[RolloutItem],
+    current_host_turn_id: Option<&str>,
+    current_lhc_turn_id: Option<&str>,
 ) -> HashMap<String, String> {
     let mut map = HashMap::new();
+    let mut consumed: HashSet<String> = HashSet::new();
 
     for event in events {
         let EventRecord::TurnEnd {
@@ -70,32 +80,38 @@ pub fn host_turn_id_map(
         let Some(host) = parse_host_turn_id_from_turn_end_key(idempotency_key) else {
             continue;
         };
-        if let Some(turn) = turns
+        let Some(turn) = turns
             .iter()
             .find(|turn| turn.closed_at_event_order == Some(*event_order))
-        {
-            map.insert(turn.turn_id.clone(), host);
+        else {
+            continue;
+        };
+        if consumed.contains(&host) || map.contains_key(&turn.turn_id) {
             continue;
         }
-        if let Some(turn) = turns
-            .iter()
-            .filter(|turn| turn.status == TurnStatus::Open)
-            .max_by_key(|turn| turn.turn_order)
-            && turn.opened_at_event_order <= *event_order
-        {
-            map.insert(turn.turn_id.clone(), host);
-        }
+        map.insert(turn.turn_id.clone(), host.clone());
+        consumed.insert(host);
     }
 
-    let prior_ids = prior_host_turn_started_ids(prior);
+    label_live_open_turn(
+        turns,
+        current_host_turn_id,
+        current_lhc_turn_id,
+        &mut map,
+        &mut consumed,
+    );
+
+    let remaining_prior: Vec<String> = prior_host_turn_started_ids(prior)
+        .into_iter()
+        .filter(|host| !consumed.contains(host))
+        .collect();
     let mut unmatched: Vec<&TurnRecord> = turns
         .iter()
         .filter(|turn| is_synthetic_lhc_turn_id(&turn.turn_id) && !map.contains_key(&turn.turn_id))
         .collect();
     unmatched.sort_by_key(|turn| turn.turn_order);
-    if !unmatched.is_empty() && prior_ids.len() >= unmatched.len() {
-        let start = prior_ids.len() - unmatched.len();
-        for (turn, host) in unmatched.iter().zip(prior_ids[start..].iter()) {
+    if !unmatched.is_empty() && unmatched.len() == remaining_prior.len() {
+        for (turn, host) in unmatched.iter().zip(remaining_prior.iter()) {
             map.insert(turn.turn_id.clone(), host.clone());
         }
     }
@@ -108,6 +124,39 @@ pub fn display_turn_id(lhc_turn_id: &str, map: &HashMap<String, String>) -> Stri
     map.get(lhc_turn_id)
         .cloned()
         .unwrap_or_else(|| lhc_turn_id.to_string())
+}
+
+fn label_live_open_turn(
+    turns: &[TurnRecord],
+    current_host_turn_id: Option<&str>,
+    current_lhc_turn_id: Option<&str>,
+    map: &mut HashMap<String, String>,
+    consumed: &mut HashSet<String>,
+) {
+    let Some(host) = current_host_turn_id else {
+        return;
+    };
+    if consumed.contains(host) {
+        return;
+    }
+    if let Some(lhc) = current_lhc_turn_id {
+        if map.contains_key(lhc) {
+            return;
+        }
+        if turns.iter().any(|turn| turn.turn_id == lhc) {
+            map.insert(lhc.to_string(), host.to_string());
+            consumed.insert(host.to_string());
+        }
+        return;
+    }
+    let opens: Vec<&TurnRecord> = turns
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Open && !map.contains_key(&turn.turn_id))
+        .collect();
+    if let [turn] = opens.as_slice() {
+        map.insert(turn.turn_id.clone(), host.to_string());
+        consumed.insert(host.to_string());
+    }
 }
 
 fn prior_host_turn_started_ids(prior: &[RolloutItem]) -> Vec<String> {
@@ -127,3 +176,7 @@ fn prior_host_turn_started_ids(prior: &[RolloutItem]) -> Vec<String> {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "host_turn_ids_tests.rs"]
+mod tests;

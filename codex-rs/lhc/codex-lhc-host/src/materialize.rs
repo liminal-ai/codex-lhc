@@ -123,7 +123,7 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "AdditionalTools / Compaction / ContextCompaction: runtime_note stored text only; CompactionTrigger never captured",
     "Legacy image markers and InputAudio remain text; schema-13 user/tool images restore from full blocks, compressed or missing images remain placeholders",
     "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage; usage on rolled-back turns is excluded from the projected cumulative (those turns are out of the tail)",
-    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID when a turn_end key or prior TurnStarted UUID maps the SDK t{n} label (F2); otherwise the synthetic label is kept",
+    "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID when a closing turn_end key, the live compact-arm host turn, or a 1:1 remaining prior TurnStarted UUID maps the SDK t{n} label (F2); otherwise the synthetic label is kept (prefer unknown over wrong)",
     "TurnAbortReason enum: coarse map from outcome_reason string; unknown → Interrupted",
     "ThreadSettingsApplied / ThreadGoalUpdated: not in LHC → carry-forward only",
     "ThreadRolledBack: applied by excluding dropped user turns from the regenerated tail via positional alignment of prior post-boundary user segments to LHC user-prompt turns (no marker emitted). Alignment mismatch falls back to under-exclusion (exclude nothing) with a gap_notes entry — never text-set membership, which over-excludes duplicate prompts. Rolled-back content already compressed into bands remains until the LHC rollback-capture batch lands",
@@ -178,6 +178,10 @@ pub struct MaterializeInput<'a> {
     /// When set and matching the stored assistant provider/model/api, reverse
     /// maps restore `encrypted_content` from the thinking signature.
     pub live_identity: Option<ModelIdentity>,
+    /// Host UUID of the live turn at rewrite (compact arm). Reconcile leaves `None`.
+    pub current_host_turn_id: Option<&'a str>,
+    /// LHC `t{n}` bound to [`Self::current_host_turn_id`], when capture has published it.
+    pub current_lhc_turn_id: Option<&'a str>,
 }
 
 /// Checkpoints to copy from the last `Compacted` (and following `TurnContext`)
@@ -236,7 +240,13 @@ pub struct MaterializeResult {
 pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     let messages_by_id = index_messages(input.messages);
     let turns_by_id = index_turns(input.turns);
-    let host_ids = host_turn_id_map(input.turns, input.events, input.prior_generation);
+    let host_ids = host_turn_id_map(
+        input.turns,
+        input.events,
+        input.prior_generation,
+        input.current_host_turn_id,
+        input.current_lhc_turn_id,
+    );
     let (rolled_back_turns, mut gap_notes) =
         rolled_back_turn_ids(input.prior_generation, input.messages, input.turns);
     let mut refusals: Vec<String> = Vec::new();

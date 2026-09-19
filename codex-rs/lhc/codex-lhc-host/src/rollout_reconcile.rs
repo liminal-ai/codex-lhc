@@ -1266,6 +1266,8 @@ pub async fn materialize_thread_rollout_items(
         retained_context: carry.retained_context,
         latest_token_usage_record: carry.latest_token_usage_record,
         live_identity,
+        current_host_turn_id: None,
+        current_lhc_turn_id: None,
     });
 
     for note in &result.gap_notes {
