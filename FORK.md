@@ -494,7 +494,9 @@ unconditionally write AppArmor 0). On the runner VM it prints
 `kernel.apparmor_restrict_unprivileged_userns` and runs `sudo sysctl -w …=0`
 only when the current value is `1`. `cargo nextest list` is JSON identity
 compare of binary-id + test name against `scripts/lhc-sandbox-tests.tsv`
-(no `--retries` on list). `cargo nextest run` uses `--retries 0`. Verifier,
+(no `--retries` on list). The nextest `-E` filter uses `binary_id(=)` with
+the TSV package::binary ID, not `binary()`, which cannot match those IDs.
+`cargo nextest run` uses `--retries 0`. Verifier,
 build, and run logs upload even when the run step never starts.
 
 Do not invoke that workflow by pushing from a writer seat. Reed dispatches

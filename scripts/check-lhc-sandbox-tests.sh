@@ -58,7 +58,8 @@ json_out=${LHC_SANDBOX_LIST_JSON:-}
 cd "$ROOT/codex-rs"
 list_tmp=$(mktemp)
 trap 'rm -f "$list_tmp"' EXIT
-# nextest list rejects --retries; identity compare uses JSON binary-id + test name.
+# nextest list rejects --retries; identity compare uses JSON binary-id + test
+# name. The filter uses binary_id(=), not binary(), for package::binary IDs.
 set +e
 cargo nextest list \
   -p codex-core \
