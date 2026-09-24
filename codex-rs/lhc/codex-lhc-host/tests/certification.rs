@@ -39,6 +39,7 @@ use codex_lhc_host::wait_for_handle;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
@@ -453,7 +454,9 @@ async fn image_url_full_round_trip() {
         id: Some(ResponseItemId::from_server("msg_img".into())),
         role: "user".into(),
         content: vec![ContentItem::InputImage {
-            image_url: url.clone(),
+            image: ImageReference::Inline {
+                image_url: url.clone(),
+            },
             detail: None,
         }],
         phase: None,
@@ -495,7 +498,12 @@ async fn image_url_full_round_trip() {
     assert!(
         history.iter().any(|entry| matches!(entry,
             ResponseItem::Message { content, .. }
-            if content == &vec![ContentItem::InputImage { image_url: url.clone(), detail: None }]
+            if content == &vec![ContentItem::InputImage {
+                image: ImageReference::Inline {
+                    image_url: url.clone(),
+                },
+                detail: None,
+            }]
         )),
         "reconstructed provider history must contain the original image"
     );

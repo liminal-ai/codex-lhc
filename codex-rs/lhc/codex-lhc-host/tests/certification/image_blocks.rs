@@ -3,6 +3,7 @@ use super::*;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -152,14 +153,18 @@ async fn image_tool_result_preserves_order_detail_and_pair_after_restart() {
                 text: "before".into(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "data:image/png;base64,YWJj".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,YWJj".into(),
+                },
                 detail: Some(ImageDetail::Original),
             },
             FunctionCallOutputContentItem::InputText {
                 text: "between".into(),
             },
             FunctionCallOutputContentItem::InputImage {
-                image_url: "https://example.invalid/image.png".into(),
+                image: ImageReference::Inline {
+                    image_url: "https://example.invalid/image.png".into(),
+                },
                 detail: Some(ImageDetail::Low),
             },
             FunctionCallOutputContentItem::InputText {
@@ -249,6 +254,6 @@ async fn image_tool_result_preserves_order_detail_and_pair_after_restart() {
         matches!(&parts[1], FunctionCallOutputContentItem::InputText { text } if text.contains("image") && text.len() < 100)
     );
     assert!(
-        matches!(&parts[3], FunctionCallOutputContentItem::InputImage { image_url, .. } if image_url == "https://example.invalid/image.png")
+        matches!(&parts[3], FunctionCallOutputContentItem::InputImage { image: ImageReference::Inline { image_url }, .. } if image_url == "https://example.invalid/image.png")
     );
 }

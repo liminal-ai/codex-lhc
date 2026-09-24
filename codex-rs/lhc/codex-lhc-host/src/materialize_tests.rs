@@ -556,6 +556,7 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
     let prior = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-rb1".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -573,6 +574,7 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-rb2".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -593,6 +595,7 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-live1".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -610,6 +613,7 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-live2".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -774,6 +778,7 @@ fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
     let prior = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-drop".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -794,6 +799,7 @@ fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-live".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -903,6 +909,7 @@ fn c1_alignment_mismatch_excludes_nothing_and_logs_gap() {
     let prior = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t1".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -923,6 +930,7 @@ fn c1_alignment_mismatch_excludes_nothing_and_logs_gap() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t2".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -1198,6 +1206,7 @@ fn h2_cumulative_excludes_rollback_excluded_turns() {
     let prior = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-rb".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
@@ -1218,6 +1227,7 @@ fn h2_cumulative_excludes_rollback_excluded_turns() {
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-live".into(),
+            root_turn_id: None,
             trace_id: None,
             started_at: None,
             model_context_window: None,
