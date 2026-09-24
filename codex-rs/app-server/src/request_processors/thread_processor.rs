@@ -2123,14 +2123,14 @@ impl ThreadRequestProcessor {
         } = params;
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
         ensure_direct_input_allowed(thread.as_ref()).await?;
+        if codex_lhc_host::thread_has_lhc_database(&thread_id.to_string()) {
+            return Err(invalid_request(REWINDING_NOT_YET_SUPPORTED));
+        }
         let config_snapshot = thread.config_snapshot().await;
         if !matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
             return Err(invalid_request(
                 "thread/revert only supports paginated threads",
             ));
-        }
-        if thread.config().await.features.enabled(Feature::LhcCapture) {
-            return Err(invalid_request(REWINDING_NOT_YET_SUPPORTED));
         }
         let runtime_snapshot = ThreadRevertRuntimeSnapshot {
             config: thread.config().await.as_ref().clone(),

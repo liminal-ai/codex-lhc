@@ -559,9 +559,8 @@ fn lhc_user_prompt_turns_ordered(
 
 /// Resolve prior rollback drops to LHC turn ids by **positional alignment**.
 ///
-/// Kept to open 0.155.1-era threads that were already rewound with a
-/// `ThreadRolledBack` marker. Live rewind on LHC threads is refused; this is
-/// not a new rewind path.
+/// Materializer exclusion for constructed `ThreadRolledBack` records. Live
+/// rewind on LHC threads is refused; this is not a new rewind path.
 ///
 /// Prior post-boundary user segments (oldest→newest) align one-to-one with the
 /// corresponding suffix of LHC user-prompt turns (by `turn_order`). Text is the

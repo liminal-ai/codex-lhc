@@ -542,17 +542,19 @@ fn boundary_record_field_completeness_pinned() {
     );
 }
 
-// ── C1: rollback applied by exclusion ─────────────────────────────────────
+// ── C1: materializer exclusion over constructed rollback records ───────────
 
 #[test]
 fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
+    // Materializer unit test over constructed records, not a 0.155.1
+    // reopen/resume proof. Reverse-scan drops rolled-B then rolled-A
+    // (the 2 before the marker) and keeps the live tail.
     // Prior gen (chronological):
     //   TurnStarted t-rb1, UserMessage "rolled-A", TurnComplete,
     //   TurnStarted t-rb2, UserMessage "rolled-B", TurnComplete,
     //   ThreadRolledBack{2},
     //   TurnStarted t-live1, UserMessage "live-1", TurnComplete,
     //   TurnStarted t-live2, UserMessage "live-2", TurnComplete
-    // Reverse-scan drops rolled-B then rolled-A (the 2 before the marker).
     let prior = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "t-rb1".into(),

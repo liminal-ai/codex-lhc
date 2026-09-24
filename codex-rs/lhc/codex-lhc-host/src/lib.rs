@@ -272,7 +272,9 @@ pub use rollout_swap::proves_new_generation;
 pub use rollout_swap::reconcile_interrupted_swap;
 pub use rollout_swap::strict_read_generation;
 pub use session::encode_thread_id_for_path;
+pub use session::live_turn_ids;
 pub use session::thread_file_path;
+pub use session::thread_has_lhc_database;
 
 #[cfg(any(test, feature = "test-util"))]
 pub use rollout_swap::SwapFailpointGuard;

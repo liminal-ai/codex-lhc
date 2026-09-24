@@ -403,6 +403,39 @@ pub fn thread_file_path(root: &Path, thread_id: &str) -> PathBuf {
         .join(format!("{}.sqlite", encode_thread_id_for_path(thread_id)))
 }
 
+/// True when this thread already has an LHC sqlite database, whether or not
+/// capture is enabled on the current process.
+pub fn thread_has_lhc_database(thread_id: &str) -> bool {
+    thread_file_path(&lhc_root(), thread_id).is_file()
+}
+
+/// Live (non-deleted) turn ids in capture order. Fails if the database is
+/// missing or unreadable.
+pub fn live_turn_ids(path: &Path) -> Result<Vec<String>, String> {
+    let Some(path) = path.to_str() else {
+        return Err("LHC database path is not utf-8".into());
+    };
+    if !std::path::Path::new(path).is_file() {
+        return Err(format!("LHC database missing: {path}"));
+    }
+    let db = match lhc::shared_tech::storage::open_database(path) {
+        OpResult::Ok { value } => value,
+        OpResult::Err { error } => return Err(error.reason),
+    };
+    let ids = db
+        .prepare("SELECT turn_id FROM turns WHERE deleted_at IS NULL ORDER BY turn_order")
+        .all(&[])
+        .into_iter()
+        .map(|row| {
+            row.get("turn_id")
+                .and_then(|value| value.as_str().map(str::to_string))
+                .ok_or_else(|| format!("turn_id missing in {path}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    db.close();
+    Ok(ids)
+}
+
 async fn open_existing(
     lhc: &Lhc,
     thread_id: &str,

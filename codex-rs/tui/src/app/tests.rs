@@ -7583,14 +7583,7 @@ async fn lhc_rewind_refusal_is_shown_verbatim() {
         other => panic!("expected InsertHistoryCell event, got {other:?}"),
     };
     let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
-    assert!(
-        rendered.contains(codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED),
-        "rendered={rendered}"
-    );
-    assert!(
-        !rendered.contains("Failed to edit the selected prompt"),
-        "rendered={rendered}"
-    );
+    assert_app_snapshot!("lhc_rewind_refusal_is_shown_verbatim", rendered);
 }
 
 #[tokio::test]
