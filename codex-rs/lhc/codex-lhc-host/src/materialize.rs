@@ -683,6 +683,9 @@ fn user_message_event(text: &str) -> RolloutItem {
         message: text.to_string(),
         images: None,
         image_details: Vec::new(),
+        file_ids: None,
+        file_id_details: Vec::new(),
+        image_order: Vec::new(),
         local_images: Vec::new(),
         local_image_details: Vec::new(),
         audio: None,
@@ -723,9 +726,10 @@ fn emit_display_twins(item: &ResponseItem, out: &mut Vec<RolloutItem>) {
                     let images: Vec<_> = content
                         .iter()
                         .filter_map(|part| match part {
-                            ContentItem::InputImage { image_url, detail } => {
-                                Some((image_url.clone(), *detail))
-                            }
+                            ContentItem::InputImage { image, detail } => Some((
+                                crate::image_blocks::image_ref_label(image).to_string(),
+                                *detail,
+                            )),
                             _ => None,
                         })
                         .collect();
@@ -818,7 +822,7 @@ fn content_text(content: &[ContentItem]) -> String {
         .iter()
         .map(|c| match c {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => text.as_str(),
-            ContentItem::InputImage { image_url, .. } => image_url.as_str(),
+            ContentItem::InputImage { image, .. } => crate::image_blocks::image_ref_label(image),
             ContentItem::InputAudio { audio_url } => audio_url.as_str(),
         })
         .collect::<Vec<_>>()
@@ -1276,6 +1280,7 @@ fn maybe_open_turn(
     out.push(RolloutItem::EventMsg(EventMsg::TurnStarted(
         TurnStartedEvent {
             turn_id: display_turn_id(turn_id, host_ids),
+            root_turn_id: None,
             trace_id: None,
             started_at,
             model_context_window: None,

@@ -4093,7 +4093,9 @@ impl Session {
             state.replace_annotated_history(
                 items,
                 reference_context_item,
-                HistoryReplacement::Compaction,
+                HistoryReplacement::Compaction {
+                    reviewer_compaction_hash: None,
+                },
             );
             if let Some(world_state) = world_state_baseline {
                 let snapshot = world_state.snapshot();

@@ -861,11 +861,11 @@ fn content_items_text(content: &[ContentItem]) -> String {
             ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                 chunks.push(text.clone());
             }
-            ContentItem::InputImage {
-                image_url,
-                detail: _,
-            } => {
-                chunks.push(format!("[image:{image_url}]"));
+            ContentItem::InputImage { image, detail: _ } => {
+                chunks.push(format!(
+                    "[image:{}]",
+                    crate::image_blocks::image_ref_label(image)
+                ));
             }
             ContentItem::InputAudio { audio_url } => {
                 chunks.push(format!("[audio:{audio_url}]"));
@@ -908,11 +908,11 @@ fn content_items_output_text(items: &[FunctionCallOutputContentItem]) -> String 
     for item in items {
         match item {
             FunctionCallOutputContentItem::InputText { text } => chunks.push(text.clone()),
-            FunctionCallOutputContentItem::InputImage {
-                image_url,
-                detail: _,
-            } => {
-                chunks.push(format!("[image:{image_url}]"));
+            FunctionCallOutputContentItem::InputImage { image, detail: _ } => {
+                chunks.push(format!(
+                    "[image:{}]",
+                    crate::image_blocks::image_ref_label(image)
+                ));
             }
             FunctionCallOutputContentItem::InputAudio { audio_url } => {
                 chunks.push(format!("[audio:{audio_url}]"));
@@ -1285,7 +1285,9 @@ mod tests {
             id: None,
             role: "user".into(),
             content: vec![ContentItem::InputImage {
-                image_url: url.clone(),
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: url.clone(),
+                },
                 detail: None,
             }],
             phase: None,

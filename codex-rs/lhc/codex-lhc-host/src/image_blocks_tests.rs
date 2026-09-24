@@ -36,7 +36,9 @@ fn image_details_and_text_order_round_trip() {
                 text: "before".into(),
             },
             ContentItem::InputImage {
-                image_url: "data:image/png;base64,YWJj".into(),
+                image: codex_protocol::models::ImageReference::Inline {
+                    image_url: "data:image/png;base64,YWJj".into(),
+                },
                 detail,
             },
             ContentItem::InputText {

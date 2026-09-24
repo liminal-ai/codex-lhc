@@ -516,7 +516,6 @@ fn format_history_snapshot(
 }
 
 #[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
-
 #[test_case::test_case(false, false; "checklist disabled")]
 #[test_case::test_case(true, false; "checklist enabled")]
 #[test_case::test_case(false, true; "custom instructions with checklist disabled")]

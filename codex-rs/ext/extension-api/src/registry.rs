@@ -189,6 +189,7 @@ impl<C: Sync> ExtensionRegistry<C> {
                 tool_contributors: self.tool_contributors.clone(),
                 tool_lifecycle_contributors: self.tool_lifecycle_contributors.clone(),
                 turn_item_contributors: self.turn_item_contributors.clone(),
+                raw_item_contributors: self.raw_item_contributors.clone(),
                 approval_review_contributors: self.approval_review_contributors.clone(),
             },
         }

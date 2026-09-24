@@ -1467,11 +1467,11 @@ fn content_items_equal(a: &[ContentItem], b: &[ContentItem]) -> bool {
         (ContentItem::OutputText { text: t1 }, ContentItem::OutputText { text: t2 }) => t1 == t2,
         (
             ContentItem::InputImage {
-                image_url: u1,
+                image: u1,
                 detail: d1,
             },
             ContentItem::InputImage {
-                image_url: u2,
+                image: u2,
                 detail: d2,
             },
         ) => u1 == u2 && d1 == d2,

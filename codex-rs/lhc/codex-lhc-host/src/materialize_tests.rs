@@ -3307,7 +3307,9 @@ fn unrepresentable_unpaired_function_output_is_refused_not_converted() {
             text: "see attachment".into(),
         },
         codex_protocol::models::FunctionCallOutputContentItem::InputImage {
-            image_url: "https://example.invalid/a.png".into(),
+            image: codex_protocol::models::ImageReference::Inline {
+                image_url: "https://example.invalid/a.png".into(),
+            },
             detail: None,
         },
     ]));

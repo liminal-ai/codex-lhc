@@ -774,6 +774,8 @@ pub(crate) async fn run_turn(
                             InitialContextInjection::DoNotInject,
                             CompactionReason::ContextLimit,
                             CompactionPhase::PostTurn,
+                            /*mid_turn*/ None,
+                            &cancellation_token,
                         )
                         .await
                     {

@@ -913,7 +913,7 @@ fn handle_app_exit(
         | ExitReason::ThreadRemoved => false,
     };
 
-    let update_action = exit_info.update_action;
+    let update_action = exit_info.update_action.clone();
     if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
         let color_enabled = supports_color::on(Stream::Stdout).is_some();
         for line in exit_info.format_exit_messages(color_enabled) {

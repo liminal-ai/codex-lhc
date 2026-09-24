@@ -4,9 +4,21 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ImageDetail;
+use codex_protocol::models::ImageReference;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+
+pub(crate) fn image_ref_label(image: &ImageReference) -> &str {
+    match image {
+        ImageReference::Inline { image_url } => image_url,
+        ImageReference::File { file_id } => file_id,
+    }
+}
+
+fn image_block_from_ref(image: &ImageReference, detail: Option<ImageDetail>) -> Value {
+    image_block(image_ref_label(image), detail)
+}
 
 fn image_block(url: &str, detail: Option<ImageDetail>) -> Value {
     let source = url
@@ -32,7 +44,7 @@ pub(crate) fn user_blocks(items: &[ContentItem]) -> Option<Value> {
         items
             .iter()
             .map(|item| match item {
-                ContentItem::InputImage { image_url, detail } => image_block(image_url, *detail),
+                ContentItem::InputImage { image, detail } => image_block_from_ref(image, *detail),
                 ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                     json!({"type":"text", "text":text})
                 }
@@ -58,8 +70,8 @@ pub(crate) fn tool_blocks(body: &FunctionCallOutputBody) -> Option<Value> {
         items
             .iter()
             .map(|item| match item {
-                FunctionCallOutputContentItem::InputImage { image_url, detail } => {
-                    image_block(image_url, *detail)
+                FunctionCallOutputContentItem::InputImage { image, detail } => {
+                    image_block_from_ref(image, *detail)
                 }
                 FunctionCallOutputContentItem::InputText { text } => {
                     json!({"type":"text", "text":text})
@@ -110,7 +122,10 @@ pub(crate) fn restore_user(blocks: &[Map<String, Value>]) -> Vec<ContentItem> {
                     let detail = block
                         .get("codexImageDetail")
                         .and_then(|v| serde_json::from_value(v.clone()).ok());
-                    return ContentItem::InputImage { image_url, detail };
+                    return ContentItem::InputImage {
+                        image: ImageReference::Inline { image_url },
+                        detail,
+                    };
                 }
             }
             ContentItem::InputText {
@@ -127,8 +142,8 @@ pub(crate) fn restore_tool(blocks: &[Map<String, Value>]) -> FunctionCallOutputB
         restore_user(blocks)
             .into_iter()
             .map(|item| match item {
-                ContentItem::InputImage { image_url, detail } => {
-                    FunctionCallOutputContentItem::InputImage { image_url, detail }
+                ContentItem::InputImage { image, detail } => {
+                    FunctionCallOutputContentItem::InputImage { image, detail }
                 }
                 ContentItem::InputText { text } | ContentItem::OutputText { text } => {
                     FunctionCallOutputContentItem::InputText { text }
