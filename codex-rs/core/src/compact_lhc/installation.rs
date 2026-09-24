@@ -672,7 +672,7 @@ pub(super) async fn install_lhc_compact_rewrite(
 /// post-boundary `ResponseItem` / `InterAgentCommunication` entries (the tail).
 /// Positions the mask does not cover are kept — a shorter mask must never
 /// silently truncate durable state.
-pub(super) fn drop_materialized_items(items: &mut Vec<RolloutItem>, kept: &[bool]) {
+pub(crate) fn drop_materialized_items(items: &mut Vec<RolloutItem>, kept: &[bool]) {
     let boundary = items
         .iter()
         .rposition(|item| matches!(item, RolloutItem::Compacted(_)));

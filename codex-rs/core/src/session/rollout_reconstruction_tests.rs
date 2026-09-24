@@ -11,6 +11,7 @@ use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
 use codex_history::ResumedHistory;
 use codex_protocol::AgentPath;
+use codex_protocol::ResponseItemId;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -191,8 +192,12 @@ macro_rules! object {
 }
 
 fn user_message(text: &str) -> ResponseItem {
+    user_message_id(text, None)
+}
+
+fn user_message_id(text: &str, id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
-        id: None,
+        id: id.map(|id| ResponseItemId::from_server(id.into())),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
             text: text.to_string(),
@@ -203,8 +208,12 @@ fn user_message(text: &str) -> ResponseItem {
 }
 
 fn assistant_message(text: &str) -> ResponseItem {
+    assistant_message_id(text, None)
+}
+
+fn assistant_message_id(text: &str, id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
-        id: None,
+        id: id.map(|id| ResponseItemId::from_server(id.into())),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),
@@ -2549,9 +2558,9 @@ async fn thread_owned_guardian_keeps_first_fold_order_after_restart_without_dupl
     let (mut session, turn_context) = make_session_and_context().await;
     session.guardian_context_mode = GuardianContextMode::ThreadOwned;
     let original_user = user_message("Keep the release private.");
-    let original_assistant = assistant_message("Acknowledged.");
+    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
     let band = user_message("folded band");
-    let overlapping_tail = user_message("Keep the release private.");
+    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
     let mut context = turn_context.to_turn_context_item();
     context.turn_id = Some("fold-1".into());
     let rollout_items = completed_user_turn_rollout(
@@ -2561,7 +2570,7 @@ async fn thread_owned_guardian_keeps_first_fold_order_after_restart_without_dupl
                 vec![band],
                 vec![original_user, original_assistant],
                 1,
-                1,
+                99,
             )),
             RolloutItem::ResponseItem(overlapping_tail.into()),
         ],
@@ -2596,9 +2605,9 @@ async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplic
     let (mut session, turn_context) = make_session_and_context().await;
     session.guardian_context_mode = GuardianContextMode::ThreadOwned;
     let first = user_message("Keep the release private.");
-    let second = user_message("Second-fold evidence.");
+    let second = user_message_id("Second-fold evidence.", Some("msg-second"));
     let band = user_message("second folded band");
-    let overlapping_tail = user_message("Second-fold evidence.");
+    let overlapping_tail = user_message_id("Second-fold evidence.", Some("msg-second"));
     let mut context = turn_context.to_turn_context_item();
     context.turn_id = Some("fold-2".into());
     let rollout_items = completed_user_turn_rollout(
@@ -2608,7 +2617,7 @@ async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplic
                 vec![band],
                 vec![first, second],
                 2,
-                1,
+                99,
             )),
             RolloutItem::ResponseItem(overlapping_tail.into()),
         ],
@@ -2662,9 +2671,9 @@ async fn thread_owned_guardian_keeps_new_post_fold_exchange_after_cold_replay() 
     let (mut session, turn_context) = make_session_and_context().await;
     session.guardian_context_mode = GuardianContextMode::ThreadOwned;
     let original_user = user_message("Keep the release private.");
-    let original_assistant = assistant_message("Acknowledged.");
+    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
     let band = user_message("folded band");
-    let overlapping_tail = user_message("Keep the release private.");
+    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
     let new_instruction = user_message("Also redact the changelog.");
     let tool_call = function_call(
         "call-post-fold",
@@ -2681,7 +2690,7 @@ async fn thread_owned_guardian_keeps_new_post_fold_exchange_after_cold_replay() 
                 vec![band],
                 vec![original_user.clone(), original_assistant.clone()],
                 1,
-                1,
+                99,
             )),
             RolloutItem::ResponseItem(overlapping_tail.into()),
             RolloutItem::ResponseItem(new_instruction.clone().into()),
@@ -2747,6 +2756,82 @@ async fn native_guardian_backup_replays_new_suffix_without_duplicates_or_omissio
             new_instruction,
             tool_call,
             tool_result,
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn legacy_checkpoint_without_count_replays_new_post_fold_exchange() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let original_user = user_message("Keep the release private.");
+    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
+    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
+    let new_instruction = user_message("Also redact the changelog.");
+    // 85534694e2 CompactedItemWire has no guardian_covered_suffix_items field.
+    let mut wire = serde_json::to_value(compacted_with_guardian(
+        vec![user_message("folded band")],
+        vec![original_user.clone(), original_assistant.clone()],
+        1,
+        99,
+    ))
+    .expect("serialize compacted");
+    wire.as_object_mut()
+        .expect("compacted object")
+        .remove("guardian_covered_suffix_items");
+    let compacted: CompactedItem =
+        serde_json::from_value(wire).expect("85534694e2 record must deserialize");
+    assert_eq!(compacted.guardian_covered_suffix_items, None);
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("legacy-85534694e2".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted),
+            RolloutItem::ResponseItem(overlapping_tail.into()),
+            RolloutItem::ResponseItem(new_instruction.clone().into()),
+        ],
+    );
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        reconstructed.guardian_history,
+        Some(codex_history::GuardianHistoryCheckpoint(vec![
+            original_user,
+            original_assistant,
+            new_instruction,
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn unproven_repeated_continue_is_replayed_rather_than_suppressed() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let original = user_message("continue");
+    let repeated = user_message("continue");
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("continue-false-overlap".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted_with_guardian(
+                vec![user_message("folded band")],
+                vec![original.clone()],
+                1,
+                99,
+            )),
+            RolloutItem::ResponseItem(repeated.clone().into()),
+        ],
+    );
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        reconstructed.guardian_history,
+        Some(codex_history::GuardianHistoryCheckpoint(vec![
+            original, repeated,
         ]))
     );
 }

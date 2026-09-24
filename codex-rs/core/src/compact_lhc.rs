@@ -116,7 +116,7 @@ use workers::writer_claim_owner_on_thread;
 #[path = "compact_lhc/installation.rs"]
 mod installation;
 #[cfg(test)]
-use installation::drop_materialized_items;
+pub(crate) use installation::drop_materialized_items;
 use installation::install_lhc_compact_rewrite;
 #[cfg(test)]
 use installation::patch_materialized_history_ids;

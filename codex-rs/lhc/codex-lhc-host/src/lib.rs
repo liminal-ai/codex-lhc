@@ -231,6 +231,18 @@ pub use materialize::iso_to_unix_secs;
 pub use materialize::materialize_rollout;
 pub use materialize::model_stream_response_item_count;
 pub use materialize::prior_compact_carry;
+#[cfg(any(test, feature = "test-util"))]
+mod materialize_test_support;
+#[cfg(any(test, feature = "test-util"))]
+pub use materialize_test_support::GuardianFoldTailExtras;
+#[cfg(any(test, feature = "test-util"))]
+pub use materialize_test_support::OVERLAP_CALL_ID;
+#[cfg(any(test, feature = "test-util"))]
+pub use materialize_test_support::OVERLAP_OUTPUT;
+#[cfg(any(test, feature = "test-util"))]
+pub use materialize_test_support::OVERLAP_USER;
+#[cfg(any(test, feature = "test-util"))]
+pub use materialize_test_support::materialize_guardian_tool_fold;
 pub use projections::ProjectionQueryStats;
 pub use rollout_reconcile::CaptureFrontier;
 pub use rollout_reconcile::CompactedRolloutIdentity;

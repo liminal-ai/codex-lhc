@@ -235,6 +235,7 @@ mod handlers;
 mod inject;
 mod reasoning_effort;
 pub(crate) use reasoning_effort::RequestEffortUsage;
+mod guardian_overlap;
 mod input_queue;
 mod mcp;
 mod mcp_prewarm;
@@ -280,6 +281,9 @@ use self::turn::agent_message_text;
 use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
 use self::turn_context::TurnContext;
+#[cfg(test)]
+#[path = "guardian_replay_seam_tests.rs"]
+mod guardian_replay_seam_tests;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
 

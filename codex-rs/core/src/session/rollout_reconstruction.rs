@@ -344,12 +344,6 @@ impl Session {
             &turn_context.session_source,
         );
         let mut saw_legacy_compaction_without_replacement_history = false;
-        let covered_suffix_items = base_compaction
-            .and_then(|checkpoint| checkpoint.compacted.guardian_covered_suffix_items);
-        let park_unknown_boundary = self.guardian_context_mode == GuardianContextMode::ThreadOwned
-            && base_compaction
-                .is_some_and(|checkpoint| checkpoint.compacted.guardian_history.is_some())
-            && covered_suffix_items.is_none();
         if let Some(checkpoint) = base_compaction
             && let Some(items) = &checkpoint.compacted.replacement_history
         {
@@ -362,24 +356,39 @@ impl Session {
                 None,
             );
         }
-        // Compacted.guardian_history is coverage at fold time. Suffix
-        // ResponseItems rebuild the parent window; only the recorded overlap
-        // is already inside that checkpoint. Legacy records without a covered
-        // count still park the whole suffix.
-        let mut remaining_overlap = if park_unknown_boundary {
-            0
-        } else {
-            covered_suffix_items.unwrap_or(0)
-        };
-        let mut parked_review = if park_unknown_boundary || remaining_overlap > 0 {
-            history.take_review_history()
-        } else {
-            None
-        };
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
         let rollout_suffix = base_compaction.map_or(rollout_items, |checkpoint| checkpoint.suffix);
+        // Native compact writes Some(0): the suffix after Compacted is not an
+        // LHC-rewritten tail, so there is nothing to align. LHC producers still
+        // store a positional count; replay ignores it. Overlap is derived from
+        // the checkpoint vs suffix sequences so stale/missing counts cannot
+        // suppress later evidence.
+        let native_zero_coverage = base_compaction.is_some_and(|checkpoint| {
+            checkpoint.compacted.guardian_covered_suffix_items == Some(0)
+        });
+        let mut remaining_overlap = 0;
+        if self.guardian_context_mode == GuardianContextMode::ThreadOwned
+            && !native_zero_coverage
+            && let Some(guardian) = base_compaction
+                .and_then(|checkpoint| checkpoint.compacted.guardian_history.as_ref())
+        {
+            let suffix_items: Vec<codex_protocol::models::ResponseItem> = rollout_suffix
+                .iter()
+                .filter_map(|item| match item {
+                    RolloutItem::ResponseItem(envelope) => Some(envelope.item.clone()),
+                    _ => None,
+                })
+                .collect();
+            remaining_overlap =
+                super::guardian_overlap::proven_suffix_overlap(&guardian.0, &suffix_items);
+        }
+        let mut parked_review = if remaining_overlap > 0 {
+            history.take_review_history()
+        } else {
+            None
+        };
         for item in rollout_suffix {
             match item {
                 RolloutItem::RetainedContext(event) => {
