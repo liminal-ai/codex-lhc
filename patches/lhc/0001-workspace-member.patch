@@ -368,19 +368,6 @@ index abe6f8077c..62e43fc10f 100644
  fn workspace_permissions(workspace: &Path) -> Result<ResolvedWindowsSandboxPermissions> {
      ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
          &PermissionProfile::workspace_write_with(
-diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
-index 46f9710b4c..131ef02909 100644
---- a/codex-rs/windows-sandbox-rs/src/lib.rs
-+++ b/codex-rs/windows-sandbox-rs/src/lib.rs
-@@ -226,7 +226,7 @@ pub use acl::ensure_allow_write_aces;
- #[cfg(target_os = "windows")]
- pub use acl::fetch_dacl_handle;
- #[cfg(target_os = "windows")]
--pub use acl::path_has_standard_user_mutation_allow;
-+pub use acl::path_has_standard_user_mutation_allow
- #[cfg(target_os = "windows")]
- pub use acl::path_has_trusted_system_owner;
- #[cfg(target_os = "windows")]
 diff --git a/codex-rs/windows-sandbox-rs/src/winutil.rs b/codex-rs/windows-sandbox-rs/src/winutil.rs
 index 0899362684..c924a365a0 100644
 --- a/codex-rs/windows-sandbox-rs/src/winutil.rs
