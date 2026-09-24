@@ -1620,6 +1620,18 @@ impl Session {
                     thread_store: &thread_extension_data,
                 }).await;
             }
+            if let Some(slot) = thread_extension_data.get::<codex_lhc_host::LhcCaptureSlot>()
+                && let codex_lhc_host::CaptureState::Failed(reason) = slot.state()
+                && reason == codex_lhc_host::CAPTURE_STILL_SHUTTING_DOWN
+            {
+                for contributor in extensions.thread_lifecycle_contributors() {
+                    contributor.on_thread_stop(codex_extension_api::ThreadStopInput {
+                        session_store: &session_extension_data,
+                        thread_store: &thread_extension_data,
+                    }).await;
+                }
+                anyhow::bail!("{reason}");
+            }
 
             // Strict LHC preserves/rebuilds history; upstream token-budget mode
             // promises native clearing. Reject before tools/context are exposed.

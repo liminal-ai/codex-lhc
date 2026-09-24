@@ -184,6 +184,7 @@ pub const CAPTURE_OPEN_RUNTIME_UNAVAILABLE: &str = "capture open runtime unavail
 pub const CAPTURE_OPEN_FAILED: &str = "capture open failed";
 pub const CAPTURE_OPEN_THREAD_UNAVAILABLE: &str = "capture open thread unavailable";
 pub const CAPTURE_OPEN_ABANDONED: &str = "capture open abandoned before settling";
+pub const CAPTURE_STILL_SHUTTING_DOWN: &str = "LHC for this thread is still shutting down; retry";
 
 /// Why resolving a live retrieval thread from the capture slot failed.
 ///
@@ -1417,7 +1418,18 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 debug!(thread_id = %thread_id, "LHC: capture slot held Opening (test)");
                 return;
             }
-            // Fire-and-forget open — Session construction continues immediately.
+            let db_path = crate::capture::capture_db_path_for(&thread_id, Some(root.as_path()));
+            if !crate::capture::wait_for_live_capture_path(
+                &db_path,
+                crate::capture::CAPTURE_ADMISSION_BOUND,
+            )
+            .await
+            {
+                slot.publish_failed(CAPTURE_STILL_SHUTTING_DOWN);
+                return;
+            }
+            // Fire-and-forget SQLite open — Session construction is not blocked
+            // on the database. Predecessor admission already completed above.
             schedule_open(
                 slot,
                 thread_id,

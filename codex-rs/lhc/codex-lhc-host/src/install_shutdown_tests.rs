@@ -324,17 +324,9 @@ async fn shutdown_ack_returns_while_seeded_provider_is_pending() {
         started.elapsed()
     );
     assert!(
-        !wait.is_terminated(),
-        "capture runtime must still be inside close while the provider is pending"
-    );
-    assert!(
-        claimed_work_item_count(&path) > 0,
-        "claim must stay held until the capture runtime stops"
-    );
-
-    assert!(
-        wait.wait_terminated_bounded(Duration::from_secs(8)).await,
-        "close settle bound must still terminate the capture runtime"
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "cancelled derivation must let the capture runtime return within write+close settle"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -379,12 +371,10 @@ async fn thread_stop_hands_back_only_after_pending_provider_runtime_stops() {
         "thread stop must stay bounded while inference is pending"
     );
     assert!(
-        claimed_work_item_count(&path) > 0,
-        "thread stop must not hand back while the capture worker is still settling"
-    );
-    assert!(
-        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
-        "runtime-owned hand-back waits for worker_loop to return"
+        handle
+            .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "cancelled derivation must return the worker within write+close settle"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -453,26 +443,17 @@ async fn shutdown_timeout_with_live_worker_hands_back_once_after_return() {
     seed_held_claim(&path, "w-timeout");
     assert_eq!(claimed_work_item_count(&path), 1);
 
-    let release = handle.block_worker().await;
+    let _release = handle.block_worker().await;
     let stopped = tokio::time::timeout(Duration::from_secs(5), harness.stop_thread()).await;
     assert!(
         stopped.is_ok(),
-        "thread stop must return when shutdown ack times out on a live worker"
+        "thread stop must return when shutdown preempts a blocked worker"
     );
     assert!(
-        !handle.is_terminated(),
-        "blocked worker must still be inside worker_loop after the stop bound"
-    );
-    assert_eq!(
-        claimed_work_item_count(&path),
-        1,
-        "no hand-back until the live worker returns"
-    );
-
-    let _ = release.send(());
-    assert!(
-        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
-        "unblocking the worker must finish the runtime"
+        handle
+            .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "shutdown must preempt Block and return the worker within write+close settle"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -579,6 +560,174 @@ async fn cancelled_spawn_capture_releases_path_slot() {
     let wait = handle.clone();
     handle.shutdown().await;
     assert!(wait.wait_terminated_bounded(Duration::from_secs(5)).await);
+}
+
+#[tokio::test]
+async fn shutdown_returns_within_bound_when_derivation_call_hangs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r8-derivation-hang";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("capture");
+    handle.persist(
+        &message("user", "hang derivation prompt", "user-1"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &message("assistant", "hang derivation reply", "assistant-1"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "hanging derivation must hold a claim"
+    );
+    let wait = handle.clone();
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "worker stuck in a derivation call must return within write+close settle"
+    );
+    assert!(
+        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    assert_eq!(claimed_work_item_count(&path), 0);
+}
+
+#[tokio::test]
+async fn shutdown_returns_within_bound_when_resolve_is_unseeded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r8-unseeded-resolve";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::new(),
+    )
+    .await
+    .expect("capture");
+    handle.persist(
+        &message("user", "unseeded prompt", "user-1"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &message("assistant", "unseeded reply", "assistant-1"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+    let wait = handle.clone();
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "worker stuck in unseeded resolve must return within write+close settle"
+    );
+    assert!(
+        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
+        "elapsed {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn shutdown_returns_within_bound_when_persist_is_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r8-blocked-persist";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    handle.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+    };
+    db.exec("BEGIN EXCLUSIVE");
+    handle.persist(
+        &message("user", "blocked persist prompt", "user-block"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    let wait = handle.clone();
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "worker stuck in persist must return within write+close settle"
+    );
+    assert!(
+        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    db.exec("ROLLBACK");
+}
+
+#[tokio::test]
+async fn successor_open_fails_when_predecessor_does_not_return() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let thread_id = "r8-admission-backstop";
+    let owner_a = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("owner A");
+    let _release = owner_a.block_worker().await;
+    let started = Instant::now();
+    let owner_b = spawn_capture(
+        thread_id,
+        None,
+        Some(root),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await;
+    assert!(
+        owner_b.is_none(),
+        "successor must fail instead of waiting forever"
+    );
+    assert!(
+        started.elapsed() >= crate::capture::CAPTURE_ADMISSION_BOUND,
+        "admission timeout must wait the bound; elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < crate::capture::CAPTURE_ADMISSION_BOUND + Duration::from_secs(2),
+        "admission timeout must not hang past the bound; elapsed {:?}",
+        started.elapsed()
+    );
+    let wait_a = owner_a.clone();
+    owner_a.shutdown().await;
+    let _ = wait_a
+        .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+        .await;
 }
 
 fn seed_held_claim(path: &std::path::Path, work_item_id: &str) {
