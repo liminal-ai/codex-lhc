@@ -12,6 +12,7 @@ use super::thread_input::can_accept_direct_input;
 use super::thread_input::ensure_direct_input_allowed;
 use super::*;
 use crate::error_code::method_not_found;
+use codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED;
 use codex_app_server_protocol::SelectedCapabilityRoot;
 use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
 use codex_app_server_protocol::ThreadRevertParams;
@@ -2136,6 +2137,9 @@ impl ThreadRequestProcessor {
             return Err(invalid_request(
                 "thread/revert only supports paginated threads",
             ));
+        }
+        if thread.config().await.features.enabled(Feature::LhcCapture) {
+            return Err(invalid_request(REWINDING_NOT_YET_SUPPORTED));
         }
         let runtime_snapshot = ThreadRevertRuntimeSnapshot {
             config: thread.config().await.as_ref().clone(),

@@ -7563,6 +7563,37 @@ async fn backtrack_branch_failure_restores_selected_prompt_snapshot() {
 }
 
 #[tokio::test]
+async fn lhc_rewind_refusal_is_shown_verbatim() {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+    app.restore_backtrack_prompt_after_revert_error(
+        crate::chatwidget::UserMessage::from("edit this prompt"),
+        format!(
+            "thread/revert failed: {} (code -32600)",
+            codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED
+        ),
+    );
+
+    assert_eq!(
+        app.chat_widget.composer_text_with_pending(),
+        "edit this prompt"
+    );
+    let cell = match app_event_rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+        other => panic!("expected InsertHistoryCell event, got {other:?}"),
+    };
+    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
+    assert!(
+        rendered.contains(codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED),
+        "rendered={rendered}"
+    );
+    assert!(
+        !rendered.contains("Failed to edit the selected prompt"),
+        "rendered={rendered}"
+    );
+}
+
+#[tokio::test]
 async fn remote_resume_current_cwd_rejection_snapshot() -> Result<()> {
     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
     std::fs::write(

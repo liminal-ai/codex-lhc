@@ -12,6 +12,7 @@ use codex_app_server_protocol::ClientRequest;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
+use codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::SortDirection;
 use codex_app_server_protocol::ThreadForkParams;
@@ -46,6 +47,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::load_default_config_for_test;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::Path;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
@@ -59,6 +62,7 @@ async fn thread_revert_preserves_model_selected_multi_agent_version(restart: boo
     let codex_home = TempDir::new()?;
     MockResponsesConfig::new(&server.uri())
         .disable_feature(Feature::MultiAgentV2)
+        .disable_feature(Feature::LhcCapture)
         .write(codex_home.path())?;
     let config = load_default_config_for_test(&codex_home).await;
     let mut model = codex_core::test_support::construct_model_info_offline("mock-model", &config);
@@ -160,7 +164,9 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
         AbsolutePathBuf::from_absolute_path(&saved_cwd)?,
         AbsolutePathBuf::from_absolute_path(extra_workspace.path().canonicalize()?)?,
     ];
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::LhcCapture)
+        .write(codex_home.path())?;
     // This fixture checks host-native cwd and workspace restoration across fork and revert.
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -334,7 +340,9 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
 async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::LhcCapture)
+        .write(codex_home.path())?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
         .build()
@@ -516,7 +524,9 @@ async fn thread_revert_interrupts_active_turn_and_keeps_thread_loaded() -> Resul
         create_final_assistant_message_sse_response("third")?,
     ])
     .await;
-    MockResponsesConfig::new(&server.uri()).write(home.path())?;
+    MockResponsesConfig::new(&server.uri())
+        .disable_feature(Feature::LhcCapture)
+        .write(home.path())?;
     let mut mcp = TestAppServer::builder()
         .with_codex_home(home.path())
         .build()
@@ -622,6 +632,107 @@ async fn thread_revert_interrupts_active_turn_and_keeps_thread_loaded() -> Resul
     })
     .await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn thread_revert_on_lhc_thread_refuses_and_leaves_history_untouched() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let lhc_root = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[(
+            "CODEX_LHC_ROOT",
+            Some(lhc_root.path().to_str().expect("utf-8")),
+        )])
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    mcp.start_turn_and_wait_for_completion(TurnStartParams {
+        thread_id: thread.id.clone(),
+        input: vec![UserInput::Text {
+            text: "first".to_string(),
+            text_elements: Vec::new(),
+        }],
+        ..Default::default()
+    })
+    .await?;
+    let second = mcp
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "second".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+
+    let rollout_path = thread.path.clone().expect("thread rollout path");
+    let native_before = std::fs::read(rollout_path.as_path())?;
+    let lhc_before = snapshot_tree(lhc_root.path());
+
+    let revert_id = mcp
+        .send_raw_request(
+            "thread/revert",
+            Some(serde_json::to_value(ThreadRevertParams {
+                thread_id: thread.id.clone(),
+                before_turn_id: second.turn.id,
+            })?),
+        )
+        .await?;
+    let revert_error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(revert_id)),
+    )
+    .await??;
+    assert_eq!(revert_error.error.message, REWINDING_NOT_YET_SUPPORTED);
+    assert_eq!(revert_error.error.code, -32600);
+
+    assert_eq!(
+        std::fs::read(rollout_path.as_path())?,
+        native_before,
+        "native history must be unchanged"
+    );
+    assert_eq!(
+        snapshot_tree(lhc_root.path()),
+        lhc_before,
+        "LHC database must be unchanged"
+    );
+    Ok(())
+}
+
+fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    snapshot_tree_inner(root, root, &mut out);
+    out
+}
+
+fn snapshot_tree_inner(root: &Path, dir: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            snapshot_tree_inner(root, &path, out);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.insert(rel, bytes);
+        }
+    }
 }
 
 async fn turn_ids_from_cursor(

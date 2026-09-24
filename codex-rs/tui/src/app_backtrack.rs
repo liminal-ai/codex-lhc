@@ -151,8 +151,13 @@ impl App {
         err: impl std::fmt::Display,
     ) {
         self.chat_widget.restore_user_message_to_composer(prompt);
-        self.chat_widget
-            .add_error_message(format!("Failed to edit the selected prompt: {err:#}"));
+        let rendered = err.to_string();
+        let message = if rendered.contains(codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED) {
+            codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED.to_string()
+        } else {
+            format!("Failed to edit the selected prompt: {err:#}")
+        };
+        self.chat_widget.add_error_message(message);
     }
 
     /// Show detailed history in the owned viewport or the inline session's transcript overlay.

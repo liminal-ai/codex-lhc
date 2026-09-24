@@ -1254,6 +1254,9 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
     pub terminated: bool,
 }
 
+/// Exact refusal for every rewind path on an LHC-enabled Codex thread.
+pub const REWINDING_NOT_YET_SUPPORTED: &str = "Rewinding is not yet supported.";
+
 /// Replace a paginated thread's durable history with the prefix before one turn.
 ///
 /// This only changes persisted conversation history. It does not revert local file changes.
