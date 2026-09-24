@@ -723,7 +723,14 @@ async fn shutdown_returns_within_bound_when_queued_writes_are_blocked() {
     }
     let wait = handle.clone();
     let started = Instant::now();
-    handle.shutdown().await;
+    let result = handle
+        .shutdown_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+        .await;
+    assert_eq!(
+        result,
+        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed),
+        "uncommitted queued writes must not be reported as Persisted"
+    );
     assert!(
         wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
             .await,
@@ -735,6 +742,167 @@ async fn shutdown_returns_within_bound_when_queued_writes_are_blocked() {
         started.elapsed()
     );
     db.exec("ROLLBACK");
+}
+
+#[tokio::test]
+async fn shutdown_returns_within_bound_when_active_flush_is_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r8-active-flush";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    handle.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+    };
+    db.exec("BEGIN EXCLUSIVE");
+    for index in 0..3 {
+        handle.persist(
+            &message(
+                "assistant",
+                &format!("flush output {index}"),
+                &format!("asst-flush-{index}"),
+            ),
+            RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
+        );
+    }
+    handle.flush_async();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let wait = handle.clone();
+    let started = Instant::now();
+    let result = handle.shutdown_bounded(Duration::from_secs(11)).await;
+    assert_eq!(
+        result,
+        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed),
+        "an in-flight flush under a held lock must not report Persisted"
+    );
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "active flush under a held lock must return within the worker bound"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(11),
+        "active flush must not run past 11s; elapsed {:?}",
+        started.elapsed()
+    );
+    db.exec("ROLLBACK");
+}
+
+#[tokio::test]
+async fn dropping_last_handle_releases_admission_for_a_successor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let thread_id = "r10-last-handle-drop";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.clone()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    drop(handle);
+    let successor = tokio::time::timeout(
+        Duration::from_secs(2),
+        spawn_capture(
+            thread_id,
+            None,
+            Some(root),
+            LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+        ),
+    )
+    .await;
+    let successor = successor.expect("successor must not wait on a leaked reservation");
+    let successor = successor.expect("successor must open after last handle drop");
+    successor.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_drains_queued_model_change_through_the_command_handler() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r11-model-change";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    let release = handle.block_worker().await;
+    handle.model_or_thinking_change("old", "new", "low", "high");
+    let wait = handle.clone();
+    let shutting =
+        tokio::spawn(async move { handle.shutdown_bounded(Duration::from_secs(5)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = release.send(());
+    let result = shutting.await.expect("join");
+    assert_eq!(result, CaptureShutdownResult::Persisted);
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await
+    );
+    let reopened = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("reopen");
+    let kinds = reopened
+        .list_events()
+        .await
+        .expect("list events")
+        .iter()
+        .map(|event| event.event_kind().as_str().to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        kinds.iter().any(|kind| kind == "model_change"),
+        "queued model change must be committed; kinds={kinds:?}"
+    );
+    assert!(
+        kinds.iter().any(|kind| kind == "thinking_level_change"),
+        "queued thinking-level change must be committed; kinds={kinds:?}"
+    );
+    reopened.shutdown().await;
+}
+
+#[tokio::test]
+async fn shutdown_none_with_a_live_handle_does_not_wait_the_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn_capture(
+        "r12-shutdown-none",
+        None,
+        Some(dir.path().to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    let wait = handle.clone();
+    let started = Instant::now();
+    handle.shutdown_async();
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "Shutdown(None) must still retire the worker"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Shutdown(None) must not wait the full return deadline; elapsed {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
