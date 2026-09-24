@@ -1005,7 +1005,7 @@ async fn slice_d_f2_interrupt_rewrite_preserves_host_uuid_on_resume() {
             .on_turn_start(TurnStartInput {
                 turn_id: host_turn,
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage_at_start,
+                token_usage_at_turn_start: Some(&token_usage_at_start),
                 started_at: Some(1_789_835_009),
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,

@@ -126,7 +126,7 @@ pub(super) async fn start_host_turn(
             .on_turn_start(TurnStartInput {
                 turn_id: tc.sub_id.as_str(),
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage_at_start,
+                token_usage_at_turn_start: Some(&token_usage_at_start),
                 started_at: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,

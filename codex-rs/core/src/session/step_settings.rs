@@ -130,7 +130,6 @@ impl ResolvedStepSettings {
         constraints: &StepSettingsConstraints<'_>,
         models_manager: &dyn ModelsManager,
         overrides: &ModelInfoOverrides,
-        personality_enabled: bool,
         fast_mode_enabled: bool,
     ) -> ConstraintResult<Self> {
         let selected = self.selected.apply(update, constraints)?;
@@ -140,11 +139,7 @@ impl ResolvedStepSettings {
         {
             Arc::clone(&self.model_info)
         } else {
-            Arc::new(
-                selected
-                    .resolve_model_info(models_manager, overrides, personality_enabled)
-                    .await,
-            )
+            Arc::new(selected.resolve_model_info(models_manager, overrides).await)
         };
         let mut next = Self::new(Arc::new(selected), model_info, fast_mode_enabled);
         next.mcp_approvals_reviewer_override = update
@@ -211,7 +206,6 @@ impl ModelInfoOverrides {
     pub(crate) fn models_manager_config(
         &self,
         personality: Option<Personality>,
-        personality_enabled: bool,
     ) -> ModelsManagerConfig {
         ModelsManagerConfig {
             model_context_window: self.context_window,
@@ -219,8 +213,8 @@ impl ModelInfoOverrides {
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),
             personality,
-            personality_enabled,
-            model_catalog: self.model_catalog.clone(),
+            // The models manager already owns its catalog.
+            model_catalog: None,
         }
     }
 }
@@ -258,9 +252,8 @@ impl StepSettings {
         &self,
         models_manager: &dyn ModelsManager,
         overrides: &ModelInfoOverrides,
-        personality_enabled: bool,
     ) -> ModelInfo {
-        let config = overrides.models_manager_config(self.personality, personality_enabled);
+        let config = overrides.models_manager_config(self.personality);
         models_manager
             .get_model_info(self.collaboration_mode.model(), &config)
             .await

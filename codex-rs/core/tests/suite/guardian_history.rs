@@ -1,4 +1,4 @@
-//! Exercises retained review history through compaction, resume, fork, eviction, and rollback.
+//! Exercises retained review history through compaction, resume, fork, eviction, and legacy rollback replay.
 
 use anyhow::Result;
 use base64::Engine;
@@ -19,10 +19,12 @@ use codex_lhc_host::install_with_root;
 use codex_lhc_host::wait_for_handle;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadRolledBackEvent;
 use codex_protocol::request_user_input::RequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
@@ -355,7 +357,8 @@ async fn guardian_history_uses_deltas_between_eviction_batches() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() -> Result<()> {
+async fn guardian_history_survives_compaction_and_eviction_but_not_legacy_rollback_replay()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(
         Ok(()),
@@ -363,7 +366,7 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
     );
     let server = start_mock_server().await;
     let lhc_root = TempDir::new()?;
-    let test = test_codex()
+    let mut test = test_codex()
         .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             enable_lhc_compact(config);
@@ -487,7 +490,9 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
                     text_elements: Vec::new(),
                 },
                 UserInput::Image {
-                    image_url: image_url.clone(),
+                    image: ImageReference::Inline {
+                        image_url: image_url.clone(),
+                    },
                     detail: None,
                 },
             ]))
@@ -540,12 +545,35 @@ async fn guardian_history_survives_compaction_and_eviction_but_not_rollback() ->
             assert_eq!(positions, ordered);
             test.codex.ensure_rollout_materialized().await;
             test.codex
-                .submit(Op::ThreadRollback { num_turns: 2 })
+                .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+                    ThreadRolledBackEvent { num_turns: 2 },
+                ))])
                 .await?;
-            wait_for_event(&test.codex, |event| {
-                matches!(event, EventMsg::ThreadRolledBack(_))
-            })
-            .await;
+            test.codex.shutdown_and_wait().await?;
+            let thread_id = test.session_configured.thread_id;
+            test.thread_manager.remove_thread(&thread_id).await;
+            let model_context = test
+                .thread_store
+                .load_latest_model_context(LoadThreadHistoryParams {
+                    thread_id,
+                    include_archived: false,
+                })
+                .await?;
+            test.codex = test
+                .thread_manager
+                .resume_thread_with_history(
+                    test.config.clone(),
+                    InitialHistory::Resumed(ResumedHistory {
+                        conversation_id: thread_id,
+                        history: Arc::new(model_context.items),
+                        rollout_path: None,
+                    }),
+                    test.thread_manager.auth_manager(),
+                    /*parent_trace*/ None,
+                    ClientMcpExtensions::default(),
+                )
+                .await?
+                .thread;
         } else {
             assert!(!transcript.contains(">>> TRUSTED USER ANSWERS START"));
             assert!(!transcript.contains("Do not publish anything."));

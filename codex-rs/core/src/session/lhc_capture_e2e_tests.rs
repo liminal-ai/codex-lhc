@@ -690,7 +690,7 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
             .on_turn_start(TurnStartInput {
                 turn_id: turn_context.sub_id.as_str(),
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage_at_start,
+                token_usage_at_turn_start: Some(&token_usage_at_start),
                 started_at: Some(started_at),
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
@@ -845,7 +845,7 @@ async fn e2e_v5_host_facts_abort_with_reason() {
             .on_turn_start(TurnStartInput {
                 turn_id: turn_context.sub_id.as_str(),
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage_at_start,
+                token_usage_at_turn_start: Some(&token_usage_at_start),
                 started_at: Some(started_at),
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,
@@ -932,7 +932,7 @@ async fn e2e_v5_turn_end_without_host_facts_still_records() {
             .on_turn_start(TurnStartInput {
                 turn_id: turn_context.sub_id.as_str(),
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage_at_start,
+                token_usage_at_turn_start: Some(&token_usage_at_start),
                 started_at: None,
                 session_store: &session.services.session_extension_data,
                 thread_store: &session.services.thread_extension_data,

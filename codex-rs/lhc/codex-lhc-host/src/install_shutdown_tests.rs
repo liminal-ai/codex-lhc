@@ -150,7 +150,7 @@ async fn successful_thread_stop_persists_prompt_assistant_and_completed_turn() {
             .on_turn_start(TurnStartInput {
                 turn_id,
                 collaboration_mode: &collaboration_mode,
-                token_usage_at_turn_start: &token_usage,
+                token_usage_at_turn_start: Some(&token_usage),
                 started_at: Some(1_720_000_000),
                 session_store: &harness.session_store,
                 thread_store: &harness.thread_store,

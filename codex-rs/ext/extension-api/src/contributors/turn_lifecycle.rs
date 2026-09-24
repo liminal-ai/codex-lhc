@@ -1,9 +1,18 @@
+//! Turn lifecycle inputs and scheduling phases for host-owned contributors.
+
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 
 use crate::ExtensionData;
+
+/// Runs before task registration or during cancellable regular-task startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnStartPhase {
+    BeforeTaskRegistration,
+    RegularTaskStart,
+}
 
 /// Input supplied when the host starts a turn.
 pub struct TurnStartInput<'a> {
@@ -12,7 +21,9 @@ pub struct TurnStartInput<'a> {
     /// Effective collaboration mode for this turn.
     pub collaboration_mode: &'a CollaborationMode,
     /// Total token usage snapshot captured when the turn started.
-    pub token_usage_at_turn_start: &'a TokenUsage,
+    /// Present before task registration; absent during regular-task preparation.
+    /// Token-accounting contributors must remain in `BeforeTaskRegistration`.
+    pub token_usage_at_turn_start: Option<&'a TokenUsage>,
     /// Host-reported turn start time (Unix seconds), when known.
     ///
     /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).

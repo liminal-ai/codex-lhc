@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
+use codex_extension_api::TurnStartPhase;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
@@ -9,14 +12,23 @@ use crate::session::turn_context::TurnContext;
 
 impl Session {
     pub(super) async fn emit_turn_start_lifecycle(
-        &self,
+        self: &Arc<Self>,
         turn_context: &TurnContext,
-        token_usage_at_turn_start: &TokenUsage,
+        token_usage_at_turn_start: Option<&TokenUsage>,
+        phase: TurnStartPhase,
     ) {
         let collaboration_mode = turn_context.collaboration_mode();
         // LHC-HOOK: pass host turn start time into turn lifecycle (schema v5).
         let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            if contributor.turn_start_phase(&self.services.thread_extension_data) != phase {
+                continue;
+            }
+            if phase == TurnStartPhase::RegularTaskStart
+                && contributor.requires_mcp_runtime(&self.services.thread_extension_data)
+            {
+                self.refresh_mcp_if_dirty().await;
+            }
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
                     turn_id: turn_context.sub_id.as_str(),
