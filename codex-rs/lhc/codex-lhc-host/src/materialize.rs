@@ -923,6 +923,13 @@ fn emit_tail(
                         .get(&s.message_id)
                         .is_some_and(|m| m.kind == MessageKind::RuntimeNote)
                 });
+                // Verbatim tail copies keep the captured host id so Guardian
+                // identity overlap can suppress them on restart.
+                let id_hint = u.source_messages.iter().find_map(|s| {
+                    s.idempotency_key
+                        .as_deref()
+                        .and_then(parse_host_id_from_key)
+                });
                 if is_runtime_note {
                     let text = u
                         .source_messages
@@ -940,15 +947,14 @@ fn emit_tail(
                     if text.is_empty() {
                         continue;
                     }
-                    push_response_with_twins(
-                        user_text_message(&text),
-                        out,
-                        /*with_twins*/ false,
-                    );
-                } else {
-                    if u.content.is_empty() {
-                        continue;
+                    let mut item = user_text_message(&text);
+                    if let Some(id) = id_hint {
+                        item.set_id(Some(ResponseItemId::from_server(id)));
                     }
+                    push_response_with_twins(item, out, /*with_twins*/ false);
+                } else if u.content.is_empty() {
+                    continue;
+                } else {
                     let text = u
                         .source_messages
                         .first()
@@ -957,6 +963,9 @@ fn emit_tail(
                         .filter(|t| !t.is_empty())
                         .unwrap_or_else(|| u.content.clone());
                     let mut item = user_text_message(&text);
+                    if let Some(id) = id_hint {
+                        item.set_id(Some(ResponseItemId::from_server(id)));
+                    }
                     if let Some(blocks) = &u.blocks
                         && let ResponseItem::Message { content, .. } = &mut item
                     {

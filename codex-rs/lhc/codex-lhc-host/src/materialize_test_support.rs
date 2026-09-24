@@ -36,6 +36,11 @@ use serde_json::json;
 pub struct GuardianFoldTailExtras<'a> {
     pub extra_call_id: Option<&'a str>,
     pub unpaired_call_id: Option<&'a str>,
+    /// Host `ResponseItemId` captured on the overlapping user prompt. When set,
+    /// the fold copies it onto the rebuilt tail via the id-primary key.
+    pub overlap_user_item_id: Option<&'a str>,
+    /// Emit only the overlapping user (no tool pair). Short user-text tails.
+    pub user_text_only: bool,
 }
 
 pub const OVERLAP_CALL_ID: &str = "fc_overlap";
@@ -54,40 +59,50 @@ pub fn materialize_guardian_tool_fold(
 
     let mut entries = vec![
         band_entry("compressed prior turns"),
-        user_tail("m-overlap-user", OVERLAP_USER),
-        tool_call_tail("m-overlap-call", OVERLAP_CALL_ID, "read_file", args.clone()),
-        tool_result_tail(
+        user_tail("m-overlap-user", OVERLAP_USER, extras.overlap_user_item_id),
+    ];
+    let mut messages = vec![msg(
+        "m-overlap-user",
+        "t-overlap",
+        MessageKind::UserPrompt,
+        10,
+        OVERLAP_USER,
+    )];
+    let mut members = vec!["m-overlap-user".to_string()];
+    let mut order = 11i64;
+    if !extras.user_text_only {
+        entries.push(tool_call_tail(
+            "m-overlap-call",
+            OVERLAP_CALL_ID,
+            "read_file",
+            args.clone(),
+        ));
+        entries.push(tool_result_tail(
             "m-overlap-out",
             OVERLAP_CALL_ID,
             "read_file",
             OVERLAP_OUTPUT,
             Some(false),
-        ),
-    ];
-    let mut messages = vec![
-        msg(
-            "m-overlap-user",
+        ));
+        messages.push(msg(
+            "m-overlap-call",
             "t-overlap",
-            MessageKind::UserPrompt,
-            10,
-            OVERLAP_USER,
-        ),
-        msg("m-overlap-call", "t-overlap", MessageKind::ToolCall, 11, ""),
-        msg_tool_result(
+            MessageKind::ToolCall,
+            11,
+            "",
+        ));
+        messages.push(msg_tool_result(
             "m-overlap-out",
             "t-overlap",
             12,
             OVERLAP_CALL_ID,
             OVERLAP_OUTPUT,
             false,
-        ),
-    ];
-    let mut members = vec![
-        "m-overlap-user".to_string(),
-        "m-overlap-call".to_string(),
-        "m-overlap-out".to_string(),
-    ];
-    let mut order = 13i64;
+        ));
+        members.push("m-overlap-call".to_string());
+        members.push("m-overlap-out".to_string());
+        order = 13;
+    }
 
     if let Some(call_id) = extras.extra_call_id {
         let mid_call = "m-extra-call";
@@ -165,13 +180,14 @@ fn band_entry(text: &str) -> SessionThreadViewEntry {
     }))
 }
 
-fn user_tail(mid: &str, text: &str) -> SessionThreadViewEntry {
+fn user_tail(mid: &str, text: &str, host_item_id: Option<&str>) -> SessionThreadViewEntry {
     SessionThreadViewEntry::Message(SessionThreadViewMessage::User(SessionUserMessage {
         blocks: None,
         content: text.into(),
         source_messages: vec![SessionThreadViewEntrySource {
             message_id: mid.into(),
-            idempotency_key: None,
+            idempotency_key: host_item_id
+                .map(|id| format!("codex:guardian-fold:id:{id}:deadbeef:user_prompt")),
         }],
     }))
 }

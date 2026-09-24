@@ -14,6 +14,7 @@ use codex_lhc_host::degrade_body_to_best_available;
 use codex_lhc_host::history_from_materialized_items;
 use codex_lhc_host::materialize_guardian_tool_fold;
 use codex_lhc_host::prior_compact_carry;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
@@ -21,8 +22,12 @@ use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
 fn user(text: &str) -> ResponseItem {
+    user_with_id(text, None)
+}
+
+fn user_with_id(text: &str, id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
-        id: None,
+        id: id.map(|id| ResponseItemId::from_server(id.into())),
         role: "user".to_string(),
         content: vec![ContentItem::InputText {
             text: text.to_string(),
@@ -109,6 +114,8 @@ async fn real_fold_then_new_exchange_is_replayed_on_restart() {
         GuardianFoldTailExtras {
             extra_call_id: None,
             unpaired_call_id: None,
+            overlap_user_item_id: None,
+            user_text_only: false,
         },
     );
     assert!(
@@ -152,6 +159,8 @@ async fn stale_recovery_rematerialize_replays_new_tail_on_restart() {
         GuardianFoldTailExtras {
             extra_call_id: None,
             unpaired_call_id: None,
+            overlap_user_item_id: None,
+            user_text_only: false,
         },
     );
     let carry = prior_compact_carry(&first);
@@ -165,6 +174,8 @@ async fn stale_recovery_rematerialize_replays_new_tail_on_restart() {
         GuardianFoldTailExtras {
             extra_call_id: Some("fc_stale_b"),
             unpaired_call_id: None,
+            overlap_user_item_id: None,
+            user_text_only: false,
         },
     );
     let covered = producer_covered_count(&recovered).expect("recovery still writes a count");
@@ -200,6 +211,8 @@ async fn mid_turn_degrade_then_new_response_is_replayed_on_restart() {
         GuardianFoldTailExtras {
             extra_call_id: None,
             unpaired_call_id: Some("fc_orphan"),
+            overlap_user_item_id: None,
+            user_text_only: false,
         },
     );
     let covered_before_drop =
@@ -246,5 +259,79 @@ async fn mid_turn_degrade_then_new_response_is_replayed_on_restart() {
     assert!(
         guardian_has_user(&guardian, "new instruction after degrade"),
         "a new item after MidTurn drop must not be swallowed as leftover overlap: {guardian:?}"
+    );
+}
+
+fn guardian_user_text_count(checkpoint: &GuardianHistoryCheckpoint, text: &str) -> usize {
+    checkpoint
+        .0
+        .iter()
+        .filter(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "user" => {
+                content.iter().any(|part| match part {
+                    ContentItem::InputText { text: body } => body == text,
+                    _ => false,
+                })
+            }
+            _ => false,
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn real_fold_then_restart_replays_no_duplicate_user_messages() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let overlap_id = "msg_overlap_user";
+    let items = materialize_guardian_tool_fold(
+        GuardianHistoryCheckpoint(vec![
+            user("Keep the release private."),
+            user_with_id(OVERLAP_USER, Some(overlap_id)),
+        ]),
+        GuardianFoldTailExtras {
+            extra_call_id: None,
+            unpaired_call_id: None,
+            overlap_user_item_id: Some(overlap_id),
+            user_text_only: true,
+        },
+    );
+    let suffix_overlap_ids: Vec<_> = items
+        .iter()
+        .skip_while(|item| !matches!(item, RolloutItem::Compacted(_)))
+        .skip(1)
+        .filter_map(|item| match item {
+            RolloutItem::ResponseItem(envelope) => match &envelope.item {
+                ResponseItem::Message {
+                    role, id, content, ..
+                } if role == "user" => content.iter().find_map(|part| match part {
+                    ContentItem::InputText { text } if text == OVERLAP_USER => id.clone(),
+                    _ => None,
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        suffix_overlap_ids,
+        vec![ResponseItemId::from_server(overlap_id.into())],
+        "verbatim user tail must keep the captured host id"
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &items)
+        .await;
+    let guardian = reconstructed
+        .guardian_history
+        .expect("user-text fold snapshot must survive restart");
+    assert_eq!(
+        guardian_user_text_count(&guardian, "Keep the release private."),
+        1,
+        "pre-fold user must remain once: {guardian:?}"
+    );
+    assert_eq!(
+        guardian_user_text_count(&guardian, OVERLAP_USER),
+        1,
+        "real fold then restart must not duplicate the overlapping user: {guardian:?}"
     );
 }
