@@ -5,8 +5,11 @@ use super::*;
 use crate::LateBoundCallbacks;
 use crate::lhc_inference_callbacks;
 use crate::spawn_capture;
+use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::RawItemInput;
+use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -685,6 +688,110 @@ async fn shutdown_returns_within_bound_when_persist_is_blocked() {
         started.elapsed()
     );
     db.exec("ROLLBACK");
+}
+
+#[tokio::test]
+async fn shutdown_returns_within_bound_when_queued_writes_are_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "r8-queued-writes";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    handle.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+    };
+    db.exec("BEGIN EXCLUSIVE");
+    for index in 0..3 {
+        handle.persist(
+            &message(
+                "user",
+                &format!("queued persist {index}"),
+                &format!("user-queued-{index}"),
+            ),
+            RawItemProvenance::UserPrompt,
+            /*step_index*/ None,
+        );
+    }
+    let wait = handle.clone();
+    let started = Instant::now();
+    handle.shutdown().await;
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "queued writes under a held lock must finish or fail within write+close settle"
+    );
+    assert!(
+        started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND + Duration::from_secs(1),
+        "elapsed {:?}",
+        started.elapsed()
+    );
+    db.exec("ROLLBACK");
+}
+
+#[tokio::test]
+async fn racing_thread_starts_loser_gets_retry_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let thread_id = "r8-race-admission";
+    let start = |root: std::path::PathBuf| async move {
+        let mut builder = ExtensionRegistryBuilder::<()>::new();
+        install_with_root(&mut builder, |_config| true, root);
+        let registry = builder.build();
+        let session_store = ExtensionData::new("session");
+        let thread_store = ExtensionData::new(thread_id);
+        let config = ();
+        let session_source = SessionSource::Exec;
+        let environments = [];
+        for contributor in registry.thread_lifecycle_contributors() {
+            contributor
+                .on_thread_start(ThreadStartInput {
+                    config: &config,
+                    session_source: &session_source,
+                    persistent_thread_state_available: false,
+                    environments: &environments,
+                    mcp_resource_client: None,
+                    extension_metrics: None,
+                    session_store: &session_store,
+                    thread_store: &thread_store,
+                })
+                .await;
+        }
+        let slot = thread_store.get::<LhcCaptureSlot>().expect("capture slot");
+        (registry, session_store, thread_store, slot.state())
+    };
+    let ((registry_a, session_a, thread_a, state_a), (registry_b, session_b, thread_b, state_b)) =
+        tokio::join!(start(root.clone()), start(root));
+    let retry = |state: &CaptureState| matches!(state, CaptureState::Failed(reason) if reason == CAPTURE_STILL_SHUTTING_DOWN);
+    assert!(
+        retry(&state_a) ^ retry(&state_b),
+        "exactly one starter must fail with the retry error; a={state_a:?} b={state_b:?}"
+    );
+    let winner = if retry(&state_a) {
+        (&registry_b, &session_b, &thread_b)
+    } else {
+        (&registry_a, &session_a, &thread_a)
+    };
+    let slot = winner.2.get::<LhcCaptureSlot>().expect("winner slot");
+    wait_for_handle(&slot, Duration::from_secs(5))
+        .await
+        .expect("winner capture opened");
+    for contributor in winner.0.thread_lifecycle_contributors() {
+        contributor
+            .on_thread_stop(ThreadStopInput {
+                session_store: winner.1,
+                thread_store: winner.2,
+            })
+            .await;
+    }
 }
 
 #[tokio::test]

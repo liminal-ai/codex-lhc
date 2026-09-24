@@ -57,7 +57,8 @@ use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
 use crate::capture::CaptureShutdownFailure;
 use crate::capture::CaptureShutdownResult;
-use crate::capture::spawn_capture_with_identity;
+use crate::capture::LiveCaptureAdmission;
+use crate::capture::spawn_capture_with_admission;
 use crate::gating::lhc_root;
 use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
@@ -1232,6 +1233,7 @@ fn schedule_open(
     root: PathBuf,
     initial_identity: Option<ModelIdentity>,
     fault: Option<OpenThreadFaultSeam>,
+    admission: LiveCaptureAdmission,
 ) {
     if slot
         .open_scheduled
@@ -1261,12 +1263,13 @@ fn schedule_open(
                 return;
             }
         };
-        let handle = rt.block_on(spawn_capture_with_identity(
+        let handle = rt.block_on(spawn_capture_with_admission(
             &thread_id,
             cwd.as_deref(),
             Some(root.clone()),
             derivation,
             initial_identity,
+            Some(admission),
         ));
         match handle {
             Some(h) => {
@@ -1419,17 +1422,15 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 return;
             }
             let db_path = crate::capture::capture_db_path_for(&thread_id, Some(root.as_path()));
-            if !crate::capture::wait_for_live_capture_path(
-                &db_path,
-                crate::capture::CAPTURE_ADMISSION_BOUND,
-            )
-            .await
-            {
-                slot.publish_failed(CAPTURE_STILL_SHUTTING_DOWN);
-                return;
-            }
+            let admission = match LiveCaptureAdmission::acquire(db_path).await {
+                Ok(admission) => admission,
+                Err(()) => {
+                    slot.publish_failed(CAPTURE_STILL_SHUTTING_DOWN);
+                    return;
+                }
+            };
             // Fire-and-forget SQLite open — Session construction is not blocked
-            // on the database. Predecessor admission already completed above.
+            // on the database. The process-wide path slot is already reserved.
             schedule_open(
                 slot,
                 thread_id,
@@ -1437,6 +1438,7 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 root,
                 Some(identity),
                 self.open_thread_fault,
+                admission,
             );
         })
     }
