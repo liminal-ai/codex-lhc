@@ -40,30 +40,30 @@
 > install `codex-lhc` and leaves any stock `codex` command alone.
 > Official Codex installers and `openai/codex` releases do **not** include LHC.
 >
-> ### What changes in v0.153.4
+> ### What changes in v0.156.1
 >
-> This update brings the fork to Codex 0.153.4 and improves updates, images,
-> and the summaries used to keep long-running conversations coherent.
+> This update brings the fork to Codex 0.156.1.
 >
-> - **Updates stay with LHC.** New installations use `codex-lhc`, alongside
->   stock `codex`. Run `codex-lhc update` to update a managed fork installation;
->   its in-app update prompt and `doctor` advice also use LHC releases.
->   `--lhc-version` reports the fork release; `--version` reports its Codex base.
-> - **Images can survive history reconstruction and restart.** Image data and
->   detail settings are restored when that portion of history is retained in
->   full. Older compressed portions may carry an image placeholder instead.
-> - **History summaries use the intended summarization instructions.** This
->   fixes a bridge error that could produce replies where summaries belonged.
+> - **Custom context windows stick.** A set model context window is kept when
+>   a turn is rebuilt, instead of falling back to the default catalog window.
+> - **Guardian after compaction.** Later conversation stays in order after a
+>   compact: new work is not dropped, and overlapping user messages are not
+>   duplicated.
+> - **Unfinished summary work is handed back** when a thread is closed or
+>   Codex exits, so the next session on that thread can continue from it.
+> - **Rewind is refused** on LHC threads, with the message
+>   `Rewinding is not yet supported.`
 >
-> **Upgrade impact:** opening existing LHC history upgrades its storage in
-> place to schema 13. Releases v0.150.2 and earlier cannot reopen migrated
-> threads. If you need the option to return to an older release, preserve a
-> backup of your LHC state before upgrading. See [upgrade details](lhc-docs/INSTALL.md#upgrade-and-compatibility).
+> **Known limitation:** threads rewound under 0.155.1 or earlier can surface
+> rewound turns via retrieval and after compaction.
+>
+> **Upgrade impact:** LHC thread schema remains 13. Opening a schema-12 (or
+> older) thread still migrates it in place. Releases v0.150.2 and earlier
+> cannot reopen migrated threads. See [upgrade details](lhc-docs/INSTALL.md#upgrade-and-compatibility).
 >
 > Upstream's optional experimental context-management mode remains incompatible
 > with LHC and is rejected at startup. Normal LHC use does not require it.
-> [Release notes](lhc-release/notes/v0.153.4.md) describe the remaining changes
-> and qualification coverage.
+> [Release notes](lhc-release/notes/v0.156.1.md) describe the remaining changes.
 >
 > Everything below is upstream's README. Its install commands install stock
 > Codex, not Codex + LHC.

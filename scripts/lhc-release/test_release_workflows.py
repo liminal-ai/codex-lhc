@@ -171,6 +171,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("runs_on: windows-11-arm", remaining)
         self.assertNotIn("group:", remaining)
+        self.assertIn("runs_on: [self-hosted, lhc-windows-x64]", remaining)
+        self.assertIn("runs_on: [self-hosted, lhc-macos-arm64]", remaining)
+        self.assertNotIn("blacksmith-32vcpu-windows-2025", remaining)
+        self.assertNotIn("blacksmith-12vcpu-macos-15", remaining)
+        self.assertIn("if: github.repository == 'liminal-ai/codex-lhc'", remaining)
 
     def test_candidate_has_exact_hosted_platform_set(self) -> None:
         text = (ROOT / ".github/workflows/lhc-release.yml").read_text()

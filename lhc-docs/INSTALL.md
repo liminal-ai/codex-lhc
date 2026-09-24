@@ -27,7 +27,7 @@ sh install.sh
 To install a specific release:
 
 ```bash
-sh install.sh --version 0.153.4
+sh install.sh --version 0.156.1
 ```
 
 Supported release targets are Linux x86-64/ARM64 and Apple Silicon macOS.
@@ -44,7 +44,7 @@ Invoke-WebRequest https://github.com/liminal-ai/codex-lhc/releases/latest/downlo
 To install a specific release:
 
 ```powershell
-.\install.ps1 -Version 0.153.4
+.\install.ps1 -Version 0.156.1
 ```
 
 The installer selects the Windows x86-64 or ARM64 package from the process
@@ -101,10 +101,10 @@ instructions pointing at the installer instead.
 
 ## Upgrade and compatibility
 
-The current `v0.153.4` release uses LHC thread schema 13 (content blocks and
+The current `v0.156.1` release uses LHC thread schema 13 (content blocks and
 blob storage on top of the schema-12 turn parts).
 
-> **One-way migration:** opening a schema-12 (or older) thread with `v0.153.4`
+> **One-way migration:** opening a schema-12 (or older) thread with `v0.156.1`
 > migrates it in place, in one transaction, to schema 13. `v0.150.2` and
 > earlier cannot open a migrated thread; there is no downgrade.
 
