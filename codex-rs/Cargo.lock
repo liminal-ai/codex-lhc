@@ -2279,6 +2279,7 @@ dependencies = [
  "futures",
  "hmac 0.12.1",
  "http 1.4.0",
+ "lhc",
  "opentelemetry",
  "opentelemetry_sdk",
  "pretty_assertions",

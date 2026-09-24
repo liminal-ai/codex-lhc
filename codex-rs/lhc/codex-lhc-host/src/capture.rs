@@ -19,6 +19,7 @@ use serde_json::Map;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tracing::error;
 use tracing::warn;
 
@@ -175,6 +176,10 @@ struct CaptureShared {
     degraded: Arc<AtomicBool>,
     /// Durable turn bound to the current host turn (published by the worker).
     turn_binding: Arc<std::sync::Mutex<Option<TurnBinding>>>,
+    /// True after the capture OS thread has left `worker_loop` (or failed to
+    /// start it). Intake-durability ack is earlier; this is when the runtime
+    /// can no longer claim work.
+    terminated: watch::Sender<bool>,
 }
 
 /// Durable identity of the LHC turn opened under one host turn (turn parts,
@@ -680,6 +685,26 @@ impl CaptureHandle {
         }
     }
 
+    /// Wait until this capture runtime has left `worker_loop` and cannot claim
+    /// again. Intake-durability ack is a separate, earlier contract.
+    pub(crate) async fn wait_terminated_bounded(&self, timeout: std::time::Duration) -> bool {
+        let mut rx = self.inner.terminated.subscribe();
+        if *rx.borrow() {
+            return true;
+        }
+        tokio::time::timeout(timeout, rx.wait_for(|done| *done))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .is_some()
+    }
+
+    /// Whether the capture OS thread has already left `worker_loop`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn is_terminated(&self) -> bool {
+        *self.inner.terminated.borrow()
+    }
+
     pub fn dropped_count(&self) -> u64 {
         self.inner.dropped.load(Ordering::Relaxed)
     }
@@ -768,6 +793,7 @@ pub async fn spawn_capture_with_identity(
     let dropped = Arc::new(AtomicU64::new(0));
     let degraded = Arc::new(AtomicBool::new(false));
     let turn_binding = Arc::new(std::sync::Mutex::new(None));
+    let (terminated, _) = watch::channel(false);
     let shared = Arc::new(CaptureShared {
         thread_id: thread_id.to_string(),
         root: root.clone(),
@@ -775,12 +801,17 @@ pub async fn spawn_capture_with_identity(
         dropped: Arc::clone(&dropped),
         degraded: Arc::clone(&degraded),
         turn_binding: Arc::clone(&turn_binding),
+        terminated,
     });
     let thread_id_owned = thread_id.to_string();
     let degraded_worker = Arc::clone(&degraded);
+    let terminated = shared.terminated.clone();
     std::thread::Builder::new()
         .name(format!("lhc-capture-{thread_id}"))
         .spawn(move || {
+            let mark_terminated = || {
+                let _ = terminated.send(true);
+            };
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -789,6 +820,7 @@ pub async fn spawn_capture_with_identity(
                 Err(err) => {
                     error!(?err, "LHC: failed to build capture runtime");
                     degraded_worker.store(true, Ordering::SeqCst);
+                    mark_terminated();
                     return;
                 }
             };
@@ -819,6 +851,7 @@ pub async fn spawn_capture_with_identity(
                 };
                 error!(%msg, "LHC: capture worker panicked");
             }
+            mark_terminated();
         })
         .map_err(|err| {
             error!(?err, "LHC: failed to spawn capture thread");

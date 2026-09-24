@@ -502,6 +502,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 crate::transport::ConnectionOrigin::InProcess,
             ));
             let mut listen_for_threads = true;
+            let mut owned_thread_ids = Vec::<String>::new();
 
             loop {
                 tokio::select! {
@@ -550,6 +551,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
+                                owned_thread_ids.push(thread_id.to_string());
                                 let connection_ids = if session.initialized() {
                                     vec![IN_PROCESS_CONNECTION_ID]
                                 } else {
@@ -571,6 +573,9 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }
 
             processor.clear_runtime_references();
+            owned_thread_ids.extend(processor.list_thread_ids().await);
+            owned_thread_ids.sort();
+            owned_thread_ids.dedup();
             processor.cancel_active_login().await;
             processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
@@ -578,7 +583,12 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             processor.clear_all_thread_listeners().await;
             processor.drain_background_tasks().await;
             processor.shutdown_threads().await;
-            codex_lhc_host::on_process_shutdown();
+            // Release only this client's databases. Process-wide release-all
+            // would take other live in-process clients' claims.
+            codex_lhc_host::on_server_shutdown(
+                /*root*/ None,
+                owned_thread_ids.iter().map(String::as_str),
+            );
         });
         let mut pending_request_responses =
             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
@@ -878,7 +888,161 @@ mod tests {
         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
     }
 
+    fn seed_held_claim(path: &Path, work_item_id: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("threads dir");
+        let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+            lhc::shared_tech::errors::OpResult::Ok { value } => value,
+            lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+        };
+        db.exec(&format!(
+            "CREATE TABLE IF NOT EXISTS work_item (
+                work_item_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                status TEXT NOT NULL,
+                queued_at TEXT NOT NULL,
+                claimed_at TEXT,
+                claim_expires_at TEXT,
+                payload TEXT NOT NULL
+             );
+             INSERT INTO work_item (
+                work_item_id, owner, kind, source_ref, status, queued_at,
+                claimed_at, claim_expires_at, payload
+             ) VALUES (
+                '{work_item_id}', 'test', 'test', 'test', 'claimed', 'now',
+                'now', 'later', '{{\"claimAttempt\":1}}'
+             );"
+        ));
+        lhc::shared_tech::work_queue::note_claim_held(
+            &db,
+            &lhc::shared_tech::work_queue::ClaimAttempt {
+                work_item_id: work_item_id.into(),
+                claim_attempt: Some(1),
+            },
+        );
+        db.close();
+    }
+
+    fn work_item_status(path: &Path, work_item_id: &str) -> String {
+        let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+            lhc::shared_tech::errors::OpResult::Ok { value } => value,
+            lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+        };
+        let status = db
+            .prepare("SELECT status FROM work_item WHERE work_item_id = ?")
+            .get_params(&[lhc::shared_tech::storage::SqlParam::from(work_item_id)])
+            .expect("row")
+            .get("status")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        db.close();
+        status
+    }
+
+    async fn start_thread(client: &InProcessClientHandle, request_id: i64) -> String {
+        let response = client
+            .request(ClientRequest::ThreadStart {
+                request_id: RequestId::Integer(request_id),
+                params: ThreadStartParams {
+                    ephemeral: Some(true),
+                    ..ThreadStartParams::default()
+                },
+            })
+            .await
+            .expect("request transport should work")
+            .expect("thread/start should succeed");
+        let parsed: ThreadStartResponse =
+            serde_json::from_value(response).expect("thread/start response should parse");
+        parsed.thread.id
+    }
+
+    async fn start_test_client_without_lhc_capture(
+        session_source: SessionSource,
+    ) -> InProcessClientHandle {
+        let codex_home = TempDir::new().expect("temp dir");
+        let mut config = build_test_config(codex_home.path()).await;
+        config
+            .features
+            .set_enabled(codex_features::Feature::LhcCapture, false)
+            .expect("disable LhcCapture");
+        let config = Arc::new(config);
+        let state_db = codex_rollout::state_db::try_init(config.as_ref())
+            .await
+            .expect("state db should initialize for in-process test");
+        let args = InProcessStartArgs {
+            arg0_paths: Arg0DispatchPaths::default(),
+            config,
+            cli_overrides: Vec::new(),
+            loader_overrides: LoaderOverrides::default(),
+            strict_config: false,
+            cloud_config_bundle: CloudConfigBundleLoader::default(),
+            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
+            feedback: CodexFeedback::new(),
+            log_db: None,
+            state_db: Some(state_db),
+            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
+            config_warnings: Vec::new(),
+            session_source,
+            enable_codex_api_key_env: false,
+            initialize: InitializeParams {
+                client_info: ClientInfo {
+                    name: "codex-in-process-test".to_string(),
+                    title: None,
+                    version: "0.0.0".to_string(),
+                },
+                capabilities: None,
+            },
+            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
+        };
+        let mut client = start(args).await.expect("in-process runtime should start");
+        client._test_codex_home = Some(codex_home);
+        client
+    }
+
     #[tokio::test]
+    #[serial_test::serial(codex_lhc_root)]
+    async fn closing_one_in_process_client_leaves_the_other_clients_claim() {
+        let lhc_root = TempDir::new().expect("lhc root");
+        let previous = std::env::var_os("CODEX_LHC_ROOT");
+        // SAFETY: serialized against other CODEX_LHC_ROOT tests.
+        unsafe { std::env::set_var("CODEX_LHC_ROOT", lhc_root.path()) };
+
+        let client_a = start_test_client_without_lhc_capture(SessionSource::Cli).await;
+        let client_b = start_test_client_without_lhc_capture(SessionSource::Cli).await;
+        let thread_a = start_thread(&client_a, 11).await;
+        let thread_b = start_thread(&client_b, 12).await;
+        let path_a = codex_lhc_host::thread_sqlite_path(&thread_a, Some(lhc_root.path()))
+            .expect("thread A sqlite path");
+        let path_b = codex_lhc_host::thread_sqlite_path(&thread_b, Some(lhc_root.path()))
+            .expect("thread B sqlite path");
+        seed_held_claim(&path_a, "w-a");
+        seed_held_claim(&path_b, "w-b");
+
+        client_a
+            .shutdown()
+            .await
+            .expect("client A should shutdown cleanly");
+
+        assert_eq!(
+            work_item_status(&path_b, "w-b"),
+            "claimed",
+            "closing client A must not take client B's held claim"
+        );
+
+        client_b
+            .shutdown()
+            .await
+            .expect("client B should shutdown cleanly");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEX_LHC_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_LHC_ROOT") },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(codex_lhc_root)]
     async fn in_process_start_initializes_and_handles_typed_v2_request() {
         let client = start_test_client(SessionSource::Cli).await;
         let response = client
@@ -900,6 +1064,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(codex_lhc_root)]
     async fn in_process_start_uses_requested_session_source_for_thread_start() {
         for (requested_source, expected_source) in [
             (SessionSource::Cli, ApiSessionSource::Cli),
@@ -928,6 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(codex_lhc_root)]
     async fn in_process_start_clamps_zero_channel_capacity() {
         let client =
             start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;

@@ -231,3 +231,158 @@ async fn successful_thread_stop_persists_prompt_assistant_and_completed_turn() {
     );
     reopened.shutdown().await;
 }
+
+fn pending_inference_callbacks() -> crate::InferenceCallbacks {
+    use std::sync::Arc;
+    fn hang() -> crate::BoxInferenceFuture {
+        Box::pin(std::future::pending())
+    }
+    crate::InferenceCallbacks {
+        smooth_prompt: Arc::new(|_| hang()),
+        summarize_tool_result: Arc::new(|_| hang()),
+        compress_detailed_turn: Arc::new(|_| hang()),
+        summarize_chunk_brief: Arc::new(|_| hang()),
+    }
+}
+
+fn claimed_work_item_count(path: &std::path::Path) -> i64 {
+    let Some(path) = path.to_str() else {
+        return 0;
+    };
+    if !std::path::Path::new(path).exists() {
+        return 0;
+    }
+    let db = match lhc::shared_tech::storage::open_database(path) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { .. } => return 0,
+    };
+    db.prepare("SELECT count(*) AS n FROM work_item WHERE status = 'claimed'")
+        .get()
+        .and_then(|row| {
+            row.get("n")
+                .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|n| n as i64)))
+        })
+        .unwrap_or(0)
+}
+
+async fn wait_for_claimed_work_item(path: &std::path::Path, bound: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if claimed_work_item_count(path) > 0 {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn shutdown_ack_returns_while_seeded_provider_is_pending() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "acked-provider-pending";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("capture");
+    handle.persist(
+        &message("user", "pending provider prompt", "user-1"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &message("assistant", "pending provider reply", "assistant-1"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "seeded hanging inference must hold a claim before shutdown"
+    );
+
+    let wait = handle.clone();
+    let started = std::time::Instant::now();
+    let result = handle.shutdown_bounded(Duration::from_secs(2)).await;
+    assert_eq!(
+        result,
+        CaptureShutdownResult::Persisted,
+        "intake-durability ack must not wait for hanging inference"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "ack returned after {:?}, which waited on the provider",
+        started.elapsed()
+    );
+    assert!(
+        !wait.is_terminated(),
+        "capture runtime must still be inside close while the provider is pending"
+    );
+    assert!(
+        claimed_work_item_count(&path) > 0,
+        "claim must stay held until the capture runtime stops"
+    );
+
+    assert!(
+        wait.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "close settle bound must still terminate the capture runtime"
+    );
+    crate::handback::on_thread_unload(Some(root), thread_id);
+    assert_eq!(claimed_work_item_count(&path), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        claimed_work_item_count(&path),
+        0,
+        "a stopped runtime must not re-claim after hand-back"
+    );
+}
+
+#[tokio::test]
+async fn thread_stop_hands_back_only_after_pending_provider_runtime_stops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "stop-provider-pending";
+    let harness = LifecycleHarness::start(root, thread_id).await;
+    harness
+        .slot()
+        .set_derivation_callbacks(pending_inference_callbacks());
+    let handle = harness.slot().get().expect("capture handle");
+    handle.persist(
+        &message("user", "pending stop prompt", "user-1"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.persist(
+        &message("assistant", "pending stop reply", "assistant-1"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "hanging inference must hold a claim before thread stop"
+    );
+
+    let stopped = tokio::time::timeout(Duration::from_secs(10), harness.stop_thread()).await;
+    assert!(
+        stopped.is_ok(),
+        "thread stop must stay bounded while inference is pending"
+    );
+    assert_eq!(claimed_work_item_count(&path), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        claimed_work_item_count(&path),
+        0,
+        "thread stop must not requeue a claim under a still-running worker"
+    );
+}

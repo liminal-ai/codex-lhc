@@ -856,6 +856,10 @@ impl MessageProcessor {
         self.thread_processor.shutdown_threads().await;
     }
 
+    pub(crate) async fn list_thread_ids(&self) -> Vec<String> {
+        self.thread_processor.list_thread_ids().await
+    }
+
     pub(crate) async fn connection_closed(
         &self,
         connection_id: ConnectionId,

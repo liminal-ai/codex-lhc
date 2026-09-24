@@ -93,6 +93,10 @@ pub fn live_compact_writer_owner(thread_id: &str, attempt_id: &str) -> bool {
     matches!(owners.get(thread_id), Some(owner) if owner != attempt_id)
 }
 
+/// Bound on [`LhcSession::close`]'s settle-wait. Close is cleanup, not a gate:
+/// give in-flight background derivation a moment to land, then let go.
+pub(crate) const CLOSE_SETTLE_BOUND: Duration = Duration::from_secs(5);
+
 /// Live LHC capture session (owns the SDK instance + thread path).
 pub struct LhcSession {
     pub thread_id: String,
@@ -352,10 +356,6 @@ impl LhcSession {
         self.lhc.drain_settled(self.thread_ref.clone()).await;
     }
 
-    /// Bound on [`Self::close`]'s settle-wait. Close is cleanup, not a gate:
-    /// give in-flight background derivation a moment to land, then let go.
-    const CLOSE_SETTLE_BOUND: Duration = Duration::from_secs(5);
-
     pub async fn close(self) {
         // Best-effort settle before the session (and, on the capture worker,
         // its runtime) drops. Bounded: a scheduler that cannot settle — a
@@ -365,7 +365,7 @@ impl LhcSession {
         // re-drains it on the next open. On a `Manual` session the scheduler
         // holds no state and this returns immediately.
         let _ = tokio::time::timeout(
-            Self::CLOSE_SETTLE_BOUND,
+            CLOSE_SETTLE_BOUND,
             self.lhc.drain_settled(self.thread_ref.clone()),
         )
         .await;

@@ -343,7 +343,6 @@ mod tests {
     /// flag ON → slot present; explicit OFF → no `LhcCaptureSlot`.
     #[tokio::test]
     async fn thread_extensions_registers_lhc_raw_item_contributor() -> anyhow::Result<()> {
-        use crate::extensions::guardian_agent_spawner;
         use codex_core::config::ConfigOverrides;
         use codex_core::init_state_db;
         use codex_exec_server::EnvironmentManager;
@@ -386,23 +385,20 @@ mod tests {
         );
 
         // Production path: same dependency shape as mcp_refresh / message_processor.
-        let registry = thread_extensions(
-            guardian_agent_spawner(std::sync::Weak::new()),
-            ThreadExtensionDependencies {
-                event_sink: Arc::new(NoopExtensionEventSink),
-                auth_manager: auth_manager.clone(),
-                state_db: Some(state_db.clone()),
-                analytics_events_client: AnalyticsEventsClient::disabled(),
-                thread_manager: std::sync::Weak::new(),
-                goal_service: Arc::new(codex_goal_extension::GoalService::new()),
-                environment_manager: Arc::clone(&environment_manager),
-                executor_skill_provider,
-                git_attribution_base_url: config.chatgpt_base_url.clone(),
-                http_client_factory: config.http_client_factory(),
-                queue_service: None,
-                turn_start_admission: None,
-            },
-        );
+        let registry = thread_extensions(ThreadExtensionDependencies {
+            event_sink: Arc::new(NoopExtensionEventSink),
+            auth_manager: auth_manager.clone(),
+            state_db: Some(state_db.clone()),
+            analytics_events_client: AnalyticsEventsClient::disabled(),
+            thread_manager: std::sync::Weak::new(),
+            goal_service: Arc::new(codex_goal_extension::GoalService::new()),
+            environment_manager: Arc::clone(&environment_manager),
+            executor_skill_provider,
+            git_attribution_base_url: config.chatgpt_base_url.clone(),
+            http_client_factory: config.http_client_factory(),
+            queue_service: None,
+            turn_start_admission: None,
+        });
 
         assert!(
             !registry.raw_item_contributors().is_empty(),
