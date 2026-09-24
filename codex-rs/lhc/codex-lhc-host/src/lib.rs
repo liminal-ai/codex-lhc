@@ -9,6 +9,7 @@ mod body_validation;
 mod capture;
 mod compact_bridge;
 mod compact_continuation;
+mod database_digest;
 mod gating;
 mod handback;
 mod host_turn_ids;
@@ -233,6 +234,7 @@ pub use materialize::model_stream_response_item_count;
 pub use materialize::prior_compact_carry;
 #[cfg(any(test, feature = "test-util"))]
 mod materialize_test_support;
+pub use database_digest::lhc_database_digest;
 #[cfg(any(test, feature = "test-util"))]
 pub use materialize_test_support::GuardianFoldTailExtras;
 #[cfg(any(test, feature = "test-util"))]
@@ -285,7 +287,6 @@ pub use rollout_swap::proves_new_generation;
 pub use rollout_swap::reconcile_interrupted_swap;
 pub use rollout_swap::strict_read_generation;
 pub use session::encode_thread_id_for_path;
-pub use session::lhc_database_digest;
 pub use session::live_turn_ids;
 pub use session::thread_file_path;
 pub use session::thread_has_lhc_database;

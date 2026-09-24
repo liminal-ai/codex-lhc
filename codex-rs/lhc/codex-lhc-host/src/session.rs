@@ -21,8 +21,6 @@ use tracing::error;
 use tracing::warn;
 
 use lhc::shared_tech::InferenceCallbacks;
-use sha2::Digest;
-use sha2::Sha256;
 
 use crate::gating::lhc_root;
 use crate::idempotency::OccurrenceTracker;
@@ -441,61 +439,6 @@ pub fn live_turn_ids(path: &Path) -> Result<Vec<String>, String> {
         .collect::<Result<Vec<_>, _>>()?;
     db.close();
     Ok(ids)
-}
-
-/// Checkpoint the WAL, then digest event rows, message blocks, and live turns.
-/// Fails if the database is missing or unreadable.
-pub fn lhc_database_digest(path: &Path) -> Result<String, String> {
-    let Some(path) = path.to_str() else {
-        return Err("LHC database path is not utf-8".into());
-    };
-    if !std::path::Path::new(path).is_file() {
-        return Err(format!("LHC database missing: {path}"));
-    }
-    let db = match lhc::shared_tech::storage::open_database(path) {
-        OpResult::Ok { value } => value,
-        OpResult::Err { error } => return Err(error.reason),
-    };
-    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
-    let mut hasher = Sha256::new();
-    for row in db
-        .prepare(
-            "SELECT event_order, event_kind, idempotency_key, payload FROM event ORDER BY event_order",
-        )
-        .all(&[])
-    {
-        hash_sql_row(&mut hasher, &row);
-    }
-    for row in db
-        .prepare(
-            "SELECT message_id, block_index, block_type, content FROM message_block ORDER BY message_id, block_index",
-        )
-        .all(&[])
-    {
-        hash_sql_row(&mut hasher, &row);
-    }
-    for row in db
-        .prepare("SELECT turn_id, turn_order, deleted_at FROM turns ORDER BY turn_order")
-        .all(&[])
-    {
-        hash_sql_row(&mut hasher, &row);
-    }
-    db.close();
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn hash_sql_row(hasher: &mut Sha256, row: &serde_json::Map<String, serde_json::Value>) {
-    let mut keys: Vec<_> = row.keys().cloned().collect();
-    keys.sort();
-    for key in keys {
-        hasher.update(key.as_bytes());
-        hasher.update([0]);
-        match row.get(&key) {
-            Some(value) => hasher.update(value.to_string().as_bytes()),
-            None => hasher.update(b"<null>"),
-        }
-        hasher.update([0xff]);
-    }
 }
 
 async fn open_existing(
