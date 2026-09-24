@@ -26,10 +26,11 @@ the adapter captures; it cannot recover host structure discarded during capture
 - `codex-rs/lhc/vendor/long-horizon-context` — submodule, pinned to
   **certified commits only** (gate-green at the pin; the historical
   `lhc-rs-port` working branch was retired into `main` 2026-08-08).
-  Current pin: **`e9456a6e`** (`e9456a6ee23a10cf04e15b16bcf77738c52b0f7c`) — schema 13 content
-  blocks and blob storage on top of schema-12 turn parts. Selected from the
-  shared Rust port ledger and Grok's image integration reference; Codex image,
-  migration, and compact/recovery qualification must pass at this pin.
+  Current pin: **`47e360a3`** (`47e360a39eb29013bceb87cbf5c0d06c01ac71c4`) — f5h claim fencing,
+  F6 walk, scoped per-database hand-back, and fallible abort-safe hand-back storage
+  on top of schema 13 content blocks. Alder accepted this SHA as the reviewed Rust
+  core pin (2026-09-24). Codex image, migration, compact/recovery, Guardian, and
+  shutdown-handback qualification must pass at this pin.
   The tripwire refreshes and reports ancestry separately from certification;
   main ancestry alone is not certification.
   Prior pin `b408f89` —
@@ -166,6 +167,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 4b | `core/src/tasks/lifecycle.rs` + `tasks/mod.rs` | pass host turn timestamps into turn lifecycle emitters; abort path returns timing from `handle_task_abort`; LIM-134 centralizes terminal contributor selection so exactly one of stop, abort, or error fires | (with 0007) |
 | 5 | `app-server/Cargo.toml` | `codex-lhc-host` dependency | `0005-app-server-dep` |
 | 6 | `app-server/src/extensions.rs` | `codex_lhc_host::install(...)` (cwd + host seam) | `0006-app-server-install` |
+| 6a | `app-server/src/{lib.rs,in_process.rs}` | process-wide LHC claim hand-back after `shutdown_threads` on stdio/websocket and in-process (exec one-shot) exit | `0006-app-server-install` |
 | 7 | `core/Cargo.toml` | `codex-lhc-host` runtime dep (compact arm) + dev e2e | `0007` |
 | 8 | `Cargo.lock` | regenerated lockfile (not hand-edited) | n/a |
 | 9 | `core/src/stream_events_utils.rs` | model-output path tags `RawItemProvenance::ModelOutput` | (with 0004) |
@@ -176,7 +178,7 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 13b | `core/src/session/turn.rs` | turn parts F2: begin the provider request/response cycle before each outer sampling request so raw-item capture stamps `stepIndex` on assistant_text/assistant_thinking/tool_call/tool_result | (with 0007) |
 | 13a | `core/src/session/input_queue.rs` | monotonic pending-input epoch for MidTurn input-epoch gate (steer/mailbox enqueue) | (with 0007) |
 | 14 | `core/src/lhc_inference_bridge.rs` | ModelClient → InferenceCallbacks (live, gated). Supplies the SDK adapter a `ModelCall` only; the adapter renders the templates (`create_inference_callbacks`). `derivation_prompt` maps template system text → `base_instructions`, user messages → input — never `..Default::default()` (P1). Guarded by `p1_derivation_prompt_carries_template_not_agent_instructions` and the J2 wire test. Incident 2026-09-05: the pre-fix bridge sent bare input and every model-derived row since July was a reply, not a derivation. | (with 0007) |
-| 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` | (with 0007) |
+| 15 | `core/src/lib.rs` | `mod compact_lhc` + `mod lhc_inference_bridge` + `release_held_lhc_claims_at_shutdown` | (with 0007) |
 | 16 | `core/src/compact.rs` | `#[derive(Clone)]` on `InitialContextInjection` (native arms still take it by value; production dispatch does not clone-and-fall-through) | (with 0004) |
 | 17 | `core/src/tasks/lifecycle.rs` | seeds production derivation callbacks into the capture slot (what the capture session's background scheduler derives with) | (with 0007) |
 | 18 | `core/src/tasks/compact.rs` | manual ladder binds `cancellation_token` (was `_cancellation_token`) and passes it to the arm — N3 | (with 0007) |
@@ -205,7 +207,10 @@ Every `LHC-HOOK` marker is an occurrence of the substring `LHC-HOOK` outside
 | 41 | `exec/tests/suite/{apply_patch.rs,auth_env.rs}` | LIM-134 F6: fixtures gain a minimal assistant message so completed turns satisfy empty-result truth; no sentinel | `0007-lhc-compact-arm` |
 | 42 | `exec/tests/suite/resume.rs` | F7 ruling (Lee): 12 resume tests disabled-with-reasons — budgeted mount_sse_sequence mocks cannot absorb LHC background-derivation POSTs (harness artifact, prod unaffected) | `0007-lhc-compact-arm` |
 | 43 | `install-context/{BUILD.bazel,src/lhc_release.rs,src/lhc_release_tests.rs,src/lib.rs}`, repo-root `BUILD.bazel` | embedded fork release identity (`LHC_RELEASE_VERSION` from `lhc-release/VERSION`, exported for Bazel), `parse_lhc_release` ordering, fork installer/release URL constants; no sentinel | `0008-release-identity-update-wiring` |
-| 44 | `cli/src/main.rs` | `--lhc-version`; `update` and the accepted TUI prompt execute the fork installer against the managed store, manual fork instructions otherwise; no sentinel | `0008-release-identity-update-wiring` |
+| 44 | `cli/src/main.rs` | `--lhc-version`; `update` and the accepted TUI prompt execute the fork installer against the managed store, manual fork instructions otherwise; TUI/app exit calls `release_held_lhc_claims_at_shutdown`; no sentinel | `0008-release-identity-update-wiring` |
+| 47 | `ext/guardian-v2/src/async_scorer/{parent_compaction.rs,parent_compaction_tests.rs,approval.rs,observation.rs,config.rs}`, `ext/guardian-v2/src/sync_reviewer/{reviewer_config.rs,lifecycle_tests.rs}`, `core/src/context_manager/history.rs` | Guardian v2 treats an LHC fold (no native Compaction item) as a valid omit; parent LHC capture stays inherited so reviewer compact uses the strict LHC arm; test-only `into_raw_items`; no new sentinel | `0007-lhc-compact-arm` |
+| 48 | `ext/mcp/src/cloud_plugin_tests.rs` | supplies fork `TurnStartInput.started_at` on the MCP cloud-plugin fixture | (with 0002) |
+| 49 | `windows-sandbox-rs/src/{winutil.rs,lib.rs,desktop_tests.rs}` | Windows voice: token-resolved account name and `grant_read_execute_aces` export | (with 0001) |
 | 45 | `cli/src/doctor/{updates.rs,output.rs}` | doctor update row reads `lhc-version.json`, probes the fork release API, compares fork releases, prints fork advice; update note shows the fork release; no sentinel | `0008-release-identity-update-wiring` |
 | 46 | `tui/src/{update_action.rs,update_action_tests.rs,update_prompt.rs,update_versions.rs,updates.rs,updates_cache.rs,updates_cache_tests.rs,app/exit_summary.rs,history_cell/mod.rs,history_cell/notices.rs,history_cell/tests.rs}` + update prompt/notice snapshots | managed-install detection (`<store>/versions/<v>` + ownership record), LHC installer update actions, fork release discovery and ordering, `lhc-version.json` cache, readable update advice; no sentinel | `0008-release-identity-update-wiring` |
 
@@ -337,7 +342,9 @@ byte-identical (accepted under the criterion's semantic arm).
 
 Dated merge accounts, qualification evidence, and conflict resolutions are in
 [the maintenance history](lhc-internal/history/fork-maintenance-through-2026-09-04.md).
-Current upstream base: `patches/lhc/BASE` (`rust-v0.155.1` at this revision).
+Current upstream base: `patches/lhc/BASE` (`rust-v0.156.1` at this revision).
+
+2026-09-24 `rust-v0.156.1` merge: merged peeled `b412ff32c4` onto the 0.155.1 LHC tree. SDK pin advanced to Alder-accepted `47e360a3` (f5h/F6 + abort-safe scoped hand-back). Clean-exit hand-back is wired on thread stop, CLI `handle_app_exit`, app-server stdio/websocket shutdown, and in-process exec shutdown. `BASE` to `b412ff32c4`. `lhc-release/VERSION` stays `0.153.4` until a separate release cut.
 
 2026-09-18 `rust-v0.155.1` retarget: merged peeled `be2951ea34` (tag object
 `4e21628f9e`) onto the isolated `rust-v0.155.0` LHC tree. Upstream delta from

@@ -29,7 +29,10 @@ regen 0001-workspace-member.patch \
   codex-rs/app-server-daemon/src/managed_install.rs \
   codex-rs/app-server-daemon/src/managed_install_tests.rs \
   codex-rs/app-server-daemon/src/update_loop.rs \
-  codex-rs/app-server-daemon/src/update_loop_tests.rs
+  codex-rs/app-server-daemon/src/update_loop_tests.rs \
+  codex-rs/windows-sandbox-rs/src/desktop_tests.rs \
+  codex-rs/windows-sandbox-rs/src/lib.rs \
+  codex-rs/windows-sandbox-rs/src/winutil.rs
 
 regen 0002-raw-item-contributor.patch \
   codex-rs/ext/extension-api/src/contributors.rs \
@@ -37,7 +40,8 @@ regen 0002-raw-item-contributor.patch \
   codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs \
   codex-rs/ext/extension-api/src/lib.rs \
   codex-rs/ext/extension-api/src/registry.rs \
-  codex-rs/ext/goal/tests/goal_extension_backend.rs
+  codex-rs/ext/goal/tests/goal_extension_backend.rs \
+  codex-rs/ext/mcp/src/cloud_plugin_tests.rs
 
 regen 0003-feature-flag.patch \
   codex-rs/features/src/lib.rs \
@@ -55,7 +59,9 @@ regen 0005-app-server-dep.patch \
   codex-rs/app-server/Cargo.toml
 
 regen 0006-app-server-install.patch \
-  codex-rs/app-server/src/extensions.rs
+  codex-rs/app-server/src/extensions.rs \
+  codex-rs/app-server/src/lib.rs \
+  codex-rs/app-server/src/in_process.rs
 
 regen 0007-lhc-compact-arm.patch \
   codex-rs/core/Cargo.toml \
@@ -65,6 +71,14 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/src/compact_lhc/installation.rs \
   codex-rs/core/src/compact_lhc.rs \
   codex-rs/core/src/guardian/review_session.rs \
+  codex-rs/core/src/context_manager/history.rs \
+  codex-rs/ext/guardian-v2/src/async_scorer/approval.rs \
+  codex-rs/ext/guardian-v2/src/async_scorer/config.rs \
+  codex-rs/ext/guardian-v2/src/async_scorer/observation.rs \
+  codex-rs/ext/guardian-v2/src/async_scorer/parent_compaction.rs \
+  codex-rs/ext/guardian-v2/src/async_scorer/parent_compaction_tests.rs \
+  codex-rs/ext/guardian-v2/src/sync_reviewer/lifecycle_tests.rs \
+  codex-rs/ext/guardian-v2/src/sync_reviewer/reviewer_config.rs \
   codex-rs/core/src/compact_lhc_worker_error.rs \
   codex-rs/core/src/compact_lhc_tests.rs \
   codex-rs/core/src/compact_lhc_strict_routing_tests.rs \

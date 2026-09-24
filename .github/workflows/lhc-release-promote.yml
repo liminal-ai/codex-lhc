@@ -81,7 +81,7 @@ jobs:
           assert manifest["release"] == os.environ["VERSION"]
           assert manifest["sourceCommit"] == os.environ["SOURCE_SHA"]
           assert manifest["buildRunId"] == os.environ["CANDIDATE_RUN_ID"]
-          assert manifest["lhcSdkCommit"] == "e9456a6ee23a10cf04e15b16bcf77738c52b0f7c"
+          assert manifest["lhcSdkCommit"] == "47e360a39eb29013bceb87cbf5c0d06c01ac71c4"
           assert manifest["compactAlgorithmDefault"] == "bounded-selector"
           assert manifest["compactAlgorithmRollback"] == {
               "environment": "LHC_COMPACT_ALGORITHM", "value": "legacy",

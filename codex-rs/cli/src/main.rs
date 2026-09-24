@@ -913,6 +913,9 @@ fn handle_app_exit(
         | ExitReason::ThreadRemoved => false,
     };
 
+    // Process-wide LHC claim hand-back after the TUI/session has stopped.
+    // Bounded; does not wait on inference.
+    codex_core::release_held_lhc_claims_at_shutdown();
     let update_action = exit_info.update_action.clone();
     if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
         let color_enabled = supports_color::on(Stream::Stdout).is_some();

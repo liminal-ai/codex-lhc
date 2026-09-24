@@ -1,8 +1,8 @@
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index 46af9c9a9c..5635641993 100644
+index 34adaff2f2..63072717c5 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
-@@ -134,6 +134,28 @@ where
+@@ -121,6 +121,28 @@ pub(crate) fn thread_extensions(
                  .enabled(codex_features::Feature::SkillSearch),
          },
      );
@@ -31,7 +31,7 @@ index 46af9c9a9c..5635641993 100644
      Arc::new(builder.build())
  }
  
-@@ -343,6 +365,136 @@ mod tests {
+@@ -312,6 +334,136 @@ mod tests {
  
      use super::*;
  
@@ -168,3 +168,27 @@ index 46af9c9a9c..5635641993 100644
      #[tokio::test]
      async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
          let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
+diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
+index 20e44d3253..a20fe33ad2 100644
+--- a/codex-rs/app-server/src/in_process.rs
++++ b/codex-rs/app-server/src/in_process.rs
+@@ -578,6 +578,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
+             processor.clear_all_thread_listeners().await;
+             processor.drain_background_tasks().await;
+             processor.shutdown_threads().await;
++            codex_lhc_host::on_process_shutdown();
+         });
+         let mut pending_request_responses =
+             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
+diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
+index fc11b838a0..921c725324 100644
+--- a/codex-rs/app-server/src/lib.rs
++++ b/codex-rs/app-server/src/lib.rs
+@@ -1312,6 +1312,7 @@ pub async fn run_main_with_transport_options(
+                 connection_cleanup_tasks.drain().await;
+                 processor.drain_background_tasks().await;
+                 processor.shutdown_threads().await;
++                codex_lhc_host::on_process_shutdown();
+             } else {
+                 connection_cleanup_tasks.abort();
+             }

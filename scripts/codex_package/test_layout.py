@@ -71,6 +71,7 @@ class PackageLayoutTest(unittest.TestCase):
                     "threadSchema": 12,
                 },
             )
+
     def test_winget_preserves_signed_files_and_voice_hashes(self) -> None:
         for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as temp:

@@ -1172,7 +1172,11 @@ async fn mid_turn_uses_response_scoped_usage_and_attempt_id() {
     // Pollute session aggregate with a different later snapshot via the
     // production record path (session.state is private to the session module).
     session
-        .record_token_usage_info(&tc, tc.initial_settings.as_ref(), Some(&sample_usage(99_999)))
+        .record_token_usage_info(
+            &tc,
+            tc.initial_settings.as_ref(),
+            Some(&sample_usage(99_999)),
+        )
         .await
         .expect("pollute aggregate");
     // Response-scoped usage is much smaller — arm must prefer it.

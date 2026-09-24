@@ -1,5 +1,5 @@
 diff --git a/codex-rs/ext/extension-api/src/contributors.rs b/codex-rs/ext/extension-api/src/contributors.rs
-index 89480df2f1..a6344991b7 100644
+index 6b5acb267f..bc85663cb7 100644
 --- a/codex-rs/ext/extension-api/src/contributors.rs
 +++ b/codex-rs/ext/extension-api/src/contributors.rs
 @@ -15,6 +15,7 @@ mod approval_review;
@@ -10,7 +10,7 @@ index 89480df2f1..a6344991b7 100644
  mod skill_invocation;
  mod thread_lifecycle;
  mod tool_lifecycle;
-@@ -35,6 +36,9 @@ pub use mcp::SelectedPluginIdentity;
+@@ -33,6 +34,9 @@ pub use mcp::SelectedPluginIdentity;
  pub use mcp::SelectedPluginSnapshot;
  pub use prompt::PromptFragment;
  pub use prompt::PromptSlot;
@@ -89,13 +89,13 @@ index 0000000000..3b754efc03
 +    }
 +}
 diff --git a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
-index e2c9e4bf7b..dd4a9b335c 100644
+index ce9e854930..ea66e72609 100644
 --- a/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
 +++ b/codex-rs/ext/extension-api/src/contributors/turn_lifecycle.rs
-@@ -13,6 +13,10 @@ pub struct TurnStartInput<'a> {
-     pub collaboration_mode: &'a CollaborationMode,
-     /// Total token usage snapshot captured when the turn started.
-     pub token_usage_at_turn_start: &'a TokenUsage,
+@@ -24,6 +24,10 @@ pub struct TurnStartInput<'a> {
+     /// Present before task registration; absent during regular-task preparation.
+     /// Token-accounting contributors must remain in `BeforeTaskRegistration`.
+     pub token_usage_at_turn_start: Option<&'a TokenUsage>,
 +    /// Host-reported turn start time (Unix seconds), when known.
 +    ///
 +    /// LHC-HOOK: optional host wall-clock start for turn_end payload (schema v5).
@@ -103,7 +103,7 @@ index e2c9e4bf7b..dd4a9b335c 100644
      /// Store scoped to the host session runtime.
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
-@@ -23,6 +27,14 @@ pub struct TurnStartInput<'a> {
+@@ -34,6 +38,14 @@ pub struct TurnStartInput<'a> {
  
  /// Input supplied when the host completes a turn.
  pub struct TurnStopInput<'a> {
@@ -118,7 +118,7 @@ index e2c9e4bf7b..dd4a9b335c 100644
      /// Store scoped to the host session runtime.
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
-@@ -35,6 +47,14 @@ pub struct TurnStopInput<'a> {
+@@ -46,6 +58,14 @@ pub struct TurnStopInput<'a> {
  pub struct TurnAbortInput<'a> {
      /// Reason the host aborted the turn.
      pub reason: TurnAbortReason,
@@ -134,10 +134,10 @@ index e2c9e4bf7b..dd4a9b335c 100644
      pub session_store: &'a ExtensionData,
      /// Store scoped to this thread runtime.
 diff --git a/codex-rs/ext/extension-api/src/lib.rs b/codex-rs/ext/extension-api/src/lib.rs
-index 3daadfe87a..6cb9fd216c 100644
+index 44faae9472..da18b195d2 100644
 --- a/codex-rs/ext/extension-api/src/lib.rs
 +++ b/codex-rs/ext/extension-api/src/lib.rs
-@@ -63,6 +63,9 @@ pub use contributors::McpToolSource;
+@@ -60,6 +60,9 @@ pub use contributors::McpToolSource;
  pub use contributors::PreviousWorldStateSection;
  pub use contributors::PromptFragment;
  pub use contributors::PromptSlot;
@@ -148,7 +148,7 @@ index 3daadfe87a..6cb9fd216c 100644
  pub use contributors::SelectedPluginIdentity;
  pub use contributors::SelectedPluginSnapshot;
 diff --git a/codex-rs/ext/extension-api/src/registry.rs b/codex-rs/ext/extension-api/src/registry.rs
-index dddd8b8ab0..5cda5196d8 100644
+index 357cb681d6..0a9b54c4cb 100644
 --- a/codex-rs/ext/extension-api/src/registry.rs
 +++ b/codex-rs/ext/extension-api/src/registry.rs
 @@ -6,6 +6,7 @@ use crate::ContextContributor;
@@ -189,7 +189,15 @@ index dddd8b8ab0..5cda5196d8 100644
      approval_review_contributors: Vec<Arc<dyn ApprovalReviewContributor>>,
  }
  
-@@ -254,6 +264,12 @@ impl<C: Sync> ExtensionRegistry<C> {
+@@ -179,6 +189,7 @@ impl<C: Sync> ExtensionRegistry<C> {
+                 tool_contributors: self.tool_contributors.clone(),
+                 tool_lifecycle_contributors: self.tool_lifecycle_contributors.clone(),
+                 turn_item_contributors: self.turn_item_contributors.clone(),
++                raw_item_contributors: self.raw_item_contributors.clone(),
+                 approval_review_contributors: self.approval_review_contributors.clone(),
+             },
+         }
+@@ -276,6 +287,12 @@ impl<C: Sync> ExtensionRegistry<C> {
      pub fn turn_item_contributors(&self) -> &[Arc<dyn TurnItemContributor>] {
          &self.turn_item_contributors
      }
@@ -203,18 +211,26 @@ index dddd8b8ab0..5cda5196d8 100644
  
  /// Creates an empty shared registry for hosts that do not register contributions.
 diff --git a/codex-rs/ext/goal/tests/goal_extension_backend.rs b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-index 7c1dbee345..5fb1a5edc0 100644
+index 4b41740f89..5a13021cfa 100644
 --- a/codex-rs/ext/goal/tests/goal_extension_backend.rs
 +++ b/codex-rs/ext/goal/tests/goal_extension_backend.rs
-@@ -1746,6 +1746,7 @@ impl GoalExtensionHarness {
+@@ -270,6 +270,7 @@ async fn create_goal_resets_baseline_before_turn_stop_accounting() -> anyhow::Re
+                 turn_id: "missing-baseline",
+                 collaboration_mode: &default_collaboration_mode(),
+                 token_usage_at_turn_start: None,
++                started_at: None,
+                 session_store: &harness.session_store,
+                 thread_store: &harness.thread_store,
+                 turn_store: &ExtensionData::new("missing-baseline"),
+@@ -1780,6 +1781,7 @@ impl GoalExtensionHarness {
                      turn_id,
                      collaboration_mode: &collaboration_mode,
-                     token_usage_at_turn_start: usage,
+                     token_usage_at_turn_start: Some(usage),
 +                    started_at: None,
                      session_store: &self.session_store,
                      thread_store: &self.thread_store,
                      turn_store: &turn_store,
-@@ -1759,6 +1760,8 @@ impl GoalExtensionHarness {
+@@ -1793,6 +1795,8 @@ impl GoalExtensionHarness {
          for contributor in self.registry.turn_lifecycle_contributors() {
              contributor
                  .on_turn_stop(TurnStopInput {
@@ -223,3 +239,15 @@ index 7c1dbee345..5fb1a5edc0 100644
                      session_store: &self.session_store,
                      thread_store: &self.thread_store,
                      turn_store: &turn_store,
+diff --git a/codex-rs/ext/mcp/src/cloud_plugin_tests.rs b/codex-rs/ext/mcp/src/cloud_plugin_tests.rs
+index 8ac0f36b27..b5cdec2376 100644
+--- a/codex-rs/ext/mcp/src/cloud_plugin_tests.rs
++++ b/codex-rs/ext/mcp/src/cloud_plugin_tests.rs
+@@ -150,6 +150,7 @@ async fn disabling_plugins_clears_cloud_catalog_and_skips_discovery() -> anyhow:
+                     turn_id,
+                     collaboration_mode: &mode,
+                     token_usage_at_turn_start: None,
++                    started_at: None,
+                     session_store: &session,
+                     thread_store: &thread,
+                     turn_store: &ExtensionData::new(turn_id),

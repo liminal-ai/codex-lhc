@@ -1456,6 +1456,10 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 let settled = slot.await_settled(CAPTURE_SHUTDOWN_BOUND).await;
                 apply_thread_stop(&slot, settled).await;
             }
+            crate::handback::on_thread_unload(
+                Some(self.root().as_path()),
+                input.thread_store.level_id(),
+            );
         })
     }
 }

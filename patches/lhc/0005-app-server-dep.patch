@@ -1,5 +1,5 @@
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index 0643950835..e4ed186c77 100644
+index bd47a54d08..6b17e17e1d 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
 @@ -51,6 +51,8 @@ codex-extension-api = { workspace = true }

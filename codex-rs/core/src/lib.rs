@@ -32,6 +32,12 @@ pub use turn_metadata::detached_memory_responses_metadata;
 mod codex_thread;
 mod compact_lhc;
 pub use compact_lhc::reconcile_rollout_before_history_load;
+
+/// Process-wide LHC claim hand-back. Hosts call this once at coordinated
+/// shutdown after claim admission has stopped.
+pub fn release_held_lhc_claims_at_shutdown() {
+    codex_lhc_host::on_process_shutdown();
+}
 mod compact_model_fallback;
 mod compact_remote_history;
 mod compact_remote_v2;

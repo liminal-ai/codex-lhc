@@ -1312,6 +1312,7 @@ pub async fn run_main_with_transport_options(
                 connection_cleanup_tasks.drain().await;
                 processor.drain_background_tasks().await;
                 processor.shutdown_threads().await;
+                codex_lhc_host::on_process_shutdown();
             } else {
                 connection_cleanup_tasks.abort();
             }

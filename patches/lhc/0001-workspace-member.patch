@@ -1,8 +1,8 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 64304afb51..d6bcf7d5f5 100644
+index 1feba3c7fb..ee804ff247 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
-@@ -77,6 +77,8 @@ members = [
+@@ -78,6 +78,8 @@ members = [
      "file-search",
      "file-watcher",
      "linux-sandbox",
@@ -11,7 +11,7 @@ index 64304afb51..d6bcf7d5f5 100644
      "lmstudio",
      "login",
      "codex-mcp",
-@@ -231,6 +233,8 @@ codex-hooks = { path = "hooks" }
+@@ -235,6 +237,8 @@ codex-hooks = { path = "hooks" }
  codex-history = { path = "history" }
  codex-keyring-store = { path = "keyring-store" }
  codex-linux-sandbox = { path = "linux-sandbox" }
@@ -19,12 +19,12 @@ index 64304afb51..d6bcf7d5f5 100644
 +codex-lhc-host = { path = "lhc/codex-lhc-host" }
  codex-lmstudio = { path = "lmstudio" }
  codex-login = { path = "login" }
- codex-message-history = { path = "message-history" }
+ codex-mermaid = { path = "mermaid" }
 diff --git a/codex-rs/app-server-daemon/README.md b/codex-rs/app-server-daemon/README.md
-index 7707b9e9a4..9432fdd0ae 100644
+index 74721c8b8d..64e3a95540 100644
 --- a/codex-rs/app-server-daemon/README.md
 +++ b/codex-rs/app-server-daemon/README.md
-@@ -78,23 +78,20 @@ running.
+@@ -78,28 +78,27 @@ running.
  For a new Linux or macOS machine:
  
  ```sh
@@ -36,33 +36,46 @@ index 7707b9e9a4..9432fdd0ae 100644
  ```
  
 -On Windows, use a non-elevated PowerShell terminal whose host allows breakaway:
-+`bootstrap` requires the standalone managed install of **this fork**. Fresh
-+`CODEX_HOME` trees seed the running Codex-LHC binary instead of downloading
-+stock Codex. It records the daemon settings under
-+`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed
-+detached process, and launches a detached updater loop.
- 
+-
 -```powershell
 -irm https://chatgpt.com/codex/install.ps1 | iex
 -$codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
 -& "$codexHome\packages\standalone\current\bin\codex.exe" app-server daemon bootstrap --remote-control
 -```
 -
--`bootstrap` requires the standalone managed install. It records the daemon
--settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
+-`bootstrap` can use any complete CLI package. If no daemon package is installed,
+-it copies the invoking package into `CODEX_HOME/packages/app-server-daemon` and
+-prints an installation message without asking for confirmation. Existing daemon
+-packages are reused, including legacy installations; a broken selection is not
+-silently replaced. A bare executable cannot supply a new installation.
+-
+-It records the daemon settings under `CODEX_HOME/app-server-daemon/`, starts app-server as a
 -pidfile-backed detached process. It launches a detached updater loop when
 -automatic updates are enabled, the installer selected the stable `latest`
 -channel, and the managed binary supports the updater command.
++`bootstrap` requires the standalone managed install of **this fork**. Fresh
++`CODEX_HOME` trees seed the running Codex-LHC binary instead of downloading
++stock Codex. It records the daemon settings under
++`CODEX_HOME/app-server-daemon/`, starts app-server as a pidfile-backed
++detached process, and launches a detached updater loop.
++
 +On Windows, use a non-elevated PowerShell terminal whose host allows breakaway,
 +then bootstrap from this fork's managed standalone install (never stock Codex).
++
++`bootstrap` can use a complete CLI package of **this fork**. If no daemon
++package is installed, it copies the invoking package into
++`CODEX_HOME/packages/app-server-daemon` and prints an installation message
++without asking for confirmation. Existing daemon packages are reused,
++including legacy installations; a broken selection is not silently replaced.
++A bare executable cannot supply a new installation. Never seed stock Codex.
  
  ## Installation and update cases
  
 diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index ccb1be9717..54eff090ef 100644
+index fbeff0988e..1b2a8de7e9 100644
 --- a/codex-rs/app-server-daemon/src/lib.rs
 +++ b/codex-rs/app-server-daemon/src/lib.rs
-@@ -26,6 +26,8 @@ use codex_utils_home_dir::find_codex_home;
+@@ -34,6 +34,8 @@ use codex_utils_home_dir::find_codex_home;
  use managed_install::managed_codex_bin;
  #[cfg(any(unix, windows))]
  use managed_install::managed_codex_version;
@@ -71,7 +84,7 @@ index ccb1be9717..54eff090ef 100644
  use serde::Serialize;
  use settings::DaemonSettings;
  use settings::MAX_SHUTDOWN_GRACE_SECONDS;
-@@ -874,6 +876,14 @@ impl Daemon {
+@@ -933,9 +935,21 @@ impl Daemon {
              return Ok(());
          }
  
@@ -84,24 +97,17 @@ index ccb1be9717..54eff090ef 100644
 +        }
 +
          let managed_codex_path = self.managed_codex_bin.display();
-         let install_command = if cfg!(windows) {
-             "irm https://chatgpt.com/codex/install.ps1 | iex"
-@@ -881,10 +891,10 @@ impl Daemon {
-             "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
-         };
          Err(anyhow!(
--            "managed standalone Codex install not found at {managed_codex_path}\n\n\
--             This command requires the standalone install managed by the Codex installer, because \
--             the daemon starts and updates app-server from that fixed path.\n\n\
--             Install it with:\n  {install_command}\n\n\
+-            "daemon executable not found at {managed_codex_path}; repair the existing installation, or run `codex app-server daemon start` to install a missing daemon"
 +            "managed standalone Codex-LHC install not found at {managed_codex_path}\n\n\
 +             Isolated remote-control homes must use this fork's bytes, never stock Codex.\n\
 +             Seed the running `codex`/`codex-lhc` binary, or install from the fork release:\n  \
 +             curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh && sh install.sh\n\n\
-              Then rerun the command you just tried."
++             Then rerun the command you just tried."
          ))
      }
-@@ -1092,8 +1102,9 @@ mod tests {
+ 
+@@ -1142,8 +1156,9 @@ mod tests {
  
      #[test]
      fn restart_decision_preserves_forced_refreshes() {
@@ -112,7 +118,7 @@ index ccb1be9717..54eff090ef 100644
          };
  
          assert_eq!(
-@@ -1101,14 +1112,18 @@ mod tests {
+@@ -1151,14 +1166,18 @@ mod tests {
                  restart_decision(
                      RestartMode::IfVersionChanged,
                      Some(&current_info),
@@ -134,10 +140,10 @@ index ccb1be9717..54eff090ef 100644
                      RestartMode::Always,
                      /*info*/ None,
 diff --git a/codex-rs/app-server-daemon/src/managed_install.rs b/codex-rs/app-server-daemon/src/managed_install.rs
-index b7b57f7f68..e2d4c7a7b8 100644
+index 362cbf5795..cbe25692af 100644
 --- a/codex-rs/app-server-daemon/src/managed_install.rs
 +++ b/codex-rs/app-server-daemon/src/managed_install.rs
-@@ -91,6 +91,57 @@ pub(crate) async fn supports_daemon_update_loop(codex_bin: &Path) -> bool {
+@@ -140,6 +140,57 @@ pub(crate) async fn supports_daemon_command(codex_bin: &Path, args: &[&str]) ->
      .is_ok_and(|result| result.is_ok_and(|status| status.success()))
  }
  
@@ -240,10 +246,10 @@ index 93caa468e4..426bde996b 100644
 +    assert_ne!(managed, source);
 +}
 diff --git a/codex-rs/app-server-daemon/src/update_loop.rs b/codex-rs/app-server-daemon/src/update_loop.rs
-index 2fe7850df4..505489004b 100644
+index 8f55126878..43b29ebdd7 100644
 --- a/codex-rs/app-server-daemon/src/update_loop.rs
 +++ b/codex-rs/app-server-daemon/src/update_loop.rs
-@@ -43,9 +43,13 @@ pub(crate) use manual_update::request as request_manual_update;
+@@ -63,9 +63,13 @@ pub(crate) async fn request_manual_update(
  const INITIAL_UPDATE_DELAY: Duration = Duration::from_secs(5 * 60);
  const RESTART_RETRY_INTERVAL: Duration = Duration::from_millis(50);
  #[cfg(unix)]
@@ -257,10 +263,10 @@ index 2fe7850df4..505489004b 100644
 +const INSTALL_URL: &str =
 +    "https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.ps1";
  
- pub(crate) async fn run(http_client_factory: HttpClientFactory) -> Result<()> {
-     let http = RouteAwareClientPool::new_without_request_logging(
+ pub(crate) async fn run(
+     http_client_factory: HttpClientFactory,
 diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
-index ff2b177b86..d9e30e9404 100644
+index 198cbcea4b..feaef391d3 100644
 --- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
 +++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
 @@ -49,6 +49,16 @@ async fn installer_fetch_rejects_non_success_status() {
@@ -322,3 +328,97 @@ index 0000000000..7533b52d26
 +    assert_eq!(output.stderr, b"");
 +    Ok(())
 +}
+diff --git a/codex-rs/windows-sandbox-rs/src/desktop_tests.rs b/codex-rs/windows-sandbox-rs/src/desktop_tests.rs
+index abe6f8077c..62e43fc10f 100644
+--- a/codex-rs/windows-sandbox-rs/src/desktop_tests.rs
++++ b/codex-rs/windows-sandbox-rs/src/desktop_tests.rs
+@@ -7,6 +7,7 @@ use crate::setup::SandboxSetupRequest;
+ use crate::setup::SetupRootOverrides;
+ use crate::spawn_prep::legacy_session_capability_roots;
+ use crate::spawn_prep::prepare_legacy_session_security;
++use crate::winutil::current_account_name;
+ use anyhow::Result;
+ use codex_protocol::models::PermissionProfile;
+ use codex_protocol::permissions::NetworkSandboxPolicy;
+@@ -20,10 +21,6 @@ use std::os::windows::io::FromRawHandle;
+ use std::os::windows::io::OwnedHandle;
+ use std::path::Path;
+ use tempfile::TempDir;
+-use windows_sys::Win32::NetworkManagement::NetManagement::DNLEN;
+-use windows_sys::Win32::NetworkManagement::NetManagement::UNLEN;
+-use windows_sys::Win32::Security::Authentication::Identity::GetUserNameExW;
+-use windows_sys::Win32::Security::Authentication::Identity::NameSamCompatible;
+ 
+ #[test]
+ fn private_desktop_rejects_interactive_and_injected_names() {
+@@ -218,16 +215,6 @@ fn legacy_desktop_reuses_only_equivalent_permissions() -> Result<()> {
+     Ok(())
+ }
+ 
+-fn current_account_name() -> Result<String> {
+-    // Bazel does not provide USERDOMAIN or USERNAME in the test environment.
+-    let mut account = [0; (DNLEN + UNLEN + 2) as usize];
+-    let mut length = account.len() as u32;
+-    if unsafe { GetUserNameExW(NameSamCompatible, account.as_mut_ptr(), &mut length) } == 0 {
+-        return Err(std::io::Error::last_os_error().into());
+-    }
+-    Ok(String::from_utf16(&account[..length as usize])?)
+-}
+-
+ fn workspace_permissions(workspace: &Path) -> Result<ResolvedWindowsSandboxPermissions> {
+     ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
+         &PermissionProfile::workspace_write_with(
+diff --git a/codex-rs/windows-sandbox-rs/src/lib.rs b/codex-rs/windows-sandbox-rs/src/lib.rs
+index 46f9710b4c..c0d2e48f69 100644
+--- a/codex-rs/windows-sandbox-rs/src/lib.rs
++++ b/codex-rs/windows-sandbox-rs/src/lib.rs
+@@ -226,6 +226,8 @@ pub use acl::ensure_allow_write_aces;
+ #[cfg(target_os = "windows")]
+ pub use acl::fetch_dacl_handle;
+ #[cfg(target_os = "windows")]
++pub use acl::grant_read_execute_aces;
++#[cfg(target_os = "windows")]
+ pub use acl::path_has_standard_user_mutation_allow;
+ #[cfg(target_os = "windows")]
+ pub use acl::path_has_trusted_system_owner;
+diff --git a/codex-rs/windows-sandbox-rs/src/winutil.rs b/codex-rs/windows-sandbox-rs/src/winutil.rs
+index 0899362684..c924a365a0 100644
+--- a/codex-rs/windows-sandbox-rs/src/winutil.rs
++++ b/codex-rs/windows-sandbox-rs/src/winutil.rs
+@@ -6,6 +6,7 @@ use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+ use windows_sys::Win32::Foundation::GetLastError;
+ use windows_sys::Win32::Foundation::HLOCAL;
+ use windows_sys::Win32::Foundation::LocalFree;
++use windows_sys::Win32::NetworkManagement::NetManagement::DNLEN;
+ use windows_sys::Win32::NetworkManagement::NetManagement::LOCALGROUP_INFO_1;
+ use windows_sys::Win32::NetworkManagement::NetManagement::NERR_Success;
+ use windows_sys::Win32::NetworkManagement::NetManagement::NERR_UserNotFound;
+@@ -13,8 +14,11 @@ use windows_sys::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
+ use windows_sys::Win32::NetworkManagement::NetManagement::NetLocalGroupAdd;
+ use windows_sys::Win32::NetworkManagement::NetManagement::NetUserGetInfo;
+ use windows_sys::Win32::NetworkManagement::NetManagement::NetUserSetInfo;
++use windows_sys::Win32::NetworkManagement::NetManagement::UNLEN;
+ use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1;
+ use windows_sys::Win32::NetworkManagement::NetManagement::USER_INFO_1008;
++use windows_sys::Win32::Security::Authentication::Identity::GetUserNameExW;
++use windows_sys::Win32::Security::Authentication::Identity::NameSamCompatible;
+ use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+ use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+ use windows_sys::Win32::Security::CopySid;
+@@ -29,6 +33,16 @@ use windows_sys::Win32::System::Diagnostics::Debug::FormatMessageW;
+ pub const SANDBOX_USERS_GROUP: &str = "CodexSandboxUsers";
+ const SANDBOX_USERS_GROUP_COMMENT: &str = "Codex sandbox internal group (managed)";
+ 
++pub(crate) fn current_account_name() -> Result<String> {
++    // Sandbox launchers can filter USERNAME, so resolve the caller from its Windows token.
++    let mut account = [0; (DNLEN + UNLEN + 2) as usize];
++    let mut length = account.len() as u32;
++    if unsafe { GetUserNameExW(NameSamCompatible, account.as_mut_ptr(), &mut length) } == 0 {
++        return Err(std::io::Error::last_os_error()).context("resolve current Windows account");
++    }
++    Ok(String::from_utf16(&account[..length as usize])?)
++}
++
+ pub fn to_wide<S: AsRef<OsStr>>(s: S) -> Vec<u16> {
+     let mut v: Vec<u16> = s.as_ref().encode_wide().collect();
+     v.push(0);

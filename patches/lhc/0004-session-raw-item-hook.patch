@@ -1,8 +1,8 @@
 diff --git a/codex-rs/core/src/compact.rs b/codex-rs/core/src/compact.rs
-index 55cc1718ba..ac8930683b 100644
+index e102da28b4..1a880afe7f 100644
 --- a/codex-rs/core/src/compact.rs
 +++ b/codex-rs/core/src/compact.rs
-@@ -70,6 +70,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+@@ -68,6 +68,10 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
  /// Mid-turn compaction must use `BeforeLastUserMessage` because the model is trained to see the
  /// compaction summary as the last item in history after mid-turn compaction; we therefore inject
  /// initial context into the replacement history just above the last real user message.
@@ -13,25 +13,25 @@ index 55cc1718ba..ac8930683b 100644
  pub(crate) enum InitialContextInjection {
      BeforeLastUserMessage {
          world_state: Arc<WorldState>,
-@@ -796,10 +800,12 @@ async fn drain_to_completed(
-         };
-         match event {
-             Ok(ResponseEvent::OutputItemDone(item)) => {
--                sess.record_conversation_items(
-+                // LHC-HOOK: compaction model output is ModelOutput (not HostContext default).
-+                sess.record_conversation_items_with_provenance(
-                     turn_context,
-                     turn_context.model_info(),
-                     std::slice::from_ref(&item),
-+                    codex_extension_api::RawItemProvenance::ModelOutput,
-                 )
-                 .await;
-             }
+@@ -809,10 +813,12 @@ async fn drain_to_completed(
+                     // the live history and persisted rollout intact.
+                     output.push(item);
+                 } else {
+-                    sess.record_conversation_items(
++                    // LHC-HOOK: compaction model output is ModelOutput (not HostContext default).
++                    sess.record_conversation_items_with_provenance(
+                         turn_context,
+                         turn_context.model_info(),
+                         std::slice::from_ref(&item),
++                        codex_extension_api::RawItemProvenance::ModelOutput,
+                     )
+                     .await;
+                 }
 diff --git a/codex-rs/core/src/session/inject.rs b/codex-rs/core/src/session/inject.rs
-index b2d0c05673..df0dd92dfa 100644
+index d66602b205..bbd9311eb9 100644
 --- a/codex-rs/core/src/session/inject.rs
 +++ b/codex-rs/core/src/session/inject.rs
-@@ -147,6 +147,7 @@ impl Session {
+@@ -133,6 +133,7 @@ impl Session {
              model_info,
              annotated_items,
              image_preparations,
@@ -41,10 +41,10 @@ index b2d0c05673..df0dd92dfa 100644
      }
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..25618cc4a1
+index 0000000000..85034166e5
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1256 @@
+@@ -0,0 +1,1258 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -279,11 +279,9 @@ index 0000000000..25618cc4a1
 +        phase: None,
 +        internal_chat_message_metadata_passthrough: None,
 +    }];
-+    let (prepared, _) = session.prepare_conversation_items_for_history(
-+        &turn_context,
-+        turn_context.model_info(),
-+        &items,
-+    );
++    let (prepared, _) = session
++        .prepare_conversation_items_for_history(&turn_context, turn_context.model_info(), &items)
++        .await;
 +    let prepared = prepared.into_owned();
 +    let id_str = prepared[0]
 +        .id()
@@ -676,7 +674,7 @@ index 0000000000..25618cc4a1
 +    // The production entry itself — the same call `InitialHistory::Resumed`
 +    // and `InitialHistory::Forked` make in `Session::new`.
 +    let _ = session
-+        .apply_rollout_reconstruction(&turn_context, &rollout_items)
++        .apply_rollout_reconstruction(&Arc::new(turn_context), &rollout_items)
 +        .await;
 +
 +    // Reconstruction is synchronous into state; give any stray async capture
@@ -737,7 +735,7 @@ index 0000000000..25618cc4a1
 +            .on_turn_start(TurnStartInput {
 +                turn_id: turn_context.sub_id.as_str(),
 +                collaboration_mode: &collaboration_mode,
-+                token_usage_at_turn_start: &token_usage_at_start,
++                token_usage_at_turn_start: Some(&token_usage_at_start),
 +                started_at: Some(started_at),
 +                session_store: &session.services.session_extension_data,
 +                thread_store: &session.services.thread_extension_data,
@@ -787,7 +785,11 @@ index 0000000000..25618cc4a1
 +        codex_rollout_budget_units: None,
 +    };
 +    session
-+        .record_token_usage_info(&turn_context, Some(&per_call))
++        .record_token_usage_info(
++            &turn_context,
++            turn_context.initial_settings.as_ref(),
++            Some(&per_call),
++        )
 +        .await
 +        .expect("record token usage");
 +
@@ -892,7 +894,7 @@ index 0000000000..25618cc4a1
 +            .on_turn_start(TurnStartInput {
 +                turn_id: turn_context.sub_id.as_str(),
 +                collaboration_mode: &collaboration_mode,
-+                token_usage_at_turn_start: &token_usage_at_start,
++                token_usage_at_turn_start: Some(&token_usage_at_start),
 +                started_at: Some(started_at),
 +                session_store: &session.services.session_extension_data,
 +                thread_store: &session.services.thread_extension_data,
@@ -979,7 +981,7 @@ index 0000000000..25618cc4a1
 +            .on_turn_start(TurnStartInput {
 +                turn_id: turn_context.sub_id.as_str(),
 +                collaboration_mode: &collaboration_mode,
-+                token_usage_at_turn_start: &token_usage_at_start,
++                token_usage_at_turn_start: Some(&token_usage_at_start),
 +                started_at: None,
 +                session_store: &session.services.session_extension_data,
 +                thread_store: &session.services.thread_extension_data,
@@ -1302,10 +1304,21 @@ index 0000000000..25618cc4a1
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index 98bfa792b2..fd271d8eeb 100644
+index a4b4ba0032..e635f08ef1 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -1355,6 +1355,12 @@ impl Session {
+@@ -338,8 +338,10 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
+ use codex_git_utils::get_git_repo_root;
+ use codex_history::CodexHarnessMetadata;
+ use codex_history::CompactedItem;
++use codex_history::GuardianHistoryCheckpoint;
+ use codex_history::InitialHistory;
+ use codex_history::ResponseItemEnvelope;
++use codex_history::RetainedContext;
+ use codex_mcp::McpConfig;
+ use codex_mcp::effective_mcp_servers;
+ use codex_otel::SessionTelemetry;
+@@ -1443,6 +1445,12 @@ impl Session {
          state.get_total_token_usage(state.server_reasoning_included())
      }
  
@@ -1318,7 +1331,7 @@ index 98bfa792b2..fd271d8eeb 100644
      pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
          let state = self.state.lock().await;
          state.auto_compact_window_snapshot()
-@@ -1488,6 +1494,9 @@ impl Session {
+@@ -1576,6 +1584,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1328,7 +1341,7 @@ index 98bfa792b2..fd271d8eeb 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info().slug.as_str();
-@@ -1536,6 +1545,8 @@ impl Session {
+@@ -1624,6 +1635,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1337,7 +1350,7 @@ index 98bfa792b2..fd271d8eeb 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3470,6 +3481,27 @@ impl Session {
+@@ -3513,6 +3526,27 @@ impl Session {
          turn_context: &TurnContext,
          model_info: &ModelInfo,
          items: &[ResponseItem],
@@ -1363,9 +1376,9 @@ index 98bfa792b2..fd271d8eeb 100644
 +        items: &[ResponseItem],
 +        provenance: codex_extension_api::RawItemProvenance,
      ) {
-         let (items, image_preparations) =
-             self.prepare_conversation_items_for_history(turn_context, model_info, items);
-@@ -3483,6 +3515,7 @@ impl Session {
+         let (items, image_preparations) = self
+             .prepare_conversation_items_for_history(turn_context, model_info, items)
+@@ -3527,6 +3561,7 @@ impl Session {
              model_info,
              items,
              image_preparations,
@@ -1373,7 +1386,7 @@ index 98bfa792b2..fd271d8eeb 100644
          )
          .await;
      }
-@@ -3493,6 +3526,7 @@ impl Session {
+@@ -3537,6 +3572,7 @@ impl Session {
          model_info: &ModelInfo,
          mut items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
@@ -1381,7 +1394,7 @@ index 98bfa792b2..fd271d8eeb 100644
      ) {
          // Save the originating history budget for replay.
          // Preserve any existing tool-specific override.
-@@ -3541,7 +3575,7 @@ impl Session {
+@@ -3601,7 +3637,7 @@ impl Session {
          {
              mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
          }
@@ -1390,7 +1403,7 @@ index 98bfa792b2..fd271d8eeb 100644
              .await;
      }
  
-@@ -3822,7 +3856,13 @@ impl Session {
+@@ -3875,7 +3911,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1405,7 +1418,7 @@ index 98bfa792b2..fd271d8eeb 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3920,7 +3960,7 @@ impl Session {
+@@ -3971,7 +4013,7 @@ impl Session {
                  .compaction_model_hash = metadata.compaction_model_hash;
          }
          let mut compacted_item = CompactedItem {
@@ -1414,7 +1427,7 @@ index 98bfa792b2..fd271d8eeb 100644
              replacement_history: Some(items.clone()),
              retained_context: None,
              guardian_history: None,
-@@ -3955,6 +3995,10 @@ impl Session {
+@@ -4008,6 +4050,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1425,7 +1438,7 @@ index 98bfa792b2..fd271d8eeb 100644
          }
  
          let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-@@ -3976,10 +4020,83 @@ impl Session {
+@@ -4029,10 +4075,94 @@ impl Session {
          }
      }
  
@@ -1441,6 +1454,8 @@ index 98bfa792b2..fd271d8eeb 100644
 +        reference_context_item: Option<TurnContextItem>,
 +        world_state_baseline: Option<Arc<WorldState>>,
 +        durable_message: Option<String>,
++        guardian_history: Option<GuardianHistoryCheckpoint>,
++        retained_context: Option<RetainedContext>,
 +    ) {
 +        let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
 +        let items = items.into_iter().map(Into::into).collect();
@@ -1449,7 +1464,16 @@ index 98bfa792b2..fd271d8eeb 100644
 +            state.replace_annotated_history(
 +                items,
 +                reference_context_item,
-+                HistoryReplacement::Compaction,
++                HistoryReplacement::Compaction {
++                    reviewer_compaction_hash: None,
++                },
++            );
++            // Same restore resume uses from CompactedItem so live Guardian v2
++            // snapshots match the rewritten rollout after an LHC fold.
++            state.history.restore_review_context(
++                retained_context.as_ref(),
++                guardian_history.as_ref(),
++                /*reviewer_compaction_hash*/ None,
 +            );
 +            if let Some(world_state) = world_state_baseline {
 +                let snapshot = world_state.snapshot();
@@ -1509,7 +1533,7 @@ index 98bfa792b2..fd271d8eeb 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -4019,7 +4136,42 @@ impl Session {
+@@ -4072,7 +4202,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1553,7 +1577,7 @@ index 98bfa792b2..fd271d8eeb 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -4341,6 +4493,32 @@ impl Session {
+@@ -4404,6 +4569,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1586,7 +1610,7 @@ index 98bfa792b2..fd271d8eeb 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4682,11 +4860,12 @@ impl Session {
+@@ -4758,11 +4949,12 @@ impl Session {
          model_info: &ModelInfo,
          response_item: ResponseItem,
      ) {
@@ -1601,28 +1625,21 @@ index 98bfa792b2..fd271d8eeb 100644
          )
          .await;
  
-@@ -4710,16 +4889,12 @@ impl Session {
-         // UI-only `text_elements` are preserved. `ResponseItem::Message` does not carry
-         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
-         let response_item = self.response_item_from_user_input(input.to_vec());
--        self.record_annotated_conversation_items(
+@@ -4809,11 +5001,13 @@ impl Session {
+             &prepared_items,
+             &user_image_content_indices,
+         );
 +        // LHC-HOOK: user-prompt provenance — the only real human-input path.
-+        self.record_conversation_items_with_provenance(
+         self.record_prepared_conversation_items(
              turn_context,
              model_info,
--            vec![ResponseItemEnvelope {
--                item: response_item,
--                metadata: acceptance_order.map(|order| CodexHarnessMetadata {
--                    user_input_order: Some(order),
--                    ..Default::default()
--                }),
--            }],
-+            std::slice::from_ref(&response_item),
+             prepared_items,
+             image_preparations,
 +            codex_extension_api::RawItemProvenance::UserPrompt,
          )
          .await;
-         let mut user_message_item = UserMessageItem::new(input);
-@@ -4887,3 +5062,14 @@ mod elicitation_holders_tests;
+         user_message_item.client_id = client_id;
+@@ -5015,3 +5209,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;
@@ -1638,10 +1655,10 @@ index 98bfa792b2..fd271d8eeb 100644
 +#[path = "lhc_band_shape_eval_tests.rs"]
 +mod lhc_band_shape_eval_tests;
 diff --git a/codex-rs/core/src/stream_events_utils.rs b/codex-rs/core/src/stream_events_utils.rs
-index 285e85fa14..fc6deda0d0 100644
+index 3e3456e9ba..44d4c3d145 100644
 --- a/codex-rs/core/src/stream_events_utils.rs
 +++ b/codex-rs/core/src/stream_events_utils.rs
-@@ -97,10 +97,12 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
+@@ -98,10 +98,12 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
      finalized_facts: Option<&FinalizedTurnItemFacts>,
  ) {
      let turn_context = &step_context.turn;

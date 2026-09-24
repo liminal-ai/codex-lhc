@@ -11,7 +11,7 @@ index a0223e9d72..c8ac9ec2c1 100644
      "workspace_root_test_launcher.sh.tpl",
  ])
 diff --git a/codex-rs/cli/src/doctor/output.rs b/codex-rs/cli/src/doctor/output.rs
-index c4c0087259..65e3a5e419 100644
+index bef6dc7772..cb9dbd2107 100644
 --- a/codex-rs/cli/src/doctor/output.rs
 +++ b/codex-rs/cli/src/doctor/output.rs
 @@ -529,7 +529,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
@@ -32,7 +32,7 @@ index c4c0087259..65e3a5e419 100644
      if let Some(dismissed) = dismissed
          && !detail::is_falsy(&dismissed)
      {
-@@ -1657,7 +1657,10 @@ Run codex doctor without --summary for detailed diagnostics.
+@@ -1713,7 +1713,10 @@ Run codex doctor without --summary for detailed diagnostics.
          let rendered = render_human_report(&report, summary_no_color_unicode_options());
  
          assert!(rendered.contains("Notes\n   ↑ updates"));
@@ -220,10 +220,10 @@ index fbad7d91ce..b96396ff67 100644
      }
  }
 diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
-index ee42ceb1e5..8114be1b30 100644
+index 2d9e7ed7f5..44a1ee7064 100644
 --- a/codex-rs/cli/src/main.rs
 +++ b/codex-rs/cli/src/main.rs
-@@ -139,6 +139,10 @@ struct MultitoolCli {
+@@ -142,6 +142,10 @@ struct MultitoolCli {
      #[clap(flatten)]
      interactive: TuiCli,
  
@@ -234,16 +234,19 @@ index ee42ceb1e5..8114be1b30 100644
      #[clap(subcommand)]
      subcommand: Option<Subcommand>,
  }
-@@ -883,7 +887,7 @@ fn handle_app_exit(exit_info: AppExitInfo) -> anyhow::Result<()> {
+@@ -909,7 +913,10 @@ fn handle_app_exit(
          | ExitReason::ThreadRemoved => false,
      };
  
 -    let update_action = exit_info.update_action;
++    // Process-wide LHC claim hand-back after the TUI/session has stopped.
++    // Bounded; does not wait on inference.
++    codex_core::release_held_lhc_claims_at_shutdown();
 +    let update_action = exit_info.update_action.clone();
-     let color_enabled = supports_color::on(Stream::Stdout).is_some();
-     for line in exit_info.format_exit_messages(color_enabled) {
-         println!("{line}");
-@@ -907,7 +911,10 @@ fn run_update_action(action: UpdateAction) -> anyhow::Result<()> {
+     if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
+         let color_enabled = supports_color::on(Stream::Stdout).is_some();
+         for line in exit_info.format_exit_messages(color_enabled) {
+@@ -953,7 +960,10 @@ fn run_update_action(
          #[cfg(windows)]
          {
              let (cmd, args) = action.command_args();
@@ -255,7 +258,7 @@ index ee42ceb1e5..8114be1b30 100644
                  // These args contain PowerShell metacharacters, so do not let
                  // PATHEXT select a batch shim for this action.
                  "powershell.exe"
-@@ -976,8 +983,19 @@ fn run_update_command() -> anyhow::Result<()> {
+@@ -1022,8 +1032,19 @@ fn run_update_command() -> anyhow::Result<()> {
      #[cfg(not(debug_assertions))]
      {
          let Some(action) = codex_tui::get_update_action() else {
@@ -275,8 +278,8 @@ index ee42ceb1e5..8114be1b30 100644
 +                "This Codex + LHC binary was not installed by the fork installer, so it cannot update itself. Install or update it manually:\n  {installer}"
              );
          };
-         run_update_action(action)
-@@ -1140,8 +1158,13 @@ async fn cli_main(
+         run_update_action(action, /*cli_executable*/ None)
+@@ -1187,8 +1208,13 @@ async fn cli_main(
          feature_toggles,
          remote,
          mut interactive,
@@ -287,10 +290,10 @@ index ee42ceb1e5..8114be1b30 100644
 +        println!("{}", codex_install_context::LHC_RELEASE_VERSION);
 +        return Ok(());
 +    }
-     reject_unsupported_worktree_for_subcommand(interactive.shared.worktree, &subcommand)?;
-     // Fold --enable/--disable into config overrides so they flow to all subcommands.
-     let toggle_overrides = feature_toggles.to_overrides()?;
-@@ -3166,6 +3189,7 @@ mod tests {
+     // Retain the launch target through TUI exit, even if a launcher changes selection.
+     let daemon_cli_executable = arg0_paths
+         .codex_self_exe
+@@ -3296,6 +3322,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -298,7 +301,7 @@ index ee42ceb1e5..8114be1b30 100644
          } = cli;
          interactive
              .shared
-@@ -3203,6 +3227,7 @@ mod tests {
+@@ -3333,6 +3360,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -306,7 +309,7 @@ index ee42ceb1e5..8114be1b30 100644
          } = cli;
          interactive
              .shared
-@@ -3247,6 +3272,7 @@ mod tests {
+@@ -3377,6 +3405,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -418,7 +421,7 @@ index 0000000000..9d4ab4fe47
 +    }
 +}
 diff --git a/codex-rs/install-context/src/lib.rs b/codex-rs/install-context/src/lib.rs
-index 699add63db..0b6fd407cc 100644
+index 1a9be86a11..3d24822d3a 100644
 --- a/codex-rs/install-context/src/lib.rs
 +++ b/codex-rs/install-context/src/lib.rs
 @@ -21,6 +21,15 @@ const STANDALONE_PACKAGES_DIRNAME: &str = "standalone";
@@ -451,18 +454,18 @@ index 39b023805b..f2417680cc 100644
          }
      }
 diff --git a/codex-rs/tui/src/app/tests/realtime_requests.rs b/codex-rs/tui/src/app/tests/realtime_requests.rs
-index 77e5d07eb4..cc7bd0454e 100644
+index 79e257eab1..07974d548c 100644
 --- a/codex-rs/tui/src/app/tests/realtime_requests.rs
 +++ b/codex-rs/tui/src/app/tests/realtime_requests.rs
-@@ -6,6 +6,7 @@ use crate::app::tests::session_lifecycle_requests::recorded_params;
- use crate::app::tests::session_lifecycle_requests::start_recording_realtime_speech_app_server;
+@@ -7,6 +7,7 @@ use crate::app::tests::session_lifecycle_requests::start_recording_realtime_spee
  use crate::app::tests::session_lifecycle_requests::start_recording_remote_app_server;
+ use crate::chatwidget::commit_realtime_history_events;
  use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 +use crate::version::CODEX_CLI_VERSION;
  use codex_app_server_protocol::ItemCompletedNotification;
  use codex_app_server_protocol::ItemStartedNotification;
  use codex_app_server_protocol::ServerNotification;
-@@ -18,6 +19,7 @@ use codex_app_server_protocol::UserInput;
+@@ -19,6 +20,7 @@ use codex_app_server_protocol::UserInput;
  use codex_protocol::models::MessagePhase;
  use pretty_assertions::assert_eq;
  use std::path::Path;
@@ -470,7 +473,7 @@ index 77e5d07eb4..cc7bd0454e 100644
  
  fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
      let cwd = cwd.display().to_string();
-@@ -26,7 +28,38 @@ fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
+@@ -27,7 +29,38 @@ fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
          "{placeholder}{}",
          " ".repeat(cwd.len().saturating_sub(placeholder.len()))
      );
@@ -511,10 +514,10 @@ index 77e5d07eb4..cc7bd0454e 100644
  
  #[test]
 diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index bcbcd8dc1c..475e36f812 100644
+index c177895a1b..9768e7e672 100644
 --- a/codex-rs/tui/src/history_cell/mod.rs
 +++ b/codex-rs/tui/src/history_cell/mod.rs
-@@ -59,6 +59,9 @@ use codex_app_server_protocol::ToolRequestUserInputQuestion;
+@@ -58,6 +58,9 @@ use codex_app_server_protocol::ToolRequestUserInputQuestion;
  use codex_app_server_protocol::WebSearchAction;
  #[cfg(test)]
  use codex_config::types::McpServerTransportConfig;
@@ -525,15 +528,19 @@ index bcbcd8dc1c..475e36f812 100644
  use codex_mcp::qualified_mcp_tool_name_prefix;
  use codex_otel::RuntimeMetricsSummary;
 diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
-index 82e62f07d5..33349c1c00 100644
+index a786340378..8fe88e92c7 100644
 --- a/codex-rs/tui/src/history_cell/notices.rs
 +++ b/codex-rs/tui/src/history_cell/notices.rs
-@@ -26,29 +26,35 @@ impl HistoryCell for UpdateAvailableHistoryCell {
+@@ -30,35 +30,39 @@ impl HistoryCell for UpdateAvailableHistoryCell {
      fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
          use ratatui_macros::line;
          use ratatui_macros::text;
 -        let update_instruction = if let Some(update_action) = self.update_action {
--            line!["Run ", update_action.command_str().cyan(), " to update."]
+-            line![
+-                "Run ",
+-                update_action.command_str().fg(accent_color()),
+-                " to update."
+-            ]
 -        } else {
 -            line![
 +        // The fork's installer action is a shell script; give advice instead
@@ -541,16 +548,22 @@ index 82e62f07d5..33349c1c00 100644
 +        let update_instruction = match &self.update_action {
 +            Some(UpdateAction::LhcUnix { .. } | UpdateAction::LhcWindows { .. }) => line![
 +                "Run your Codex + LHC command with ",
-+                "update".cyan(),
++                "update".fg(accent_color()),
 +                " to install it."
 +            ],
 +            Some(update_action) => {
-+                line!["Run ", update_action.command_str().cyan(), " to update."]
++                line![
++                    "Run ",
++                    update_action.command_str().fg(accent_color()),
++                    " to update."
++                ]
 +            }
 +            None => line![
                  "See ",
--                "https://github.com/openai/codex".cyan().underlined(),
-+                LHC_INSTALL_DOCS_URL.cyan().underlined(),
+-                "https://github.com/openai/codex"
+-                    .fg(accent_color())
+-                    .underlined(),
++                LHC_INSTALL_DOCS_URL.fg(accent_color()).underlined(),
                  " for installation options."
 -            ]
 +            ],
@@ -558,9 +571,9 @@ index 82e62f07d5..33349c1c00 100644
  
          let content = text![
              line![
-                 "✨\u{200A}".bold().cyan(),
--                "Update available!".bold().cyan(),
-+                "Codex + LHC update available!".bold().cyan(),
+                 "✨\u{200A}".bold().fg(accent_color()),
+-                "Update available!".bold().fg(accent_color()),
++                "Codex + LHC update available!".bold().fg(accent_color()),
                  " ",
 -                format!("{CODEX_CLI_VERSION} -> {}", self.latest_version).bold(),
 +                format!("{LHC_RELEASE_VERSION} -> {}", self.latest_version).bold(),
@@ -569,13 +582,13 @@ index 82e62f07d5..33349c1c00 100644
              "",
              "See full release notes:",
 -            "https://github.com/openai/codex/releases/latest"
--                .cyan()
+-                .fg(accent_color())
 -                .underlined(),
-+            LHC_RELEASES_URL.cyan().underlined(),
++            LHC_RELEASES_URL.fg(accent_color()).underlined(),
          ];
  
          let inner_width = content
-@@ -60,18 +66,20 @@ impl HistoryCell for UpdateAvailableHistoryCell {
+@@ -70,18 +74,20 @@ impl HistoryCell for UpdateAvailableHistoryCell {
      }
  
      fn raw_lines(&self) -> Vec<Line<'static>> {
@@ -715,10 +728,10 @@ index 1a2df82a9d..7dfcbe551b 100644
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest │
 +╰─────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index 138c9b5b94..543809df83 100644
+index 0062cd5b2c..9589ee4c17 100644
 --- a/codex-rs/tui/src/history_cell/tests.rs
 +++ b/codex-rs/tui/src/history_cell/tests.rs
-@@ -1289,6 +1289,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
+@@ -1355,6 +1355,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
      insta::assert_snapshot!(rendered);
  }
  
@@ -745,28 +758,8 @@ index 138c9b5b94..543809df83 100644
  #[test]
  fn standalone_windows_update_available_history_cell_snapshot() {
      let cell =
-diff --git a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
-index 24d8831c95..01b051b939 100644
---- a/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
-+++ b/codex-rs/tui/src/snapshots/codex_tui__update_prompt__tests__update_prompt_modal.snap
-@@ -2,11 +2,12 @@
- source: tui/src/update_prompt.rs
- expression: terminal.backend()
- ---
--  ✨ Update available! 0.0.0 -> 9.9.9
- 
--  Release notes: https://github.com/openai/codex/releases/latest
-+  ✨ Codex + LHC update available! 0.153.4 -> 9.9.9-lhc.1
- 
--› 1. Update now (runs `npm install -g @openai/codex@latest`)                    
-+  Release notes: https://github.com/liminal-ai/codex-lhc/releases/latest
-+
-+› 1. Update now (re-runs the Codex + LHC installer)                             
-   2. Skip
-   3. Skip until next version
- 
 diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
-index 41069d770a..baaf310789 100644
+index 8c75176aa3..4cb4a4dcb5 100644
 --- a/codex-rs/tui/src/status/tests.rs
 +++ b/codex-rs/tui/src/status/tests.rs
 @@ -20,6 +20,7 @@ use crate::test_support::PathBufExt;
@@ -777,7 +770,7 @@ index 41069d770a..baaf310789 100644
  use app_test_support::ChatGptAuthFixture;
  use app_test_support::write_chatgpt_auth;
  use app_test_support::write_models_cache;
-@@ -183,6 +184,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
+@@ -184,6 +185,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
          .collect()
  }
  
@@ -808,7 +801,7 @@ index 41069d770a..baaf310789 100644
  fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
      let frame_width = lines
          .iter()
-@@ -191,7 +216,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+@@ -192,7 +217,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
      lines
          .into_iter()
          .map(|line| {
@@ -817,7 +810,7 @@ index 41069d770a..baaf310789 100644
                  (frame_width, line.find("Directory: "), line.rfind('│'))
              {
                  let prefix = &line[..dir_pos + "Directory: ".len()];
-@@ -210,7 +235,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+@@ -211,7 +236,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                  rebuilt
              } else {
                  line
@@ -828,7 +821,7 @@ index 41069d770a..baaf310789 100644
          .collect()
  }
 diff --git a/codex-rs/tui/src/update_action.rs b/codex-rs/tui/src/update_action.rs
-index 225c457086..59cc4f07d7 100644
+index 860d0bd102..dced4dc3f1 100644
 --- a/codex-rs/tui/src/update_action.rs
 +++ b/codex-rs/tui/src/update_action.rs
 @@ -1,12 +1,13 @@
@@ -847,9 +840,9 @@ index 225c457086..59cc4f07d7 100644
 -#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 +#[derive(Debug, Clone, PartialEq, Eq)]
  pub enum UpdateAction {
-     /// Update via `npm install -g @openai/codex@latest`.
-     NpmGlobalLatest,
-@@ -22,159 +23,128 @@ pub enum UpdateAction {
+     /// Replace the local daemon after restoring the terminal.
+     Daemon(DaemonUpdateSource),
+@@ -24,163 +25,132 @@ pub enum UpdateAction {
      StandaloneUnix,
      /// Update via `$env:CODEX_NON_INTERACTIVE=1; irm https://chatgpt.com/codex/install.ps1 | iex`.
      StandaloneWindows,
@@ -909,11 +902,13 @@ index 225c457086..59cc4f07d7 100644
 +    /// Returns the command and arguments for invoking the update.
 +    pub fn command_args(&self) -> (&'static str, Vec<String>) {
          match self {
+-            UpdateAction::Daemon(source) => ("codex", source.command_args()),
 -            UpdateAction::NpmGlobalLatest => ("npm", &["install", "-g", "@openai/codex"]),
 -            UpdateAction::BunGlobalLatest => ("bun", &["install", "-g", "@openai/codex"]),
 -            UpdateAction::VitePlusGlobalLatest => ("vp", &["install", "-g", "@openai/codex"]),
 -            UpdateAction::PnpmGlobalLatest => ("pnpm", &["add", "-g", "@openai/codex"]),
 -            UpdateAction::BrewUpgrade => ("brew", &["upgrade", "--cask", "codex"]),
++            UpdateAction::Daemon(source) => ("codex", static_args(source.command_args())),
 +            UpdateAction::NpmGlobalLatest => {
 +                ("npm", static_args(&["install", "-g", "@openai/codex"]))
 +            }
@@ -1097,6 +1092,9 @@ index 225c457086..59cc4f07d7 100644
 -}
 +#[path = "update_action_tests.rs"]
 +mod tests;
+ 
+ /// Package source explicitly selected by the user in the daemon menu.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 diff --git a/codex-rs/tui/src/update_action_tests.rs b/codex-rs/tui/src/update_action_tests.rs
 new file mode 100644
 index 0000000000..f29c5b22c3
@@ -1465,28 +1463,28 @@ index 0000000000..f29c5b22c3
 +    }
 +}
 diff --git a/codex-rs/tui/src/update_prompt.rs b/codex-rs/tui/src/update_prompt.rs
-index 688d113487..9ec36be654 100644
+index 30e948da89..8c1e721cf3 100644
 --- a/codex-rs/tui/src/update_prompt.rs
 +++ b/codex-rs/tui/src/update_prompt.rs
-@@ -12,6 +12,8 @@ use crate::tui::Tui;
- use crate::tui::TuiEvent;
+@@ -21,6 +21,8 @@ use crate::tui::TuiEvent;
  use crate::update_action::UpdateAction;
+ #[cfg(not(debug_assertions))]
  use crate::updates;
 +use codex_install_context::LHC_RELEASE_VERSION;
 +use codex_install_context::LHC_RELEASES_URL;
+ #[cfg(not(debug_assertions))]
  use color_eyre::Result;
  use crossterm::event::KeyCode;
- use crossterm::event::KeyEvent;
-@@ -26,7 +28,7 @@ use ratatui::widgets::Clear;
- use ratatui::widgets::WidgetRef;
+@@ -39,7 +41,7 @@ use ratatui::widgets::Wrap;
+ #[cfg(not(debug_assertions))]
  use tokio_stream::StreamExt;
  
 -const RELEASE_NOTES_URL: &str = "https://github.com/openai/codex/releases/latest";
 +const RELEASE_NOTES_URL: &str = LHC_RELEASES_URL;
  
+ #[cfg(not(debug_assertions))]
  pub(crate) enum UpdatePromptOutcome {
-     Continue,
-@@ -44,8 +46,11 @@ pub(crate) async fn run_update_prompt_if_needed(
+@@ -59,8 +61,11 @@ pub(crate) async fn run_update_prompt_if_needed(
          return Ok(UpdatePromptOutcome::Continue);
      };
  
@@ -1500,7 +1498,7 @@ index 688d113487..9ec36be654 100644
      tui.draw(u16::MAX, |frame| {
          frame.render_widget_ref(&screen, frame.area());
      })?;
-@@ -111,7 +116,7 @@ impl UpdatePromptScreen {
+@@ -126,7 +131,7 @@ impl UpdatePromptScreen {
          Self {
              request_frame,
              latest_version,
@@ -1509,9 +1507,9 @@ index 688d113487..9ec36be654 100644
              update_action,
              highlighted: UpdateSelection::UpdateNow,
              selection: None,
-@@ -189,12 +194,19 @@ impl WidgetRef for &UpdatePromptScreen {
+@@ -205,7 +210,14 @@ impl WidgetRef for &UpdatePromptScreen {
          Clear.render(area, buf);
-         let mut column = ColumnRenderable::new();
+         let mut column = FlexRenderable::new();
  
 -        let update_command = self.update_action.command_str();
 +        // The fork's installer action is a shell script; describe it instead
@@ -1523,24 +1521,18 @@ index 688d113487..9ec36be654 100644
 +            action => format!("Update now (runs `{}`)", action.command_str()),
 +        };
  
-         column.push("");
-         column.push(Line::from(vec![
-             "  ✨\u{200A}".bold().cyan(),
--            "Update available!".bold(),
-+            "Codex + LHC update available!".bold(),
-             " ".into(),
-             format!(
-                 "{current} -> {latest}",
-@@ -214,7 +226,7 @@ impl WidgetRef for &UpdatePromptScreen {
-         column.push("");
-         column.push(selection_option_row(
-             0,
--            format!("Update now (runs `{update_command}`)"),
-+            update_now,
-             self.highlighted == UpdateSelection::UpdateNow,
-         ));
-         column.push(selection_option_row(
-@@ -253,10 +265,17 @@ mod tests {
+         column.push(/*flex*/ 1, RenderableItem::Borrowed(&""));
+         column.push(
+@@ -241,7 +253,7 @@ impl WidgetRef for &UpdatePromptScreen {
+             /*flex*/ 1,
+             picker_option_list(
+                 vec![
+-                    format!("Update now (runs `{update_command}`)"),
++                    update_now,
+                     "Skip".to_string(),
+                     "Skip until next version".to_string(),
+                 ],
+@@ -283,10 +295,17 @@ mod tests {
      use ratatui::widgets::FrameExt;
  
      fn new_prompt() -> UpdatePromptScreen {
@@ -1561,7 +1553,7 @@ index 688d113487..9ec36be654 100644
      }
  
 diff --git a/codex-rs/tui/src/update_versions.rs b/codex-rs/tui/src/update_versions.rs
-index 696290dc34..5b6c3ff83f 100644
+index b0aa3deb47..c38d78e74f 100644
 --- a/codex-rs/tui/src/update_versions.rs
 +++ b/codex-rs/tui/src/update_versions.rs
 @@ -1,15 +1,19 @@
@@ -1586,7 +1578,7 @@ index 696290dc34..5b6c3ff83f 100644
          .map(str::to_owned)
          .ok_or_else(|| anyhow::anyhow!("Failed to parse latest tag name '{latest_tag_name}'"))
  }
-@@ -62,14 +66,29 @@ mod tests {
+@@ -60,14 +64,29 @@ mod tests {
      #[test]
      fn extracts_version_from_latest_tag() {
          assert_eq!(
@@ -1620,7 +1612,7 @@ index 696290dc34..5b6c3ff83f 100644
  
      #[test]
 diff --git a/codex-rs/tui/src/updates.rs b/codex-rs/tui/src/updates.rs
-index b801426552..9aeaed950d 100644
+index 9bbdf310a8..8aacef51ff 100644
 --- a/codex-rs/tui/src/updates.rs
 +++ b/codex-rs/tui/src/updates.rs
 @@ -16,6 +16,8 @@ use chrono::Utc;
@@ -1652,7 +1644,7 @@ index b801426552..9aeaed950d 100644
  
  #[derive(Deserialize, Debug, Clone)]
  struct ReleaseInfo {
-@@ -109,9 +113,11 @@ async fn check_for_update(
+@@ -110,9 +114,11 @@ async fn check_for_update(
              npm_registry::ensure_version_ready(&package_info, &latest_version)?;
              latest_version
          }
