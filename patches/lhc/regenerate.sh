@@ -61,7 +61,14 @@ regen 0005-app-server-dep.patch \
 regen 0006-app-server-install.patch \
   codex-rs/app-server/src/extensions.rs \
   codex-rs/app-server/src/lib.rs \
-  codex-rs/app-server/src/in_process.rs
+  codex-rs/app-server/src/in_process.rs \
+  codex-rs/app-server-protocol/src/protocol/thread_history.rs \
+  codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs \
+  codex-rs/app-server-protocol/src/protocol/v2/thread.rs \
+  codex-rs/app-server/tests/suite/v2/guardian_v2.rs \
+  codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs \
+  codex-rs/app-server/tests/suite/v2/thread_resume.rs \
+  codex-rs/app-server/tests/suite/v2/thread_revert.rs
 
 regen 0007-lhc-compact-arm.patch \
   codex-rs/core/Cargo.toml \
@@ -101,6 +108,27 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/tests/suite/compact_remote_parity.rs \
   codex-rs/core/tests/suite/compact_resume_fork.rs \
   codex-rs/core/tests/suite/guardian_history.rs \
+  codex-rs/core/tests/suite/guardian_authorization.rs \
+  codex-rs/core/tests/suite/guardian_checkpoint_migration_tests.rs \
+  codex-rs/core/tests/suite/guardian_context_budget.rs \
+  codex-rs/core/tests/suite/guardian_retained_context.rs \
+  codex-rs/core/tests/suite/guardian_review.rs \
+  codex-rs/core/src/agent/control_tests.rs \
+  codex-rs/core/src/session/guardian_checkpoint.rs \
+  codex-rs/core/src/session/guardian_overlap.rs \
+  codex-rs/core/src/session/guardian_overlap_tests.rs \
+  codex-rs/core/src/session/guardian_replay_seam_tests.rs \
+  codex-rs/core/src/session/rollout_reconstruction.rs \
+  codex-rs/core/src/session/rollout_reconstruction_tests.rs \
+  codex-rs/history/src/rollout_payload.rs \
+  codex-rs/history/src/tests.rs \
+  codex-rs/rollout/src/metadata_tests.rs \
+  codex-rs/thread-store/src/local/model_context_tests.rs \
+  codex-rs/thread-store/src/thread_metadata_sync.rs \
+  codex-rs/tui/src/app/tests.rs \
+  codex-rs/tui/src/app_backtrack.rs \
+  codex-rs/tui/src/resume_picker_transcript_preview_tests.rs \
+  codex-rs/tui/src/snapshots/codex_tui__app__tests__lhc_rewind_refusal_is_shown_verbatim.snap \
   codex-rs/core/tests/suite/rollout_compression.rs \
   codex-rs/core/tests/suite/step_settings_compaction.rs \
   codex-rs/core/tests/suite/client.rs \

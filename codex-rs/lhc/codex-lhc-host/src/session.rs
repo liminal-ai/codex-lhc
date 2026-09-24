@@ -32,11 +32,6 @@ fn registry_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
-#[cfg(any(test, feature = "test-util"))]
-pub async fn hold_registry_lock_for_tests() -> tokio::sync::MutexGuard<'static, ()> {
-    registry_lock().lock().await
-}
-
 /// Process-global compact-writer ownership registry, keyed by LHC `thread_id`.
 ///
 /// This is the host authority the SDK consults before reclaiming a stale
@@ -416,6 +411,7 @@ pub fn thread_has_lhc_database(thread_id: &str) -> bool {
 
 /// Live (non-deleted) turn ids in capture order. Fails if the database is
 /// missing or unreadable.
+#[cfg(any(test, feature = "test-util"))]
 pub fn live_turn_ids(path: &Path) -> Result<Vec<String>, String> {
     let Some(path) = path.to_str() else {
         return Err("LHC database path is not utf-8".into());

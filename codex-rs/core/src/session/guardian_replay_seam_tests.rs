@@ -118,9 +118,10 @@ async fn real_fold_then_new_exchange_is_replayed_on_restart() {
             user_text_only: false,
         },
     );
-    assert!(
-        producer_covered_count(&items).is_some(),
-        "LHC materialize still writes a coverage count; replay must not trust it"
+    assert_eq!(
+        producer_covered_count(&items),
+        None,
+        "LHC materialize does not write a positional coverage count; replay uses identity"
     );
     let new_instruction = user("Also redact the changelog.");
     let new_call = function_call("fc_post_fold", "{}");
@@ -167,8 +168,7 @@ async fn stale_recovery_rematerialize_replays_new_tail_on_restart() {
     assert_eq!(carry.guardian_history, Some(checkpoint_a.clone()));
 
     // Interrupted compact / stale recovery: carry old checkpoint A, rebuild a
-    // tail that now includes new B. The producer counts the whole rebuilt tail
-    // as covered; replay must still record B.
+    // tail that now includes new B. Replay uses identity, not a positional count.
     let recovered = materialize_guardian_tool_fold(
         carry.guardian_history.expect("carried A"),
         GuardianFoldTailExtras {
@@ -178,17 +178,7 @@ async fn stale_recovery_rematerialize_replays_new_tail_on_restart() {
             user_text_only: false,
         },
     );
-    let covered = producer_covered_count(&recovered).expect("recovery still writes a count");
-    let suffix_items = recovered
-        .iter()
-        .skip_while(|item| !matches!(item, RolloutItem::Compacted(_)))
-        .skip(1)
-        .filter(|item| matches!(item, RolloutItem::ResponseItem(_)))
-        .count() as u64;
-    assert_eq!(
-        covered, suffix_items,
-        "stale recovery counts the whole rebuilt tail, including B"
-    );
+    assert_eq!(producer_covered_count(&recovered), None);
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &recovered)
@@ -215,8 +205,7 @@ async fn mid_turn_degrade_then_new_response_is_replayed_on_restart() {
             user_text_only: false,
         },
     );
-    let covered_before_drop =
-        producer_covered_count(&items).expect("MidTurn materialize writes the count first");
+    assert_eq!(producer_covered_count(&items), None);
     let assembled = history_from_materialized_items(&items);
     let spec = BodyValidationSpec {
         attempt_id: "degrade".into(),
@@ -232,22 +221,7 @@ async fn mid_turn_degrade_then_new_response_is_replayed_on_restart() {
         degraded.summary()
     );
     drop_materialized_items(&mut items, &degraded.kept);
-    let covered_after_drop = producer_covered_count(&items);
-    assert_eq!(
-        covered_after_drop,
-        Some(covered_before_drop),
-        "degrade must not rewrite the stored count"
-    );
-    let suffix_after_drop = items
-        .iter()
-        .skip_while(|item| !matches!(item, RolloutItem::Compacted(_)))
-        .skip(1)
-        .filter(|item| matches!(item, RolloutItem::ResponseItem(_)))
-        .count() as u64;
-    assert!(
-        suffix_after_drop < covered_before_drop,
-        "dropped tail leaves the stored count stale: suffix={suffix_after_drop} count={covered_before_drop}"
-    );
+    assert_eq!(producer_covered_count(&items), None);
 
     append_response(&mut items, user("new instruction after degrade"));
     let reconstructed = session

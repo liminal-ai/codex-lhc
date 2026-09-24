@@ -1719,6 +1719,16 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
         .await
         .expect("I2: write-back must record a durable derived message");
 
+    let wait_h1 = h1.clone();
+    h1.shutdown().await;
+    assert!(
+        wait_h1
+            .wait_terminated_bounded(std::time::Duration::from_secs(10))
+            .await,
+        "predecessor capture must release the path before resume"
+    );
+    drop(sess1);
+
     // ── the resume: a new Session over the same archive, rollout-reconstructed.
     let (mut s2, tc2) = make_session_and_context().await;
     install_lhc_with_thread_id(&mut s2, root.clone(), tid).await;

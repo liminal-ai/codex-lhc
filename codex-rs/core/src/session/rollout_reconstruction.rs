@@ -361,10 +361,9 @@ impl Session {
         // instead of an eagerly loaded `&[RolloutItem]`.
         let rollout_suffix = base_compaction.map_or(rollout_items, |checkpoint| checkpoint.suffix);
         // Native compact writes Some(0): the suffix after Compacted is not an
-        // LHC-rewritten tail, so there is nothing to align. LHC producers still
-        // store a positional count; replay ignores it. Overlap is derived from
-        // the checkpoint vs suffix sequences so stale/missing counts cannot
-        // suppress later evidence.
+        // LHC-rewritten tail, so there is nothing to align. LHC writes None so
+        // identity-derived overlap runs. Reconstruction ignores a nonzero stored
+        // count.
         let native_zero_coverage = base_compaction.is_some_and(|checkpoint| {
             checkpoint.compacted.guardian_covered_suffix_items == Some(0)
         });

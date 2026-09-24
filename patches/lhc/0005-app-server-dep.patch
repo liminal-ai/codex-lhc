@@ -1,5 +1,5 @@
 diff --git a/codex-rs/app-server/Cargo.toml b/codex-rs/app-server/Cargo.toml
-index bd47a54d08..6b17e17e1d 100644
+index bd47a54d08..e3aa25730b 100644
 --- a/codex-rs/app-server/Cargo.toml
 +++ b/codex-rs/app-server/Cargo.toml
 @@ -51,6 +51,8 @@ codex-extension-api = { workspace = true }
@@ -11,3 +11,12 @@ index bd47a54d08..6b17e17e1d 100644
  codex-git-attribution = { workspace = true }
  codex-guardian-v2 = { workspace = true }
  codex-git-utils = { workspace = true }
+@@ -125,6 +127,8 @@ tikv-jemallocator = { workspace = true }
+ codex-windows-sandbox = { workspace = true }
+ 
+ [dev-dependencies]
++lhc = { path = "../lhc/vendor/long-horizon-context/packages/lhc-rs" }
++codex-lhc-host = { workspace = true, features = ["test-util"] }
+ codex-uds = { workspace = true }
+ app_test_support = { workspace = true }
+ axum = { workspace = true, default-features = false, features = [

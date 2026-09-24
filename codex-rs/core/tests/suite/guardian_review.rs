@@ -809,6 +809,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
         .into_iter()
         .find(|model| model.slug == expected_model)
         .expect("bundled Guardian review model");
+    let expected_context_window = review_model.usable_context_window();
     let use_responses_lite = review_model.use_responses_lite;
     if expected_model == "gpt-5.6-luna" {
         assert!(use_responses_lite, "Luna must use Responses Lite");
@@ -1098,7 +1099,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(guardian_context_windows, vec![Some(258_400)]);
+    assert_eq!(guardian_context_windows, vec![expected_context_window]);
     for handshake in server.handshakes() {
         let is_guardian = handshake.header("x-openai-subagent").as_deref() == Some("guardian");
         let is_guardian_request = credits_enabled && is_guardian;

@@ -2,14 +2,20 @@
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_core::CodexThread;
 use codex_core::TurnInputRequest;
+use codex_core::config::Config;
 use codex_core::config::Constrained;
 use codex_core::context::ContextualUserFragment;
 use codex_core::context::GuardianContextMode;
 use codex_core::context::InternalContextSource;
 use codex_core::context::InternalModelContextFragment;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_features::Feature;
 use codex_history::RolloutItem;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::models::ImageReference;
 use codex_protocol::protocol::AskForApproval;
@@ -35,9 +41,44 @@ use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::oneshot;
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+fn enable_lhc_compact(config: &mut Config) {
+    config
+        .features
+        .enable(Feature::LhcCapture)
+        .expect("enable LHC capture");
+    config
+        .features
+        .disable(Feature::TokenBudget)
+        .expect("disable token budget");
+    let _ = config.features.disable(Feature::ContextManagement);
+}
+
+async fn wait_lhc_capture(thread: &CodexThread) {
+    let slot = thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
 
 #[derive(Clone, Copy)]
 enum PendingReviewChange {
@@ -136,7 +177,9 @@ async fn guardian_revalidates_owning_session_before_allow(
     ]).await;
     let base_url = format!("{}/v1", streaming_server.uri());
     let server = responses::start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let mut test = test_codex()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_model_info_override("test-gpt-5.1-codex", |model| {
             model.comp_hash = Some("compatible".to_owned());
             model.auto_review_model_override = Some(model.slug.clone());
@@ -148,6 +191,7 @@ async fn guardian_revalidates_owning_session_before_allow(
             config
                 .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
                 .expect("set sandbox policy");
+            enable_lhc_compact(config);
             for feature in [
                 Feature::GuardianThreadContext,
                 Feature::CodeMode,
@@ -163,6 +207,7 @@ async fn guardian_revalidates_owning_session_before_allow(
         .with_code_mode_host_program(codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?)
         .build_with_auto_env(&server)
         .await?;
+    wait_lhc_capture(&test.codex).await;
     if review_mode == GuardianContextMode::Legacy {
         test.codex.ensure_rollout_materialized().await;
         test.codex = super::guardian_checkpoint_migration::resume(

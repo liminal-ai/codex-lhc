@@ -403,8 +403,6 @@ async fn parent_response(
             }),
             responses::ev_completed("root-compaction"),
         ]
-    } else if request["model"] == "gpt-5.6-luna" {
-        luna_response(&state, request).await
     } else if request
         .pointer("/client_metadata/x-openai-subagent")
         .and_then(Value::as_str)
@@ -440,6 +438,8 @@ async fn parent_response(
             responses::ev_assistant_message("guardian-assessment", &assessment),
             responses::ev_completed("guardian-review"),
         ]
+    } else if request["model"] == "gpt-5.6-luna" {
+        luna_response(&state, request).await
     } else if state.root_worker
         && request
             .pointer("/client_metadata/x-codex-parent-thread-id")

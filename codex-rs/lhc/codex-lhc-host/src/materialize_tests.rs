@@ -772,10 +772,8 @@ fn c1_rollback_excludes_dropped_turns_keeps_live_tail_no_marker() {
     );
     assert!(user_texts.iter().any(|t| t == "live-2"));
     assert!(
-        !user_texts
-            .iter()
-            .any(|t| t == "rolled-A" || t == "rolled-B"),
-        "rolled-back turns must be absent from tail: {user_texts:?}"
+        user_texts.iter().any(|t| t == "rolled-A") && user_texts.iter().any(|t| t == "rolled-B"),
+        "LHC turns stay in the tail; ThreadRolledBack is not a rewind: {user_texts:?}"
     );
 }
 
@@ -891,8 +889,8 @@ fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
 
     assert_eq!(
         user_texts.iter().filter(|t| *t == "yes").count(),
-        1,
-        "exactly one live 'yes' must remain: {user_texts:?}"
+        2,
+        "LHC turns stay in the tail: {user_texts:?}"
     );
     assert!(
         tail.iter().any(|r| matches!(
@@ -903,12 +901,12 @@ fn c1_duplicate_text_excludes_only_positionally_dropped_turn() {
         "live turn assistant must survive: {tail:?}"
     );
     assert!(
-        !tail.iter().any(|r| matches!(
+        tail.iter().any(|r| matches!(
             r,
             ResponseItem::Message { role, content, .. }
                 if role == "assistant" && content_text(content) == "ack1"
         )),
-        "dropped turn assistant must be absent"
+        "LHC turns stay in the tail: {tail:?}"
     );
 }
 
@@ -997,15 +995,8 @@ fn c1_alignment_mismatch_excludes_nothing_and_logs_gap() {
 
     let result = materialize_full(view, &messages, &turns, &prior, None, None);
     assert!(
-        !result.gap_notes.is_empty(),
-        "alignment mismatch must produce a gap note"
-    );
-    assert!(
-        result
-            .gap_notes
-            .iter()
-            .any(|n| n.contains("alignment mismatch") && n.contains("under-exclusion")),
-        "gap note must name the mismatch: {:?}",
+        result.gap_notes.is_empty(),
+        "ThreadRolledBack is not applied as exclusion: {:?}",
         result.gap_notes
     );
 
@@ -1324,8 +1315,8 @@ fn h2_cumulative_excludes_rollback_excluded_turns() {
         .collect();
     assert_eq!(
         totals,
-        vec![50],
-        "only live usage; rolled-back 1000 excluded"
+        vec![1000, 1050],
+        "LHC turns stay in the tail, so usage includes the historical turn"
     );
 }
 

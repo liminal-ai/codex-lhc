@@ -14,7 +14,7 @@
 //!   → optional TurnContext (when supplied — previous_turn_settings recovery)
 //!   → ContextCompacted display marker
 //!   → post-boundary: native ResponseItems + lifecycle / TokenCount /
-//!     message-reasoning twins (rollback applied by exclusion, not marker)
+//!     message-reasoning twins (ThreadRolledBack marker not carried)
 //!   → carry-forward review / patch / MCP / subagent / plan-sleep /
 //!     inter-agent items
 //!   → carry-forward eligible paginated `RealtimeItem` rows (projection input)
@@ -41,7 +41,7 @@
 //! | `UserMessage` / `AgentMessage` / `AgentReasoning` (tail) | **Regenerated** from native tail ResponseItems | model stream tail |
 //! | `AgentReasoningRawContent` | **Conditional** | encrypted_content re-emitted when stored identity matches live model (R2) |
 //! | `ThreadSettingsApplied` / `ThreadGoalUpdated` | **Carried forward** | prior generation |
-//! | `ThreadRolledBack` | **Applied, not carried** | prior markers drop those user turns from the tail; no marker in the rebuilt file |
+//! | `ThreadRolledBack` | **Not carried** | marker dropped; LHC turns stay in the tail. Threads rewound before 0.156.1 can surface rewound turns |
 //! | `ContextCompacted` | **Regenerated** | once at the boundary after `Compacted` |
 //! | `WebSearchEnd` / `ImageGenerationEnd` | **Regenerated** when tail holds native tools | reverse-mapped tail |
 //! | `ItemCompleted(Plan\|Sleep)` / `InterAgentCommunication{,Metadata}` | **Carried forward** | prior generation |
@@ -123,11 +123,11 @@ pub const CAPTURE_GAPS: &[&str] = &[
     "AgentMessage (inter-agent): forward folds to runtime_note text; reverse cannot restore author/recipient structure → runtime_note user Message without display twin (stored text, no view prefix)",
     "AdditionalTools / Compaction / ContextCompaction: runtime_note stored text only; CompactionTrigger never captured",
     "Legacy image markers and InputAudio remain text; schema-13 user/tool images restore from full blocks, compressed or missing images remain placeholders",
-    "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage; usage on rolled-back turns is excluded from the projected cumulative (those turns are out of the tail)",
+    "TokenCount.rate_limits / model_context_window: not in provider_usage → None; cumulative total undercounts where pre-slice-A rows lack provider_usage",
     "TurnStarted.trace_id / model_context_window / collaboration_mode_kind: not in LHC turns → defaults; pre-boundary turns get no lifecycle events (post-boundary only). TurnStarted/TurnAborted/TurnComplete ids are the host UUID only from a closing turn_end key or the capture-bound live turn (F2); otherwise the synthetic label is kept and rewrite warns (proven binding or unknown)",
     "TurnAbortReason enum: coarse map from outcome_reason string; unknown → Interrupted",
     "ThreadSettingsApplied / ThreadGoalUpdated: not in LHC → carry-forward only",
-    "ThreadRolledBack: applied by excluding dropped user turns from the regenerated tail via positional alignment of prior post-boundary user segments to LHC user-prompt turns (no marker emitted). Alignment mismatch falls back to under-exclusion (exclude nothing) with a gap_notes entry — never text-set membership, which over-excludes duplicate prompts. Rolled-back content already compressed into bands remains until the LHC rollback-capture batch lands",
+    "ThreadRolledBack: not a rewind of the LHC record. The marker is not carried; turns remain in the regenerated tail. Threads rewound before 0.156.1 can surface rewound turns via retrieval and after compaction",
     "Review / patch / MCP / subagent end-events: not in LHC → carry-forward only",
     "ItemCompleted(Plan|Sleep) / InterAgentCommunication{,Metadata}: not regenerable from LHC → carry-forward only",
     "TurnContextItem / previous_turn_settings: optional input (slice C wires TurnContext after Compacted/WorldState and before ContextCompacted). Without it, reconstruction leaves previous_turn_settings None and the reverse-scan early-exit at settings+context is disabled",
@@ -255,11 +255,11 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
             );
         }
     }
-    let (rolled_back_turns, mut gap_notes) =
-        rolled_back_turn_ids(input.prior_generation, input.messages, input.turns);
+    // Live rewind on LHC threads is refused. Historical ThreadRolledBack
+    // markers are not a rewind: native rollback never removed LHC turns.
+    let mut gap_notes: Vec<String> = Vec::new();
     let mut refusals: Vec<String> = Vec::new();
-    // H2: rolled-back turns' usage must not inflate projected totals.
-    let usage_totals = cumulative_usage_index(input.messages, &rolled_back_turns);
+    let usage_totals = cumulative_usage_index(input.messages);
 
     let (band_entries, tail_entries) = split_band_and_tail(&input.thread_view.entries);
 
@@ -330,7 +330,6 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         input.turns,
         &host_ids,
         &usage_totals,
-        &rolled_back_turns,
         input.live_identity.as_ref(),
         &mut out,
         &mut gap_notes,
@@ -355,19 +354,6 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         tracing::error!(%refusal, "LHC materialize refusal (context must not be installed)");
     }
 
-    if let Some(idx) = out
-        .iter()
-        .position(|item| matches!(item, RolloutItem::Compacted(_)))
-    {
-        let covered = out[idx + 1..]
-            .iter()
-            .filter(|item| matches!(item, RolloutItem::ResponseItem(_)))
-            .count() as u64;
-        if let RolloutItem::Compacted(item) = &mut out[idx] {
-            item.guardian_covered_suffix_items = Some(covered);
-        }
-    }
-
     MaterializeResult {
         items: out,
         gap_notes: std::mem::take(&mut gap_notes),
@@ -386,14 +372,10 @@ fn index_turns(turns: &[TurnRecord]) -> HashMap<String, &TurnRecord> {
 }
 
 /// Per-message cumulative token totals: `(total_up_to_including, last_call)`.
-/// Messages belonging to `exclude_turns` (rollback-excluded) are omitted entirely.
-fn cumulative_usage_index(
-    messages: &[MessageRecord],
-    exclude_turns: &HashSet<String>,
-) -> HashMap<String, (TokenUsage, TokenUsage)> {
+fn cumulative_usage_index(messages: &[MessageRecord]) -> HashMap<String, (TokenUsage, TokenUsage)> {
     let mut ordered: Vec<&MessageRecord> = messages
         .iter()
-        .filter(|m| m.provider_usage.is_some() && !exclude_turns.contains(&m.turn_id))
+        .filter(|m| m.provider_usage.is_some())
         .collect();
     ordered.sort_by_key(|m| m.source_event_order);
     let mut cumulative = TokenUsage::default();
@@ -433,195 +415,6 @@ fn stored_tool_is_error(m: &MessageRecord) -> Option<bool> {
         .find(|b| b.block_type == BlockType::ToolResult)
         .and_then(|b| b.content.get("isError"))
         .and_then(Value::as_bool)
-}
-
-/// One post-boundary user-turn segment from the prior generation.
-#[derive(Debug, Clone)]
-struct PriorUserSegment {
-    /// Chronologically first user-message text of the segment (alignment key).
-    text: String,
-    /// True when reverse-scan arithmetic would drop this segment.
-    dropped: bool,
-}
-
-/// Post-boundary slice of `prior`: after the last `Compacted` with
-/// `replacement_history`, or the whole file if none.
-fn prior_post_boundary_slice(prior: &[RolloutItem]) -> &[RolloutItem] {
-    let start = prior
-        .iter()
-        .rposition(|item| {
-            matches!(
-                item,
-                RolloutItem::Compacted(c) if c.replacement_history.is_some()
-            )
-        })
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    &prior[start..]
-}
-
-/// Chronological (oldest→newest) post-boundary user segments with drop flags
-/// from the same reverse-scan arithmetic as `rollout_reconstruction`.
-fn prior_user_segments_with_drop(prior: &[RolloutItem]) -> Vec<PriorUserSegment> {
-    let slice = prior_post_boundary_slice(prior);
-    let mut pending = 0usize;
-    let mut segments_newest_first: Vec<PriorUserSegment> = Vec::new();
-    // Within a reverse segment, the last assignment is the chronologically first UM.
-    let mut segment_text: Option<String> = None;
-    let mut segment_is_user = false;
-
-    let finalize = |pending: &mut usize,
-                    text: &mut Option<String>,
-                    is_user: &mut bool,
-                    out: &mut Vec<PriorUserSegment>| {
-        if *is_user {
-            let dropped = if *pending > 0 {
-                *pending = pending.saturating_sub(1);
-                true
-            } else {
-                false
-            };
-            out.push(PriorUserSegment {
-                text: text.take().unwrap_or_default(),
-                dropped,
-            });
-        } else {
-            *text = None;
-        }
-        *is_user = false;
-    };
-
-    for item in slice.iter().rev() {
-        match item {
-            RolloutItem::EventMsg(EventMsg::ThreadRolledBack(r)) => {
-                pending =
-                    pending.saturating_add(usize::try_from(r.num_turns).unwrap_or(usize::MAX));
-            }
-            RolloutItem::EventMsg(EventMsg::UserMessage(u)) => {
-                segment_is_user = true;
-                // Overwrite: last write under reverse walk = chronologically first.
-                segment_text = Some(u.message.clone());
-            }
-            RolloutItem::EventMsg(EventMsg::TurnStarted(_)) => {
-                finalize(
-                    &mut pending,
-                    &mut segment_text,
-                    &mut segment_is_user,
-                    &mut segments_newest_first,
-                );
-            }
-            RolloutItem::ResponseItem(item) => {
-                if let ResponseItem::Message { role, content, .. } = &item.item
-                    && role == "user"
-                {
-                    segment_is_user = true;
-                    let t = content_text(content);
-                    if !t.is_empty() {
-                        segment_text = Some(t);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    finalize(
-        &mut pending,
-        &mut segment_text,
-        &mut segment_is_user,
-        &mut segments_newest_first,
-    );
-    segments_newest_first.reverse();
-    segments_newest_first
-}
-
-/// LHC user-prompt turns ordered by `turn_order` (stable secondary: event order).
-fn lhc_user_prompt_turns_ordered(
-    messages: &[MessageRecord],
-    turns: &[TurnRecord],
-) -> Vec<(String, String)> {
-    let turn_order: HashMap<&str, i64> = turns
-        .iter()
-        .map(|t| (t.turn_id.as_str(), t.turn_order))
-        .collect();
-    let mut rows: Vec<(i64, i64, String, String)> = messages
-        .iter()
-        .filter(|m| m.kind == MessageKind::UserPrompt)
-        .map(|m| {
-            let order = turn_order
-                .get(m.turn_id.as_str())
-                .copied()
-                .unwrap_or(i64::MAX);
-            (
-                order,
-                m.source_event_order,
-                m.turn_id.clone(),
-                stored_text(m),
-            )
-        })
-        .collect();
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    // One row per turn_id (first user_prompt of the turn).
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for (_, _, tid, text) in rows {
-        if seen.insert(tid.clone()) {
-            out.push((tid, text));
-        }
-    }
-    out
-}
-
-/// Resolve prior rollback drops to LHC turn ids by **positional alignment**.
-///
-/// Materializer exclusion for constructed `ThreadRolledBack` records. Live
-/// rewind on LHC threads is refused; this is not a new rewind path.
-///
-/// Prior post-boundary user segments (oldest→newest) align one-to-one with the
-/// corresponding suffix of LHC user-prompt turns (by `turn_order`). Text is the
-/// alignment check; position is the discriminator. On length or text mismatch:
-/// exclude nothing and emit a gap note (under-exclusion preferred to destroying
-/// live turns).
-fn rolled_back_turn_ids(
-    prior: &[RolloutItem],
-    messages: &[MessageRecord],
-    turns: &[TurnRecord],
-) -> (HashSet<String>, Vec<String>) {
-    let segments = prior_user_segments_with_drop(prior);
-    if !segments.iter().any(|s| s.dropped) {
-        return (HashSet::new(), Vec::new());
-    }
-
-    let lhc = lhc_user_prompt_turns_ordered(messages, turns);
-    if lhc.len() < segments.len() {
-        let note = format!(
-            "rollback alignment: fewer LHC user-prompt turns ({}) than prior post-boundary segments ({}); excluding nothing (under-exclusion)",
-            lhc.len(),
-            segments.len()
-        );
-        return (HashSet::new(), vec![note]);
-    }
-
-    // Same range: suffix of LHC turns matching post-boundary segment count.
-    let offset = lhc.len() - segments.len();
-    let lhc_range = &lhc[offset..];
-
-    for (i, (seg, (_, lhc_text))) in segments.iter().zip(lhc_range.iter()).enumerate() {
-        if seg.text != *lhc_text {
-            let note = format!(
-                "rollback alignment mismatch at position {i}: prior_segment={:?} lhc_turn={:?}; excluding nothing (under-exclusion)",
-                seg.text, lhc_text
-            );
-            return (HashSet::new(), vec![note]);
-        }
-    }
-
-    let excluded = segments
-        .iter()
-        .zip(lhc_range.iter())
-        .filter(|(seg, _)| seg.dropped)
-        .map(|(_, (tid, _))| tid.clone())
-        .collect();
-    (excluded, Vec::new())
 }
 
 fn split_band_and_tail(
@@ -872,7 +665,6 @@ fn emit_tail(
     all_turns: &[TurnRecord],
     host_ids: &HashMap<String, String>,
     usage_totals: &HashMap<String, (TokenUsage, TokenUsage)>,
-    rolled_back_turns: &HashSet<String>,
     live_identity: Option<&ModelIdentity>,
     out: &mut Vec<RolloutItem>,
     gap_notes: &mut Vec<String>,
@@ -884,11 +676,6 @@ fn emit_tail(
     let mut tool_call_kinds: HashMap<String, RecoveredToolCallKind> = HashMap::new();
 
     for entry in tail {
-        // C1: skip entries belonging to rolled-back turns.
-        if entry_belongs_to_rolled_back(entry, messages_by_id, rolled_back_turns) {
-            continue;
-        }
-
         // F1 / law 6: fork compact-marker runtime notes are bookkeeping (key
         // namespace codex:{tid}:compact_marker:…), not conversation. Exclude
         // from model stream and display stream before turn open / emit.
@@ -899,9 +686,6 @@ fn emit_tail(
 
         for mid in entry_message_ids(entry) {
             if let Some(msg) = messages_by_id.get(&mid) {
-                if rolled_back_turns.contains(&msg.turn_id) {
-                    continue;
-                }
                 maybe_open_turn(
                     msg.turn_id.as_str(),
                     turns_by_id,
@@ -980,9 +764,6 @@ fn emit_tail(
                     let msg = source
                         .and_then(|s| messages_by_id.get(&s.message_id))
                         .copied();
-                    if msg.is_some_and(|m| rolled_back_turns.contains(&m.turn_id)) {
-                        continue;
-                    }
                     let id_hint = source.and_then(|s| {
                         s.idempotency_key
                             .as_deref()
@@ -1036,9 +817,6 @@ fn emit_tail(
                 let msg = source
                     .and_then(|s| messages_by_id.get(&s.message_id))
                     .copied();
-                if msg.is_some_and(|m| rolled_back_turns.contains(&m.turn_id)) {
-                    continue;
-                }
                 // Law 6: route by tool identity only — never content sniffing.
                 let is_image = tr.tool_name.as_deref() == Some("image_generation")
                     || pending_images.contains_key(&tr.tool_call_id);
@@ -1100,9 +878,6 @@ fn emit_tail(
 
         for mid in entry_message_ids(entry) {
             if let Some(msg) = messages_by_id.get(&mid) {
-                if rolled_back_turns.contains(&msg.turn_id) {
-                    continue;
-                }
                 maybe_close_turn_if_last(
                     msg,
                     turns_by_id,
@@ -1127,7 +902,6 @@ fn emit_tail(
             t.status == TurnStatus::Closed
                 && opened.contains(&t.turn_id)
                 && !closed.contains(&t.turn_id)
-                && !rolled_back_turns.contains(&t.turn_id)
         })
         .collect();
     remaining.sort_by_key(|t| t.turn_order);
@@ -1206,26 +980,6 @@ fn entry_source_keys(entry: &SessionThreadViewEntry) -> impl Iterator<Item = &st
         }
     };
     sources.iter().filter_map(|s| s.idempotency_key.as_deref())
-}
-
-fn entry_belongs_to_rolled_back(
-    entry: &SessionThreadViewEntry,
-    messages_by_id: &HashMap<String, &MessageRecord>,
-    rolled_back: &HashSet<String>,
-) -> bool {
-    if rolled_back.is_empty() {
-        return false;
-    }
-    let ids = entry_message_ids(entry);
-    if ids.is_empty() {
-        return false;
-    }
-    // Skip when every sourced message belongs to a rolled-back turn.
-    ids.iter().all(|mid| {
-        messages_by_id
-            .get(mid)
-            .is_some_and(|m| rolled_back.contains(&m.turn_id))
-    })
 }
 
 fn entry_message_ids(entry: &SessionThreadViewEntry) -> Vec<String> {
@@ -1952,7 +1706,7 @@ fn push_carry_forwards_settings_goal(out: &mut Vec<RolloutItem>, prior: &[Rollou
 fn push_carry_forwards_ends(out: &mut Vec<RolloutItem>, prior: &[RolloutItem]) {
     for item in prior {
         match item {
-            // C1: ThreadRolledBack is applied by exclusion — never carried.
+            // ThreadRolledBack is not a rewind of the LHC record — never carried.
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(_)) => {}
             RolloutItem::EventMsg(EventMsg::EnteredReviewMode(_))
             | RolloutItem::EventMsg(EventMsg::ExitedReviewMode(_))

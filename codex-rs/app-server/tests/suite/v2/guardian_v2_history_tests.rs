@@ -206,8 +206,6 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                                 }),
                                 responses::ev_completed("compact"),
                             ]
-                        } else if request["model"] == "gpt-5.6-luna" {
-                            luna_response(&classifier, request).await
                         } else if request["client_metadata"]["x-openai-subagent"] == "guardian" {
                             review_requests
                                 .lock()
@@ -217,6 +215,8 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
                                 responses::ev_assistant_message("review", r#"{"outcome":"allow"}"#),
                                 responses::ev_completed("review"),
                             ]
+                        } else if request["model"] == "gpt-5.6-luna" {
+                            luna_response(&classifier, request).await
                         } else {
                             let mut requests = parent_requests.lock().expect("request log lock");
                             let step = requests.len();

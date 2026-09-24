@@ -41,10 +41,10 @@ index d66602b205..bbd9311eb9 100644
      }
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..85034166e5
+index 0000000000..178abea0d2
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1258 @@
+@@ -0,0 +1,1260 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -1099,6 +1099,7 @@ index 0000000000..85034166e5
 +            previous_window_id: None,
 +            window_id: Some("win-1".into()),
 +            guardian_history: None,
++            guardian_covered_suffix_items: None,
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
@@ -1114,6 +1115,7 @@ index 0000000000..85034166e5
 +            previous_window_id: Some("win-1".into()),
 +            window_id: Some("win-2".into()),
 +            guardian_history: None,
++            guardian_covered_suffix_items: None,
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
@@ -1304,10 +1306,28 @@ index 0000000000..85034166e5
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index a4b4ba0032..d80cc8ef50 100644
+index a4b4ba0032..66f5d607e1 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
-@@ -338,8 +338,10 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
+@@ -235,6 +235,7 @@ mod handlers;
+ mod inject;
+ mod reasoning_effort;
+ pub(crate) use reasoning_effort::RequestEffortUsage;
++mod guardian_overlap;
+ mod input_queue;
+ mod mcp;
+ mod mcp_prewarm;
+@@ -281,6 +282,9 @@ use self::turn::collect_explicit_app_ids_from_skill_items;
+ use self::turn::realtime_text_for_event;
+ use self::turn_context::TurnContext;
+ #[cfg(test)]
++#[path = "guardian_replay_seam_tests.rs"]
++mod guardian_replay_seam_tests;
++#[cfg(test)]
+ mod rollout_reconstruction_tests;
+ 
+ /// Notes from the previous real user turn.
+@@ -338,8 +342,10 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
  use codex_git_utils::get_git_repo_root;
  use codex_history::CodexHarnessMetadata;
  use codex_history::CompactedItem;
@@ -1318,7 +1338,7 @@ index a4b4ba0032..d80cc8ef50 100644
  use codex_mcp::McpConfig;
  use codex_mcp::effective_mcp_servers;
  use codex_otel::SessionTelemetry;
-@@ -1443,6 +1445,12 @@ impl Session {
+@@ -1443,6 +1449,12 @@ impl Session {
          state.get_total_token_usage(state.server_reasoning_included())
      }
  
@@ -1331,7 +1351,7 @@ index a4b4ba0032..d80cc8ef50 100644
      pub(crate) async fn auto_compact_window_snapshot(&self) -> AutoCompactWindowSnapshot {
          let state = self.state.lock().await;
          state.auto_compact_window_snapshot()
-@@ -1576,6 +1584,9 @@ impl Session {
+@@ -1576,6 +1588,9 @@ impl Session {
                  let previous_turn_settings = self
                      .apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1341,7 +1361,7 @@ index a4b4ba0032..d80cc8ef50 100644
  
                  // If resuming, warn when the last recorded model differs from the current one.
                  let curr: &str = turn_context.model_info().slug.as_str();
-@@ -1624,6 +1635,8 @@ impl Session {
+@@ -1624,6 +1639,8 @@ impl Session {
                  Self::assign_missing_rollout_response_item_ids(&mut rollout_items);
                  self.apply_rollout_reconstruction(&turn_context, &rollout_items)
                      .await;
@@ -1350,7 +1370,7 @@ index a4b4ba0032..d80cc8ef50 100644
  
                  // Seed usage info from the recorded rollout so UIs can show token counts
                  // immediately on resume/fork.
-@@ -3513,6 +3526,27 @@ impl Session {
+@@ -3513,6 +3530,27 @@ impl Session {
          turn_context: &TurnContext,
          model_info: &ModelInfo,
          items: &[ResponseItem],
@@ -1378,7 +1398,7 @@ index a4b4ba0032..d80cc8ef50 100644
      ) {
          let (items, image_preparations) = self
              .prepare_conversation_items_for_history(turn_context, model_info, items)
-@@ -3527,6 +3561,7 @@ impl Session {
+@@ -3527,6 +3565,7 @@ impl Session {
              model_info,
              items,
              image_preparations,
@@ -1386,7 +1406,7 @@ index a4b4ba0032..d80cc8ef50 100644
          )
          .await;
      }
-@@ -3537,6 +3572,7 @@ impl Session {
+@@ -3537,6 +3576,7 @@ impl Session {
          model_info: &ModelInfo,
          mut items: Vec<ResponseItemEnvelope>,
          image_preparations: Vec<ImagePreparationMetadata>,
@@ -1394,7 +1414,7 @@ index a4b4ba0032..d80cc8ef50 100644
      ) {
          // Save the originating history budget for replay.
          // Preserve any existing tool-specific override.
-@@ -3601,7 +3637,7 @@ impl Session {
+@@ -3601,7 +3641,7 @@ impl Session {
          {
              mark_thread_memory_mode_polluted_if_external_context(self, turn_context, item).await;
          }
@@ -1403,7 +1423,7 @@ index a4b4ba0032..d80cc8ef50 100644
              .await;
      }
  
-@@ -3875,7 +3911,13 @@ impl Session {
+@@ -3875,7 +3915,13 @@ impl Session {
              RolloutItem::ResponseItem(response_item.into()),
          ])
          .await;
@@ -1418,7 +1438,7 @@ index a4b4ba0032..d80cc8ef50 100644
      }
  
      async fn maybe_warn_on_server_model_mismatch(
-@@ -3971,7 +4013,7 @@ impl Session {
+@@ -3971,10 +4017,11 @@ impl Session {
                  .compaction_model_hash = metadata.compaction_model_hash;
          }
          let mut compacted_item = CompactedItem {
@@ -1427,7 +1447,11 @@ index a4b4ba0032..d80cc8ef50 100644
              replacement_history: Some(items.clone()),
              retained_context: None,
              guardian_history: None,
-@@ -4008,6 +4050,10 @@ impl Session {
++            guardian_covered_suffix_items: Some(0),
+             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
+             window_number: Some(metadata.window_number),
+             first_window_id: Some(metadata.window_ids.first_window_id.to_string()),
+@@ -4008,6 +4055,10 @@ impl Session {
                  world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                  state.history.set_world_state_baseline(snapshot);
              }
@@ -1438,7 +1462,7 @@ index a4b4ba0032..d80cc8ef50 100644
          }
  
          let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-@@ -4029,10 +4075,95 @@ impl Session {
+@@ -4029,10 +4080,95 @@ impl Session {
          }
      }
  
@@ -1534,7 +1558,7 @@ index a4b4ba0032..d80cc8ef50 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -4072,7 +4203,42 @@ impl Session {
+@@ -4072,7 +4208,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1578,7 +1602,7 @@ index a4b4ba0032..d80cc8ef50 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -4404,6 +4570,32 @@ impl Session {
+@@ -4404,6 +4575,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1611,7 +1635,7 @@ index a4b4ba0032..d80cc8ef50 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4758,11 +4950,12 @@ impl Session {
+@@ -4758,11 +4955,12 @@ impl Session {
          model_info: &ModelInfo,
          response_item: ResponseItem,
      ) {
@@ -1626,7 +1650,7 @@ index a4b4ba0032..d80cc8ef50 100644
          )
          .await;
  
-@@ -4809,11 +5002,13 @@ impl Session {
+@@ -4809,11 +5007,13 @@ impl Session {
              &prepared_items,
              &user_image_content_indices,
          );
@@ -1640,7 +1664,7 @@ index a4b4ba0032..d80cc8ef50 100644
          )
          .await;
          user_message_item.client_id = client_id;
-@@ -5015,3 +5210,14 @@ mod elicitation_holders_tests;
+@@ -5015,3 +5215,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

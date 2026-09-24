@@ -128,6 +128,7 @@ codex-windows-sandbox = { workspace = true }
 
 [dev-dependencies]
 lhc = { path = "../lhc/vendor/long-horizon-context/packages/lhc-rs" }
+codex-lhc-host = { workspace = true, features = ["test-util"] }
 codex-uds = { workspace = true }
 app_test_support = { workspace = true }
 axum = { workspace = true, default-features = false, features = [

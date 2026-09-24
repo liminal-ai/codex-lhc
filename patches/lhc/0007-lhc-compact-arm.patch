@@ -16,10 +16,30 @@ index 8a095942dd..dc3249cf56 100644
  # Do not add new tests here
  filter = 'test(rmcp_client) | test(humanlike_typing_1000_chars_appears_live_no_placeholder)'
 diff --git a/codex-rs/app-server/src/request_processors/thread_processor.rs b/codex-rs/app-server/src/request_processors/thread_processor.rs
-index b7affb2367..2c38285a3d 100644
+index b7affb2367..d07f57b3f5 100644
 --- a/codex-rs/app-server/src/request_processors/thread_processor.rs
 +++ b/codex-rs/app-server/src/request_processors/thread_processor.rs
-@@ -4524,6 +4524,22 @@ impl ThreadRequestProcessor {
+@@ -12,6 +12,7 @@ use super::thread_input::can_accept_direct_input;
+ use super::thread_input::ensure_direct_input_allowed;
+ use super::*;
+ use crate::error_code::method_not_found;
++use codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED;
+ use codex_app_server_protocol::SelectedCapabilityRoot;
+ use codex_app_server_protocol::ThreadHistoryMode as ApiThreadHistoryMode;
+ use codex_app_server_protocol::ThreadRevertParams;
+@@ -2123,6 +2124,11 @@ impl ThreadRequestProcessor {
+         let (thread_id, thread) = self.load_thread(&thread_id).await?;
+         ensure_direct_input_allowed(thread.as_ref()).await?;
+         let config_snapshot = thread.config_snapshot().await;
++        if thread.config().await.features.enabled(Feature::LhcCapture)
++            || codex_lhc_host::thread_has_lhc_database(&thread_id.to_string())
++        {
++            return Err(invalid_request(REWINDING_NOT_YET_SUPPORTED));
++        }
+         if !matches!(config_snapshot.history_mode, ThreadHistoryMode::Paginated) {
+             return Err(invalid_request(
+                 "thread/revert only supports paginated threads",
+@@ -4524,6 +4530,22 @@ impl ThreadRequestProcessor {
          &self,
          stored_thread: StoredThread,
      ) -> Result<(InitialHistory, StoredThread), JSONRPCErrorError> {
@@ -348,9 +368,53 @@ index 693fbd7b78..fd22227ee5 100644
  codex-exec-server-test-support = { workspace = true }
  codex-image-generation-extension = { workspace = true }
  codex-home = { workspace = true }
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index a55a8bbbc5..6618468515 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -1842,6 +1842,7 @@ async fn spawn_agent_fork_drops_inherited_token_usage_state(thread_context_enabl
+                 replacement_history: Some(vec![user_message("compacted parent context").into()]),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -1968,6 +1969,7 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
+                 ]),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -2527,6 +2529,7 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history(
+                 guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
+                     user_message("Parent-local approval must not be inherited."),
+                 ])),
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -2732,6 +2735,7 @@ async fn spawn_agent_full_fork_restores_instructions_after_compaction_discards_p
+                 ),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -2889,6 +2893,7 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
+                 replacement_history: None,
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
 diff --git a/codex-rs/core/src/compact_lhc.rs b/codex-rs/core/src/compact_lhc.rs
 new file mode 100644
-index 0000000000..ed2781f4e5
+index 0000000000..5ed3b4bf98
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc.rs
 @@ -0,0 +1,1515 @@
@@ -472,7 +536,7 @@ index 0000000000..ed2781f4e5
 +#[path = "compact_lhc/installation.rs"]
 +mod installation;
 +#[cfg(test)]
-+use installation::drop_materialized_items;
++pub(crate) use installation::drop_materialized_items;
 +use installation::install_lhc_compact_rewrite;
 +#[cfg(test)]
 +use installation::patch_materialized_history_ids;
@@ -1871,7 +1935,7 @@ index 0000000000..ed2781f4e5
 +mod readiness_tests;
 diff --git a/codex-rs/core/src/compact_lhc/installation.rs b/codex-rs/core/src/compact_lhc/installation.rs
 new file mode 100644
-index 0000000000..d1b383d06d
+index 0000000000..5e66480123
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc/installation.rs
 @@ -0,0 +1,742 @@
@@ -1998,7 +2062,7 @@ index 0000000000..d1b383d06d
 +        .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 +
 +    let history = sess.clone_history().await;
-+    let guardian_history = history.guardian_history_checkpoint();
++    let guardian_history = history.lhc_fold_guardian_checkpoint();
 +    let retained_context = Some(history.retained_context().clone());
 +    let latest_token_usage_record = sess.latest_token_usage_record().await;
 +
@@ -2549,7 +2613,7 @@ index 0000000000..d1b383d06d
 +/// post-boundary `ResponseItem` / `InterAgentCommunication` entries (the tail).
 +/// Positions the mask does not cover are kept — a shorter mask must never
 +/// silently truncate durable state.
-+pub(super) fn drop_materialized_items(items: &mut Vec<RolloutItem>, kept: &[bool]) {
++pub(crate) fn drop_materialized_items(items: &mut Vec<RolloutItem>, kept: &[bool]) {
 +    let boundary = items
 +        .iter()
 +        .rposition(|item| matches!(item, RolloutItem::Compacted(_)));
@@ -4568,10 +4632,10 @@ index 0000000000..e8c030ffa8
 +}
 diff --git a/codex-rs/core/src/compact_lhc_mid_turn_tests.rs b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
 new file mode 100644
-index 0000000000..84c6b33a31
+index 0000000000..4ea6b45a7a
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_mid_turn_tests.rs
-@@ -0,0 +1,4806 @@
+@@ -0,0 +1,4696 @@
 +//! LIM-63B MidTurn compact-continuation evidence (offline, mock path).
 +//!
 +//! Drives production `try_run_lhc_compact_arm` / `run_auto_compact` at
@@ -8191,116 +8255,6 @@ index 0000000000..84c6b33a31
 +    );
 +}
 +
-+/// AC-7.4 (host side): the durable active turn must be exactly the turn bound
-+/// to the current Codex turn identity. A second writer opens a newer durable
-+/// turn that this host turn never bound; the production arm reads
-+/// `host_metadata.active_turn.turn_id`, finds it differs, and must keep the
-+/// current body without invoking compact — and without any fallback to the
-+/// compact-continuation path. Progress to a later seam stays allowed.
-+#[tokio::test]
-+async fn mid_turn_parts_mismatched_durable_turn_cannot_compact() {
-+    let dir = tempdir().unwrap();
-+    let root = dir.path().to_path_buf();
-+    let (mut session, tc) = make_session_and_context().await;
-+    install_lhc_midturn(&mut session, root.clone()).await;
-+    let slot = session
-+        .services
-+        .thread_extension_data
-+        .get::<LhcCaptureSlot>()
-+        .expect("slot");
-+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
-+        .await
-+        .expect("handle");
-+    seed_turns(&session, &tc, 10).await;
-+    inject_response_usage(&session, &tc, 2_000).await;
-+    handle.flush().await;
-+    let bound = handle
-+        .durable_turn_id(&tc.sub_id)
-+        .expect("capture bound the seeded open turn to this host turn");
-+
-+    // Another writer opens a newer durable turn under no host binding.
-+    let other = codex_lhc_host::spawn_capture(
-+        handle.thread_id(),
-+        None,
-+        Some(root.clone()),
-+        codex_lhc_host::LateBoundCallbacks::new(),
-+    )
-+    .await
-+    .expect("second writer");
-+    other.persist(
-+        &ResponseItem::Message {
-+            id: None,
-+            role: "user".into(),
-+            content: vec![ContentItem::InputText {
-+                text: "drift prompt from another writer".into(),
-+            }],
-+            phase: None,
-+            internal_chat_message_metadata_passthrough: None,
-+        },
-+        codex_extension_api::RawItemProvenance::UserPrompt,
-+        /*step_index*/ None,
-+    );
-+    other.flush().await;
-+    assert_eq!(
-+        handle.durable_turn_id(&tc.sub_id).as_deref(),
-+        Some(bound.as_str()),
-+        "the host binding is unchanged by a foreign writer"
-+    );
-+
-+    let sess = Arc::new(session);
-+    let history_before: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
-+    let epoch = decision_epoch(&sess);
-+    let attempt = try_run_lhc_compact_arm(
-+        &sess,
-+        &tc,
-+        InitialContextInjection::DoNotInject,
-+        /*manual*/ false,
-+        CompactionPhase::MidTurn,
-+        Some(mid_facts(
-+            "identity-1",
-+            true,
-+            epoch,
-+            Vec::new(),
-+            Some(sample_usage(2_000)),
-+        )),
-+        &CancellationToken::new(),
-+    )
-+    .await
-+    .expect("arm");
-+    match attempt {
-+        LhcCompactAttempt::MidTurnBlocked {
-+            reason,
-+            next_provider_request_allowed,
-+        } => {
-+            assert!(
-+                reason.contains("is not the current host turn's bound turn"),
-+                "must refuse on durable identity mismatch: {reason}"
-+            );
-+            assert!(
-+                reason.contains(&bound),
-+                "reason names the bound turn {bound}: {reason}"
-+            );
-+            assert!(
-+                next_provider_request_allowed,
-+                "identity mismatch keeps the body and retries at a later seam"
-+            );
-+        }
-+        other => panic!("mismatched durable turn must not compact, got {other:?}"),
-+    }
-+    let history_after: Vec<_> = sess.clone_history().await.raw_items().cloned().collect();
-+    assert_eq!(history_before, history_after, "current body preserved");
-+    let receipts = codex_lhc_host::inspect_compact_continuation_receipts(
-+        handle.thread_id(),
-+        Some(root.as_path()),
-+    )
-+    .await
-+    .expect("inspect receipts");
-+    assert!(
-+        receipts.is_empty(),
-+        "identity mismatch must never route to compact-continuation"
-+    );
-+}
-+
 +/// Failure split at the parts hop: a generic (non-cancellation) failure keeps
 +/// the current body and allows the next provider request, so compact retries
 +/// at a later eligible seam — it never denies progress, never falls open to
@@ -9765,10 +9719,10 @@ index 0000000000..d5a30374ff
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..6f0ba7ca09
+index 0000000000..4cc8013fbe
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1934 @@
+@@ -0,0 +1,1935 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -10033,6 +9987,7 @@ index 0000000000..6f0ba7ca09
 +        previous_window_id: prev.map(str::to_string),
 +        window_id: Some(window_id.into()),
 +        guardian_history: None,
++        guardian_covered_suffix_items: None,
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
@@ -12254,10 +12209,10 @@ index 0000000000..902ef91166
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..eca5b271ad
+index 0000000000..4634a269cc
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3689 @@
+@@ -0,0 +1,3706 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -13242,6 +13197,7 @@ index 0000000000..eca5b271ad
 +        previous_window_id: None,
 +        window_id: Some("b".into()),
 +        guardian_history: None,
++        guardian_covered_suffix_items: None,
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
@@ -13315,6 +13271,7 @@ index 0000000000..eca5b271ad
 +        previous_window_id: Some("w1".into()),
 +        window_id: Some("w2".into()),
 +        guardian_history: None,
++        guardian_covered_suffix_items: None,
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
@@ -13977,6 +13934,16 @@ index 0000000000..eca5b271ad
 +        .await
 +        .expect("I2: write-back must record a durable derived message");
 +
++    let wait_h1 = h1.clone();
++    h1.shutdown().await;
++    assert!(
++        wait_h1
++            .wait_terminated_bounded(std::time::Duration::from_secs(10))
++            .await,
++        "predecessor capture must release the path before resume"
++    );
++    drop(sess1);
++
 +    // ── the resume: a new Session over the same archive, rollout-reconstructed.
 +    let (mut s2, tc2) = make_session_and_context().await;
 +    install_lhc_with_thread_id(&mut s2, root.clone(), tid).await;
@@ -14006,6 +13973,7 @@ index 0000000000..eca5b271ad
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            guardian_covered_suffix_items: None,
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
@@ -14118,6 +14086,7 @@ index 0000000000..eca5b271ad
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            guardian_covered_suffix_items: None,
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
@@ -15793,6 +15762,7 @@ index 0000000000..eca5b271ad
 +            previous_window_id: None,
 +            window_id: None,
 +            guardian_history: None,
++            guardian_covered_suffix_items: None,
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
@@ -15838,6 +15808,7 @@ index 0000000000..eca5b271ad
 +        previous_window_id: None,
 +        window_id: None,
 +        guardian_history: None,
++        guardian_covered_suffix_items: None,
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
@@ -15912,6 +15883,7 @@ index 0000000000..eca5b271ad
 +        previous_window_id: None,
 +        window_id: None,
 +        guardian_history: None,
++        guardian_covered_suffix_items: None,
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
@@ -16211,10 +16183,10 @@ index e71ad88dde..b3dbba8ec2 100644
              model_context_window: cfg.model_context_window,
              model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
 diff --git a/codex-rs/core/src/context_manager/history.rs b/codex-rs/core/src/context_manager/history.rs
-index 955dbc9196..0420382dfa 100644
+index 955dbc9196..99e8cd835a 100644
 --- a/codex-rs/core/src/context_manager/history.rs
 +++ b/codex-rs/core/src/context_manager/history.rs
-@@ -239,9 +239,6 @@ impl ContextManager {
+@@ -239,14 +239,44 @@ impl ContextManager {
      }
  
      pub(crate) fn guardian_history_checkpoint(&self) -> Option<GuardianHistoryCheckpoint> {
@@ -16224,7 +16196,45 @@ index 955dbc9196..0420382dfa 100644
          self.review_history
              .as_ref()
              .map(|history| GuardianHistoryCheckpoint(history.items().cloned().collect()))
-@@ -318,10 +315,25 @@ impl ContextManager {
+     }
+ 
++    /// Guardian coverage to persist on an LHC Compacted record.
++    ///
++    /// First fold has no `review_history` yet; snapshot the current conversation
++    /// the same way [`Self::replace_compacted`] will. Later folds already hold
++    /// the independent transcript.
++    pub(crate) fn lhc_fold_guardian_checkpoint(&self) -> Option<GuardianHistoryCheckpoint> {
++        if let Some(checkpoint) = self.guardian_history_checkpoint() {
++            return Some(checkpoint);
++        }
++        if self.guardian_review_mode != GuardianContextMode::ThreadOwned
++            && self.guardian_context_mode != GuardianContextMode::ThreadOwned
++        {
++            return None;
++        }
++        let items: Vec<ResponseItem> = self
++            .raw_items()
++            .filter(|item| {
++                !matches!(item, ResponseItem::Message { role, content, .. }
++                    if role == "user" && is_contextual_user_message_content(content))
++            })
++            .cloned()
++            .collect();
++        (!items.is_empty()).then_some(GuardianHistoryCheckpoint(items))
++    }
++
++    pub(crate) fn take_review_history(&mut self) -> Option<TranscriptHistory> {
++        self.review_history.take()
++    }
++
++    pub(crate) fn set_review_history(&mut self, history: Option<TranscriptHistory>) {
++        self.review_history = history;
++    }
++
+     pub(crate) fn restore_review_context(
+         &mut self,
+         retained_context: Option<&RetainedContext>,
+@@ -318,10 +348,25 @@ impl ContextManager {
                  )
              });
          }
@@ -16254,7 +16264,7 @@ index 955dbc9196..0420382dfa 100644
              return;
          }
          let generation = self
-@@ -491,6 +503,12 @@ impl ContextManager {
+@@ -491,6 +536,12 @@ impl ContextManager {
          self.items.iter().map(|envelope| &envelope.item)
      }
  
@@ -16267,7 +16277,7 @@ index 955dbc9196..0420382dfa 100644
      /// Returns annotated history items without cloning their response payloads.
      pub(crate) fn annotated_items(&self) -> &[ResponseItemEnvelope] {
          &self.items
-@@ -584,7 +602,21 @@ impl ContextManager {
+@@ -584,7 +635,21 @@ impl ContextManager {
                  == GuardianContextMode::ThreadOwned;
          if promoted {
              self.guardian_review_mode = GuardianContextMode::ThreadOwned;
@@ -16290,7 +16300,7 @@ index 955dbc9196..0420382dfa 100644
              self.user_message_revision = self.user_message_revision.saturating_add(/*rhs*/ 1);
          }
          if self.guardian_review_mode == GuardianContextMode::Legacy && self.review_history.is_none()
-@@ -598,6 +630,19 @@ impl ContextManager {
+@@ -598,6 +663,19 @@ impl ContextManager {
              }
              self.review_history = Some(retained);
          }
@@ -17415,6 +17425,572 @@ index eb1fc55cdb..7848260970 100644
  mod thread_startup_metadata;
  pub use codex_network_proxy::EnvironmentNetworkPolicy;
  pub use codex_network_proxy::NetworkDomainPermission;
+diff --git a/codex-rs/core/src/session/guardian_checkpoint.rs b/codex-rs/core/src/session/guardian_checkpoint.rs
+index 934aa7b8c4..ffbfde940f 100644
+--- a/codex-rs/core/src/session/guardian_checkpoint.rs
++++ b/codex-rs/core/src/session/guardian_checkpoint.rs
+@@ -16,6 +16,7 @@ impl Session {
+             message: String::new(),
+             replacement_history: Some(history.annotated_items().to_vec()),
+             guardian_history: history.guardian_history_checkpoint(),
++            guardian_covered_suffix_items: None,
+             retained_context: Some(history.retained_context().clone()),
+             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
+             window_number: Some(state.auto_compact_window_number()),
+diff --git a/codex-rs/core/src/session/guardian_overlap.rs b/codex-rs/core/src/session/guardian_overlap.rs
+new file mode 100644
+index 0000000000..7a6100a658
+--- /dev/null
++++ b/codex-rs/core/src/session/guardian_overlap.rs
+@@ -0,0 +1,130 @@
++//! Proven overlap between a Guardian checkpoint and a Compacted suffix.
++//!
++//! Replay finds the longest `k` where `checkpoint[-k:]` is the same sequence as
++//! `suffix[:k]`. A window is proven only when every pair is compatible **and**
++//! at least one pair shares an id or call_id (the anchor).
++//!
++//! Compatible pairs:
++//! - both sides carry the same identity token (variant + id/`call_id`);
++//! - or both lack identity and the message/reasoning content matches.
++//!
++//! Content-only windows (a repeated "continue" with `id: None`) are unproven.
++//! Unproven suffix items are replayed. Duplicates are allowed; omitting a new
++//! instruction or tool result is not.
++//!
++//! Full [`ResponseItem`] `PartialEq` is not used: LHC materialize rebuilds
++//! native shapes (new ids, dropped namespace/phase) that are not equal to the
++//! live checkpoint items even when they are the same turn.
++
++use codex_protocol::models::ResponseItem;
++
++pub(super) fn proven_suffix_overlap(checkpoint: &[ResponseItem], suffix: &[ResponseItem]) -> usize {
++    let max = checkpoint.len().min(suffix.len());
++    for k in (1..=max).rev() {
++        if window_is_proven(&checkpoint[checkpoint.len() - k..], &suffix[..k]) {
++            return k;
++        }
++    }
++    0
++}
++
++fn window_is_proven(left: &[ResponseItem], right: &[ResponseItem]) -> bool {
++    let mut anchored = false;
++    for (left, right) in left.iter().zip(right) {
++        match (identity_token(left), identity_token(right)) {
++            (Some(left_id), Some(right_id)) if left_id == right_id => anchored = true,
++            (None, None) if content_equivalent(left, right) => {}
++            _ => return false,
++        }
++    }
++    anchored
++}
++
++fn identity_token(item: &ResponseItem) -> Option<String> {
++    let kind = kind_tag(item);
++    if let Some(call_id) = call_id(item) {
++        return Some(format!("{kind}:call:{call_id}"));
++    }
++    item.id().map(|id| format!("{kind}:id:{id}"))
++}
++
++fn kind_tag(item: &ResponseItem) -> &'static str {
++    match item {
++        ResponseItem::Message { role, .. } if role == "user" => "user",
++        ResponseItem::Message { .. } => "assistant",
++        ResponseItem::AgentMessage { .. } => "agent_message",
++        ResponseItem::FunctionCall { .. } => "function_call",
++        ResponseItem::FunctionCallOutput { .. } => "function_call_output",
++        ResponseItem::CustomToolCall { .. } => "custom_tool_call",
++        ResponseItem::CustomToolCallOutput { .. } => "custom_tool_call_output",
++        ResponseItem::LocalShellCall { .. } => "local_shell_call",
++        ResponseItem::ToolSearchCall { .. } => "tool_search_call",
++        ResponseItem::ToolSearchOutput { .. } => "tool_search_output",
++        ResponseItem::WebSearchCall { .. } => "web_search_call",
++        ResponseItem::ImageGenerationCall { .. } => "image_generation_call",
++        ResponseItem::Reasoning { .. } => "reasoning",
++        ResponseItem::AdditionalTools { .. } => "additional_tools",
++        ResponseItem::Compaction { .. } => "compaction",
++        ResponseItem::ContextCompaction { .. } => "context_compaction",
++        ResponseItem::ConfigurationUpdate { .. } => "configuration_update",
++        ResponseItem::CompactionTrigger { .. } => "compaction_trigger",
++        ResponseItem::Other => "other",
++    }
++}
++
++fn call_id(item: &ResponseItem) -> Option<String> {
++    match item {
++        ResponseItem::FunctionCall { call_id, .. }
++        | ResponseItem::CustomToolCall { call_id, .. }
++        | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
++        ResponseItem::FunctionCallOutput { call_id, .. }
++        | ResponseItem::LocalShellCall { call_id, .. }
++        | ResponseItem::ToolSearchCall { call_id, .. }
++        | ResponseItem::ToolSearchOutput { call_id, .. } => call_id.clone(),
++        ResponseItem::AdditionalTools { .. }
++        | ResponseItem::Message { .. }
++        | ResponseItem::AgentMessage { .. }
++        | ResponseItem::Reasoning { .. }
++        | ResponseItem::WebSearchCall { .. }
++        | ResponseItem::ImageGenerationCall { .. }
++        | ResponseItem::Compaction { .. }
++        | ResponseItem::ContextCompaction { .. }
++        | ResponseItem::ConfigurationUpdate { .. }
++        | ResponseItem::CompactionTrigger { .. }
++        | ResponseItem::Other => None,
++    }
++}
++
++fn content_equivalent(left: &ResponseItem, right: &ResponseItem) -> bool {
++    match (left, right) {
++        (
++            ResponseItem::Message {
++                role: left_role,
++                content: left_content,
++                ..
++            },
++            ResponseItem::Message {
++                role: right_role,
++                content: right_content,
++                ..
++            },
++        ) => left_role == right_role && left_content == right_content,
++        (
++            ResponseItem::Reasoning {
++                summary: left_summary,
++                content: left_content,
++                ..
++            },
++            ResponseItem::Reasoning {
++                summary: right_summary,
++                content: right_content,
++                ..
++            },
++        ) => left_summary == right_summary && left_content == right_content,
++        _ => false,
++    }
++}
++
++#[cfg(test)]
++#[path = "guardian_overlap_tests.rs"]
++mod tests;
+diff --git a/codex-rs/core/src/session/guardian_overlap_tests.rs b/codex-rs/core/src/session/guardian_overlap_tests.rs
+new file mode 100644
+index 0000000000..753a14bed6
+--- /dev/null
++++ b/codex-rs/core/src/session/guardian_overlap_tests.rs
+@@ -0,0 +1,95 @@
++use super::proven_suffix_overlap;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::FunctionCallOutputPayload;
++use codex_protocol::models::ResponseItem;
++use pretty_assertions::assert_eq;
++
++fn user(text: &str) -> ResponseItem {
++    ResponseItem::Message {
++        id: None,
++        role: "user".to_string(),
++        content: vec![ContentItem::InputText {
++            text: text.to_string(),
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn function_call(call_id: &str, arguments: &str) -> ResponseItem {
++    ResponseItem::FunctionCall {
++        id: None,
++        name: "shell".into(),
++        namespace: None,
++        arguments: arguments.into(),
++        encrypted_function_args: None,
++        call_id: call_id.into(),
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
++    ResponseItem::FunctionCallOutput {
++        id: None,
++        call_id: Some(call_id.into()),
++        name: None,
++        namespace: None,
++        output: FunctionCallOutputPayload {
++            body: FunctionCallOutputBody::Text(output.into()),
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++#[test]
++fn unproven_repeated_continue_is_not_overlap() {
++    let checkpoint = vec![user("continue")];
++    let suffix = vec![user("continue")];
++    assert_eq!(proven_suffix_overlap(&checkpoint, &suffix), 0);
++}
++
++#[test]
++fn call_and_output_with_the_same_call_id_are_not_the_same_item() {
++    let checkpoint = vec![function_call_output("fc_1", "out")];
++    let suffix = vec![function_call("fc_1", "{}")];
++    assert_eq!(proven_suffix_overlap(&checkpoint, &suffix), 0);
++}
++
++#[test]
++fn anchored_window_proves_id_less_user_plus_matching_call() {
++    let checkpoint = vec![
++        user("older"),
++        user("read the file"),
++        function_call("fc_1", "{\"path\":\"src/main.rs\"}"),
++        function_call_output("fc_1", "fn main() {}"),
++    ];
++    let suffix = vec![
++        user("read the file"),
++        function_call("fc_1", "{\"path\":\"src/main.rs\"}"),
++        function_call_output("fc_1", "fn main() {}"),
++        user("also redact the changelog"),
++    ];
++    assert_eq!(proven_suffix_overlap(&checkpoint, &suffix), 3);
++}
++
++#[test]
++fn matching_call_id_is_enough_when_other_fields_differ() {
++    let mut reconstructed = function_call("fc_1", "{}");
++    if let ResponseItem::FunctionCall { namespace, .. } = &mut reconstructed {
++        *namespace = None;
++    }
++    let mut live = function_call("fc_1", "{}");
++    if let ResponseItem::FunctionCall { namespace, .. } = &mut live {
++        *namespace = Some("mcp".into());
++    }
++    assert_eq!(proven_suffix_overlap(&[live], &[reconstructed]), 1);
++}
++
++#[test]
++fn new_call_after_overlapping_prefix_is_not_swallowed() {
++    let checkpoint = vec![function_call("fc_old", "{}")];
++    let suffix = vec![function_call("fc_old", "{}"), function_call("fc_new", "{}")];
++    assert_eq!(proven_suffix_overlap(&checkpoint, &suffix), 1);
++}
+diff --git a/codex-rs/core/src/session/guardian_replay_seam_tests.rs b/codex-rs/core/src/session/guardian_replay_seam_tests.rs
+new file mode 100644
+index 0000000000..859159d3af
+--- /dev/null
++++ b/codex-rs/core/src/session/guardian_replay_seam_tests.rs
+@@ -0,0 +1,311 @@
++//! Guardian overlap at replay, driven from LHC producers rather than a stored count.
++
++use super::tests::make_session_and_context;
++use crate::compact_lhc::drop_materialized_items;
++use crate::context::GuardianContextMode;
++use codex_history::GuardianHistoryCheckpoint;
++use codex_history::RolloutItem;
++use codex_lhc_host::BodyValidationSpec;
++use codex_lhc_host::GuardianFoldTailExtras;
++use codex_lhc_host::OVERLAP_CALL_ID;
++use codex_lhc_host::OVERLAP_OUTPUT;
++use codex_lhc_host::OVERLAP_USER;
++use codex_lhc_host::degrade_body_to_best_available;
++use codex_lhc_host::history_from_materialized_items;
++use codex_lhc_host::materialize_guardian_tool_fold;
++use codex_lhc_host::prior_compact_carry;
++use codex_protocol::ResponseItemId;
++use codex_protocol::models::ContentItem;
++use codex_protocol::models::FunctionCallOutputBody;
++use codex_protocol::models::FunctionCallOutputPayload;
++use codex_protocol::models::ResponseItem;
++use pretty_assertions::assert_eq;
++
++fn user(text: &str) -> ResponseItem {
++    user_with_id(text, None)
++}
++
++fn user_with_id(text: &str, id: Option<&str>) -> ResponseItem {
++    ResponseItem::Message {
++        id: id.map(|id| ResponseItemId::from_server(id.into())),
++        role: "user".to_string(),
++        content: vec![ContentItem::InputText {
++            text: text.to_string(),
++        }],
++        phase: None,
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn function_call(call_id: &str, arguments: &str) -> ResponseItem {
++    ResponseItem::FunctionCall {
++        id: None,
++        name: "read_file".into(),
++        namespace: None,
++        arguments: arguments.into(),
++        encrypted_function_args: None,
++        call_id: call_id.into(),
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
++    ResponseItem::FunctionCallOutput {
++        id: None,
++        call_id: Some(call_id.into()),
++        name: None,
++        namespace: None,
++        output: FunctionCallOutputPayload {
++            body: FunctionCallOutputBody::Text(output.into()),
++            success: Some(true),
++        },
++        internal_chat_message_metadata_passthrough: None,
++    }
++}
++
++fn live_checkpoint() -> Vec<ResponseItem> {
++    vec![
++        user("Keep the release private."),
++        user(OVERLAP_USER),
++        function_call(OVERLAP_CALL_ID, "{\"path\":\"src/main.rs\"}"),
++        function_call_output(OVERLAP_CALL_ID, OVERLAP_OUTPUT),
++    ]
++}
++
++fn append_response(items: &mut Vec<RolloutItem>, item: ResponseItem) {
++    items.push(RolloutItem::ResponseItem(item.into()));
++}
++
++fn guardian_has_call(checkpoint: &GuardianHistoryCheckpoint, call_id: &str) -> bool {
++    checkpoint.0.iter().any(|item| match item {
++        ResponseItem::FunctionCall { call_id: id, .. } => id == call_id,
++        ResponseItem::FunctionCallOutput {
++            call_id: Some(id), ..
++        } => id == call_id,
++        _ => false,
++    })
++}
++
++fn guardian_has_user(checkpoint: &GuardianHistoryCheckpoint, text: &str) -> bool {
++    checkpoint.0.iter().any(|item| match item {
++        ResponseItem::Message { role, content, .. } if role == "user" => {
++            content.iter().any(|part| match part {
++                ContentItem::InputText { text: body } => body == text,
++                _ => false,
++            })
++        }
++        _ => false,
++    })
++}
++
++fn producer_covered_count(items: &[RolloutItem]) -> Option<u64> {
++    items.iter().rev().find_map(|item| match item {
++        RolloutItem::Compacted(compacted) => compacted.guardian_covered_suffix_items,
++        _ => None,
++    })
++}
++
++#[tokio::test]
++async fn real_fold_then_new_exchange_is_replayed_on_restart() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let mut items = materialize_guardian_tool_fold(
++        GuardianHistoryCheckpoint(live_checkpoint()),
++        GuardianFoldTailExtras {
++            extra_call_id: None,
++            unpaired_call_id: None,
++            overlap_user_item_id: None,
++            user_text_only: false,
++        },
++    );
++    assert_eq!(
++        producer_covered_count(&items),
++        None,
++        "LHC materialize does not write a positional coverage count; replay uses identity"
++    );
++    let new_instruction = user("Also redact the changelog.");
++    let new_call = function_call("fc_post_fold", "{}");
++    let new_result = function_call_output("fc_post_fold", "redacted");
++    append_response(&mut items, new_instruction.clone());
++    append_response(&mut items, new_call);
++    append_response(&mut items, new_result);
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &items)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("fold snapshot must survive restart");
++    assert!(
++        guardian_has_user(&guardian, "Keep the release private."),
++        "pre-fold evidence must remain: {guardian:?}"
++    );
++    assert!(
++        guardian_has_user(&guardian, "Also redact the changelog."),
++        "new post-fold instruction must not be swallowed as overlap: {guardian:?}"
++    );
++    assert!(
++        guardian_has_call(&guardian, "fc_post_fold"),
++        "new post-fold tool result must not be swallowed: {guardian:?}"
++    );
++}
++
++#[tokio::test]
++async fn stale_recovery_rematerialize_replays_new_tail_on_restart() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let checkpoint_a = GuardianHistoryCheckpoint(live_checkpoint());
++    let first = materialize_guardian_tool_fold(
++        checkpoint_a.clone(),
++        GuardianFoldTailExtras {
++            extra_call_id: None,
++            unpaired_call_id: None,
++            overlap_user_item_id: None,
++            user_text_only: false,
++        },
++    );
++    let carry = prior_compact_carry(&first);
++    assert_eq!(carry.guardian_history, Some(checkpoint_a.clone()));
++
++    // Interrupted compact / stale recovery: carry old checkpoint A, rebuild a
++    // tail that now includes new B. Replay uses identity, not a positional count.
++    let recovered = materialize_guardian_tool_fold(
++        carry.guardian_history.expect("carried A"),
++        GuardianFoldTailExtras {
++            extra_call_id: Some("fc_stale_b"),
++            unpaired_call_id: None,
++            overlap_user_item_id: None,
++            user_text_only: false,
++        },
++    );
++    assert_eq!(producer_covered_count(&recovered), None);
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &recovered)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("stale recovery snapshot must survive restart");
++    assert!(
++        guardian_has_call(&guardian, "fc_stale_b"),
++        "new B in the rebuilt tail must not be treated as already covered: {guardian:?}"
++    );
++}
++
++#[tokio::test]
++async fn mid_turn_degrade_then_new_response_is_replayed_on_restart() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let mut items = materialize_guardian_tool_fold(
++        GuardianHistoryCheckpoint(live_checkpoint()),
++        GuardianFoldTailExtras {
++            extra_call_id: None,
++            unpaired_call_id: Some("fc_orphan"),
++            overlap_user_item_id: None,
++            user_text_only: false,
++        },
++    );
++    assert_eq!(producer_covered_count(&items), None);
++    let assembled = history_from_materialized_items(&items);
++    let spec = BodyValidationSpec {
++        attempt_id: "degrade".into(),
++        protected_tool_call_ids: Vec::new(),
++        protected_pairs: Vec::new(),
++        required_encrypted_reasoning: Vec::new(),
++        safe_runway_threshold_tokens: None,
++    };
++    let degraded = degrade_body_to_best_available(&assembled, &spec);
++    assert!(
++        degraded.dropped_count() > 0,
++        "fixture: unpaired tail call must drop: {}",
++        degraded.summary()
++    );
++    drop_materialized_items(&mut items, &degraded.kept);
++    assert_eq!(producer_covered_count(&items), None);
++
++    append_response(&mut items, user("new instruction after degrade"));
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &items)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("degraded fold snapshot must survive restart");
++    assert!(
++        guardian_has_user(&guardian, "new instruction after degrade"),
++        "a new item after MidTurn drop must not be swallowed as leftover overlap: {guardian:?}"
++    );
++}
++
++fn guardian_user_text_count(checkpoint: &GuardianHistoryCheckpoint, text: &str) -> usize {
++    checkpoint
++        .0
++        .iter()
++        .filter(|item| match item {
++            ResponseItem::Message { role, content, .. } if role == "user" => {
++                content.iter().any(|part| match part {
++                    ContentItem::InputText { text: body } => body == text,
++                    _ => false,
++                })
++            }
++            _ => false,
++        })
++        .count()
++}
++
++#[tokio::test]
++async fn real_fold_then_restart_replays_no_duplicate_user_messages() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let overlap_id = "msg_overlap_user";
++    let items = materialize_guardian_tool_fold(
++        GuardianHistoryCheckpoint(vec![
++            user("Keep the release private."),
++            user_with_id(OVERLAP_USER, Some(overlap_id)),
++        ]),
++        GuardianFoldTailExtras {
++            extra_call_id: None,
++            unpaired_call_id: None,
++            overlap_user_item_id: Some(overlap_id),
++            user_text_only: true,
++        },
++    );
++    let suffix_overlap_ids: Vec<_> = items
++        .iter()
++        .skip_while(|item| !matches!(item, RolloutItem::Compacted(_)))
++        .skip(1)
++        .filter_map(|item| match item {
++            RolloutItem::ResponseItem(envelope) => match &envelope.item {
++                ResponseItem::Message {
++                    role, id, content, ..
++                } if role == "user" => content.iter().find_map(|part| match part {
++                    ContentItem::InputText { text } if text == OVERLAP_USER => id.clone(),
++                    _ => None,
++                }),
++                _ => None,
++            },
++            _ => None,
++        })
++        .collect();
++    assert_eq!(
++        suffix_overlap_ids,
++        vec![ResponseItemId::from_server(overlap_id.into())],
++        "verbatim user tail must keep the captured host id"
++    );
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &items)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("user-text fold snapshot must survive restart");
++    assert_eq!(
++        guardian_user_text_count(&guardian, "Keep the release private."),
++        1,
++        "pre-fold user must remain once: {guardian:?}"
++    );
++    assert_eq!(
++        guardian_user_text_count(&guardian, OVERLAP_USER),
++        1,
++        "real fold then restart must not duplicate the overlapping user: {guardian:?}"
++    );
++}
 diff --git a/codex-rs/core/src/session/input_queue.rs b/codex-rs/core/src/session/input_queue.rs
 index ddd3038c8b..8d15771b3c 100644
 --- a/codex-rs/core/src/session/input_queue.rs
@@ -18355,6 +18931,539 @@ index 0000000000..eadef3a71b
 +        "law 2: write-back must clear auto-compact prefill"
 +    );
 +}
+diff --git a/codex-rs/core/src/session/rollout_reconstruction.rs b/codex-rs/core/src/session/rollout_reconstruction.rs
+index 8860d4c36a..a9fef68796 100644
+--- a/codex-rs/core/src/session/rollout_reconstruction.rs
++++ b/codex-rs/core/src/session/rollout_reconstruction.rs
+@@ -360,6 +360,34 @@ impl Session {
+         // design should keep this same replay shape, but drive it from a resumable reverse source
+         // instead of an eagerly loaded `&[RolloutItem]`.
+         let rollout_suffix = base_compaction.map_or(rollout_items, |checkpoint| checkpoint.suffix);
++        // Native compact writes Some(0): the suffix after Compacted is not an
++        // LHC-rewritten tail, so there is nothing to align. LHC writes None so
++        // identity-derived overlap runs. Reconstruction ignores a nonzero stored
++        // count.
++        let native_zero_coverage = base_compaction.is_some_and(|checkpoint| {
++            checkpoint.compacted.guardian_covered_suffix_items == Some(0)
++        });
++        let mut remaining_overlap = 0;
++        if self.guardian_context_mode == GuardianContextMode::ThreadOwned
++            && !native_zero_coverage
++            && let Some(guardian) = base_compaction
++                .and_then(|checkpoint| checkpoint.compacted.guardian_history.as_ref())
++        {
++            let suffix_items: Vec<codex_protocol::models::ResponseItem> = rollout_suffix
++                .iter()
++                .filter_map(|item| match item {
++                    RolloutItem::ResponseItem(envelope) => Some(envelope.item.clone()),
++                    _ => None,
++                })
++                .collect();
++            remaining_overlap =
++                super::guardian_overlap::proven_suffix_overlap(&guardian.0, &suffix_items);
++        }
++        let mut parked_review = if remaining_overlap > 0 {
++            history.take_review_history()
++        } else {
++            None
++        };
+         for item in rollout_suffix {
+             match item {
+                 RolloutItem::RetainedContext(event) => {
+@@ -370,6 +398,14 @@ impl Session {
+                         std::slice::from_ref(response_item),
+                         turn_context.model_info().truncation_policy.into(),
+                     );
++                    if remaining_overlap > 0 {
++                        remaining_overlap -= 1;
++                        if remaining_overlap == 0
++                            && let Some(review) = parked_review.take()
++                        {
++                            history.set_review_history(Some(review));
++                        }
++                    }
+                 }
+                 RolloutItem::InterAgentCommunication(communication) => {
+                     let response_item = communication.to_model_input_item();
+@@ -425,6 +461,9 @@ impl Session {
+                 | RolloutItem::SessionMeta(_) => {}
+             }
+         }
++        if let Some(review) = parked_review {
++            history.set_review_history(Some(review));
++        }
+ 
+         let reference_context_item = match reference_context_item {
+             TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
+diff --git a/codex-rs/core/src/session/rollout_reconstruction_tests.rs b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
+index 4a863a97ef..18968fa083 100644
+--- a/codex-rs/core/src/session/rollout_reconstruction_tests.rs
++++ b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
+@@ -11,6 +11,7 @@ use codex_history::InitialHistory;
+ use codex_history::ResponseItemEnvelope;
+ use codex_history::ResumedHistory;
+ use codex_protocol::AgentPath;
++use codex_protocol::ResponseItemId;
+ use codex_protocol::ThreadId;
+ use codex_protocol::models::ContentItem;
+ use codex_protocol::models::ResponseItem;
+@@ -191,8 +192,12 @@ macro_rules! object {
+ }
+ 
+ fn user_message(text: &str) -> ResponseItem {
++    user_message_id(text, None)
++}
++
++fn user_message_id(text: &str, id: Option<&str>) -> ResponseItem {
+     ResponseItem::Message {
+-        id: None,
++        id: id.map(|id| ResponseItemId::from_server(id.into())),
+         role: "user".to_string(),
+         content: vec![ContentItem::InputText {
+             text: text.to_string(),
+@@ -203,8 +208,12 @@ fn user_message(text: &str) -> ResponseItem {
+ }
+ 
+ fn assistant_message(text: &str) -> ResponseItem {
++    assistant_message_id(text, None)
++}
++
++fn assistant_message_id(text: &str, id: Option<&str>) -> ResponseItem {
+     ResponseItem::Message {
+-        id: None,
++        id: id.map(|id| ResponseItemId::from_server(id.into())),
+         role: "assistant".to_string(),
+         content: vec![ContentItem::OutputText {
+             text: text.to_string(),
+@@ -1236,6 +1245,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -1300,6 +1310,7 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
+                 replacement_history: Some(Vec::new()),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -1336,6 +1347,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -1410,6 +1422,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: Some(2),
+             first_window_id: Some(compacted_first_window_id.to_string()),
+@@ -1450,6 +1463,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
+                 replacement_history: Some(Vec::new()),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: Some(1),
+                 first_window_id: None,
+@@ -1518,6 +1532,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions() {
+                     guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
+                         user_message("original task"),
+                     ])),
++                    guardian_covered_suffix_items: None,
+                     mcp_resource_origins: None,
+                     window_number: Some(window_number as u64),
+                     first_window_id: Some(window_ids[0].to_string()),
+@@ -1627,6 +1642,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -1674,6 +1690,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -1715,6 +1732,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -1827,6 +1845,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -2004,6 +2023,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -2269,6 +2289,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -2452,6 +2473,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -2492,3 +2514,324 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+     );
+     assert!(session.reference_context_item().await.is_none());
+ }
++
++fn compacted_with_guardian(
++    replacement: Vec<ResponseItem>,
++    guardian: Vec<ResponseItem>,
++    window_number: u64,
++    covered_suffix_items: u64,
++) -> CompactedItem {
++    CompactedItem {
++        message: String::new(),
++        replacement_history: Some(annotated(replacement)),
++        retained_context: None,
++        guardian_history: Some(codex_history::GuardianHistoryCheckpoint(guardian)),
++        guardian_covered_suffix_items: Some(covered_suffix_items),
++        mcp_resource_origins: None,
++        window_number: Some(window_number),
++        first_window_id: None,
++        previous_window_id: None,
++        window_id: None,
++        compaction_response_id: None,
++        latest_token_usage_record: None,
++    }
++}
++
++fn guardian_item_texts(checkpoint: &codex_history::GuardianHistoryCheckpoint) -> Vec<String> {
++    checkpoint
++        .0
++        .iter()
++        .filter_map(|item| match item {
++            ResponseItem::Message { content, .. } => content.iter().find_map(|part| match part {
++                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
++                    Some(text.clone())
++                }
++                _ => None,
++            }),
++            _ => None,
++        })
++        .collect()
++}
++
++#[tokio::test]
++async fn thread_owned_guardian_keeps_first_fold_order_after_restart_without_duplicates() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let original_user = user_message("Keep the release private.");
++    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let band = user_message("folded band");
++    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("fold-1".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted_with_guardian(
++                vec![band],
++                vec![original_user, original_assistant],
++                1,
++                99,
++            )),
++            RolloutItem::ResponseItem(overlapping_tail.into()),
++        ],
++    );
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("first-fold snapshot must persist");
++    let texts = guardian_item_texts(&guardian);
++    assert_eq!(
++        texts,
++        vec![
++            "Keep the release private.".to_string(),
++            "Acknowledged.".to_string()
++        ]
++    );
++    let mut seen = texts.clone();
++    seen.sort();
++    seen.dedup();
++    assert_eq!(
++        seen.len(),
++        texts.len(),
++        "restart must not duplicate Guardian evidence"
++    );
++}
++
++#[tokio::test]
++async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplicates() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let first = user_message("Keep the release private.");
++    let second = user_message_id("Second-fold evidence.", Some("msg-second"));
++    let band = user_message("second folded band");
++    let overlapping_tail = user_message_id("Second-fold evidence.", Some("msg-second"));
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("fold-2".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted_with_guardian(
++                vec![band],
++                vec![first, second],
++                2,
++                99,
++            )),
++            RolloutItem::ResponseItem(overlapping_tail.into()),
++        ],
++    );
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    let guardian = reconstructed
++        .guardian_history
++        .expect("second-fold snapshot must persist");
++    let texts = guardian_item_texts(&guardian);
++    assert_eq!(
++        texts,
++        vec![
++            "Keep the release private.".to_string(),
++            "Second-fold evidence.".to_string()
++        ]
++    );
++    let mut seen = texts.clone();
++    seen.sort();
++    seen.dedup();
++    assert_eq!(
++        seen.len(),
++        texts.len(),
++        "two folds then restart must not duplicate Guardian evidence"
++    );
++}
++
++fn function_call(call_id: &str, name: &str, arguments: &str) -> ResponseItem {
++    serde_json::from_value(json!({
++        "type": "function_call",
++        "call_id": call_id,
++        "name": name,
++        "arguments": arguments
++    }))
++    .expect("function call")
++}
++
++fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
++    serde_json::from_value(json!({
++        "type": "function_call_output",
++        "call_id": call_id,
++        "output": output
++    }))
++    .expect("function call output")
++}
++
++#[tokio::test]
++async fn thread_owned_guardian_keeps_new_post_fold_exchange_after_cold_replay() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let original_user = user_message("Keep the release private.");
++    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let band = user_message("folded band");
++    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let new_instruction = user_message("Also redact the changelog.");
++    let tool_call = function_call(
++        "call-post-fold",
++        "shell",
++        "{\"command\":\"echo restricted\"}",
++    );
++    let tool_result = function_call_output("call-post-fold", "restricted");
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("fold-1-then-new".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted_with_guardian(
++                vec![band],
++                vec![original_user.clone(), original_assistant.clone()],
++                1,
++                99,
++            )),
++            RolloutItem::ResponseItem(overlapping_tail.into()),
++            RolloutItem::ResponseItem(new_instruction.clone().into()),
++            RolloutItem::ResponseItem(tool_call.clone().into()),
++            RolloutItem::ResponseItem(tool_result.clone().into()),
++        ],
++    );
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    assert_eq!(
++        reconstructed.guardian_history,
++        Some(codex_history::GuardianHistoryCheckpoint(vec![
++            original_user,
++            original_assistant,
++            new_instruction,
++            tool_call,
++            tool_result,
++        ]))
++    );
++}
++
++#[tokio::test]
++async fn native_guardian_backup_replays_new_suffix_without_duplicates_or_omissions() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let original_user = user_message("Keep the release private.");
++    let original_assistant = assistant_message("Acknowledged.");
++    let band = user_message("native folded band");
++    let new_instruction = user_message("Also redact the changelog.");
++    let tool_call = function_call(
++        "call-native-post-fold",
++        "shell",
++        "{\"command\":\"echo restricted\"}",
++    );
++    let tool_result = function_call_output("call-native-post-fold", "restricted");
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("native-fold".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted_with_guardian(
++                vec![band],
++                vec![original_user.clone(), original_assistant.clone()],
++                1,
++                0,
++            )),
++            RolloutItem::ResponseItem(new_instruction.clone().into()),
++            RolloutItem::ResponseItem(tool_call.clone().into()),
++            RolloutItem::ResponseItem(tool_result.clone().into()),
++        ],
++    );
++
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    assert_eq!(
++        reconstructed.guardian_history,
++        Some(codex_history::GuardianHistoryCheckpoint(vec![
++            original_user,
++            original_assistant,
++            new_instruction,
++            tool_call,
++            tool_result,
++        ]))
++    );
++}
++
++#[tokio::test]
++async fn legacy_checkpoint_without_count_replays_new_post_fold_exchange() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let original_user = user_message("Keep the release private.");
++    let original_assistant = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let overlapping_tail = assistant_message_id("Acknowledged.", Some("msg-ack"));
++    let new_instruction = user_message("Also redact the changelog.");
++    // 85534694e2 CompactedItemWire has no guardian_covered_suffix_items field.
++    let mut wire = serde_json::to_value(compacted_with_guardian(
++        vec![user_message("folded band")],
++        vec![original_user.clone(), original_assistant.clone()],
++        1,
++        99,
++    ))
++    .expect("serialize compacted");
++    wire.as_object_mut()
++        .expect("compacted object")
++        .remove("guardian_covered_suffix_items");
++    let compacted: CompactedItem =
++        serde_json::from_value(wire).expect("85534694e2 record must deserialize");
++    assert_eq!(compacted.guardian_covered_suffix_items, None);
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("legacy-85534694e2".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted),
++            RolloutItem::ResponseItem(overlapping_tail.into()),
++            RolloutItem::ResponseItem(new_instruction.clone().into()),
++        ],
++    );
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    assert_eq!(
++        reconstructed.guardian_history,
++        Some(codex_history::GuardianHistoryCheckpoint(vec![
++            original_user,
++            original_assistant,
++            new_instruction,
++        ]))
++    );
++}
++
++#[tokio::test]
++async fn unproven_repeated_continue_is_replayed_rather_than_suppressed() {
++    let (mut session, turn_context) = make_session_and_context().await;
++    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
++    let original = user_message("continue");
++    let repeated = user_message("continue");
++    let mut context = turn_context.to_turn_context_item();
++    context.turn_id = Some("continue-false-overlap".into());
++    let rollout_items = completed_user_turn_rollout(
++        context,
++        vec![
++            RolloutItem::Compacted(compacted_with_guardian(
++                vec![user_message("folded band")],
++                vec![original.clone()],
++                1,
++                99,
++            )),
++            RolloutItem::ResponseItem(repeated.clone().into()),
++        ],
++    );
++    let reconstructed = session
++        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
++        .await;
++    assert_eq!(
++        reconstructed.guardian_history,
++        Some(codex_history::GuardianHistoryCheckpoint(vec![
++            original, repeated,
++        ]))
++    );
++}
 diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
 index 92c1481375..41e8c1f462 100644
 --- a/codex-rs/core/src/session/session.rs
@@ -18471,10 +19580,26 @@ index 38fd6d1ad9..d12d5013f3 100644
 +    assert_eq!(resolved.auto_compact_token_limit, None);
 +}
 diff --git a/codex-rs/core/src/session/tests.rs b/codex-rs/core/src/session/tests.rs
-index fc1df5abf7..61d0ac8728 100644
+index fc1df5abf7..c70764c74b 100644
 --- a/codex-rs/core/src/session/tests.rs
 +++ b/codex-rs/core/src/session/tests.rs
-@@ -6239,6 +6239,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
+@@ -2287,6 +2287,7 @@ async fn reconstruct_history_uses_replacement_history_verbatim() {
+         replacement_history: Some(replacement_history.clone()),
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(42),
+         first_window_id: Some(first_window_id.to_string()),
+@@ -3079,6 +3080,7 @@ fn latest_token_usage_record_stops_at_compaction_checkpoint() {
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+@@ -6239,6 +6241,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
              config.workspace_routing_context(),
          ),
          executed_tool_calls: executed_tool_calls.clone(),
@@ -18483,7 +19608,7 @@ index fc1df5abf7..61d0ac8728 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              thread_id,
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
-@@ -8497,6 +8499,8 @@ where
+@@ -8497,6 +8501,8 @@ where
              config.workspace_routing_context(),
          ),
          executed_tool_calls: executed_tool_calls.clone(),
@@ -18492,7 +19617,7 @@ index fc1df5abf7..61d0ac8728 100644
          code_mode_service: crate::tools::code_mode::CodeModeService::new(
              thread_id,
              Arc::new(codex_code_mode::DisabledCodeModeSessionProvider),
-@@ -11089,6 +11093,7 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
+@@ -11089,6 +11095,7 @@ async fn remote_compaction_v2_retains_only_the_selected_step(first_attempt: Firs
  }
  
  #[tokio::test]
@@ -18500,6 +19625,22 @@ index fc1df5abf7..61d0ac8728 100644
  async fn interrupting_compaction_fallback_retains_last_known_step_context() {
      let (release_primary, primary_gate) = tokio::sync::oneshot::channel();
      let (release_fallback, fallback_gate) = tokio::sync::oneshot::channel();
+@@ -12242,6 +12249,7 @@ async fn sample_rollout(
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(window_number),
+         first_window_id: Some(window_ids.first_window_id.to_string()),
+@@ -12276,6 +12284,7 @@ async fn sample_rollout(
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(window_number),
+         first_window_id: Some(window_ids.first_window_id.to_string()),
 diff --git a/codex-rs/core/src/session/turn.rs b/codex-rs/core/src/session/turn.rs
 index 360607f3f4..caa3b72ee5 100644
 --- a/codex-rs/core/src/session/turn.rs
@@ -23022,6 +24163,103 @@ index badc053d5d..1063eb666a 100644
  async fn current_time_reminder_is_refreshed_after_compaction() -> Result<()> {
      skip_if_no_network!(Ok(()));
  
+diff --git a/codex-rs/core/tests/suite/guardian_authorization.rs b/codex-rs/core/tests/suite/guardian_authorization.rs
+index a252baee34..6c8981f22e 100644
+--- a/codex-rs/core/tests/suite/guardian_authorization.rs
++++ b/codex-rs/core/tests/suite/guardian_authorization.rs
+@@ -2,14 +2,20 @@
+ 
+ use anyhow::Context;
+ use anyhow::Result;
++use codex_core::CodexThread;
+ use codex_core::TurnInputRequest;
++use codex_core::config::Config;
+ use codex_core::config::Constrained;
+ use codex_core::context::ContextualUserFragment;
+ use codex_core::context::GuardianContextMode;
+ use codex_core::context::InternalContextSource;
+ use codex_core::context::InternalModelContextFragment;
++use codex_extension_api::ExtensionRegistryBuilder;
+ use codex_features::Feature;
+ use codex_history::RolloutItem;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::install_with_root;
++use codex_lhc_host::wait_for_handle;
+ use codex_protocol::config_types::ApprovalsReviewer;
+ use codex_protocol::models::ImageReference;
+ use codex_protocol::protocol::AskForApproval;
+@@ -35,10 +41,45 @@ use pretty_assertions::assert_eq;
+ use serde_json::Value;
+ use serde_json::json;
+ use std::collections::HashMap;
++use std::path::PathBuf;
++use std::sync::Arc;
+ use std::time::Duration;
++use tempfile::TempDir;
+ use test_case::test_case;
+ use tokio::sync::oneshot;
+ 
++fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root(
++        &mut builder,
++        |config| config.features.enabled(Feature::LhcCapture),
++        root,
++    );
++    Arc::new(builder.build())
++}
++
++fn enable_lhc_compact(config: &mut Config) {
++    config
++        .features
++        .enable(Feature::LhcCapture)
++        .expect("enable LHC capture");
++    config
++        .features
++        .disable(Feature::TokenBudget)
++        .expect("disable token budget");
++    let _ = config.features.disable(Feature::ContextManagement);
++}
++
++async fn wait_lhc_capture(thread: &CodexThread) {
++    let slot = thread
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("LhcCaptureSlot");
++    wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("LHC capture ready");
++}
++
+ #[derive(Clone, Copy)]
+ enum PendingReviewChange {
+     UserInstruction,
+@@ -136,7 +177,9 @@ async fn guardian_revalidates_owning_session_before_allow(
+     ]).await;
+     let base_url = format!("{}/v1", streaming_server.uri());
+     let server = responses::start_mock_server().await;
++    let lhc_root = TempDir::new()?;
+     let mut test = test_codex()
++        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+         .with_model_info_override("test-gpt-5.1-codex", |model| {
+             model.comp_hash = Some("compatible".to_owned());
+             model.auto_review_model_override = Some(model.slug.clone());
+@@ -148,6 +191,7 @@ async fn guardian_revalidates_owning_session_before_allow(
+             config
+                 .set_legacy_sandbox_policy(SandboxPolicy::new_workspace_write_policy())
+                 .expect("set sandbox policy");
++            enable_lhc_compact(config);
+             for feature in [
+                 Feature::GuardianThreadContext,
+                 Feature::CodeMode,
+@@ -163,6 +207,7 @@ async fn guardian_revalidates_owning_session_before_allow(
+         .with_code_mode_host_program(codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")?)
+         .build_with_auto_env(&server)
+         .await?;
++    wait_lhc_capture(&test.codex).await;
+     if review_mode == GuardianContextMode::Legacy {
+         test.codex.ensure_rollout_materialized().await;
+         test.codex = super::guardian_checkpoint_migration::resume(
 diff --git a/codex-rs/core/tests/suite/guardian_history.rs b/codex-rs/core/tests/suite/guardian_history.rs
 index 94badeabc3..72d913ddf7 100644
 --- a/codex-rs/core/tests/suite/guardian_history.rs
@@ -23195,6 +24433,192 @@ index 94badeabc3..72d913ddf7 100644
              test.codex.ensure_rollout_materialized().await;
              test.codex
                  .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+diff --git a/codex-rs/core/tests/suite/guardian_retained_context.rs b/codex-rs/core/tests/suite/guardian_retained_context.rs
+index 53274954cd..8064ef7c1f 100644
+--- a/codex-rs/core/tests/suite/guardian_retained_context.rs
++++ b/codex-rs/core/tests/suite/guardian_retained_context.rs
+@@ -3,6 +3,7 @@
+ //! the public rollout append API. Resume and child forks use production paths.
+ 
+ use std::collections::HashMap;
++use std::path::PathBuf;
+ use std::sync::Arc;
+ use std::time::Duration;
+ 
+@@ -31,6 +32,9 @@ use codex_history::RetainedContextOrder;
+ use codex_history::RolloutItem;
+ use codex_history::VerifiedAnswer;
+ use codex_history::VerifiedQuestionAnswer;
++use codex_lhc_host::LhcCaptureSlot;
++use codex_lhc_host::install_with_root;
++use codex_lhc_host::wait_for_handle;
+ use codex_protocol::ResponseItemId;
+ use codex_protocol::mcp::ClientMcpExtensions;
+ use codex_protocol::models::ContentItem;
+@@ -60,11 +64,44 @@ use core_test_support::wait_for_event;
+ use core_test_support::wait_for_event_match;
+ use pretty_assertions::assert_eq;
+ use serde_json::json;
++use tempfile::TempDir;
+ use test_case::test_case;
+ use tokio::sync::Notify;
+ use wiremock::MockServer;
+ use wiremock::matchers::header;
+ 
++fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
++    let mut builder = ExtensionRegistryBuilder::<Config>::new();
++    install_with_root(
++        &mut builder,
++        |config| config.features.enabled(Feature::LhcCapture),
++        root,
++    );
++    Arc::new(builder.build())
++}
++
++fn enable_lhc_compact(config: &mut Config) {
++    config
++        .features
++        .enable(Feature::LhcCapture)
++        .expect("enable LHC capture");
++    config
++        .features
++        .disable(Feature::TokenBudget)
++        .expect("disable token budget");
++    let _ = config.features.disable(Feature::ContextManagement);
++}
++
++async fn wait_lhc_capture(thread: &CodexThread) {
++    let slot = thread
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .expect("LhcCaptureSlot");
++    wait_for_handle(&slot, Duration::from_secs(30))
++        .await
++        .expect("LHC capture ready");
++}
++
+ // Keep child completion out of the parent's history and wait for parent turn cleanup
+ // before checking inherited authorization.
+ #[derive(Default)]
+@@ -237,6 +274,13 @@ async fn compact_and_assert_answers(
+ ) -> Result<RetainedContext> {
+     // Inspect live state by persisting a real compaction checkpoint, not a private getter.
+     // Repeating this after legacy rollback replay also catches checkpoint resurrection.
++    if thread
++        .thread_extension_data()
++        .get::<LhcCaptureSlot>()
++        .is_some()
++    {
++        wait_lhc_capture(thread).await;
++    }
+     thread.submit(Op::Compact).await?;
+     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+     thread.flush_rollout().await?;
+@@ -294,8 +338,10 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
+         ThreadHistoryMode::Paginated => &[],
+     };
+     let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
+     let test = test_codex()
+         .with_history_mode(history_mode)
++        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+         .with_config(move |config| {
+             config.experimental_thread_store = ThreadStoreConfig::Local;
+             config
+@@ -304,10 +350,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
+                 .expect("test context mode");
+             // Exercise local compaction's rebuilt user messages, not an opaque checkpoint.
+             config.model_provider.name = "Local compaction test provider".to_owned();
+-            config
+-                .features
+-                .disable(Feature::TokenBudget)
+-                .expect("use local compaction");
++            enable_lhc_compact(config);
+             config
+                 .features
+                 .enable(Feature::DefaultModeRequestUserInput)
+@@ -588,18 +631,17 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
+ ) -> Result<()> {
+     skip_if_no_network!(Ok(()));
+     let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
+     let test = test_codex()
+         .with_history_mode(history_mode)
++        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+         .with_config(|config| {
+             config.experimental_thread_store = ThreadStoreConfig::Local;
+             config
+                 .features
+                 .enable(Feature::GuardianThreadContext)
+                 .expect("enable retained instructions");
+-            config
+-                .features
+-                .disable(Feature::TokenBudget)
+-                .expect("use local compaction");
++            enable_lhc_compact(config);
+             config.model_provider.name = "Local compaction test provider".to_owned();
+         })
+         .build_with_auto_env(&server)
+@@ -708,17 +750,16 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
+ async fn disabled_capture_stays_incomplete_after_compaction_and_enabled_resume() -> Result<()> {
+     skip_if_no_network!(Ok(()));
+     let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
+     let test = test_codex()
++        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+         .with_config(|config| {
+             config.experimental_thread_store = ThreadStoreConfig::Local;
+             config
+                 .features
+                 .disable(Feature::GuardianThreadContext)
+                 .expect("disable instruction capture");
+-            config
+-                .features
+-                .disable(Feature::TokenBudget)
+-                .expect("use local compaction");
++            enable_lhc_compact(config);
+             config.model_provider.name = "Local compaction test provider".to_owned();
+         })
+         .build_with_auto_env(&server)
+@@ -963,14 +1004,13 @@ async fn standalone_fork_retains_inherited_user_instructions(
+     let compacted = history_mode == ThreadHistoryMode::Paginated;
+     skip_if_no_network!(Ok(()));
+     let server = start_mock_server().await;
++    let lhc_root = TempDir::new()?;
+     let mut test = test_codex()
+         .with_history_mode(history_mode)
++        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
+         .with_config(|config| {
+             config.experimental_thread_store = ThreadStoreConfig::Local;
+-            config
+-                .features
+-                .disable(Feature::TokenBudget)
+-                .expect("use local compaction for worker checkpoint");
++            enable_lhc_compact(config);
+             config.model_provider.name = "Local compaction test provider".to_owned();
+             for feature in [
+                 Feature::GuardianApproval,
+diff --git a/codex-rs/core/tests/suite/guardian_review.rs b/codex-rs/core/tests/suite/guardian_review.rs
+index 3a69fbe4e7..3355b8b28f 100644
+--- a/codex-rs/core/tests/suite/guardian_review.rs
++++ b/codex-rs/core/tests/suite/guardian_review.rs
+@@ -809,6 +809,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
+         .into_iter()
+         .find(|model| model.slug == expected_model)
+         .expect("bundled Guardian review model");
++    let expected_context_window = review_model.usable_context_window();
+     let use_responses_lite = review_model.use_responses_lite;
+     if expected_model == "gpt-5.6-luna" {
+         assert!(use_responses_lite, "Luna must use Responses Lite");
+@@ -1098,7 +1099,7 @@ async fn guardian_session_prewarms_and_is_reused_for_first_review(
+             _ => None,
+         })
+         .collect::<Vec<_>>();
+-    assert_eq!(guardian_context_windows, vec![Some(258_400)]);
++    assert_eq!(guardian_context_windows, vec![expected_context_window]);
+     for handshake in server.handshakes() {
+         let is_guardian = handshake.header("x-openai-subagent").as_deref() == Some("guardian");
+         let is_guardian_request = credits_enabled && is_guardian;
 diff --git a/codex-rs/core/tests/suite/hooks.rs b/codex-rs/core/tests/suite/hooks.rs
 index 037d671bd4..7d9bbd8460 100644
 --- a/codex-rs/core/tests/suite/hooks.rs
@@ -25468,7 +26892,7 @@ index 6fb27ee982..1a960f0656 100644
      config.include_skill_instructions = false;
      config.memories.use_memories = false;
 diff --git a/codex-rs/history/src/lib.rs b/codex-rs/history/src/lib.rs
-index 278d8dc839..995190fd26 100644
+index 278d8dc839..def7f19cd1 100644
 --- a/codex-rs/history/src/lib.rs
 +++ b/codex-rs/history/src/lib.rs
 @@ -1,5 +1,12 @@
@@ -25484,6 +26908,18 @@ index 278d8dc839..995190fd26 100644
  mod compaction_checkpoint;
  pub use compaction_checkpoint::CompactionCheckpoint;
  
+@@ -206,6 +213,11 @@ pub struct CompactedItem {
+     pub message: String,
+     pub replacement_history: Option<Vec<ResponseItemEnvelope>>,
+     pub guardian_history: Option<GuardianHistoryCheckpoint>,
++    /// How many post-`Compacted` `ResponseItem`s this producer believed were
++    /// already in `guardian_history`. Replay does not trust this count except
++    /// `Some(0)` from native compact (not an LHC-rewritten tail). `None` is a
++    /// legacy record (including 0.155.1 / `85534694e2`).
++    pub guardian_covered_suffix_items: Option<u64>,
+     pub retained_context: Option<RetainedContext>,
+     pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
+     pub window_number: Option<u64>,
 diff --git a/codex-rs/history/src/ordinal.rs b/codex-rs/history/src/ordinal.rs
 new file mode 100644
 index 0000000000..71964bfe7c
@@ -25565,6 +27001,71 @@ index 0000000000..71964bfe7c
 +        }
 +    }
 +}
+diff --git a/codex-rs/history/src/rollout_payload.rs b/codex-rs/history/src/rollout_payload.rs
+index 0a491fed6d..b4244add43 100644
+--- a/codex-rs/history/src/rollout_payload.rs
++++ b/codex-rs/history/src/rollout_payload.rs
+@@ -161,6 +161,8 @@ pub(super) struct CompactedItemWire<'a> {
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     guardian_history: Option<Cow<'a, crate::GuardianHistoryCheckpoint>>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
++    guardian_covered_suffix_items: Option<u64>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
+     retained_context: Option<Cow<'a, crate::RetainedContext>>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     mcp_resource_origins: Option<Cow<'a, McpResourceOriginCheckpoint>>,
+@@ -205,6 +207,7 @@ impl<'a> From<&'a CompactedItem> for CompactedItemWire<'a> {
+             }),
+             replacement_history_metadata,
+             guardian_history: item.guardian_history.as_ref().map(Cow::Borrowed),
++            guardian_covered_suffix_items: item.guardian_covered_suffix_items,
+             retained_context: item.retained_context.as_ref().map(Cow::Borrowed),
+             mcp_resource_origins: item.mcp_resource_origins.as_ref().map(Cow::Borrowed),
+             window_number: item.window_number,
+@@ -273,6 +276,7 @@ impl TryFrom<CompactedItemWire<'_>> for CompactedItem {
+             message: item.message.into_owned(),
+             replacement_history,
+             guardian_history: item.guardian_history.map(Cow::into_owned),
++            guardian_covered_suffix_items: item.guardian_covered_suffix_items,
+             retained_context: item.retained_context.map(Cow::into_owned),
+             mcp_resource_origins: item.mcp_resource_origins.map(Cow::into_owned),
+             window_number,
+diff --git a/codex-rs/history/src/tests.rs b/codex-rs/history/src/tests.rs
+index b04d2448db..a649217361 100644
+--- a/codex-rs/history/src/tests.rs
++++ b/codex-rs/history/src/tests.rs
+@@ -381,6 +381,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
+         ]),
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: None,
+         first_window_id: None,
+@@ -492,6 +493,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() ->
+         replacement_history: Some(vec![envelope]),
+         retained_context: None,
+         guardian_history: Some(checkpoint.clone()),
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: Some(McpResourceOriginCheckpoint::default()),
+         window_number: None,
+         first_window_id: None,
+@@ -700,6 +702,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(3),
+         first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
+@@ -739,6 +742,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: Some(3),
+             first_window_id: None,
 diff --git a/codex-rs/models-manager/models.json b/codex-rs/models-manager/models.json
 index 0037bcd633..d41e2eb60c 100644
 --- a/codex-rs/models-manager/models.json
@@ -26014,6 +27515,18 @@ index c74d53ee98..97cd138cad 100644
      let item = serde_json::from_value(Value::Object(fields))?;
  
      Ok(RolloutLine {
+diff --git a/codex-rs/rollout/src/metadata_tests.rs b/codex-rs/rollout/src/metadata_tests.rs
+index 3e0ec6d494..e2528282d4 100644
+--- a/codex-rs/rollout/src/metadata_tests.rs
++++ b/codex-rs/rollout/src/metadata_tests.rs
+@@ -295,6 +295,7 @@ fn builder_from_items_falls_back_to_filename() {
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: None,
+         first_window_id: None,
 diff --git a/codex-rs/rollout/src/ordinal.rs b/codex-rs/rollout/src/ordinal.rs
 index 29a151cfaf..65e143ba8f 100644
 --- a/codex-rs/rollout/src/ordinal.rs
@@ -26633,6 +28146,18 @@ index 3bc268268a..288b715fed 100644
      pub(super) async fn ensure_live_recorder_absent(
          &self,
          thread_id: ThreadId,
+diff --git a/codex-rs/thread-store/src/local/model_context_tests.rs b/codex-rs/thread-store/src/local/model_context_tests.rs
+index 0d7d90a892..3a1ee6725d 100644
+--- a/codex-rs/thread-store/src/local/model_context_tests.rs
++++ b/codex-rs/thread-store/src/local/model_context_tests.rs
+@@ -884,6 +884,7 @@ fn compacted(message: &str, replacement_history: Option<Vec<ResponseItem>>) -> R
+             .map(|items| items.into_iter().map(Into::into).collect()),
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(1),
+         first_window_id: None,
 diff --git a/codex-rs/thread-store/src/local/rollout_migration.rs b/codex-rs/thread-store/src/local/rollout_migration.rs
 index 59eaede016..4b7954255a 100644
 --- a/codex-rs/thread-store/src/local/rollout_migration.rs
@@ -26682,10 +28207,18 @@ index 59eaede016..4b7954255a 100644
              )
              .await?;
 diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
-index 7c85b6b080..18fa9d2c23 100644
+index 7c85b6b080..566584a418 100644
 --- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
 +++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
-@@ -398,6 +398,11 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
+@@ -241,6 +241,7 @@ fn compacted(replacement_history: Vec<ResponseItem>) -> RolloutItem {
+         replacement_history: Some(replacement_history.into_iter().map(Into::into).collect()),
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: Some(1),
+         first_window_id: None,
+@@ -398,6 +399,11 @@ async fn migration_publishes_canonical_projected_history_and_is_idempotent() {
      let turns = list_active_summary_turns(&store, thread_id).await;
      assert_eq!(turns.turns.len(), 1);
      assert_eq!(turns.turns[0].items.len(), 2);
@@ -26697,6 +28230,22 @@ index 7c85b6b080..18fa9d2c23 100644
  
      let bytes = fs::read(&path).expect("read first migration");
      let second = store
+@@ -1776,6 +1782,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
+                 replacement_history: Some(Vec::new()),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: Some(1),
+                 first_window_id: None,
+@@ -1800,6 +1807,7 @@ async fn migration_compacts_subagent_prefix_and_does_not_project_it() {
+                 ]),
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: Some(2),
+                 first_window_id: None,
 diff --git a/codex-rs/thread-store/src/local/thread_history.rs b/codex-rs/thread-store/src/local/thread_history.rs
 index 7b31841842..0e3a83d534 100644
 --- a/codex-rs/thread-store/src/local/thread_history.rs
@@ -28178,3 +29727,109 @@ index 3f6fcbf615..33733b3963 100644
  fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64) {
      let bytes = fs::read(path).expect("read rollout");
      let mut start_byte_offset = 0;
+diff --git a/codex-rs/thread-store/src/thread_metadata_sync.rs b/codex-rs/thread-store/src/thread_metadata_sync.rs
+index fb7d4d8c78..ce203a9cb0 100644
+--- a/codex-rs/thread-store/src/thread_metadata_sync.rs
++++ b/codex-rs/thread-store/src/thread_metadata_sync.rs
+@@ -596,6 +596,7 @@ mod tests {
+             replacement_history: None,
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: None,
+             first_window_id: None,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 9c884f2ed3..3f7904886f 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -7562,6 +7562,30 @@ async fn backtrack_branch_failure_restores_selected_prompt_snapshot() {
+     );
+ }
+ 
++#[tokio::test]
++async fn lhc_rewind_refusal_is_shown_verbatim() {
++    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
++
++    app.restore_backtrack_prompt_after_revert_error(
++        crate::chatwidget::UserMessage::from("edit this prompt"),
++        format!(
++            "thread/revert failed: {} (code -32600)",
++            codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED
++        ),
++    );
++
++    assert_eq!(
++        app.chat_widget.composer_text_with_pending(),
++        "edit this prompt"
++    );
++    let cell = match app_event_rx.try_recv() {
++        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
++        other => panic!("expected InsertHistoryCell event, got {other:?}"),
++    };
++    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 80));
++    assert_app_snapshot!("lhc_rewind_refusal_is_shown_verbatim", rendered);
++}
++
+ #[tokio::test]
+ async fn remote_resume_current_cwd_rejection_snapshot() -> Result<()> {
+     let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+diff --git a/codex-rs/tui/src/app_backtrack.rs b/codex-rs/tui/src/app_backtrack.rs
+index 1cdadf53b2..5a3a6991cc 100644
+--- a/codex-rs/tui/src/app_backtrack.rs
++++ b/codex-rs/tui/src/app_backtrack.rs
+@@ -151,8 +151,13 @@ impl App {
+         err: impl std::fmt::Display,
+     ) {
+         self.chat_widget.restore_user_message_to_composer(prompt);
+-        self.chat_widget
+-            .add_error_message(format!("Failed to edit the selected prompt: {err:#}"));
++        let rendered = err.to_string();
++        let message = if rendered.contains(codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED) {
++            codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED.to_string()
++        } else {
++            format!("Failed to edit the selected prompt: {err:#}")
++        };
++        self.chat_widget.add_error_message(message);
+     }
+ 
+     /// Show detailed history in the owned viewport or the inline session's transcript overlay.
+diff --git a/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs b/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
+index 401d7ad205..62b61a54b7 100644
+--- a/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
++++ b/codex-rs/tui/src/resume_picker_transcript_preview_tests.rs
+@@ -78,6 +78,7 @@ fn legacy_transcript_preview_scans_tail_across_compaction() {
+                 replacement_history: None,
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -213,6 +214,7 @@ fn legacy_transcript_preview_falls_back_for_oversized_hidden_record() {
+                 replacement_history: None,
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+@@ -244,6 +246,7 @@ fn legacy_transcript_preview_falls_back_when_scan_budget_is_exhausted() {
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: None,
+         first_window_id: None,
+diff --git a/codex-rs/tui/src/snapshots/codex_tui__app__tests__lhc_rewind_refusal_is_shown_verbatim.snap b/codex-rs/tui/src/snapshots/codex_tui__app__tests__lhc_rewind_refusal_is_shown_verbatim.snap
+new file mode 100644
+index 0000000000..ec0c96d1eb
+--- /dev/null
++++ b/codex-rs/tui/src/snapshots/codex_tui__app__tests__lhc_rewind_refusal_is_shown_verbatim.snap
+@@ -0,0 +1,5 @@
++---
++source: tui/src/app/tests.rs
++expression: rendered
++---
++■ Rewinding is not yet supported.

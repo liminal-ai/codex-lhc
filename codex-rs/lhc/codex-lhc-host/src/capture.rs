@@ -694,7 +694,7 @@ impl CaptureHandle {
     /// Wait until this capture runtime has left `worker_loop` and cannot claim
     /// again. Intake-durability ack is a separate, earlier contract.
     #[cfg(any(test, feature = "test-util"))]
-    pub(crate) async fn wait_terminated_bounded(&self, timeout: std::time::Duration) -> bool {
+    pub async fn wait_terminated_bounded(&self, timeout: std::time::Duration) -> bool {
         let mut rx = self.inner.terminated.subscribe();
         if *rx.borrow() {
             return true;

@@ -3,6 +3,7 @@
 //! the public rollout append API. Resume and child forks use production paths.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,6 +32,9 @@ use codex_history::RetainedContextOrder;
 use codex_history::RolloutItem;
 use codex_history::VerifiedAnswer;
 use codex_history::VerifiedQuestionAnswer;
+use codex_lhc_host::LhcCaptureSlot;
+use codex_lhc_host::install_with_root;
+use codex_lhc_host::wait_for_handle;
 use codex_protocol::ResponseItemId;
 use codex_protocol::mcp::ClientMcpExtensions;
 use codex_protocol::models::ContentItem;
@@ -60,10 +64,43 @@ use core_test_support::wait_for_event;
 use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tempfile::TempDir;
 use test_case::test_case;
 use tokio::sync::Notify;
 use wiremock::MockServer;
 use wiremock::matchers::header;
+
+fn lhc_extensions(root: PathBuf) -> Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut builder = ExtensionRegistryBuilder::<Config>::new();
+    install_with_root(
+        &mut builder,
+        |config| config.features.enabled(Feature::LhcCapture),
+        root,
+    );
+    Arc::new(builder.build())
+}
+
+fn enable_lhc_compact(config: &mut Config) {
+    config
+        .features
+        .enable(Feature::LhcCapture)
+        .expect("enable LHC capture");
+    config
+        .features
+        .disable(Feature::TokenBudget)
+        .expect("disable token budget");
+    let _ = config.features.disable(Feature::ContextManagement);
+}
+
+async fn wait_lhc_capture(thread: &CodexThread) {
+    let slot = thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .expect("LhcCaptureSlot");
+    wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("LHC capture ready");
+}
 
 // Keep child completion out of the parent's history and wait for parent turn cleanup
 // before checking inherited authorization.
@@ -237,6 +274,13 @@ async fn compact_and_assert_answers(
 ) -> Result<RetainedContext> {
     // Inspect live state by persisting a real compaction checkpoint, not a private getter.
     // Repeating this after legacy rollback replay also catches checkpoint resurrection.
+    if thread
+        .thread_extension_data()
+        .get::<LhcCaptureSlot>()
+        .is_some()
+    {
+        wait_lhc_capture(thread).await;
+    }
     thread.submit(Op::Compact).await?;
     wait_for_event(thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
     thread.flush_rollout().await?;
@@ -294,8 +338,10 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
         ThreadHistoryMode::Paginated => &[],
     };
     let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let test = test_codex()
         .with_history_mode(history_mode)
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(move |config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
             config
@@ -304,10 +350,7 @@ async fn retained_instructions_keep_identity_across_compaction_and_resume(
                 .expect("test context mode");
             // Exercise local compaction's rebuilt user messages, not an opaque checkpoint.
             config.model_provider.name = "Local compaction test provider".to_owned();
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("use local compaction");
+            enable_lhc_compact(config);
             config
                 .features
                 .enable(Feature::DefaultModeRequestUserInput)
@@ -588,18 +631,17 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let test = test_codex()
         .with_history_mode(history_mode)
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
             config
                 .features
                 .enable(Feature::GuardianThreadContext)
                 .expect("enable retained instructions");
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("use local compaction");
+            enable_lhc_compact(config);
             config.model_provider.name = "Local compaction test provider".to_owned();
         })
         .build_with_auto_env(&server)
@@ -708,17 +750,16 @@ async fn legacy_checkpoint_recovers_root_excerpt_before_discarding_backup(
 async fn disabled_capture_stays_incomplete_after_compaction_and_enabled_resume() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let test = test_codex()
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
             config
                 .features
                 .disable(Feature::GuardianThreadContext)
                 .expect("disable instruction capture");
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("use local compaction");
+            enable_lhc_compact(config);
             config.model_provider.name = "Local compaction test provider".to_owned();
         })
         .build_with_auto_env(&server)
@@ -963,14 +1004,13 @@ async fn standalone_fork_retains_inherited_user_instructions(
     let compacted = history_mode == ThreadHistoryMode::Paginated;
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
+    let lhc_root = TempDir::new()?;
     let mut test = test_codex()
         .with_history_mode(history_mode)
+        .with_extensions(lhc_extensions(lhc_root.path().to_path_buf()))
         .with_config(|config| {
             config.experimental_thread_store = ThreadStoreConfig::Local;
-            config
-                .features
-                .disable(Feature::TokenBudget)
-                .expect("use local compaction for worker checkpoint");
+            enable_lhc_compact(config);
             config.model_provider.name = "Local compaction test provider".to_owned();
             for feature in [
                 Feature::GuardianApproval,

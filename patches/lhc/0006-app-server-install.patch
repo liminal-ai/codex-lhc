@@ -1,5 +1,43 @@
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+index 6a2ad271f0..d329dbd014 100644
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
+@@ -4503,6 +4503,7 @@ mod tests {
+                 replacement_history: None,
+                 retained_context: None,
+                 guardian_history: None,
++                guardian_covered_suffix_items: None,
+                 mcp_resource_origins: None,
+                 window_number: None,
+                 first_window_id: None,
+diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
+index e976735ea3..2097d8757f 100644
+--- a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
++++ b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
+@@ -210,6 +210,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: None,
+         first_window_id: None,
+diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+index 09732cfb43..d719547a51 100644
+--- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
++++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
+@@ -1254,6 +1254,9 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
+     pub terminated: bool,
+ }
+ 
++/// Exact refusal for every rewind path on an LHC-enabled Codex thread.
++pub const REWINDING_NOT_YET_SUPPORTED: &str = "Rewinding is not yet supported.";
++
+ /// Replace a paginated thread's durable history with the prefix before one turn.
+ ///
+ /// This only changes persisted conversation history. It does not revert local file changes.
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index 34adaff2f2..63072717c5 100644
+index 34adaff2f2..efd62bf111 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
 @@ -121,6 +121,28 @@ pub(crate) fn thread_extensions(
@@ -31,7 +69,7 @@ index 34adaff2f2..63072717c5 100644
      Arc::new(builder.build())
  }
  
-@@ -312,6 +334,136 @@ mod tests {
+@@ -312,6 +334,132 @@ mod tests {
  
      use super::*;
  
@@ -44,7 +82,6 @@ index 34adaff2f2..63072717c5 100644
 +    /// flag ON → slot present; explicit OFF → no `LhcCaptureSlot`.
 +    #[tokio::test]
 +    async fn thread_extensions_registers_lhc_raw_item_contributor() -> anyhow::Result<()> {
-+        use crate::extensions::guardian_agent_spawner;
 +        use codex_core::config::ConfigOverrides;
 +        use codex_core::init_state_db;
 +        use codex_exec_server::EnvironmentManager;
@@ -87,23 +124,20 @@ index 34adaff2f2..63072717c5 100644
 +        );
 +
 +        // Production path: same dependency shape as mcp_refresh / message_processor.
-+        let registry = thread_extensions(
-+            guardian_agent_spawner(std::sync::Weak::new()),
-+            ThreadExtensionDependencies {
-+                event_sink: Arc::new(NoopExtensionEventSink),
-+                auth_manager: auth_manager.clone(),
-+                state_db: Some(state_db.clone()),
-+                analytics_events_client: AnalyticsEventsClient::disabled(),
-+                thread_manager: std::sync::Weak::new(),
-+                goal_service: Arc::new(codex_goal_extension::GoalService::new()),
-+                environment_manager: Arc::clone(&environment_manager),
-+                executor_skill_provider,
-+                git_attribution_base_url: config.chatgpt_base_url.clone(),
-+                http_client_factory: config.http_client_factory(),
-+                queue_service: None,
-+                turn_start_admission: None,
-+            },
-+        );
++        let registry = thread_extensions(ThreadExtensionDependencies {
++            event_sink: Arc::new(NoopExtensionEventSink),
++            auth_manager: auth_manager.clone(),
++            state_db: Some(state_db.clone()),
++            analytics_events_client: AnalyticsEventsClient::disabled(),
++            thread_manager: std::sync::Weak::new(),
++            goal_service: Arc::new(codex_goal_extension::GoalService::new()),
++            environment_manager: Arc::clone(&environment_manager),
++            executor_skill_provider,
++            git_attribution_base_url: config.chatgpt_base_url.clone(),
++            http_client_factory: config.http_client_factory(),
++            queue_service: None,
++            turn_start_admission: None,
++        });
 +
 +        assert!(
 +            !registry.raw_item_contributors().is_empty(),
@@ -169,17 +203,228 @@ index 34adaff2f2..63072717c5 100644
      async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
          let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
 diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
-index 20e44d3253..a20fe33ad2 100644
+index 20e44d3253..a699f55f57 100644
 --- a/codex-rs/app-server/src/in_process.rs
 +++ b/codex-rs/app-server/src/in_process.rs
-@@ -578,6 +578,7 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
-             processor.clear_all_thread_listeners().await;
-             processor.drain_background_tasks().await;
-             processor.shutdown_threads().await;
-+            codex_lhc_host::on_process_shutdown();
-         });
-         let mut pending_request_responses =
-             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
+@@ -877,7 +877,202 @@ mod tests {
+         start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
+     }
+ 
++    fn seed_held_claim(path: &Path, work_item_id: &str) {
++        std::fs::create_dir_all(path.parent().expect("parent")).expect("threads dir");
++        let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
++            lhc::shared_tech::errors::OpResult::Ok { value } => value,
++            lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
++        };
++        db.exec(&format!(
++            "CREATE TABLE IF NOT EXISTS work_item (
++                work_item_id TEXT PRIMARY KEY,
++                owner TEXT NOT NULL,
++                kind TEXT NOT NULL,
++                source_ref TEXT NOT NULL,
++                status TEXT NOT NULL,
++                queued_at TEXT NOT NULL,
++                claimed_at TEXT,
++                claim_expires_at TEXT,
++                payload TEXT NOT NULL
++             );
++             INSERT INTO work_item (
++                work_item_id, owner, kind, source_ref, status, queued_at,
++                claimed_at, claim_expires_at, payload
++             ) VALUES (
++                '{work_item_id}', 'test', 'test', 'test', 'claimed', 'now',
++                'now', 'later', '{{\"claimAttempt\":1}}'
++             );"
++        ));
++        lhc::shared_tech::work_queue::note_claim_held(
++            &db,
++            &lhc::shared_tech::work_queue::ClaimAttempt {
++                work_item_id: work_item_id.into(),
++                claim_attempt: Some(1),
++            },
++        );
++        db.close();
++    }
++
++    fn work_item_status(path: &Path, work_item_id: &str) -> String {
++        let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
++            lhc::shared_tech::errors::OpResult::Ok { value } => value,
++            lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
++        };
++        let status = db
++            .prepare("SELECT status FROM work_item WHERE work_item_id = ?")
++            .get_params(&[lhc::shared_tech::storage::SqlParam::from(work_item_id)])
++            .expect("row")
++            .get("status")
++            .and_then(|value| value.as_str().map(str::to_string))
++            .unwrap_or_default();
++        db.close();
++        status
++    }
++
++    async fn start_thread(client: &InProcessClientHandle, request_id: i64) -> String {
++        let response = client
++            .request(ClientRequest::ThreadStart {
++                request_id: RequestId::Integer(request_id),
++                params: ThreadStartParams {
++                    ephemeral: Some(true),
++                    ..ThreadStartParams::default()
++                },
++            })
++            .await
++            .expect("request transport should work")
++            .expect("thread/start should succeed");
++        let parsed: ThreadStartResponse =
++            serde_json::from_value(response).expect("thread/start response should parse");
++        parsed.thread.id
++    }
++
++    async fn start_test_client_without_lhc_capture(
++        session_source: SessionSource,
++    ) -> InProcessClientHandle {
++        let codex_home = TempDir::new().expect("temp dir");
++        let mut config = build_test_config(codex_home.path()).await;
++        config
++            .features
++            .set_enabled(codex_features::Feature::LhcCapture, false)
++            .expect("disable LhcCapture");
++        let config = Arc::new(config);
++        let state_db = codex_rollout::state_db::try_init(config.as_ref())
++            .await
++            .expect("state db should initialize for in-process test");
++        let args = InProcessStartArgs {
++            arg0_paths: Arg0DispatchPaths::default(),
++            config,
++            cli_overrides: Vec::new(),
++            loader_overrides: LoaderOverrides::default(),
++            strict_config: false,
++            cloud_config_bundle: CloudConfigBundleLoader::default(),
++            thread_config_loader: Arc::new(codex_config::NoopThreadConfigLoader),
++            feedback: CodexFeedback::new(),
++            log_db: None,
++            state_db: Some(state_db),
++            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
++            config_warnings: Vec::new(),
++            session_source,
++            enable_codex_api_key_env: false,
++            initialize: InitializeParams {
++                client_info: ClientInfo {
++                    name: "codex-in-process-test".to_string(),
++                    title: None,
++                    version: "0.0.0".to_string(),
++                },
++                capabilities: None,
++            },
++            channel_capacity: DEFAULT_IN_PROCESS_CHANNEL_CAPACITY,
++        };
++        let mut client = start(args).await.expect("in-process runtime should start");
++        client._test_codex_home = Some(codex_home);
++        client
++    }
++
++    #[tokio::test]
++    #[serial_test::serial(codex_lhc_root)]
++    async fn closing_one_in_process_client_leaves_the_other_clients_claim() {
++        let lhc_root = TempDir::new().expect("lhc root");
++        let previous = std::env::var_os("CODEX_LHC_ROOT");
++        // SAFETY: serialized against other CODEX_LHC_ROOT tests.
++        unsafe { std::env::set_var("CODEX_LHC_ROOT", lhc_root.path()) };
++
++        let client_a = start_test_client_without_lhc_capture(SessionSource::Cli).await;
++        let client_b = start_test_client_without_lhc_capture(SessionSource::Cli).await;
++        let thread_a = start_thread(&client_a, 11).await;
++        let thread_b = start_thread(&client_b, 12).await;
++        let path_a = codex_lhc_host::thread_sqlite_path(&thread_a, Some(lhc_root.path()))
++            .expect("thread A sqlite path");
++        let path_b = codex_lhc_host::thread_sqlite_path(&thread_b, Some(lhc_root.path()))
++            .expect("thread B sqlite path");
++        seed_held_claim(&path_a, "w-a");
++        seed_held_claim(&path_b, "w-b");
++
++        client_a
++            .shutdown()
++            .await
++            .expect("client A should shutdown cleanly");
++
++        assert_eq!(
++            work_item_status(&path_b, "w-b"),
++            "claimed",
++            "closing client A must not take client B's held claim"
++        );
++
++        client_b
++            .shutdown()
++            .await
++            .expect("client B should shutdown cleanly");
++
++        match previous {
++            Some(value) => unsafe { std::env::set_var("CODEX_LHC_ROOT", value) },
++            None => unsafe { std::env::remove_var("CODEX_LHC_ROOT") },
++        }
++    }
++
++    #[tokio::test]
++    #[serial_test::serial(codex_lhc_root)]
++    async fn closing_one_lhc_client_leaves_the_other_clients_live_claim() {
++        let lhc_root = TempDir::new().expect("lhc root");
++        let previous = std::env::var_os("CODEX_LHC_ROOT");
++        // SAFETY: serialized against other CODEX_LHC_ROOT tests.
++        unsafe { std::env::set_var("CODEX_LHC_ROOT", lhc_root.path()) };
++
++        let client_a = start_test_client(SessionSource::Cli).await;
++        let client_b = start_test_client(SessionSource::Cli).await;
++        let thread_a = start_thread(&client_a, 21).await;
++        let thread_b = start_thread(&client_b, 22).await;
++        let path_a = codex_lhc_host::thread_sqlite_path(&thread_a, Some(lhc_root.path()))
++            .expect("thread A sqlite path");
++        let path_b = codex_lhc_host::thread_sqlite_path(&thread_b, Some(lhc_root.path()))
++            .expect("thread B sqlite path");
++        seed_held_claim(&path_a, "w-a-lhc");
++        seed_held_claim(&path_b, "w-b-lhc");
++
++        client_a
++            .shutdown()
++            .await
++            .expect("client A should shutdown cleanly");
++
++        assert_eq!(
++            work_item_status(&path_b, "w-b-lhc"),
++            "claimed",
++            "closing an LHC capture client must not take another live client's claim"
++        );
++
++        client_b
++            .shutdown()
++            .await
++            .expect("client B should shutdown cleanly");
++
++        match previous {
++            Some(value) => unsafe { std::env::set_var("CODEX_LHC_ROOT", value) },
++            None => unsafe { std::env::remove_var("CODEX_LHC_ROOT") },
++        }
++    }
++
+     #[tokio::test]
++    #[serial_test::serial(codex_lhc_root)]
+     async fn in_process_start_initializes_and_handles_typed_v2_request() {
+         let client = start_test_client(SessionSource::Cli).await;
+         let response = client
+@@ -899,6 +1094,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
++    #[serial_test::serial(codex_lhc_root)]
+     async fn in_process_start_uses_requested_session_source_for_thread_start() {
+         for (requested_source, expected_source) in [
+             (SessionSource::Cli, ApiSessionSource::Cli),
+@@ -927,6 +1123,7 @@ mod tests {
+     }
+ 
+     #[tokio::test]
++    #[serial_test::serial(codex_lhc_root)]
+     async fn in_process_start_clamps_zero_channel_capacity() {
+         let client =
+             start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
 diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
 index fc11b838a0..921c725324 100644
 --- a/codex-rs/app-server/src/lib.rs
@@ -192,3 +437,521 @@ index fc11b838a0..921c725324 100644
              } else {
                  connection_cleanup_tasks.abort();
              }
+diff --git a/codex-rs/app-server/tests/suite/v2/guardian_v2.rs b/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
+index f8feea4a33..bdfb42bd40 100644
+--- a/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
++++ b/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
+@@ -403,8 +403,6 @@ async fn parent_response(
+             }),
+             responses::ev_completed("root-compaction"),
+         ]
+-    } else if request["model"] == "gpt-5.6-luna" {
+-        luna_response(&state, request).await
+     } else if request
+         .pointer("/client_metadata/x-openai-subagent")
+         .and_then(Value::as_str)
+@@ -440,6 +438,8 @@ async fn parent_response(
+             responses::ev_assistant_message("guardian-assessment", &assessment),
+             responses::ev_completed("guardian-review"),
+         ]
++    } else if request["model"] == "gpt-5.6-luna" {
++        luna_response(&state, request).await
+     } else if state.root_worker
+         && request
+             .pointer("/client_metadata/x-codex-parent-thread-id")
+diff --git a/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs b/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
+index 7128381526..7d0a5100d6 100644
+--- a/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
++++ b/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
+@@ -206,8 +206,6 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
+                                 }),
+                                 responses::ev_completed("compact"),
+                             ]
+-                        } else if request["model"] == "gpt-5.6-luna" {
+-                            luna_response(&classifier, request).await
+                         } else if request["client_metadata"]["x-openai-subagent"] == "guardian" {
+                             review_requests
+                                 .lock()
+@@ -217,6 +215,8 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
+                                 responses::ev_assistant_message("review", r#"{"outcome":"allow"}"#),
+                                 responses::ev_completed("review"),
+                             ]
++                        } else if request["model"] == "gpt-5.6-luna" {
++                            luna_response(&classifier, request).await
+                         } else {
+                             let mut requests = parent_requests.lock().expect("request log lock");
+                             let step = requests.len();
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+index 1904431cc7..0757af6a13 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
+@@ -199,6 +199,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() ->
+             replacement_history: Some(Vec::new()),
+             retained_context: None,
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             mcp_resource_origins: None,
+             window_number: Some(1),
+             first_window_id: None,
+diff --git a/codex-rs/app-server/tests/suite/v2/thread_revert.rs b/codex-rs/app-server/tests/suite/v2/thread_revert.rs
+index a8a9cc8a49..714d6362b7 100644
+--- a/codex-rs/app-server/tests/suite/v2/thread_revert.rs
++++ b/codex-rs/app-server/tests/suite/v2/thread_revert.rs
+@@ -1,3 +1,4 @@
++use anyhow::Context;
+ use anyhow::Result;
+ use app_test_support::MockResponsesConfig;
+ use app_test_support::TestAppServer;
+@@ -12,6 +13,7 @@ use codex_app_server_protocol::ClientRequest;
+ use codex_app_server_protocol::InitializeCapabilities;
+ use codex_app_server_protocol::JSONRPCError;
+ use codex_app_server_protocol::JSONRPCMessage;
++use codex_app_server_protocol::REWINDING_NOT_YET_SUPPORTED;
+ use codex_app_server_protocol::RequestId;
+ use codex_app_server_protocol::SortDirection;
+ use codex_app_server_protocol::ThreadForkParams;
+@@ -19,6 +21,8 @@ use codex_app_server_protocol::ThreadForkResponse;
+ use codex_app_server_protocol::ThreadHistoryMode;
+ use codex_app_server_protocol::ThreadItemsListParams;
+ use codex_app_server_protocol::ThreadItemsListResponse;
++use codex_app_server_protocol::ThreadReadParams;
++use codex_app_server_protocol::ThreadReadResponse;
+ use codex_app_server_protocol::ThreadResumeParams;
+ use codex_app_server_protocol::ThreadResumeResponse;
+ use codex_app_server_protocol::ThreadRevertParams;
+@@ -46,6 +50,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
+ use core_test_support::load_default_config_for_test;
+ use pretty_assertions::assert_eq;
+ use serde_json::Value;
++use std::path::Path;
++use std::path::PathBuf;
+ use tempfile::TempDir;
+ use tokio::time::timeout;
+ 
+@@ -59,6 +65,7 @@ async fn thread_revert_preserves_model_selected_multi_agent_version(restart: boo
+     let codex_home = TempDir::new()?;
+     MockResponsesConfig::new(&server.uri())
+         .disable_feature(Feature::MultiAgentV2)
++        .disable_feature(Feature::LhcCapture)
+         .write(codex_home.path())?;
+     let config = load_default_config_for_test(&codex_home).await;
+     let mut model = codex_core::test_support::construct_model_info_offline("mock-model", &config);
+@@ -160,7 +167,9 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
+         AbsolutePathBuf::from_absolute_path(&saved_cwd)?,
+         AbsolutePathBuf::from_absolute_path(extra_workspace.path().canonicalize()?)?,
+     ];
+-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    MockResponsesConfig::new(&server.uri())
++        .disable_feature(Feature::LhcCapture)
++        .write(codex_home.path())?;
+     // This fixture checks host-native cwd and workspace restoration across fork and revert.
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
+@@ -334,7 +343,9 @@ async fn thread_revert_preserves_fork_cutoff_after_cold_resume() -> Result<()> {
+ async fn thread_revert_replaces_paginated_history_before_turn() -> Result<()> {
+     let server = create_mock_responses_server_repeating_assistant("Done").await;
+     let codex_home = TempDir::new()?;
+-    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    MockResponsesConfig::new(&server.uri())
++        .disable_feature(Feature::LhcCapture)
++        .write(codex_home.path())?;
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(codex_home.path())
+         .build()
+@@ -516,7 +527,9 @@ async fn thread_revert_interrupts_active_turn_and_keeps_thread_loaded() -> Resul
+         create_final_assistant_message_sse_response("third")?,
+     ])
+     .await;
+-    MockResponsesConfig::new(&server.uri()).write(home.path())?;
++    MockResponsesConfig::new(&server.uri())
++        .disable_feature(Feature::LhcCapture)
++        .write(home.path())?;
+     let mut mcp = TestAppServer::builder()
+         .with_codex_home(home.path())
+         .build()
+@@ -624,6 +637,385 @@ async fn thread_revert_interrupts_active_turn_and_keeps_thread_loaded() -> Resul
+     Ok(())
+ }
+ 
++#[test_case::test_case(ThreadHistoryMode::Paginated; "paginated")]
++#[test_case::test_case(ThreadHistoryMode::Legacy; "legacy")]
++#[tokio::test]
++async fn thread_revert_on_lhc_thread_refuses_and_leaves_history_untouched(
++    history_mode: ThreadHistoryMode,
++) -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    let lhc_root = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[(
++            "CODEX_LHC_ROOT",
++            Some(lhc_root.path().to_str().expect("utf-8")),
++        )])
++        .build()
++        .await?;
++    initialize_experimental(&mut mcp).await?;
++
++    let ThreadStartResponse { thread, .. } = mcp
++        .start_thread(ThreadStartParams {
++            history_mode: Some(history_mode),
++            ..Default::default()
++        })
++        .await?;
++    mcp.start_turn_and_wait_for_completion(TurnStartParams {
++        thread_id: thread.id.clone(),
++        input: vec![UserInput::Text {
++            text: "first".to_string(),
++            text_elements: Vec::new(),
++        }],
++        ..Default::default()
++    })
++    .await?;
++    let second = mcp
++        .start_turn_and_wait_for_completion(TurnStartParams {
++            thread_id: thread.id.clone(),
++            input: vec![UserInput::Text {
++                text: "second".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++
++    let db_path = codex_lhc_host::thread_file_path(lhc_root.path(), &thread.id);
++    let captured = wait_for_stable_captured_turns(&db_path, 2).await?;
++    let captured_len = captured.len();
++    assert!(
++        captured_len >= 2,
++        "fixture LHC DB must contain both turns, got {captured_len}"
++    );
++    mcp.shutdown_gracefully().await?;
++
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[(
++            "CODEX_LHC_ROOT",
++            Some(lhc_root.path().to_str().expect("utf-8")),
++        )])
++        .build()
++        .await?;
++    initialize_experimental(&mut mcp).await?;
++    let resumed: ThreadResumeResponse = mcp
++        .request(|request_id| ClientRequest::ThreadResume {
++            request_id,
++            params: ThreadResumeParams {
++                thread_id: thread.id.clone(),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(resumed.thread.id, thread.id);
++    assert_eq!(resumed.thread.history_mode, history_mode);
++    wait_for_stable_captured_turns(&db_path, captured_len).await?;
++
++    let before = capture_history_snapshot(&mut mcp, &thread.id, lhc_root.path()).await?;
++    refuse_revert_and_assert_unchanged(
++        &mut mcp,
++        &thread.id,
++        &second.turn.id,
++        lhc_root.path(),
++        &before,
++    )
++    .await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn thread_revert_refuses_when_lhc_db_exists_even_if_capture_is_disabled() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    let lhc_root = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[(
++            "CODEX_LHC_ROOT",
++            Some(lhc_root.path().to_str().expect("utf-8")),
++        )])
++        .build()
++        .await?;
++    initialize_experimental(&mut mcp).await?;
++
++    let ThreadStartResponse { thread, .. } = mcp
++        .start_thread(ThreadStartParams {
++            history_mode: Some(ThreadHistoryMode::Paginated),
++            ..Default::default()
++        })
++        .await?;
++    mcp.start_turn_and_wait_for_completion(TurnStartParams {
++        thread_id: thread.id.clone(),
++        input: vec![UserInput::Text {
++            text: "first".to_string(),
++            text_elements: Vec::new(),
++        }],
++        ..Default::default()
++    })
++    .await?;
++    let second = mcp
++        .start_turn_and_wait_for_completion(TurnStartParams {
++            thread_id: thread.id.clone(),
++            input: vec![UserInput::Text {
++                text: "second".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++    let db_path = codex_lhc_host::thread_file_path(lhc_root.path(), &thread.id);
++    let captured = wait_for_stable_captured_turns(&db_path, 2).await?;
++    let captured_len = captured.len();
++    assert!(
++        captured_len >= 2,
++        "fixture LHC DB must contain both turns, got {captured_len}"
++    );
++    mcp.shutdown_gracefully().await?;
++
++    MockResponsesConfig::new(&server.uri())
++        .disable_feature(Feature::LhcCapture)
++        .write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[(
++            "CODEX_LHC_ROOT",
++            Some(lhc_root.path().to_str().expect("utf-8")),
++        )])
++        .build()
++        .await?;
++    initialize_experimental(&mut mcp).await?;
++    let resumed: ThreadResumeResponse = mcp
++        .request(|request_id| ClientRequest::ThreadResume {
++            request_id,
++            params: ThreadResumeParams {
++                thread_id: thread.id.clone(),
++                ..Default::default()
++            },
++        })
++        .await?;
++    assert_eq!(resumed.thread.id, thread.id);
++
++    let before = capture_history_snapshot(&mut mcp, &thread.id, lhc_root.path()).await?;
++    refuse_revert_and_assert_unchanged(
++        &mut mcp,
++        &thread.id,
++        &second.turn.id,
++        lhc_root.path(),
++        &before,
++    )
++    .await?;
++    Ok(())
++}
++
++#[tokio::test]
++async fn thread_revert_refuses_while_lhc_capture_is_opening_without_a_database() -> Result<()> {
++    let server = create_mock_responses_server_repeating_assistant("Done").await;
++    let codex_home = TempDir::new()?;
++    let lhc_root = TempDir::new()?;
++    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
++    let mut mcp = TestAppServer::builder()
++        .with_codex_home(codex_home.path())
++        .with_env_overrides(&[
++            (
++                "CODEX_LHC_ROOT",
++                Some(lhc_root.path().to_str().expect("utf-8")),
++            ),
++            ("CODEX_LHC_HOLD_OPEN", Some("1")),
++        ])
++        .build()
++        .await?;
++    initialize_experimental(&mut mcp).await?;
++
++    let ThreadStartResponse { thread, .. } = mcp
++        .start_thread(ThreadStartParams {
++            history_mode: Some(ThreadHistoryMode::Paginated),
++            ..Default::default()
++        })
++        .await?;
++    let first = mcp
++        .start_turn_and_wait_for_completion(TurnStartParams {
++            thread_id: thread.id.clone(),
++            input: vec![UserInput::Text {
++                text: "first".to_string(),
++                text_elements: Vec::new(),
++            }],
++            ..Default::default()
++        })
++        .await?;
++    let db_path = codex_lhc_host::thread_file_path(lhc_root.path(), &thread.id);
++    assert!(
++        !db_path.is_file(),
++        "Opening capture must not have created {} yet",
++        db_path.display()
++    );
++
++    let before = capture_history_snapshot(&mut mcp, &thread.id, lhc_root.path()).await?;
++    assert!(
++        before.lhc_digest.is_none(),
++        "Opening capture must not have an LHC database digest"
++    );
++    refuse_revert_and_assert_unchanged(
++        &mut mcp,
++        &thread.id,
++        &first.turn.id,
++        lhc_root.path(),
++        &before,
++    )
++    .await?;
++    assert!(
++        !db_path.is_file(),
++        "refused rewind must not create {}",
++        db_path.display()
++    );
++    Ok(())
++}
++
++struct HistorySnapshot {
++    rollout_path: PathBuf,
++    native: Vec<u8>,
++    lhc_db_path: PathBuf,
++    lhc_turn_ids: Vec<String>,
++    lhc_digest: Option<String>,
++}
++
++async fn capture_history_snapshot(
++    mcp: &mut TestAppServer,
++    thread_id: &str,
++    lhc_root: &Path,
++) -> Result<HistorySnapshot> {
++    let rollout_path = authoritative_rollout_path(mcp, thread_id).await?;
++    let native = std::fs::read(&rollout_path)
++        .with_context(|| format!("read native history {}", rollout_path.display()))?;
++    let lhc_db_path = codex_lhc_host::thread_file_path(lhc_root, thread_id);
++    let (lhc_turn_ids, lhc_digest) = if lhc_db_path.is_file() {
++        let ids = codex_lhc_host::live_turn_ids(&lhc_db_path)
++            .map_err(|err| anyhow::anyhow!("read LHC turns at {}: {err}", lhc_db_path.display()))?;
++        let digest = codex_lhc_host::lhc_database_digest(&lhc_db_path)
++            .map_err(|err| anyhow::anyhow!("digest LHC DB at {}: {err}", lhc_db_path.display()))?;
++        (ids, Some(digest))
++    } else {
++        (Vec::new(), None)
++    };
++    Ok(HistorySnapshot {
++        rollout_path,
++        native,
++        lhc_db_path,
++        lhc_turn_ids,
++        lhc_digest,
++    })
++}
++
++async fn refuse_revert_and_assert_unchanged(
++    mcp: &mut TestAppServer,
++    thread_id: &str,
++    before_turn_id: &str,
++    lhc_root: &Path,
++    before: &HistorySnapshot,
++) -> Result<()> {
++    let revert_id = mcp
++        .send_raw_request(
++            "thread/revert",
++            Some(serde_json::to_value(ThreadRevertParams {
++                thread_id: thread_id.to_string(),
++                before_turn_id: before_turn_id.to_string(),
++            })?),
++        )
++        .await?;
++    let revert_error: JSONRPCError = timeout(
++        DEFAULT_READ_TIMEOUT,
++        mcp.read_stream_until_error_message(RequestId::Integer(revert_id)),
++    )
++    .await??;
++    assert_eq!(revert_error.error.message, REWINDING_NOT_YET_SUPPORTED);
++    assert_eq!(revert_error.error.code, -32600);
++
++    let after = capture_history_snapshot(mcp, thread_id, lhc_root).await?;
++    assert_eq!(
++        after.rollout_path, before.rollout_path,
++        "authoritative rollout pointer must be unchanged"
++    );
++    assert_eq!(
++        after.native, before.native,
++        "native history must be unchanged"
++    );
++    assert_eq!(
++        after.lhc_db_path, before.lhc_db_path,
++        "LHC database path must be unchanged"
++    );
++    assert_eq!(
++        after.lhc_turn_ids, before.lhc_turn_ids,
++        "captured LHC turns must be unchanged"
++    );
++    assert_eq!(
++        after.lhc_digest, before.lhc_digest,
++        "LHC database content digest must be unchanged"
++    );
++    Ok(())
++}
++
++async fn authoritative_rollout_path(mcp: &mut TestAppServer, thread_id: &str) -> Result<PathBuf> {
++    let read: ThreadReadResponse = mcp
++        .request(|request_id| ClientRequest::ThreadRead {
++            request_id,
++            params: ThreadReadParams {
++                thread_id: thread_id.to_string(),
++                include_turns: false,
++            },
++        })
++        .await?;
++    read.thread.path.context("thread rollout path missing")
++}
++
++async fn wait_for_captured_turns(path: &Path, expected: usize) -> Result<Vec<String>> {
++    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
++    loop {
++        match codex_lhc_host::live_turn_ids(path) {
++            Ok(ids) if ids.len() >= expected => return Ok(ids),
++            Ok(_) | Err(_) if tokio::time::Instant::now() < deadline => {
++                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++            }
++            Ok(ids) => anyhow::bail!(
++                "LHC DB at {} has {} turns, expected {expected}",
++                path.display(),
++                ids.len()
++            ),
++            Err(err) => anyhow::bail!("failed to read LHC turns at {}: {err}", path.display()),
++        }
++    }
++}
++
++async fn wait_for_stable_captured_turns(path: &Path, expected: usize) -> Result<Vec<String>> {
++    let mut last = wait_for_captured_turns(path, expected).await?;
++    let mut unchanged = 0usize;
++    let deadline = tokio::time::Instant::now() + DEFAULT_READ_TIMEOUT;
++    while tokio::time::Instant::now() < deadline {
++        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        match codex_lhc_host::live_turn_ids(path) {
++            Ok(ids) if ids == last => {
++                unchanged += 1;
++                if unchanged >= 6 {
++                    return Ok(last);
++                }
++            }
++            Ok(ids) => {
++                last = ids;
++                unchanged = 0;
++            }
++            Err(_) if tokio::time::Instant::now() < deadline => {}
++            Err(err) => anyhow::bail!("failed to read LHC turns at {}: {err}", path.display()),
++        }
++    }
++    anyhow::bail!(
++        "LHC turns at {} did not stabilize before timeout (last {} turns)",
++        path.display(),
++        last.len()
++    )
++}
++
+ async fn turn_ids_from_cursor(
+     mcp: &mut TestAppServer,
+     thread_id: &str,
