@@ -815,6 +815,41 @@ async fn register_live_capture(path: &str, terminated: &watch::Sender<bool>) {
     }
 }
 
+/// Owns a live-capture map slot until the worker thread takes over cleanup.
+///
+/// `register_live_capture` inserts before `LhcSession::open` awaits. Dropping
+/// that open must unregister, or every later spawn for the path waits forever.
+struct LiveCaptureAdmission {
+    path: String,
+    terminated: watch::Sender<bool>,
+    disarmed: bool,
+}
+
+impl LiveCaptureAdmission {
+    async fn acquire(path: String, terminated: watch::Sender<bool>) -> Self {
+        register_live_capture(&path, &terminated).await;
+        Self {
+            path,
+            terminated,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for LiveCaptureAdmission {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        unregister_live_capture(&self.path, &self.terminated);
+        let _ = self.terminated.send_replace(true);
+    }
+}
+
 fn unregister_live_capture(path: &str, terminated: &watch::Sender<bool>) {
     let mut live = lock_live_capture_runtimes();
     if live
@@ -856,13 +891,11 @@ pub async fn spawn_capture_with_identity(
 ) -> Option<CaptureHandle> {
     let (terminated, _) = watch::channel(false);
     let db_path = capture_db_path(thread_id, root.as_deref());
-    register_live_capture(&db_path, &terminated).await;
+    let mut admission = LiveCaptureAdmission::acquire(db_path.clone(), terminated.clone()).await;
     // Background mode derives on this session, so its callbacks are what lands
     // in the durable record — never the deterministic ones (J1).
     let opened = LhcSession::open(thread_id, cwd, root.as_deref(), derivation.callbacks()).await;
     let Some((session, tracker)) = opened else {
-        unregister_live_capture(&db_path, &terminated);
-        let _ = terminated.send_replace(true);
         return None;
     };
     let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_CAP);
@@ -943,6 +976,7 @@ pub async fn spawn_capture_with_identity(
             err
         })
         .ok()?;
+    admission.disarm();
     Some(CaptureHandle { inner: shared })
 }
 

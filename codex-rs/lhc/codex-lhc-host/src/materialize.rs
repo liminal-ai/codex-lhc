@@ -288,6 +288,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         previous_window_id: input.boundary.previous_window_id.clone(),
         window_id: Some(input.boundary.window_id.clone()),
         guardian_history: input.guardian_history.clone(),
+        guardian_covered_suffix_items: None,
         retained_context: input.retained_context.clone(),
         compaction_response_id: None,
         latest_token_usage_record: input.latest_token_usage_record.clone(),
@@ -352,6 +353,19 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
     }
     for refusal in &refusals {
         tracing::error!(%refusal, "LHC materialize refusal (context must not be installed)");
+    }
+
+    if let Some(idx) = out
+        .iter()
+        .position(|item| matches!(item, RolloutItem::Compacted(_)))
+    {
+        let covered = out[idx + 1..]
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::ResponseItem(_)))
+            .count() as u64;
+        if let RolloutItem::Compacted(item) = &mut out[idx] {
+            item.guardian_covered_suffix_items = Some(covered);
+        }
     }
 
     MaterializeResult {

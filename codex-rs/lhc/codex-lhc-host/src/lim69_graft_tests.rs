@@ -59,6 +59,7 @@ fn grafted_custom_tool_pair_survives_rollout_resume() {
         mcp_resource_origins: None,
         window_number: None, first_window_id: None, previous_window_id: None, window_id: None,
         guardian_history: None, retained_context: None, compaction_response_id: None, latest_token_usage_record: None,
+        guardian_covered_suffix_items: None,
     };
     let items = vec![
         RolloutItem::Compacted(compacted),

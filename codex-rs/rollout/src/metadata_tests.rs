@@ -295,6 +295,7 @@ fn builder_from_items_falls_back_to_filename() {
         replacement_history: None,
         retained_context: None,
         guardian_history: None,
+        guardian_covered_suffix_items: None,
         mcp_resource_origins: None,
         window_number: None,
         first_window_id: None,

@@ -1236,6 +1236,7 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -1300,6 +1301,7 @@ async fn record_initial_history_requires_surviving_full_snapshot_without_user_tu
                 replacement_history: Some(Vec::new()),
                 retained_context: None,
                 guardian_history: None,
+                guardian_covered_suffix_items: None,
                 mcp_resource_origins: None,
                 window_number: None,
                 first_window_id: None,
@@ -1336,6 +1338,7 @@ async fn record_initial_history_resumed_does_not_seed_reference_context_item_aft
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -1410,6 +1413,7 @@ async fn reconstruct_history_prefers_compacted_window_over_session_meta() {
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: Some(2),
             first_window_id: Some(compacted_first_window_id.to_string()),
@@ -1450,6 +1454,7 @@ async fn reconstruct_history_replays_world_state_from_latest_compaction_window()
                 replacement_history: Some(Vec::new()),
                 retained_context: None,
                 guardian_history: None,
+                guardian_covered_suffix_items: None,
                 mcp_resource_origins: None,
                 window_number: Some(1),
                 first_window_id: None,
@@ -1518,6 +1523,7 @@ async fn bounded_replay_matches_full_replay_after_empty_turn_compactions() {
                     guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
                         user_message("original task"),
                     ])),
+                    guardian_covered_suffix_items: None,
                     mcp_resource_origins: None,
                     window_number: Some(window_number as u64),
                     first_window_id: Some(window_ids[0].to_string()),
@@ -1627,6 +1633,7 @@ async fn reconstruct_history_preserves_legacy_compaction_count_with_session_meta
             replacement_history: None,
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -1674,6 +1681,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_does_
             replacement_history: None,
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -1715,6 +1723,7 @@ async fn reconstruct_history_legacy_compaction_without_replacement_history_clear
             replacement_history: None,
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -1827,6 +1836,7 @@ async fn record_initial_history_resumed_turn_context_after_compaction_reestablis
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -2004,6 +2014,7 @@ async fn record_initial_history_resumed_aborted_turn_without_id_clears_active_tu
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -2269,6 +2280,7 @@ async fn record_initial_history_resumed_trailing_incomplete_turn_compaction_clea
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -2452,6 +2464,7 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: None,
             first_window_id: None,
@@ -2497,12 +2510,14 @@ fn compacted_with_guardian(
     replacement: Vec<ResponseItem>,
     guardian: Vec<ResponseItem>,
     window_number: u64,
+    covered_suffix_items: u64,
 ) -> CompactedItem {
     CompactedItem {
         message: String::new(),
         replacement_history: Some(annotated(replacement)),
         retained_context: None,
         guardian_history: Some(codex_history::GuardianHistoryCheckpoint(guardian)),
+        guardian_covered_suffix_items: Some(covered_suffix_items),
         mcp_resource_origins: None,
         window_number: Some(window_number),
         first_window_id: None,
@@ -2546,6 +2561,7 @@ async fn thread_owned_guardian_keeps_first_fold_order_after_restart_without_dupl
                 vec![band],
                 vec![original_user, original_assistant],
                 1,
+                1,
             )),
             RolloutItem::ResponseItem(overlapping_tail.into()),
         ],
@@ -2588,7 +2604,12 @@ async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplic
     let rollout_items = completed_user_turn_rollout(
         context,
         vec![
-            RolloutItem::Compacted(compacted_with_guardian(vec![band], vec![first, second], 2)),
+            RolloutItem::Compacted(compacted_with_guardian(
+                vec![band],
+                vec![first, second],
+                2,
+                1,
+            )),
             RolloutItem::ResponseItem(overlapping_tail.into()),
         ],
     );
@@ -2614,5 +2635,118 @@ async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplic
         seen.len(),
         texts.len(),
         "two folds then restart must not duplicate Guardian evidence"
+    );
+}
+
+fn function_call(call_id: &str, name: &str, arguments: &str) -> ResponseItem {
+    serde_json::from_value(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments
+    }))
+    .expect("function call")
+}
+
+fn function_call_output(call_id: &str, output: &str) -> ResponseItem {
+    serde_json::from_value(json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output
+    }))
+    .expect("function call output")
+}
+
+#[tokio::test]
+async fn thread_owned_guardian_keeps_new_post_fold_exchange_after_cold_replay() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let original_user = user_message("Keep the release private.");
+    let original_assistant = assistant_message("Acknowledged.");
+    let band = user_message("folded band");
+    let overlapping_tail = user_message("Keep the release private.");
+    let new_instruction = user_message("Also redact the changelog.");
+    let tool_call = function_call(
+        "call-post-fold",
+        "shell",
+        "{\"command\":\"echo restricted\"}",
+    );
+    let tool_result = function_call_output("call-post-fold", "restricted");
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("fold-1-then-new".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted_with_guardian(
+                vec![band],
+                vec![original_user.clone(), original_assistant.clone()],
+                1,
+                1,
+            )),
+            RolloutItem::ResponseItem(overlapping_tail.into()),
+            RolloutItem::ResponseItem(new_instruction.clone().into()),
+            RolloutItem::ResponseItem(tool_call.clone().into()),
+            RolloutItem::ResponseItem(tool_result.clone().into()),
+        ],
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        reconstructed.guardian_history,
+        Some(codex_history::GuardianHistoryCheckpoint(vec![
+            original_user,
+            original_assistant,
+            new_instruction,
+            tool_call,
+            tool_result,
+        ]))
+    );
+}
+
+#[tokio::test]
+async fn native_guardian_backup_replays_new_suffix_without_duplicates_or_omissions() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let original_user = user_message("Keep the release private.");
+    let original_assistant = assistant_message("Acknowledged.");
+    let band = user_message("native folded band");
+    let new_instruction = user_message("Also redact the changelog.");
+    let tool_call = function_call(
+        "call-native-post-fold",
+        "shell",
+        "{\"command\":\"echo restricted\"}",
+    );
+    let tool_result = function_call_output("call-native-post-fold", "restricted");
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("native-fold".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted_with_guardian(
+                vec![band],
+                vec![original_user.clone(), original_assistant.clone()],
+                1,
+                0,
+            )),
+            RolloutItem::ResponseItem(new_instruction.clone().into()),
+            RolloutItem::ResponseItem(tool_call.clone().into()),
+            RolloutItem::ResponseItem(tool_result.clone().into()),
+        ],
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    assert_eq!(
+        reconstructed.guardian_history,
+        Some(codex_history::GuardianHistoryCheckpoint(vec![
+            original_user,
+            original_assistant,
+            new_instruction,
+            tool_call,
+            tool_result,
+        ]))
     );
 }

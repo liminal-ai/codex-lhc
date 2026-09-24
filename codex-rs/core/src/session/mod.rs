@@ -4017,6 +4017,7 @@ impl Session {
             replacement_history: Some(items.clone()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: Some(0),
             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
             window_number: Some(metadata.window_number),
             first_window_id: Some(metadata.window_ids.first_window_id.to_string()),

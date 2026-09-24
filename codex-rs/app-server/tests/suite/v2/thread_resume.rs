@@ -199,6 +199,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() -> 
             replacement_history: Some(Vec::new()),
             retained_context: None,
             guardian_history: None,
+            guardian_covered_suffix_items: None,
             mcp_resource_origins: None,
             window_number: Some(1),
             first_window_id: None,

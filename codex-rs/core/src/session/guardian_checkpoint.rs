@@ -16,6 +16,7 @@ impl Session {
             message: String::new(),
             replacement_history: Some(history.annotated_items().to_vec()),
             guardian_history: history.guardian_history_checkpoint(),
+            guardian_covered_suffix_items: None,
             retained_context: Some(history.retained_context().clone()),
             mcp_resource_origins: self.services.mcp_runtime.resource_origin_checkpoint(),
             window_number: Some(state.auto_compact_window_number()),

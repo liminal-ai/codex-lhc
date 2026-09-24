@@ -32,6 +32,11 @@ fn registry_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub async fn hold_registry_lock_for_tests() -> tokio::sync::MutexGuard<'static, ()> {
+    registry_lock().lock().await
+}
+
 /// Process-global compact-writer ownership registry, keyed by LHC `thread_id`.
 ///
 /// This is the host authority the SDK consults before reclaiming a stale

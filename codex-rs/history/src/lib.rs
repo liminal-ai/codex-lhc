@@ -213,6 +213,10 @@ pub struct CompactedItem {
     pub message: String,
     pub replacement_history: Option<Vec<ResponseItemEnvelope>>,
     pub guardian_history: Option<GuardianHistoryCheckpoint>,
+    /// How many post-`Compacted` `ResponseItem`s in this generation were already
+    /// covered by `guardian_history` at fold time. `None` is a legacy record
+    /// without a recorded boundary.
+    pub guardian_covered_suffix_items: Option<u64>,
     pub retained_context: Option<RetainedContext>,
     pub mcp_resource_origins: Option<McpResourceOriginCheckpoint>,
     pub window_number: Option<u64>,

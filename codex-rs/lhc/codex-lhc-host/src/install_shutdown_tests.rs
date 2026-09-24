@@ -541,6 +541,46 @@ async fn former_owner_drop_does_not_take_resumed_thread_claim() {
     assert_eq!(claimed_work_item_count(&path), 0);
 }
 
+#[tokio::test]
+async fn cancelled_spawn_capture_releases_path_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().to_path_buf();
+    let thread_id = "cancel-open-thread";
+    let derivation = LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks"));
+
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn(async move {
+        let _guard = crate::session::hold_registry_lock_for_tests().await;
+        let _ = locked_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    locked_rx.await.expect("registry lock held");
+
+    let first = tokio::time::timeout(
+        Duration::from_millis(200),
+        spawn_capture(thread_id, None, Some(root.clone()), derivation.clone()),
+    )
+    .await;
+    assert!(
+        first.is_err(),
+        "open must stay pending while the registry lock is held"
+    );
+
+    holder.abort();
+    let _ = holder.await;
+
+    let handle = tokio::time::timeout(
+        Duration::from_secs(5),
+        spawn_capture(thread_id, None, Some(root), derivation),
+    )
+    .await
+    .expect("successor must not wait forever after a cancelled open")
+    .expect("successor capture");
+    let wait = handle.clone();
+    handle.shutdown().await;
+    assert!(wait.wait_terminated_bounded(Duration::from_secs(5)).await);
+}
+
 fn seed_held_claim(path: &std::path::Path, work_item_id: &str) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("threads dir");
     let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {

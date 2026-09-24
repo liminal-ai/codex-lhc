@@ -344,10 +344,12 @@ impl Session {
             &turn_context.session_source,
         );
         let mut saw_legacy_compaction_without_replacement_history = false;
-        let park_thread_owned_checkpoint = self.guardian_context_mode
-            == GuardianContextMode::ThreadOwned
+        let covered_suffix_items = base_compaction
+            .and_then(|checkpoint| checkpoint.compacted.guardian_covered_suffix_items);
+        let park_unknown_boundary = self.guardian_context_mode == GuardianContextMode::ThreadOwned
             && base_compaction
-                .is_some_and(|checkpoint| checkpoint.compacted.guardian_history.is_some());
+                .is_some_and(|checkpoint| checkpoint.compacted.guardian_history.is_some())
+            && covered_suffix_items.is_none();
         if let Some(checkpoint) = base_compaction
             && let Some(items) = &checkpoint.compacted.replacement_history
         {
@@ -360,11 +362,16 @@ impl Session {
                 None,
             );
         }
-        // ThreadOwned Compacted.guardian_history is the full Guardian coverage at
-        // fold time. Suffix ResponseItems rebuild the parent window, including a
-        // tail already represented inside that checkpoint; do not replay them
-        // into review_history.
-        let parked_review = if park_thread_owned_checkpoint {
+        // Compacted.guardian_history is coverage at fold time. Suffix
+        // ResponseItems rebuild the parent window; only the recorded overlap
+        // is already inside that checkpoint. Legacy records without a covered
+        // count still park the whole suffix.
+        let mut remaining_overlap = if park_unknown_boundary {
+            0
+        } else {
+            covered_suffix_items.unwrap_or(0)
+        };
+        let mut parked_review = if park_unknown_boundary || remaining_overlap > 0 {
             history.take_review_history()
         } else {
             None
@@ -383,6 +390,14 @@ impl Session {
                         std::slice::from_ref(response_item),
                         turn_context.model_info().truncation_policy.into(),
                     );
+                    if remaining_overlap > 0 {
+                        remaining_overlap -= 1;
+                        if remaining_overlap == 0
+                            && let Some(review) = parked_review.take()
+                        {
+                            history.set_review_history(Some(review));
+                        }
+                    }
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
                     let response_item = communication.to_model_input_item();
@@ -438,8 +453,8 @@ impl Session {
                 | RolloutItem::SessionMeta(_) => {}
             }
         }
-        if park_thread_owned_checkpoint {
-            history.set_review_history(parked_review);
+        if let Some(review) = parked_review {
+            history.set_review_history(Some(review));
         }
 
         let reference_context_item = match reference_context_item {
