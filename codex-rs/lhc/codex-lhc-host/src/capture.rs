@@ -6,8 +6,12 @@
 //! `degraded` latches true and subsequent persists are refused until the
 //! worker is recreated (loud terminal state, not silent 80% loss).
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -23,6 +27,7 @@ use tokio::sync::watch;
 use tracing::error;
 use tracing::warn;
 
+use crate::gating::lhc_root;
 use crate::idempotency::OccurrenceTracker;
 use crate::idempotency::item_stable_id;
 use crate::mapping::MappedEvent;
@@ -38,6 +43,7 @@ use crate::mapping::map_turn_end;
 use crate::mapping::token_usage_to_provider_usage;
 use crate::projections::ensure_legacy_occurrence;
 use crate::session::LhcSession;
+use crate::session::thread_file_path;
 
 /// Bound on the capture queue. Must not block the session path.
 /// One slot is reserved for the degradation `RuntimeNote` (H6).
@@ -687,6 +693,7 @@ impl CaptureHandle {
 
     /// Wait until this capture runtime has left `worker_loop` and cannot claim
     /// again. Intake-durability ack is a separate, earlier contract.
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) async fn wait_terminated_bounded(&self, timeout: std::time::Duration) -> bool {
         let mut rx = self.inner.terminated.subscribe();
         if *rx.borrow() {
@@ -767,6 +774,68 @@ impl CaptureHandle {
     }
 }
 
+/// One live capture runtime per thread database in this process.
+///
+/// Path-scoped hand-back is only safe when a successor spawn cannot start until
+/// the previous runtime has returned and released its own claims.
+fn live_capture_runtimes() -> &'static Mutex<HashMap<String, watch::Sender<bool>>> {
+    static LIVE: OnceLock<Mutex<HashMap<String, watch::Sender<bool>>>> = OnceLock::new();
+    LIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_live_capture_runtimes()
+-> std::sync::MutexGuard<'static, HashMap<String, watch::Sender<bool>>> {
+    live_capture_runtimes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn capture_db_path(thread_id: &str, root: Option<&Path>) -> String {
+    let root = root.map(Path::to_path_buf).unwrap_or_else(lhc_root);
+    thread_file_path(&root, thread_id)
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn register_live_capture(path: &str, terminated: &watch::Sender<bool>) {
+    loop {
+        let waiter = {
+            let mut live = lock_live_capture_runtimes();
+            if let Some(existing) = live.get(path) {
+                Some(existing.subscribe())
+            } else {
+                live.insert(path.to_string(), terminated.clone());
+                None
+            }
+        };
+        let Some(mut rx) = waiter else {
+            return;
+        };
+        let _ = rx.wait_for(|done| *done).await;
+    }
+}
+
+fn unregister_live_capture(path: &str, terminated: &watch::Sender<bool>) {
+    let mut live = lock_live_capture_runtimes();
+    if live
+        .get(path)
+        .is_some_and(|existing| existing.same_channel(terminated))
+    {
+        live.remove(path);
+    }
+}
+
+fn finish_capture_runtime(
+    root: Option<&Path>,
+    thread_id: &str,
+    path: &str,
+    terminated: &watch::Sender<bool>,
+) {
+    crate::handback::on_thread_unload(root, thread_id);
+    unregister_live_capture(path, terminated);
+    let _ = terminated.send_replace(true);
+}
+
 /// Spawn a capture worker for `thread_id` under `root`.
 pub async fn spawn_capture(
     thread_id: &str,
@@ -785,15 +854,21 @@ pub async fn spawn_capture_with_identity(
     derivation: crate::inference::LateBoundCallbacks,
     initial_identity: Option<ModelIdentity>,
 ) -> Option<CaptureHandle> {
+    let (terminated, _) = watch::channel(false);
+    let db_path = capture_db_path(thread_id, root.as_deref());
+    register_live_capture(&db_path, &terminated).await;
     // Background mode derives on this session, so its callbacks are what lands
     // in the durable record — never the deterministic ones (J1).
-    let (session, tracker) =
-        LhcSession::open(thread_id, cwd, root.as_deref(), derivation.callbacks()).await?;
+    let opened = LhcSession::open(thread_id, cwd, root.as_deref(), derivation.callbacks()).await;
+    let Some((session, tracker)) = opened else {
+        unregister_live_capture(&db_path, &terminated);
+        let _ = terminated.send_replace(true);
+        return None;
+    };
     let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_CAP);
     let dropped = Arc::new(AtomicU64::new(0));
     let degraded = Arc::new(AtomicBool::new(false));
     let turn_binding = Arc::new(std::sync::Mutex::new(None));
-    let (terminated, _) = watch::channel(false);
     let shared = Arc::new(CaptureShared {
         thread_id: thread_id.to_string(),
         root: root.clone(),
@@ -806,11 +881,20 @@ pub async fn spawn_capture_with_identity(
     let thread_id_owned = thread_id.to_string();
     let degraded_worker = Arc::clone(&degraded);
     let terminated = shared.terminated.clone();
+    let finish_root = root.clone();
+    let finish_thread = thread_id.to_string();
+    let finish_path = db_path.clone();
+    let finish_terminated = terminated.clone();
     std::thread::Builder::new()
         .name(format!("lhc-capture-{thread_id}"))
         .spawn(move || {
-            let mark_terminated = || {
-                let _ = terminated.send(true);
+            let finish = || {
+                finish_capture_runtime(
+                    finish_root.as_deref(),
+                    &finish_thread,
+                    &finish_path,
+                    &finish_terminated,
+                );
             };
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -820,7 +904,7 @@ pub async fn spawn_capture_with_identity(
                 Err(err) => {
                     error!(?err, "LHC: failed to build capture runtime");
                     degraded_worker.store(true, Ordering::SeqCst);
-                    mark_terminated();
+                    finish();
                     return;
                 }
             };
@@ -851,10 +935,11 @@ pub async fn spawn_capture_with_identity(
                 };
                 error!(%msg, "LHC: capture worker panicked");
             }
-            mark_terminated();
+            finish();
         })
         .map_err(|err| {
             error!(?err, "LHC: failed to spawn capture thread");
+            finish_capture_runtime(root.as_deref(), thread_id, &db_path, &terminated);
             err
         })
         .ok()?;

@@ -1279,15 +1279,6 @@ impl ThreadRequestProcessor {
         self.thread_state_manager.clear_all_listeners().await;
     }
 
-    pub(crate) async fn list_thread_ids(&self) -> Vec<String> {
-        self.thread_manager
-            .list_thread_ids()
-            .await
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect()
-    }
-
     pub(crate) async fn shutdown_threads(&self) {
         let report = self
             .thread_manager

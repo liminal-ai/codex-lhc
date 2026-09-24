@@ -121,7 +121,7 @@ pub(super) async fn install_lhc_compact_rewrite(
         .map(|ws| serde_json::Value::Object(ws.snapshot().into_object()));
 
     let history = sess.clone_history().await;
-    let guardian_history = history.guardian_history_checkpoint();
+    let guardian_history = history.lhc_fold_guardian_checkpoint();
     let retained_context = Some(history.retained_context().clone());
     let latest_token_usage_record = sess.latest_token_usage_record().await;
 

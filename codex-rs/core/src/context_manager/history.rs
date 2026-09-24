@@ -244,6 +244,39 @@ impl ContextManager {
             .map(|history| GuardianHistoryCheckpoint(history.items().cloned().collect()))
     }
 
+    /// Guardian coverage to persist on an LHC Compacted record.
+    ///
+    /// First fold has no `review_history` yet; snapshot the current conversation
+    /// the same way [`Self::replace_compacted`] will. Later folds already hold
+    /// the independent transcript.
+    pub(crate) fn lhc_fold_guardian_checkpoint(&self) -> Option<GuardianHistoryCheckpoint> {
+        if let Some(checkpoint) = self.guardian_history_checkpoint() {
+            return Some(checkpoint);
+        }
+        if self.guardian_review_mode != GuardianContextMode::ThreadOwned
+            && self.guardian_context_mode != GuardianContextMode::ThreadOwned
+        {
+            return None;
+        }
+        let items: Vec<ResponseItem> = self
+            .raw_items()
+            .filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            })
+            .cloned()
+            .collect();
+        (!items.is_empty()).then_some(GuardianHistoryCheckpoint(items))
+    }
+
+    pub(crate) fn take_review_history(&mut self) -> Option<TranscriptHistory> {
+        self.review_history.take()
+    }
+
+    pub(crate) fn set_review_history(&mut self, history: Option<TranscriptHistory>) {
+        self.review_history = history;
+    }
+
     pub(crate) fn restore_review_context(
         &mut self,
         retained_context: Option<&RetainedContext>,

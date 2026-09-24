@@ -2492,3 +2492,127 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
     );
     assert!(session.reference_context_item().await.is_none());
 }
+
+fn compacted_with_guardian(
+    replacement: Vec<ResponseItem>,
+    guardian: Vec<ResponseItem>,
+    window_number: u64,
+) -> CompactedItem {
+    CompactedItem {
+        message: String::new(),
+        replacement_history: Some(annotated(replacement)),
+        retained_context: None,
+        guardian_history: Some(codex_history::GuardianHistoryCheckpoint(guardian)),
+        mcp_resource_origins: None,
+        window_number: Some(window_number),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+        compaction_response_id: None,
+        latest_token_usage_record: None,
+    }
+}
+
+fn guardian_item_texts(checkpoint: &codex_history::GuardianHistoryCheckpoint) -> Vec<String> {
+    checkpoint
+        .0
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { content, .. } => content.iter().find_map(|part| match part {
+                ContentItem::InputText { text } | ContentItem::OutputText { text } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn thread_owned_guardian_keeps_first_fold_order_after_restart_without_duplicates() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let original_user = user_message("Keep the release private.");
+    let original_assistant = assistant_message("Acknowledged.");
+    let band = user_message("folded band");
+    let overlapping_tail = user_message("Keep the release private.");
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("fold-1".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted_with_guardian(
+                vec![band],
+                vec![original_user, original_assistant],
+                1,
+            )),
+            RolloutItem::ResponseItem(overlapping_tail.into()),
+        ],
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    let guardian = reconstructed
+        .guardian_history
+        .expect("first-fold snapshot must persist");
+    let texts = guardian_item_texts(&guardian);
+    assert_eq!(
+        texts,
+        vec![
+            "Keep the release private.".to_string(),
+            "Acknowledged.".to_string()
+        ]
+    );
+    let mut seen = texts.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        texts.len(),
+        "restart must not duplicate Guardian evidence"
+    );
+}
+
+#[tokio::test]
+async fn thread_owned_guardian_keeps_two_fold_order_after_restart_without_duplicates() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.guardian_context_mode = GuardianContextMode::ThreadOwned;
+    let first = user_message("Keep the release private.");
+    let second = user_message("Second-fold evidence.");
+    let band = user_message("second folded band");
+    let overlapping_tail = user_message("Second-fold evidence.");
+    let mut context = turn_context.to_turn_context_item();
+    context.turn_id = Some("fold-2".into());
+    let rollout_items = completed_user_turn_rollout(
+        context,
+        vec![
+            RolloutItem::Compacted(compacted_with_guardian(vec![band], vec![first, second], 2)),
+            RolloutItem::ResponseItem(overlapping_tail.into()),
+        ],
+    );
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+    let guardian = reconstructed
+        .guardian_history
+        .expect("second-fold snapshot must persist");
+    let texts = guardian_item_texts(&guardian);
+    assert_eq!(
+        texts,
+        vec![
+            "Keep the release private.".to_string(),
+            "Second-fold evidence.".to_string()
+        ]
+    );
+    let mut seen = texts.clone();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(
+        seen.len(),
+        texts.len(),
+        "two folds then restart must not duplicate Guardian evidence"
+    );
+}

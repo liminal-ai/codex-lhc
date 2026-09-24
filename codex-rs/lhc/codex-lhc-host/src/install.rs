@@ -1283,18 +1283,7 @@ fn schedule_open(
                     // The slot is already terminal, so the guard would be a
                     // no-op; disarm to keep "handled" explicit.
                     guard.disarm();
-                    let wait = h.clone();
-                    let result = rt.block_on(h.shutdown_bounded(CAPTURE_SHUTDOWN_BOUND));
-                    let bound = match result {
-                        CaptureShutdownResult::Persisted
-                        | CaptureShutdownResult::Failed(
-                            CaptureShutdownFailure::PersistenceFailed,
-                        ) => CAPTURE_TERMINATION_BOUND,
-                        CaptureShutdownResult::Failed(_) => CAPTURE_TERMINATION_SHORT_BOUND,
-                    };
-                    if rt.block_on(wait.wait_terminated_bounded(bound)) {
-                        crate::handback::on_thread_unload(Some(root.as_path()), &thread_id);
-                    }
+                    let _ = rt.block_on(h.shutdown_bounded(CAPTURE_SHUTDOWN_BOUND));
                 }
             }
             None => {
@@ -1323,13 +1312,6 @@ const CAPTURE_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_se
 const NATIVE_SHUTDOWN_REPLY_BOUND: std::time::Duration = std::time::Duration::from_secs(12);
 #[cfg(test)]
 const NATIVE_SHUTDOWN_REPLY_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
-/// Wait for capture `worker_loop` to return after an intake-durability ack.
-/// Covers [`crate::session::CLOSE_SETTLE_BOUND`] (5s) plus queue/runtime slack.
-const CAPTURE_TERMINATION_BOUND: std::time::Duration = std::time::Duration::from_secs(6);
-#[cfg(not(test))]
-const CAPTURE_TERMINATION_SHORT_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
-#[cfg(test)]
-const CAPTURE_TERMINATION_SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(100);
 
 async fn shutdown_capture_send(handle: CaptureHandle) -> CaptureShutdownResult {
     let thread_id = handle.thread_id().to_string();
@@ -1466,54 +1448,17 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
 
     fn on_thread_stop<'a>(&'a self, input: ThreadStopInput<'a>) -> ExtensionFuture<'a, ()> {
         Box::pin(async move {
-            let thread_id = input.thread_store.level_id();
             let Some(slot) = input.thread_store.get::<LhcCaptureSlot>() else {
-                crate::handback::on_thread_unload(Some(self.root().as_path()), thread_id);
                 return;
             };
             // LIM-134: an open that is still in flight gets the existing
             // shutdown bound to land. If it does, its ordered pre-open
             // replay has already run (Ready publishes only after the
             // final drain pass) and we run the normal bounded shutdown.
+            // Claim hand-back is the capture runtime's own termination, not
+            // this lifecycle wait.
             let settled = slot.await_settled(CAPTURE_SHUTDOWN_BOUND).await;
-            let state = match &settled {
-                Some(state) => state.clone(),
-                None => slot.state(),
-            };
-            let handle = match &state {
-                CaptureState::Ready(handle) => Some(handle.clone()),
-                CaptureState::Opening | CaptureState::Failed(_) | CaptureState::Stopped => None,
-            };
-            let opening = matches!(state, CaptureState::Opening);
-            let shutdown = apply_thread_stop(&slot, settled).await;
-            let terminated = match handle {
-                Some(handle) => {
-                    let bound = match shutdown {
-                        Some(CaptureShutdownResult::Persisted)
-                        | Some(CaptureShutdownResult::Failed(
-                            CaptureShutdownFailure::PersistenceFailed,
-                        )) => CAPTURE_TERMINATION_BOUND,
-                        Some(CaptureShutdownResult::Failed(_)) | None => {
-                            CAPTURE_TERMINATION_SHORT_BOUND
-                        }
-                    };
-                    handle.wait_terminated_bounded(bound).await
-                }
-                None => !opening,
-            };
-            if terminated {
-                crate::handback::on_thread_unload(Some(self.root().as_path()), thread_id);
-            } else if opening {
-                debug!(
-                    thread_id = %thread_id,
-                    "LHC: thread stop left capture Opening; scoped hand-back waits for a late open to terminate"
-                );
-            } else {
-                warn!(
-                    thread_id = %thread_id,
-                    "LHC: skipping scoped hand-back; capture runtime has not stopped"
-                );
-            }
+            let _ = apply_thread_stop(&slot, settled).await;
         })
     }
 }
@@ -1526,7 +1471,6 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
 /// live Ready with `stop_and_drop_pending` would skip that shutdown.
 ///
 /// Returns the intake-durability ack when a Ready handle was shut down.
-/// Scoped hand-back waits for capture termination after this ack.
 async fn apply_thread_stop(
     slot: &LhcCaptureSlot,
     settled: Option<CaptureState>,

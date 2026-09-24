@@ -58,7 +58,7 @@ fn status(db: &Db, work_item_id: &str) -> String {
 }
 
 #[test]
-fn server_shutdown_releases_only_that_servers_thread_databases() {
+fn path_scoped_unload_releases_only_that_thread_database() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path();
     std::fs::create_dir_all(root.join("threads")).expect("threads dir");
@@ -71,11 +71,11 @@ fn server_shutdown_releases_only_that_servers_thread_databases() {
     seed_claimed(&db_a, "w-a");
     seed_claimed(&db_b, "w-b");
 
-    on_server_shutdown(Some(root), [client_a.as_str()]);
+    on_thread_unload(Some(root), &client_a);
 
     assert_eq!(status(&db_a, "w-a"), "queued");
     assert_eq!(status(&db_b, "w-b"), "claimed");
 
-    on_server_shutdown(Some(root), [client_b.as_str()]);
+    on_thread_unload(Some(root), &client_b);
     assert_eq!(status(&db_b, "w-b"), "queued");
 }

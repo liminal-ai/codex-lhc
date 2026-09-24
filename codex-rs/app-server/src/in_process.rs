@@ -502,7 +502,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 crate::transport::ConnectionOrigin::InProcess,
             ));
             let mut listen_for_threads = true;
-            let mut owned_thread_ids = Vec::<String>::new();
 
             loop {
                 tokio::select! {
@@ -551,7 +550,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {
                             Ok(thread_id) => {
-                                owned_thread_ids.push(thread_id.to_string());
                                 let connection_ids = if session.initialized() {
                                     vec![IN_PROCESS_CONNECTION_ID]
                                 } else {
@@ -573,9 +571,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             }
 
             processor.clear_runtime_references();
-            owned_thread_ids.extend(processor.list_thread_ids().await);
-            owned_thread_ids.sort();
-            owned_thread_ids.dedup();
             processor.cancel_active_login().await;
             processor
                 .connection_closed(IN_PROCESS_CONNECTION_ID, &session)
@@ -583,12 +578,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             processor.clear_all_thread_listeners().await;
             processor.drain_background_tasks().await;
             processor.shutdown_threads().await;
-            // Release only this client's databases. Process-wide release-all
-            // would take other live in-process clients' claims.
-            codex_lhc_host::on_server_shutdown(
-                /*root*/ None,
-                owned_thread_ids.iter().map(String::as_str),
-            );
         });
         let mut pending_request_responses =
             HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
@@ -1028,6 +1017,47 @@ mod tests {
             work_item_status(&path_b, "w-b"),
             "claimed",
             "closing client A must not take client B's held claim"
+        );
+
+        client_b
+            .shutdown()
+            .await
+            .expect("client B should shutdown cleanly");
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("CODEX_LHC_ROOT", value) },
+            None => unsafe { std::env::remove_var("CODEX_LHC_ROOT") },
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(codex_lhc_root)]
+    async fn closing_one_lhc_client_leaves_the_other_clients_live_claim() {
+        let lhc_root = TempDir::new().expect("lhc root");
+        let previous = std::env::var_os("CODEX_LHC_ROOT");
+        // SAFETY: serialized against other CODEX_LHC_ROOT tests.
+        unsafe { std::env::set_var("CODEX_LHC_ROOT", lhc_root.path()) };
+
+        let client_a = start_test_client(SessionSource::Cli).await;
+        let client_b = start_test_client(SessionSource::Cli).await;
+        let thread_a = start_thread(&client_a, 21).await;
+        let thread_b = start_thread(&client_b, 22).await;
+        let path_a = codex_lhc_host::thread_sqlite_path(&thread_a, Some(lhc_root.path()))
+            .expect("thread A sqlite path");
+        let path_b = codex_lhc_host::thread_sqlite_path(&thread_b, Some(lhc_root.path()))
+            .expect("thread B sqlite path");
+        seed_held_claim(&path_a, "w-a-lhc");
+        seed_held_claim(&path_b, "w-b-lhc");
+
+        client_a
+            .shutdown()
+            .await
+            .expect("client A should shutdown cleanly");
+
+        assert_eq!(
+            work_item_status(&path_b, "w-b-lhc"),
+            "claimed",
+            "closing an LHC capture client must not take another live client's claim"
         );
 
         client_b

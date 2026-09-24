@@ -19,6 +19,7 @@ use codex_protocol::protocol::TokenUsage;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 struct LifecycleHarness {
     registry: ExtensionRegistry<()>,
@@ -335,7 +336,6 @@ async fn shutdown_ack_returns_while_seeded_provider_is_pending() {
         wait.wait_terminated_bounded(Duration::from_secs(8)).await,
         "close settle bound must still terminate the capture runtime"
     );
-    crate::handback::on_thread_unload(Some(root), thread_id);
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
@@ -378,11 +378,201 @@ async fn thread_stop_hands_back_only_after_pending_provider_runtime_stops() {
         stopped.is_ok(),
         "thread stop must stay bounded while inference is pending"
     );
+    assert!(
+        claimed_work_item_count(&path) > 0,
+        "thread stop must not hand back while the capture worker is still settling"
+    );
+    assert!(
+        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "runtime-owned hand-back waits for worker_loop to return"
+    );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         claimed_work_item_count(&path),
         0,
-        "thread stop must not requeue a claim under a still-running worker"
+        "a stopped runtime must not requeue a claim after its own hand-back"
     );
+}
+
+#[tokio::test]
+async fn terminated_state_is_visible_to_a_subscriber_that_arrives_after_completion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn_capture(
+        "complete-before-subscribe",
+        None,
+        Some(dir.path().to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("capture");
+    let wait = handle.clone();
+    handle.shutdown().await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !wait.is_terminated() {
+        assert!(
+            Instant::now() < deadline,
+            "idle shutdown must publish terminated without a live subscriber"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let started = Instant::now();
+    assert!(
+        wait.wait_terminated_bounded(Duration::from_secs(2)).await,
+        "late subscribe must observe the retained terminated state"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "completion-before-subscribe must not wait the termination bound; elapsed {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn idle_thread_stop_does_not_wait_the_termination_bound() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let harness = LifecycleHarness::start(dir.path(), "idle-clean-close").await;
+    let started = Instant::now();
+    harness.stop_thread().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "idle clean close must not sit on the capture termination bound; elapsed {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn shutdown_timeout_with_live_worker_hands_back_once_after_return() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "timeout-live-worker";
+    let harness = LifecycleHarness::start(root, thread_id).await;
+    let handle = harness.slot().get().expect("capture handle");
+    let path = crate::session::thread_file_path(root, thread_id);
+    seed_held_claim(&path, "w-timeout");
+    assert_eq!(claimed_work_item_count(&path), 1);
+
+    let release = handle.block_worker().await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), harness.stop_thread()).await;
+    assert!(
+        stopped.is_ok(),
+        "thread stop must return when shutdown ack times out on a live worker"
+    );
+    assert!(
+        !handle.is_terminated(),
+        "blocked worker must still be inside worker_loop after the stop bound"
+    );
+    assert_eq!(
+        claimed_work_item_count(&path),
+        1,
+        "no hand-back until the live worker returns"
+    );
+
+    let _ = release.send(());
+    assert!(
+        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "unblocking the worker must finish the runtime"
+    );
+    assert_eq!(claimed_work_item_count(&path), 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        claimed_work_item_count(&path),
+        0,
+        "hand-back must happen exactly once after the worker returns"
+    );
+}
+
+#[tokio::test]
+async fn former_owner_drop_does_not_take_resumed_thread_claim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "transfer-thread";
+    let owner_a = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+    )
+    .await
+    .expect("owner A capture");
+    let wait_a = owner_a.clone();
+    owner_a.shutdown().await;
+    assert!(
+        wait_a.wait_terminated_bounded(Duration::from_secs(5)).await,
+        "A must fully terminate before B resumes the same thread"
+    );
+    drop(wait_a);
+
+    let owner_b = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("owner B capture");
+    owner_b.persist(
+        &message("user", "resume derivation prompt", "user-resume"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    owner_b.persist(
+        &message("assistant", "resume derivation reply", "assistant-resume"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    owner_b.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "B's resumed runtime must hold a real derivation claim"
+    );
+
+    // Former owner close is not a path-scoped sweep. Dropping A (already
+    // terminated) must leave B's claim claimed.
+    assert!(
+        claimed_work_item_count(&path) > 0,
+        "closing the former owner must not take the live successor's claim"
+    );
+    let wait_b = owner_b.clone();
+    owner_b.shutdown().await;
+    assert!(wait_b.wait_terminated_bounded(Duration::from_secs(8)).await);
+    assert_eq!(claimed_work_item_count(&path), 0);
+}
+
+fn seed_held_claim(path: &std::path::Path, work_item_id: &str) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("threads dir");
+    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+    };
+    db.exec(&format!(
+        "CREATE TABLE IF NOT EXISTS work_item (
+            work_item_id TEXT PRIMARY KEY,
+            owner TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            status TEXT NOT NULL,
+            queued_at TEXT NOT NULL,
+            claimed_at TEXT,
+            claim_expires_at TEXT,
+            payload TEXT NOT NULL
+         );
+         INSERT OR REPLACE INTO work_item (
+            work_item_id, owner, kind, source_ref, status, queued_at,
+            claimed_at, claim_expires_at, payload
+         ) VALUES (
+            '{work_item_id}', 'test', 'test', 'test', 'claimed', 'now',
+            'now', 'later', '{{\"claimAttempt\":1}}'
+         );"
+    ));
+    lhc::shared_tech::work_queue::note_claim_held(
+        &db,
+        &lhc::shared_tech::work_queue::ClaimAttempt {
+            work_item_id: work_item_id.into(),
+            claim_attempt: Some(1),
+        },
+    );
+    db.close();
 }

@@ -344,6 +344,10 @@ impl Session {
             &turn_context.session_source,
         );
         let mut saw_legacy_compaction_without_replacement_history = false;
+        let park_thread_owned_checkpoint = self.guardian_context_mode
+            == GuardianContextMode::ThreadOwned
+            && base_compaction
+                .is_some_and(|checkpoint| checkpoint.compacted.guardian_history.is_some());
         if let Some(checkpoint) = base_compaction
             && let Some(items) = &checkpoint.compacted.replacement_history
         {
@@ -356,6 +360,15 @@ impl Session {
                 None,
             );
         }
+        // ThreadOwned Compacted.guardian_history is the full Guardian coverage at
+        // fold time. Suffix ResponseItems rebuild the parent window, including a
+        // tail already represented inside that checkpoint; do not replay them
+        // into review_history.
+        let parked_review = if park_thread_owned_checkpoint {
+            history.take_review_history()
+        } else {
+            None
+        };
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
@@ -424,6 +437,9 @@ impl Session {
                 | RolloutItem::TokenUsageRecord(_)
                 | RolloutItem::SessionMeta(_) => {}
             }
+        }
+        if park_thread_owned_checkpoint {
+            history.set_review_history(parked_review);
         }
 
         let reference_context_item = match reference_context_item {

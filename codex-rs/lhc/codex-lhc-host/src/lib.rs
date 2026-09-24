@@ -183,7 +183,6 @@ pub use capture::TurnBinding;
 pub use capture::spawn_capture;
 pub use gating::lhc_root;
 pub use handback::on_process_shutdown;
-pub use handback::on_server_shutdown;
 pub use handback::on_thread_unload;
 pub use idempotency::OccurrenceTracker;
 pub use idempotency::encode_thread_id;
