@@ -145,8 +145,6 @@ mod tests {
 pub struct LateBoundCallbacks {
     slot: std::sync::Arc<std::sync::Mutex<Option<InferenceCallbacks>>>,
     ready: std::sync::Arc<tokio::sync::Notify>,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    cancel_notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl LateBoundCallbacks {
@@ -154,17 +152,7 @@ impl LateBoundCallbacks {
         Self {
             slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
             ready: std::sync::Arc::new(tokio::sync::Notify::new()),
-            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
-    }
-
-    /// Cancel in-flight `resolve` waits. The callback future is then dropped
-    /// with the capture runtime; do not return `InferenceResult::Err` (terminal).
-    pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.cancel_notify.notify_waiters();
     }
 
     /// Install the host's production callbacks and wake anything waiting.
@@ -197,42 +185,17 @@ impl LateBoundCallbacks {
             .clone()
     }
 
-    async fn wait_cancelled(&self) {
-        loop {
-            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            let notified = self.cancel_notify.notified();
-            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                return;
-            }
-            notified.await;
-        }
-    }
-
     async fn resolve(&self) -> InferenceCallbacks {
         loop {
-            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
             if let Some(cb) = self.get() {
                 return cb;
             }
             let notified = self.ready.notified();
-            let cancelled = self.cancel_notify.notified();
             // Re-check after arming so a seed racing the arm is not missed.
-            if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-                std::future::pending::<()>().await;
-            }
             if let Some(cb) = self.get() {
                 return cb;
             }
-            tokio::select! {
-                _ = notified => {}
-                _ = cancelled => {
-                    std::future::pending::<()>().await;
-                }
-            }
+            notified.await;
         }
     }
 
@@ -249,16 +212,8 @@ impl LateBoundCallbacks {
                 std::sync::Arc::new(move |input: $ty| {
                     let binding = binding.clone();
                     Box::pin(async move {
-                        tokio::select! {
-                            biased;
-                            () = binding.wait_cancelled() => {
-                                std::future::pending::<lhc::shared_tech::InferenceResult>().await
-                            }
-                            result = async {
-                                let cb = binding.resolve().await;
-                                (cb.$field)(input).await
-                            } => result,
-                        }
+                        let cb = binding.resolve().await;
+                        (cb.$field)(input).await
                     })
                         as lhc::shared_tech::derivation::BoxFuture<
                             lhc::shared_tech::InferenceResult,

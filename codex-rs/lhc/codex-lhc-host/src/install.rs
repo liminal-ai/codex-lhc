@@ -57,8 +57,7 @@ use crate::capture::CAPTURE_QUEUE_CAP;
 use crate::capture::CaptureHandle;
 use crate::capture::CaptureShutdownFailure;
 use crate::capture::CaptureShutdownResult;
-use crate::capture::LiveCaptureAdmission;
-use crate::capture::spawn_capture_with_admission;
+use crate::capture::spawn_capture_with_identity;
 use crate::gating::lhc_root;
 use crate::mapping::ModelIdentity;
 use crate::mapping::TurnEndFacts;
@@ -185,7 +184,6 @@ pub const CAPTURE_OPEN_RUNTIME_UNAVAILABLE: &str = "capture open runtime unavail
 pub const CAPTURE_OPEN_FAILED: &str = "capture open failed";
 pub const CAPTURE_OPEN_THREAD_UNAVAILABLE: &str = "capture open thread unavailable";
 pub const CAPTURE_OPEN_ABANDONED: &str = "capture open abandoned before settling";
-pub const CAPTURE_STILL_SHUTTING_DOWN: &str = "LHC for this thread is still shutting down; retry";
 
 /// Why resolving a live retrieval thread from the capture slot failed.
 ///
@@ -1233,7 +1231,6 @@ fn schedule_open(
     root: PathBuf,
     initial_identity: Option<ModelIdentity>,
     fault: Option<OpenThreadFaultSeam>,
-    admission: LiveCaptureAdmission,
 ) {
     if slot
         .open_scheduled
@@ -1263,13 +1260,12 @@ fn schedule_open(
                 return;
             }
         };
-        let handle = rt.block_on(spawn_capture_with_admission(
+        let handle = rt.block_on(spawn_capture_with_identity(
             &thread_id,
             cwd.as_deref(),
             Some(root.clone()),
             derivation,
             initial_identity,
-            Some(admission),
         ));
         match handle {
             Some(h) => {
@@ -1421,16 +1417,7 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 debug!(thread_id = %thread_id, "LHC: capture slot held Opening (test)");
                 return;
             }
-            let db_path = crate::capture::capture_db_path_for(&thread_id, Some(root.as_path()));
-            let admission = match LiveCaptureAdmission::acquire(db_path).await {
-                Ok(admission) => admission,
-                Err(()) => {
-                    slot.publish_failed(CAPTURE_STILL_SHUTTING_DOWN);
-                    return;
-                }
-            };
-            // Fire-and-forget SQLite open — Session construction is not blocked
-            // on the database. The process-wide path slot is already reserved.
+            // Fire-and-forget open — Session construction continues immediately.
             schedule_open(
                 slot,
                 thread_id,
@@ -1438,7 +1425,6 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
                 root,
                 Some(identity),
                 self.open_thread_fault,
-                admission,
             );
         })
     }

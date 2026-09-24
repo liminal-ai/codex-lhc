@@ -5,36 +5,15 @@
 //! app-server). Requires the lhc-rs pin that exports `release_held_claims_for`.
 
 use std::path::Path;
-use std::time::Duration;
 
 use tracing::info;
-use tracing::warn;
 
 use crate::gating::lhc_root;
 use crate::session::thread_file_path;
 
-/// Per-statement SQLite wait in `release_held_claims_for` (`PRAGMA busy_timeout
-/// = 2000` in `claim_fence.rs`). Not a total bound on the hand-back call.
-pub(crate) const HANDBACK_BOUND: Duration = Duration::from_secs(2);
-
 /// Hand back claims held on one thread database. Call from that thread's
 /// capture runtime after its worker loop has returned.
 pub fn on_thread_unload(root: Option<&Path>, thread_id: &str) {
-    on_thread_unload_within(root, thread_id, HANDBACK_BOUND);
-}
-
-/// Like [`on_thread_unload`], but skip SQLite if `remaining` cannot cover one
-/// per-statement busy wait. Lease expiry is the fallback. The caller keeps the
-/// live-path reservation until this returns.
-pub(crate) fn on_thread_unload_within(root: Option<&Path>, thread_id: &str, remaining: Duration) {
-    if remaining < HANDBACK_BOUND {
-        warn!(
-            thread_id,
-            remaining_ms = remaining.as_millis(),
-            "LHC: hand-back skipped; claims left to expire"
-        );
-        return;
-    }
     let root = root.map(Path::to_path_buf).unwrap_or_else(lhc_root);
     let path = thread_file_path(&root, thread_id);
     let Some(path) = path.to_str() else {

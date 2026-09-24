@@ -5,11 +5,8 @@ use super::*;
 use crate::LateBoundCallbacks;
 use crate::lhc_inference_callbacks;
 use crate::spawn_capture;
-use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistry;
-use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::RawItemInput;
-use codex_extension_api::ThreadStartInput;
 use codex_extension_api::ThreadStopInput;
 use codex_extension_api::TurnStartInput;
 use codex_extension_api::TurnStopInput;
@@ -327,9 +324,17 @@ async fn shutdown_ack_returns_while_seeded_provider_is_pending() {
         started.elapsed()
     );
     assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "cancelled derivation must let the capture runtime return within write+close settle"
+        !wait.is_terminated(),
+        "capture runtime must still be inside close while the provider is pending"
+    );
+    assert!(
+        claimed_work_item_count(&path) > 0,
+        "claim must stay held until the capture runtime stops"
+    );
+
+    assert!(
+        wait.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "close settle bound must still terminate the capture runtime"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -374,10 +379,12 @@ async fn thread_stop_hands_back_only_after_pending_provider_runtime_stops() {
         "thread stop must stay bounded while inference is pending"
     );
     assert!(
-        handle
-            .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "cancelled derivation must return the worker within write+close settle"
+        claimed_work_item_count(&path) > 0,
+        "thread stop must not hand back while the capture worker is still settling"
+    );
+    assert!(
+        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "runtime-owned hand-back waits for worker_loop to return"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -446,17 +453,26 @@ async fn shutdown_timeout_with_live_worker_hands_back_once_after_return() {
     seed_held_claim(&path, "w-timeout");
     assert_eq!(claimed_work_item_count(&path), 1);
 
-    let _release = handle.block_worker().await;
+    let release = handle.block_worker().await;
     let stopped = tokio::time::timeout(Duration::from_secs(5), harness.stop_thread()).await;
     assert!(
         stopped.is_ok(),
-        "thread stop must return when shutdown preempts a blocked worker"
+        "thread stop must return when shutdown ack times out on a live worker"
     );
     assert!(
-        handle
-            .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "shutdown must preempt Block and return the worker within write+close settle"
+        !handle.is_terminated(),
+        "blocked worker must still be inside worker_loop after the stop bound"
+    );
+    assert_eq!(
+        claimed_work_item_count(&path),
+        1,
+        "no hand-back until the live worker returns"
+    );
+
+    let _ = release.send(());
+    assert!(
+        handle.wait_terminated_bounded(Duration::from_secs(8)).await,
+        "unblocking the worker must finish the runtime"
     );
     assert_eq!(claimed_work_item_count(&path), 0);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -523,625 +539,6 @@ async fn former_owner_drop_does_not_take_resumed_thread_claim() {
     owner_b.shutdown().await;
     assert!(wait_b.wait_terminated_bounded(Duration::from_secs(8)).await);
     assert_eq!(claimed_work_item_count(&path), 0);
-}
-
-#[tokio::test]
-async fn cancelled_spawn_capture_releases_path_slot() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    let thread_id = "cancel-open-thread";
-    let derivation = LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks"));
-
-    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
-    let holder = tokio::spawn(async move {
-        let _guard = crate::session::hold_registry_lock_for_tests().await;
-        let _ = locked_tx.send(());
-        std::future::pending::<()>().await;
-    });
-    locked_rx.await.expect("registry lock held");
-
-    let first = tokio::time::timeout(
-        Duration::from_millis(200),
-        spawn_capture(thread_id, None, Some(root.clone()), derivation.clone()),
-    )
-    .await;
-    assert!(
-        first.is_err(),
-        "open must stay pending while the registry lock is held"
-    );
-
-    holder.abort();
-    let _ = holder.await;
-
-    let handle = tokio::time::timeout(
-        Duration::from_secs(5),
-        spawn_capture(thread_id, None, Some(root), derivation),
-    )
-    .await
-    .expect("successor must not wait forever after a cancelled open")
-    .expect("successor capture");
-    let wait = handle.clone();
-    handle.shutdown().await;
-    assert!(wait.wait_terminated_bounded(Duration::from_secs(5)).await);
-}
-
-#[tokio::test]
-async fn shutdown_returns_within_bound_when_derivation_call_hangs() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r8-derivation-hang";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(pending_inference_callbacks()),
-    )
-    .await
-    .expect("capture");
-    handle.persist(
-        &message("user", "hang derivation prompt", "user-1"),
-        RawItemProvenance::UserPrompt,
-        /*step_index*/ None,
-    );
-    handle.persist(
-        &message("assistant", "hang derivation reply", "assistant-1"),
-        RawItemProvenance::ModelOutput,
-        /*step_index*/ None,
-    );
-    handle.flush().await;
-    let path = crate::session::thread_file_path(root, thread_id);
-    assert!(
-        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
-        "hanging derivation must hold a claim"
-    );
-    let wait = handle.clone();
-    let started = Instant::now();
-    handle.shutdown().await;
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "worker stuck in a derivation call must return within write+close settle"
-    );
-    assert!(
-        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
-        "elapsed {:?}",
-        started.elapsed()
-    );
-    assert_eq!(claimed_work_item_count(&path), 0);
-}
-
-#[tokio::test]
-async fn shutdown_returns_within_bound_when_resolve_is_unseeded() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r8-unseeded-resolve";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::new(),
-    )
-    .await
-    .expect("capture");
-    handle.persist(
-        &message("user", "unseeded prompt", "user-1"),
-        RawItemProvenance::UserPrompt,
-        /*step_index*/ None,
-    );
-    handle.persist(
-        &message("assistant", "unseeded reply", "assistant-1"),
-        RawItemProvenance::ModelOutput,
-        /*step_index*/ None,
-    );
-    handle.flush().await;
-    let wait = handle.clone();
-    let started = Instant::now();
-    handle.shutdown().await;
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "worker stuck in unseeded resolve must return within write+close settle"
-    );
-    assert!(
-        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
-        "elapsed {:?}",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn shutdown_returns_within_bound_when_persist_is_blocked() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r8-blocked-persist";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    handle.flush().await;
-    let path = crate::session::thread_file_path(root, thread_id);
-    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
-        lhc::shared_tech::errors::OpResult::Ok { value } => value,
-        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
-    };
-    db.exec("BEGIN EXCLUSIVE");
-    handle.persist(
-        &message("user", "blocked persist prompt", "user-block"),
-        RawItemProvenance::UserPrompt,
-        /*step_index*/ None,
-    );
-    let wait = handle.clone();
-    let started = Instant::now();
-    handle.shutdown().await;
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "worker stuck in persist must return within write+close settle"
-    );
-    assert!(
-        started.elapsed() < crate::capture::CAPTURE_WORKER_RETURN_BOUND,
-        "elapsed {:?}",
-        started.elapsed()
-    );
-    db.exec("ROLLBACK");
-}
-
-#[tokio::test]
-async fn shutdown_returns_within_bound_when_queued_writes_are_blocked() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r8-queued-writes";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    handle.flush().await;
-    let path = crate::session::thread_file_path(root, thread_id);
-    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
-        lhc::shared_tech::errors::OpResult::Ok { value } => value,
-        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
-    };
-    db.exec("BEGIN EXCLUSIVE");
-    for index in 0..3 {
-        handle.persist(
-            &message(
-                "user",
-                &format!("queued persist {index}"),
-                &format!("user-queued-{index}"),
-            ),
-            RawItemProvenance::UserPrompt,
-            /*step_index*/ None,
-        );
-    }
-    let wait = handle.clone();
-    let started = Instant::now();
-    let result = handle
-        .shutdown_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-        .await;
-    assert_eq!(
-        result,
-        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed),
-        "uncommitted queued writes must not be reported as Persisted"
-    );
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "queued writes under a held lock must finish or fail within write+close settle"
-    );
-    assert!(
-        started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND + Duration::from_secs(1),
-        "elapsed {:?}",
-        started.elapsed()
-    );
-    db.exec("ROLLBACK");
-}
-
-#[tokio::test]
-async fn shutdown_returns_within_bound_when_active_flush_is_blocked() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r8-active-flush";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    handle.flush().await;
-    let path = crate::session::thread_file_path(root, thread_id);
-    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
-        lhc::shared_tech::errors::OpResult::Ok { value } => value,
-        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
-    };
-    db.exec("BEGIN EXCLUSIVE");
-    for index in 0..3 {
-        handle.persist(
-            &message(
-                "assistant",
-                &format!("flush output {index}"),
-                &format!("asst-flush-{index}"),
-            ),
-            RawItemProvenance::ModelOutput,
-            /*step_index*/ None,
-        );
-    }
-    handle.flush_async();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let wait = handle.clone();
-    let started = Instant::now();
-    let result = handle.shutdown_bounded(Duration::from_secs(11)).await;
-    assert_eq!(
-        result,
-        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed),
-        "an in-flight flush under a held lock must not report Persisted"
-    );
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "active flush under a held lock must return within the worker bound"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(11),
-        "active flush must not run past 11s; elapsed {:?}",
-        started.elapsed()
-    );
-    db.exec("ROLLBACK");
-}
-
-#[cfg(target_os = "linux")]
-fn capture_os_thread_alive(thread_id: &str) -> bool {
-    let mut comm = format!("lhc-capture-{thread_id}");
-    comm.truncate(15);
-    std::fs::read_dir("/proc/self/task")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| {
-            std::fs::read_to_string(entry.path().join("comm"))
-                .ok()
-                .is_some_and(|name| name.trim() == comm)
-        })
-}
-
-#[tokio::test]
-async fn shutdown_releases_reservation_within_bound_when_flush_and_handback_are_blocked() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "cf";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(pending_inference_callbacks()),
-    )
-    .await
-    .expect("capture");
-    handle.persist(
-        &message("user", "hold a real derivation claim", "user-claim"),
-        RawItemProvenance::UserPrompt,
-        /*step_index*/ None,
-    );
-    handle.flush().await;
-    let path = crate::session::thread_file_path(root, thread_id);
-    assert!(
-        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
-        "seeded hanging inference must hold a claim"
-    );
-    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
-        lhc::shared_tech::errors::OpResult::Ok { value } => value,
-        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
-    };
-    db.exec("BEGIN EXCLUSIVE");
-    for index in 0..3 {
-        handle.persist(
-            &message(
-                "assistant",
-                &format!("flush output {index}"),
-                &format!("asst-cf-{index}"),
-            ),
-            RawItemProvenance::ModelOutput,
-            /*step_index*/ None,
-        );
-    }
-    handle.flush_async();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let wait = handle.clone();
-    let started = Instant::now();
-    let result = handle
-        .shutdown_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-        .await;
-    assert_eq!(
-        result,
-        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed)
-    );
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "reservation must be released by the worker-return bound"
-    );
-    #[cfg(target_os = "linux")]
-    {
-        while capture_os_thread_alive(thread_id)
-            && started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            !capture_os_thread_alive(thread_id),
-            "capture OS thread must be gone by the bound; elapsed {:?}",
-            started.elapsed()
-        );
-    }
-    assert!(
-        started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND,
-        "capture thread and reservation outlived the bound; elapsed {:?}",
-        started.elapsed()
-    );
-    db.exec("ROLLBACK");
-    let successor = tokio::time::timeout(
-        Duration::from_secs(2),
-        spawn_capture(
-            thread_id,
-            None,
-            Some(root.to_path_buf()),
-            LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-        ),
-    )
-    .await
-    .expect("successor must not wait on a leaked reservation");
-    let successor = successor.expect("successor must open after reservation release");
-    successor.shutdown().await;
-}
-
-#[tokio::test]
-async fn drain_settled_aborts_when_shutdown_is_requested() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let handle = spawn_capture(
-        "ds",
-        None,
-        Some(dir.path().to_path_buf()),
-        LateBoundCallbacks::seeded(pending_inference_callbacks()),
-    )
-    .await
-    .expect("capture");
-    handle.persist(
-        &message("user", "pending drain", "user-drain"),
-        RawItemProvenance::UserPrompt,
-        /*step_index*/ None,
-    );
-    handle.flush().await;
-    let wait = handle.clone();
-    let draining = tokio::spawn(async move { wait.drain_settled(Duration::from_secs(120)).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let started = Instant::now();
-    handle.shutdown().await;
-    let settled = tokio::time::timeout(Duration::from_secs(2), draining)
-        .await
-        .expect("DrainSettled must not ignore shutdown")
-        .expect("drain task");
-    assert!(!settled, "shutdown must abort DrainSettled as unsettled");
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "DrainSettled ignored shutdown; elapsed {:?}",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn dropping_last_handle_releases_admission_for_a_successor() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    let thread_id = "r10-last-handle-drop";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.clone()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    drop(handle);
-    let successor = tokio::time::timeout(
-        Duration::from_secs(2),
-        spawn_capture(
-            thread_id,
-            None,
-            Some(root),
-            LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-        ),
-    )
-    .await;
-    let successor = successor.expect("successor must not wait on a leaked reservation");
-    let successor = successor.expect("successor must open after last handle drop");
-    successor.shutdown().await;
-}
-
-#[tokio::test]
-async fn shutdown_drains_queued_model_change_through_the_command_handler() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path();
-    let thread_id = "r11-model-change";
-    let handle = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    let release = handle.block_worker().await;
-    handle.model_or_thinking_change("old", "new", "low", "high");
-    let wait = handle.clone();
-    let shutting =
-        tokio::spawn(async move { handle.shutdown_bounded(Duration::from_secs(5)).await });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let _ = release.send(());
-    let result = shutting.await.expect("join");
-    assert_eq!(result, CaptureShutdownResult::Persisted);
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await
-    );
-    let reopened = spawn_capture(
-        thread_id,
-        None,
-        Some(root.to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("reopen");
-    let kinds = reopened
-        .list_events()
-        .await
-        .expect("list events")
-        .iter()
-        .map(|event| event.event_kind().as_str().to_string())
-        .collect::<Vec<_>>();
-    assert!(
-        kinds.iter().any(|kind| kind == "model_change"),
-        "queued model change must be committed; kinds={kinds:?}"
-    );
-    assert!(
-        kinds.iter().any(|kind| kind == "thinking_level_change"),
-        "queued thinking-level change must be committed; kinds={kinds:?}"
-    );
-    reopened.shutdown().await;
-}
-
-#[tokio::test]
-async fn shutdown_none_with_a_live_handle_does_not_wait_the_deadline() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let handle = spawn_capture(
-        "r12-shutdown-none",
-        None,
-        Some(dir.path().to_path_buf()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("capture");
-    let wait = handle.clone();
-    let started = Instant::now();
-    handle.shutdown_async();
-    assert!(
-        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-            .await,
-        "Shutdown(None) must still retire the worker"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "Shutdown(None) must not wait the full return deadline; elapsed {:?}",
-        started.elapsed()
-    );
-}
-
-#[tokio::test]
-async fn racing_thread_starts_loser_gets_retry_error() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    let thread_id = "r8-race-admission";
-    let start = |root: std::path::PathBuf| async move {
-        let mut builder = ExtensionRegistryBuilder::<()>::new();
-        install_with_root(&mut builder, |_config| true, root);
-        let registry = builder.build();
-        let session_store = ExtensionData::new("session");
-        let thread_store = ExtensionData::new(thread_id);
-        let config = ();
-        let session_source = SessionSource::Exec;
-        let environments = [];
-        for contributor in registry.thread_lifecycle_contributors() {
-            contributor
-                .on_thread_start(ThreadStartInput {
-                    config: &config,
-                    session_source: &session_source,
-                    persistent_thread_state_available: false,
-                    environments: &environments,
-                    mcp_resource_client: None,
-                    extension_metrics: None,
-                    session_store: &session_store,
-                    thread_store: &thread_store,
-                })
-                .await;
-        }
-        let slot = thread_store.get::<LhcCaptureSlot>().expect("capture slot");
-        (registry, session_store, thread_store, slot.state())
-    };
-    let ((registry_a, session_a, thread_a, state_a), (registry_b, session_b, thread_b, state_b)) =
-        tokio::join!(start(root.clone()), start(root));
-    let retry = |state: &CaptureState| matches!(state, CaptureState::Failed(reason) if reason == CAPTURE_STILL_SHUTTING_DOWN);
-    assert!(
-        retry(&state_a) ^ retry(&state_b),
-        "exactly one starter must fail with the retry error; a={state_a:?} b={state_b:?}"
-    );
-    let winner = if retry(&state_a) {
-        (&registry_b, &session_b, &thread_b)
-    } else {
-        (&registry_a, &session_a, &thread_a)
-    };
-    let slot = winner.2.get::<LhcCaptureSlot>().expect("winner slot");
-    wait_for_handle(&slot, Duration::from_secs(5))
-        .await
-        .expect("winner capture opened");
-    for contributor in winner.0.thread_lifecycle_contributors() {
-        contributor
-            .on_thread_stop(ThreadStopInput {
-                session_store: winner.1,
-                thread_store: winner.2,
-            })
-            .await;
-    }
-}
-
-#[tokio::test]
-async fn successor_open_fails_when_predecessor_does_not_return() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().to_path_buf();
-    let thread_id = "r8-admission-backstop";
-    let owner_a = spawn_capture(
-        thread_id,
-        None,
-        Some(root.clone()),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await
-    .expect("owner A");
-    let _release = owner_a.block_worker().await;
-    let started = Instant::now();
-    let owner_b = spawn_capture(
-        thread_id,
-        None,
-        Some(root),
-        LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
-    )
-    .await;
-    assert!(
-        owner_b.is_none(),
-        "successor must fail instead of waiting forever"
-    );
-    assert!(
-        started.elapsed() >= crate::capture::CAPTURE_ADMISSION_BOUND,
-        "admission timeout must wait the bound; elapsed {:?}",
-        started.elapsed()
-    );
-    assert!(
-        started.elapsed() < crate::capture::CAPTURE_ADMISSION_BOUND + Duration::from_secs(2),
-        "admission timeout must not hang past the bound; elapsed {:?}",
-        started.elapsed()
-    );
-    let wait_a = owner_a.clone();
-    owner_a.shutdown().await;
-    let _ = wait_a
-        .wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
-        .await;
 }
 
 fn seed_held_claim(path: &std::path::Path, work_item_id: &str) {

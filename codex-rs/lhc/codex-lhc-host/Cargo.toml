@@ -26,7 +26,6 @@ required-features = ["test-util"]
 
 [dependencies]
 chrono = { workspace = true }
-futures = { workspace = true, features = ["std"] }
 codex-extension-api = { workspace = true }
 codex-history = { workspace = true }
 codex-protocol = { workspace = true }

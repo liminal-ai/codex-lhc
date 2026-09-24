@@ -3835,7 +3835,6 @@ dependencies = [
  "codex-protocol",
  "codex-rollout",
  "codex-utils-output-truncation",
- "futures",
  "lhc",
  "pretty_assertions",
  "serde",

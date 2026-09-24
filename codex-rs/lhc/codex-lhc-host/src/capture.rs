@@ -60,20 +60,6 @@ const SHUTDOWN_ENQUEUE_CLEANUP_BOUND: std::time::Duration = std::time::Duration:
 #[cfg(test)]
 const SHUTDOWN_ENQUEUE_CLEANUP_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Host bound on durable persist/submit. Matches `PRAGMA busy_timeout = 5000`
-/// so a write finishes or errors instead of being dropped mid-SQLite.
-pub(crate) const CAPTURE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Absolute worker-return deadline. Persist, close-settle, and claim hand-back
-/// all charge this one clock; the live-path reservation is released by then.
-pub(crate) const CAPTURE_WORKER_RETURN_BOUND: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
-/// Successor admission wait. Equals the worker return bound so a waiting
-/// opener cannot outlive the retiring owner, and cannot succeed before a
-/// competing reservation is taken.
-pub(crate) const CAPTURE_ADMISSION_BOUND: std::time::Duration = CAPTURE_WORKER_RETURN_BOUND;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CaptureShutdownFailure {
     EnqueueTimedOut,
@@ -186,48 +172,6 @@ enum CaptureCmd {
     Shutdown(Option<oneshot::Sender<CaptureShutdownResult>>),
 }
 
-/// Deadline and shutdown watch, held by handles **and** the worker.
-///
-/// Intentionally excludes the command sender: the worker must not keep the
-/// channel open after the last external handle is dropped, or admission
-/// never releases.
-struct CaptureShutdownControl {
-    requested: watch::Sender<bool>,
-    deadline: Mutex<Option<tokio::time::Instant>>,
-}
-
-impl CaptureShutdownControl {
-    fn persist_bound(&self) -> std::time::Duration {
-        if !self.has_deadline() {
-            return CAPTURE_WRITE_BOUND;
-        }
-        self.remaining_after_handback().min(CAPTURE_WRITE_BOUND)
-    }
-
-    fn has_deadline(&self) -> bool {
-        self.deadline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
-    fn remaining(&self) -> std::time::Duration {
-        let deadline = *self
-            .deadline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match deadline {
-            Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
-            None => crate::session::CLOSE_SETTLE_BOUND,
-        }
-    }
-
-    fn remaining_after_handback(&self) -> std::time::Duration {
-        self.remaining()
-            .saturating_sub(crate::handback::HANDBACK_BOUND)
-    }
-}
-
 struct CaptureShared {
     thread_id: String,
     /// LHC root used for this thread (for compact bridge re-open).
@@ -242,7 +186,6 @@ struct CaptureShared {
     /// start it). Intake-durability ack is earlier; this is when the runtime
     /// can no longer claim work.
     terminated: watch::Sender<bool>,
-    shutdown: Arc<CaptureShutdownControl>,
 }
 
 /// Durable identity of the LHC turn opened under one host turn (turn parts,
@@ -696,28 +639,11 @@ impl CaptureHandle {
         }
     }
 
-    fn request_shutdown(&self) {
-        {
-            let mut deadline = self
-                .inner
-                .shutdown
-                .deadline
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if deadline.is_none() {
-                *deadline = Some(tokio::time::Instant::now() + CAPTURE_WORKER_RETURN_BOUND);
-            }
-        }
-        let _ = self.inner.shutdown.requested.send_replace(true);
-    }
-
     pub fn shutdown_async(&self) {
-        self.request_shutdown();
         let _ = self.inner.tx.try_send(CaptureCmd::Shutdown(None));
     }
 
     pub async fn shutdown(self) {
-        self.request_shutdown();
         let (tx, rx) = oneshot::channel();
         if self
             .inner
@@ -735,7 +661,6 @@ impl CaptureHandle {
         self,
         timeout: std::time::Duration,
     ) -> CaptureShutdownResult {
-        self.request_shutdown();
         let deadline = tokio::time::Instant::now() + timeout;
         let (tx, rx) = oneshot::channel();
         match tokio::time::timeout_at(deadline, self.inner.tx.send(CaptureCmd::Shutdown(Some(tx))))
@@ -872,8 +797,7 @@ fn capture_db_path(thread_id: &str, root: Option<&Path>) -> String {
         .into_owned()
 }
 
-async fn register_live_capture(path: &str, terminated: &watch::Sender<bool>) -> Result<(), ()> {
-    let deadline = tokio::time::Instant::now() + CAPTURE_ADMISSION_BOUND;
+async fn register_live_capture(path: &str, terminated: &watch::Sender<bool>) {
     loop {
         let waiter = {
             let mut live = lock_live_capture_runtimes();
@@ -885,56 +809,9 @@ async fn register_live_capture(path: &str, terminated: &watch::Sender<bool>) -> 
             }
         };
         let Some(mut rx) = waiter else {
-            return Ok(());
-        };
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero()
-            || tokio::time::timeout(remaining, rx.wait_for(|done| *done))
-                .await
-                .is_err()
-        {
-            return Err(());
-        }
-    }
-}
-
-pub(crate) fn capture_db_path_for(thread_id: &str, root: Option<&Path>) -> String {
-    capture_db_path(thread_id, root)
-}
-
-/// Owns a live-capture map slot until the worker thread takes over cleanup.
-///
-/// `register_live_capture` inserts before `LhcSession::open` awaits. Dropping
-/// that open must unregister, or every later spawn for the path waits forever.
-pub(crate) struct LiveCaptureAdmission {
-    path: String,
-    terminated: watch::Sender<bool>,
-    disarmed: bool,
-}
-
-impl LiveCaptureAdmission {
-    pub(crate) async fn acquire(path: String) -> Result<Self, ()> {
-        let (terminated, _) = watch::channel(false);
-        register_live_capture(&path, &terminated).await?;
-        Ok(Self {
-            path,
-            terminated,
-            disarmed: false,
-        })
-    }
-
-    fn disarm(&mut self) {
-        self.disarmed = true;
-    }
-}
-
-impl Drop for LiveCaptureAdmission {
-    fn drop(&mut self) {
-        if self.disarmed {
             return;
-        }
-        unregister_live_capture(&self.path, &self.terminated);
-        let _ = self.terminated.send_replace(true);
+        };
+        let _ = rx.wait_for(|done| *done).await;
     }
 }
 
@@ -953,12 +830,8 @@ fn finish_capture_runtime(
     thread_id: &str,
     path: &str,
     terminated: &watch::Sender<bool>,
-    remaining: std::time::Duration,
 ) {
-    // Keep admission through hand-back (including skip) so a successor cannot
-    // note a claim on this path until this runtime has isolated what it owns.
-    // Hand-back's wait is already reserved inside the worker-return deadline.
-    crate::handback::on_thread_unload_within(root, thread_id, remaining);
+    crate::handback::on_thread_unload(root, thread_id);
     unregister_live_capture(path, terminated);
     let _ = terminated.send_replace(true);
 }
@@ -981,36 +854,15 @@ pub async fn spawn_capture_with_identity(
     derivation: crate::inference::LateBoundCallbacks,
     initial_identity: Option<ModelIdentity>,
 ) -> Option<CaptureHandle> {
-    spawn_capture_with_admission(thread_id, cwd, root, derivation, initial_identity, None).await
-}
-
-/// Spawn capture using a reservation taken at thread start.
-pub(crate) async fn spawn_capture_with_admission(
-    thread_id: &str,
-    cwd: Option<&str>,
-    root: Option<PathBuf>,
-    derivation: crate::inference::LateBoundCallbacks,
-    initial_identity: Option<ModelIdentity>,
-    reserved: Option<LiveCaptureAdmission>,
-) -> Option<CaptureHandle> {
-    let (shutdown_requested, _) = watch::channel(false);
-    let shutdown = Arc::new(CaptureShutdownControl {
-        requested: shutdown_requested,
-        deadline: Mutex::new(None),
-    });
+    let (terminated, _) = watch::channel(false);
     let db_path = capture_db_path(thread_id, root.as_deref());
-    let mut admission = match reserved {
-        Some(admission) => admission,
-        None => match LiveCaptureAdmission::acquire(db_path.clone()).await {
-            Ok(admission) => admission,
-            Err(()) => return None,
-        },
-    };
-    let terminated = admission.terminated.clone();
+    register_live_capture(&db_path, &terminated).await;
     // Background mode derives on this session, so its callbacks are what lands
     // in the durable record — never the deterministic ones (J1).
     let opened = LhcSession::open(thread_id, cwd, root.as_deref(), derivation.callbacks()).await;
     let Some((session, tracker)) = opened else {
+        unregister_live_capture(&db_path, &terminated);
+        let _ = terminated.send_replace(true);
         return None;
     };
     let (tx, rx) = mpsc::channel(CAPTURE_QUEUE_CAP);
@@ -1025,17 +877,14 @@ pub(crate) async fn spawn_capture_with_admission(
         degraded: Arc::clone(&degraded),
         turn_binding: Arc::clone(&turn_binding),
         terminated,
-        shutdown: Arc::clone(&shutdown),
     });
     let thread_id_owned = thread_id.to_string();
     let degraded_worker = Arc::clone(&degraded);
     let terminated = shared.terminated.clone();
-    let shutdown_rx = shutdown.requested.subscribe();
     let finish_root = root.clone();
     let finish_thread = thread_id.to_string();
     let finish_path = db_path.clone();
     let finish_terminated = terminated.clone();
-    let shutdown_for_finish = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name(format!("lhc-capture-{thread_id}"))
         .spawn(move || {
@@ -1045,7 +894,6 @@ pub(crate) async fn spawn_capture_with_admission(
                     &finish_thread,
                     &finish_path,
                     &finish_terminated,
-                    shutdown_for_finish.remaining(),
                 );
             };
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1073,8 +921,6 @@ pub(crate) async fn spawn_capture_with_admission(
                         derivation,
                         initial_identity.unwrap_or_default(),
                         turn_binding,
-                        shutdown_rx,
-                        shutdown,
                     )
                     .await;
                 });
@@ -1093,17 +939,10 @@ pub(crate) async fn spawn_capture_with_admission(
         })
         .map_err(|err| {
             error!(?err, "LHC: failed to spawn capture thread");
-            finish_capture_runtime(
-                root.as_deref(),
-                thread_id,
-                &db_path,
-                &terminated,
-                crate::handback::HANDBACK_BOUND,
-            );
+            finish_capture_runtime(root.as_deref(), thread_id, &db_path, &terminated);
             err
         })
         .ok()?;
-    admission.disarm();
     Some(CaptureHandle { inner: shared })
 }
 
@@ -1117,8 +956,6 @@ async fn worker_loop(
     derivation: crate::inference::LateBoundCallbacks,
     mut live_identity: ModelIdentity,
     turn_binding: Arc<std::sync::Mutex<Option<TurnBinding>>>,
-    mut shutdown_rx: watch::Receiver<bool>,
-    shutdown: Arc<CaptureShutdownControl>,
 ) {
     #[cfg(any(test, feature = "test-util"))]
     let mut crash_after: Option<usize> = None;
@@ -1132,500 +969,302 @@ async fn worker_loop(
     // reordering relative to thinking/tool_call siblings.
     let mut pending_model_output: Vec<(ResponseItem, RawItemProvenance, Option<i64>)> = Vec::new();
     let mut durability = CaptureDurability::default();
-    let mut shutting_down = false;
-    let mut saw_shutdown_cmd = false;
-    let mut shutdown_ack = None;
 
-    loop {
-        if shutting_down && saw_shutdown_cmd {
-            while let Ok(cmd) = rx.try_recv() {
-                match cmd {
-                    CaptureCmd::Shutdown(ack) => {
-                        if ack.is_some() {
-                            shutdown_ack = ack;
-                        }
-                    }
-                    cmd => {
-                        if handle_worker_cmd(
-                            cmd,
-                            &mut session,
-                            &mut tracker,
-                            &thread_id,
-                            &degraded,
-                            &mut pending_model_output,
-                            &mut live_identity,
-                            &mut binder,
-                            &mut durability,
-                            &mut shutdown_rx,
-                            &shutdown,
-                            &mut shutting_down,
-                            #[cfg(any(test, feature = "test-util"))]
-                            &mut crash_after,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            CaptureCmd::BindTurn { host_turn_id } => {
+                binder.host_turn_id = Some(host_turn_id);
+            }
+            CaptureCmd::Persist {
+                item,
+                provenance,
+                step_index,
+                steer,
+            } => {
+                if matches!(provenance, RawItemProvenance::ModelOutput) {
+                    pending_model_output.push((item, provenance, step_index));
+                    continue;
                 }
-            }
-            break;
-        }
-
-        if shutting_down && !saw_shutdown_cmd {
-            let remaining = shutdown.remaining();
-            if remaining.is_zero() {
-                saw_shutdown_cmd = true;
-                continue;
-            }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(CaptureCmd::Shutdown(ack))) => {
-                    saw_shutdown_cmd = true;
-                    if ack.is_some() {
-                        shutdown_ack = ack;
-                    }
-                }
-                Ok(Some(cmd)) => {
-                    if handle_worker_cmd(
-                        cmd,
-                        &mut session,
-                        &mut tracker,
-                        &thread_id,
-                        &degraded,
-                        &mut pending_model_output,
-                        &mut live_identity,
-                        &mut binder,
-                        &mut durability,
-                        &mut shutdown_rx,
-                        &shutdown,
-                        &mut shutting_down,
-                        #[cfg(any(test, feature = "test-util"))]
-                        &mut crash_after,
-                    )
-                    .await
-                    {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => saw_shutdown_cmd = true,
-            }
-            continue;
-        }
-
-        enum Wake {
-            Watch,
-            Cmd(Option<CaptureCmd>),
-        }
-        let wake = tokio::select! {
-            biased;
-            _ = shutdown_rx.wait_for(|done| *done) => Wake::Watch,
-            cmd = rx.recv() => Wake::Cmd(cmd),
-        };
-        match wake {
-            Wake::Watch => shutting_down = true,
-            Wake::Cmd(None) => {
-                shutting_down = true;
-                saw_shutdown_cmd = true;
-            }
-            Wake::Cmd(Some(CaptureCmd::Shutdown(ack))) => {
-                shutting_down = true;
-                saw_shutdown_cmd = true;
-                if ack.is_some() {
-                    shutdown_ack = ack;
-                }
-            }
-            Wake::Cmd(Some(cmd)) => {
-                if handle_worker_cmd(
-                    cmd,
+                if let Err(err) = flush_pending_model_output(
                     &mut session,
                     &mut tracker,
                     &thread_id,
                     &degraded,
                     &mut pending_model_output,
-                    &mut live_identity,
-                    &mut binder,
+                    None,
+                    &live_identity,
+                    &binder,
                     &mut durability,
-                    &mut shutdown_rx,
-                    &shutdown,
-                    &mut shutting_down,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+                if let Err(err) = persist_item(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &item,
+                    provenance,
+                    None,
+                    step_index,
+                    /*steer*/ steer,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+            }
+            CaptureCmd::ProviderUsage { usage } => {
+                let provider_usage = token_usage_to_provider_usage(&usage);
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    provider_usage.as_ref(),
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+            }
+            CaptureCmd::TurnEnd {
+                turn_id,
+                reason,
+                facts,
+            } => {
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+                let event = map_turn_end(&thread_id, &turn_id, &reason, &facts);
+                if let Err(err) = submit_mapped(&mut session, &[event]).await {
+                    durability.failed = true;
+                    warn!(thread_id = %thread_id, %err, "LHC: turn_end failed");
+                }
+            }
+            CaptureCmd::ModelOrThinkingChange {
+                previous_model,
+                new_model,
+                previous_level,
+                new_level,
+                provider,
+                api,
+            } => {
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+                // Keep signature provenance in lockstep with the live model.
+                if previous_model != new_model {
+                    live_identity.model = Some(new_model.clone());
+                    if let Some(p) = provider {
+                        live_identity.provider = Some(p);
+                    }
+                    live_identity.api =
+                        Some(api.unwrap_or_else(|| ModelIdentity::RESPONSES_API.to_string()));
+                }
+                let events = map_model_or_thinking_change(
+                    &thread_id,
+                    &previous_model,
+                    &new_model,
+                    &previous_level,
+                    &new_level,
+                );
+                if events.is_empty() {
+                    continue;
+                }
+                if let Err(err) = submit_mapped(&mut session, &events).await {
+                    durability.failed = true;
+                    warn!(thread_id = %thread_id, %err, "LHC: model/thinking change failed");
+                }
+            }
+            CaptureCmd::SetIdentity { identity } => {
+                // Flush model output buffered under the OLD identity first —
+                // otherwise pending old-model ciphertext would be mapped and
+                // tagged with the new identity (validator P1, 2026-08-08).
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
                     #[cfg(any(test, feature = "test-util"))]
                     &mut crash_after,
                 )
                 .await
                 {
-                    break;
+                    warn!(thread_id = %thread_id, %err, "LHC: pre-identity-change flush failed");
                 }
+                live_identity = identity;
+            }
+            CaptureCmd::RuntimeNote { text, key_suffix } => {
+                let event = map_runtime_note(&thread_id, &text, &key_suffix);
+                if let Err(err) = submit_mapped(&mut session, &[event]).await {
+                    durability.failed = true;
+                    warn!(thread_id = %thread_id, %err, "LHC: degraded note failed");
+                }
+            }
+            CaptureCmd::Flush(ack) => {
+                // Flush does not force pending model-output without usage —
+                // caller that needs durable state should use turn_end or
+                // provider_usage first. Still surface buffered content so
+                // tests that only flush after provider_usage see it; when
+                // nothing has attached usage yet, emit without providerUsage.
+                if let Err(err) = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await
+                    && err == "crash"
+                {
+                    return;
+                }
+                let _ = ack.send(());
+            }
+            CaptureCmd::DrainSettled { timeout, ack } => {
+                // Runs on the worker, which owns the Background-mode SDK — the
+                // only session with a live scheduler. Bounded HERE, not only at
+                // the handle: this await runs inside the worker loop, so an
+                // unbounded settle-wait on a thread that can never settle would
+                // wedge the loop and starve every command behind it, including
+                // `Shutdown`. Timing out reports unsettled and the caller fails
+                // open; it is never licence to drain inline.
+                let settled = tokio::time::timeout(timeout, session.drain_settled())
+                    .await
+                    .is_ok();
+                let _ = ack.send(settled);
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            CaptureCmd::ListEvents(ack) => {
+                let _ = ack.send(session.list_events().await);
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            CaptureCmd::ListTurns(ack) => {
+                let _ = ack.send(session.list_turns().await);
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            CaptureCmd::CrashMidPersist { after, entered } => {
+                crash_after = Some(after);
+                let _ = entered.send(());
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            CaptureCmd::Block { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
+            #[cfg(any(test, feature = "test-util"))]
+            CaptureCmd::CaptureDisabled(ack) => {
+                let _ = ack.send(session.capture_disabled);
+            }
+            CaptureCmd::Shutdown(ack) => {
+                let _ = flush_pending_model_output(
+                    &mut session,
+                    &mut tracker,
+                    &thread_id,
+                    &degraded,
+                    &mut pending_model_output,
+                    None,
+                    &live_identity,
+                    &binder,
+                    &mut durability,
+                    #[cfg(any(test, feature = "test-util"))]
+                    &mut crash_after,
+                )
+                .await;
+                // Everything ahead of Shutdown has now crossed the SDK submit
+                // boundary, including the final pending model output. Report
+                // that intake durability before best-effort derivation settle:
+                // close may consume its full five-second allowance, but its
+                // durable work queue is replayable and is not part of this
+                // acknowledgment contract.
+                if let Some(ack) = ack {
+                    let result = if durability.failed || degraded.load(Ordering::SeqCst) {
+                        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed)
+                    } else {
+                        CaptureShutdownResult::Persisted
+                    };
+                    let _ = ack.send(result);
+                }
+                close_capture_session(session, &derivation).await;
+                return;
             }
         }
     }
-
-    finish_worker(
-        session,
-        tracker,
-        pending_model_output,
-        live_identity,
-        binder,
-        durability,
-        &degraded,
-        &derivation,
-        shutdown_ack,
-        &shutdown,
-        &thread_id,
-        #[cfg(any(test, feature = "test-util"))]
-        &mut crash_after,
-    )
-    .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn handle_worker_cmd(
-    cmd: CaptureCmd,
-    session: &mut LhcSession,
-    tracker: &mut OccurrenceTracker,
-    thread_id: &str,
-    degraded: &AtomicBool,
-    pending_model_output: &mut Vec<(ResponseItem, RawItemProvenance, Option<i64>)>,
-    live_identity: &mut ModelIdentity,
-    binder: &mut TurnBinder,
-    durability: &mut CaptureDurability,
-    shutdown_rx: &mut watch::Receiver<bool>,
-    shutdown: &CaptureShutdownControl,
-    shutting_down: &mut bool,
-    #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
-) -> bool {
-    match cmd {
-        CaptureCmd::BindTurn { host_turn_id } => {
-            binder.host_turn_id = Some(host_turn_id);
-        }
-        CaptureCmd::Persist {
-            item,
-            provenance,
-            step_index,
-            steer,
-        } => {
-            if matches!(provenance, RawItemProvenance::ModelOutput) {
-                pending_model_output.push((item, provenance, step_index));
-                return false;
-            }
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                None,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-            if let Err(err) = persist_item(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                &item,
-                provenance,
-                None,
-                step_index,
-                /*steer*/ steer,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-        }
-        CaptureCmd::ProviderUsage { usage } => {
-            let provider_usage = token_usage_to_provider_usage(&usage);
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                provider_usage.as_ref(),
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-        }
-        CaptureCmd::TurnEnd {
-            turn_id,
-            reason,
-            facts,
-        } => {
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                None,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-            let event = map_turn_end(thread_id, &turn_id, &reason, &facts);
-            if let Err(err) = submit_mapped(session, &[event], shutdown).await {
-                durability.failed = true;
-                warn!(thread_id = %thread_id, %err, "LHC: turn_end failed");
-            }
-        }
-        CaptureCmd::ModelOrThinkingChange {
-            previous_model,
-            new_model,
-            previous_level,
-            new_level,
-            provider,
-            api,
-        } => {
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                None,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-            // Keep signature provenance in lockstep with the live model.
-            if previous_model != new_model {
-                live_identity.model = Some(new_model.clone());
-                if let Some(p) = provider {
-                    live_identity.provider = Some(p);
-                }
-                live_identity.api =
-                    Some(api.unwrap_or_else(|| ModelIdentity::RESPONSES_API.to_string()));
-            }
-            let events = map_model_or_thinking_change(
-                thread_id,
-                &previous_model,
-                &new_model,
-                &previous_level,
-                &new_level,
-            );
-            if events.is_empty() {
-                return false;
-            }
-            if let Err(err) = submit_mapped(session, &events, shutdown).await {
-                durability.failed = true;
-                warn!(thread_id = %thread_id, %err, "LHC: model/thinking change failed");
-            }
-        }
-        CaptureCmd::SetIdentity { identity } => {
-            // Flush model output buffered under the OLD identity first —
-            // otherwise pending old-model ciphertext would be mapped and
-            // tagged with the new identity (validator P1, 2026-08-08).
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                None,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-            {
-                warn!(thread_id = %thread_id, %err, "LHC: pre-identity-change flush failed");
-            }
-            *live_identity = identity;
-        }
-        CaptureCmd::RuntimeNote { text, key_suffix } => {
-            let event = map_runtime_note(thread_id, &text, &key_suffix);
-            if let Err(err) = submit_mapped(session, &[event], shutdown).await {
-                durability.failed = true;
-                warn!(thread_id = %thread_id, %err, "LHC: degraded note failed");
-            }
-        }
-        CaptureCmd::Flush(ack) => {
-            // Flush does not force pending model-output without usage —
-            // caller that needs durable state should use turn_end or
-            // provider_usage first. Still surface buffered content so
-            // tests that only flush after provider_usage see it; when
-            // nothing has attached usage yet, emit without providerUsage.
-            if let Err(err) = flush_pending_model_output(
-                session,
-                tracker,
-                thread_id,
-                degraded,
-                pending_model_output,
-                None,
-                live_identity,
-                binder,
-                durability,
-                shutdown,
-                #[cfg(any(test, feature = "test-util"))]
-                crash_after,
-            )
-            .await
-                && err == "crash"
-            {
-                return true;
-            }
-            let _ = ack.send(());
-        }
-        CaptureCmd::DrainSettled { timeout, ack } => {
-            // Runs on the worker, which owns the Background-mode SDK — the
-            // only session with a live scheduler. Bounded HERE, not only at
-            // the handle: this await runs inside the worker loop, so an
-            // unbounded settle-wait on a thread that can never settle would
-            // wedge the loop and starve every command behind it, including
-            // `Shutdown`. Shutdown aborts the wait so retirement can proceed.
-            // Timing out reports unsettled and the caller fails open; it is
-            // never licence to drain inline.
-            let settled = tokio::select! {
-                biased;
-                _ = shutdown_rx.wait_for(|done| *done) => {
-                    *shutting_down = true;
-                    false
-                }
-                settled = tokio::time::timeout(timeout, session.drain_settled()) => {
-                    settled.is_ok()
-                }
-            };
-            let _ = ack.send(settled);
-        }
-        #[cfg(any(test, feature = "test-util"))]
-        CaptureCmd::ListEvents(ack) => {
-            let _ = ack.send(session.list_events().await);
-        }
-        #[cfg(any(test, feature = "test-util"))]
-        CaptureCmd::ListTurns(ack) => {
-            let _ = ack.send(session.list_turns().await);
-        }
-        #[cfg(any(test, feature = "test-util"))]
-        CaptureCmd::CrashMidPersist { after, entered } => {
-            *crash_after = Some(after);
-            let _ = entered.send(());
-        }
-        #[cfg(any(test, feature = "test-util"))]
-        CaptureCmd::Block { entered, release } => {
-            let _ = entered.send(());
-            tokio::select! {
-                _ = release => {}
-                _ = shutdown_rx.wait_for(|done| *done) => {}
-            }
-            if *shutdown_rx.borrow() {
-                *shutting_down = true;
-            }
-        }
-        #[cfg(any(test, feature = "test-util"))]
-        CaptureCmd::CaptureDisabled(ack) => {
-            let _ = ack.send(session.capture_disabled);
-        }
-        CaptureCmd::Shutdown(_) => unreachable!("Shutdown is handled before the command match"),
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn finish_worker(
-    mut session: LhcSession,
-    mut tracker: OccurrenceTracker,
-    mut pending_model_output: Vec<(ResponseItem, RawItemProvenance, Option<i64>)>,
-    live_identity: ModelIdentity,
-    binder: TurnBinder,
-    mut durability: CaptureDurability,
-    degraded: &AtomicBool,
-    derivation: &crate::inference::LateBoundCallbacks,
-    shutdown_ack: Option<oneshot::Sender<CaptureShutdownResult>>,
-    shutdown: &CaptureShutdownControl,
-    thread_id: &str,
-    #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
-) {
-    derivation.cancel();
-    if let Err(err) = flush_pending_model_output(
+    let _ = flush_pending_model_output(
         &mut session,
         &mut tracker,
-        thread_id,
-        degraded,
+        &thread_id,
+        &degraded,
         &mut pending_model_output,
         None,
         &live_identity,
         &binder,
         &mut durability,
-        shutdown,
         #[cfg(any(test, feature = "test-util"))]
-        crash_after,
+        &mut crash_after,
     )
-    .await
-    {
-        if err != "crash" {
-            durability.failed = true;
-            warn!(thread_id = %thread_id, %err, "LHC: shutdown flush of pending model output failed");
-        } else {
-            durability.failed = true;
-        }
-    }
-    if !pending_model_output.is_empty() {
-        durability.failed = true;
-        error!(
-            thread_id = %thread_id,
-            unwritten = pending_model_output.len(),
-            "LHC: shutdown deadline passed with unwritten capture events"
-        );
-        pending_model_output.clear();
-    } else if durability.failed {
-        error!(
-            thread_id = %thread_id,
-            "LHC: shutdown deadline passed with unwritten capture events"
-        );
-    }
-    if let Some(ack) = shutdown_ack {
-        let result = if durability.failed || degraded.load(Ordering::SeqCst) {
-            CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed)
-        } else {
-            CaptureShutdownResult::Persisted
-        };
-        let _ = ack.send(result);
-    }
-    close_capture_session(session, derivation, shutdown.remaining_after_handback()).await;
+    .await;
+    close_capture_session(session, &derivation).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1639,7 +1278,6 @@ async fn flush_pending_model_output(
     identity: &ModelIdentity,
     binder: &TurnBinder,
     durability: &mut CaptureDurability,
-    shutdown: &CaptureShutdownControl,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
     if pending.is_empty() {
@@ -1660,7 +1298,6 @@ async fn flush_pending_model_output(
             identity,
             binder,
             durability,
-            shutdown,
             #[cfg(any(test, feature = "test-util"))]
             crash_after,
         )
@@ -1682,84 +1319,11 @@ async fn persist_item(
     identity: &ModelIdentity,
     binder: &TurnBinder,
     durability: &mut CaptureDurability,
-    shutdown: &CaptureShutdownControl,
     #[cfg(any(test, feature = "test-util"))] crash_after: &mut Option<usize>,
 ) -> Result<(), String> {
-    let events = map_persist_item(
-        session,
-        tracker,
-        thread_id,
-        degraded,
-        item,
-        provenance,
-        provider_usage,
-        step_index,
-        steer,
-        identity,
-        durability,
-        shutdown,
-    )
-    .await?;
-    if events.is_empty() {
-        return Ok(());
-    }
-    #[cfg(any(test, feature = "test-util"))]
-    if let Some(after) = crash_after.take() {
-        if after == 0 {
-            error!(thread_id = %thread_id, "LHC: crash injection before persist");
-            return Err("crash".into());
-        }
-        let n = after.min(events.len());
-        let (head, _tail) = events.split_at(n);
-        if !head.is_empty() {
-            let inputs: Vec<_> = head.iter().map(|e| e.input.clone()).collect();
-            let _ = session.submit_events(&inputs).await;
-        }
-        error!(
-            thread_id = %thread_id,
-            after,
-            "LHC: crash injection mid-persist"
-        );
-        return Err("crash".into());
-    }
-    match submit_mapped(session, &events, shutdown).await {
-        Ok(batch) => binder.observe(session, &events, &batch).await,
-        Err(err) => {
-            durability.failed = true;
-            warn!(thread_id = %thread_id, %err, "LHC: persist failed");
-            if session.capture_disabled {
-                degraded.store(true, Ordering::SeqCst);
-                error!(
-                    thread_id = %thread_id,
-                    "LHC: capture permanently disabled after repeated failures"
-                );
-                let note = map_runtime_note(
-                    thread_id,
-                    "LHC capture permanently disabled after repeated submit failures",
-                    "disabled",
-                );
-                let _ = submit_mapped(session, &[note], shutdown).await;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn map_persist_item(
-    session: &mut LhcSession,
-    tracker: &mut OccurrenceTracker,
-    thread_id: &str,
-    degraded: &AtomicBool,
-    item: &ResponseItem,
-    provenance: RawItemProvenance,
-    provider_usage: Option<&Map<String, Value>>,
-    step_index: Option<i64>,
-    steer: bool,
-    identity: &ModelIdentity,
-    durability: &mut CaptureDurability,
-    shutdown: &CaptureShutdownControl,
-) -> Result<Vec<MappedEvent>, String> {
+    // Legacy ID-less items resolve occurrence from a capped prefix listing
+    // only when they have no stable id. Cap exhaustion degrades visibly and
+    // does not guess or reset tracker state.
     if item_stable_id(item).is_none()
         && let Err(err) = ensure_legacy_occurrence(session, tracker, item).await
     {
@@ -1775,8 +1339,8 @@ async fn map_persist_item(
             &format!("LHC capture degraded after anonymous occurrence listing failure: {err}"),
             "occurrence-cap",
         );
-        let _ = submit_mapped(session, &[note], shutdown).await;
-        return Ok(Vec::new());
+        let _ = submit_mapped(session, &[note]).await;
+        return Ok(());
     }
 
     // Contain map_item panics so one bad item cannot kill the worker (H9).
@@ -1808,7 +1372,7 @@ async fn map_persist_item(
                 "LHC: map_item panicked; dropping item, worker continues"
             );
             durability.failed = true;
-            return Ok(Vec::new());
+            return Ok(());
         }
     };
     if let Some(usage) = provider_usage {
@@ -1826,54 +1390,74 @@ async fn map_persist_item(
             attach_steer(event);
         }
     }
-    Ok(events)
+    if events.is_empty() {
+        return Ok(());
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    if let Some(after) = crash_after.take() {
+        if after == 0 {
+            error!(thread_id = %thread_id, "LHC: crash injection before persist");
+            return Err("crash".into());
+        }
+        let n = after.min(events.len());
+        let (head, _tail) = events.split_at(n);
+        if !head.is_empty() {
+            let inputs: Vec<_> = head.iter().map(|e| e.input.clone()).collect();
+            let _ = session.submit_events(&inputs).await;
+        }
+        // after >= events.len() means "after all submitted" — still exit.
+        error!(
+            thread_id = %thread_id,
+            after,
+            "LHC: crash injection mid-persist"
+        );
+        return Err("crash".into());
+    }
+    match submit_mapped(session, &events).await {
+        Ok(batch) => binder.observe(session, &events, &batch).await,
+        Err(err) => {
+            durability.failed = true;
+            warn!(thread_id = %thread_id, %err, "LHC: persist failed");
+            if session.capture_disabled {
+                degraded.store(true, Ordering::SeqCst);
+                error!(
+                    thread_id = %thread_id,
+                    "LHC: capture permanently disabled after repeated failures"
+                );
+                // Record a truncation note while still possible.
+                let note = map_runtime_note(
+                    thread_id,
+                    "LHC capture permanently disabled after repeated submit failures",
+                    "disabled",
+                );
+                let _ = submit_mapped(session, &[note]).await;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Close the worker's Background-mode session.
 ///
-/// Derivation callbacks are cancelled first so in-flight model calls and
-/// `LateBoundCallbacks::resolve` are dropped. The settle-wait inside
-/// [`LhcSession::close`] is skipped when derivation was never seeded.
+/// The settle-wait inside [`LhcSession::close`] is skipped when derivation
+/// callbacks were never seeded: unseeded inference work is parked on
+/// `LateBoundCallbacks::resolve` and can never complete, so waiting on it is
+/// pure delay, not cleanup. Either way nothing is lost — the work queue is
+/// durable and first-touch catch-up re-drains it on the next open.
 async fn close_capture_session(
     session: LhcSession,
     derivation: &crate::inference::LateBoundCallbacks,
-    settle: std::time::Duration,
 ) {
-    derivation.cancel();
-    if derivation.is_seeded() && !settle.is_zero() {
-        // drain_settled can still enter a sync SQLite busy wait; catch that
-        // panic so reservation release in `finish_capture_runtime` still runs.
-        let _ = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-            tokio::time::timeout(settle, session.close()),
-        ))
-        .await;
+    if derivation.is_seeded() {
+        session.close().await;
     }
+    // else: drop. The claim lease releases the in-flight item.
 }
 
 async fn submit_mapped(
     session: &mut LhcSession,
     events: &[MappedEvent],
-    shutdown: &CaptureShutdownControl,
 ) -> Result<lhc::intake_stream::BatchResult, String> {
-    let bound = shutdown.persist_bound();
-    if bound.is_zero() {
-        return Err("LHC persist deadline already passed".into());
-    }
-    // open_database uses a fixed 5s busy_timeout. A cooperative future timeout
-    // cannot preempt that wait, so do not start a write whose SQLite wait
-    // would overrun the remaining shutdown budget.
-    if shutdown.has_deadline() && bound < CAPTURE_WRITE_BOUND {
-        return Err("LHC persist remaining is below SQLite busy_timeout".into());
-    }
     let inputs: Vec<_> = events.iter().map(|e| e.input.clone()).collect();
-    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
-        bound,
-        session.submit_events(&inputs),
-    )))
-    .await
-    {
-        Ok(Ok(result)) => result,
-        Ok(Err(_)) => Err("LHC persist timed out".into()),
-        Err(_) => Err("LHC persist panicked (database locked)".into()),
-    }
+    session.submit_events(&inputs).await
 }

@@ -199,7 +199,6 @@ pub use install::CAPTURE_OPEN_ABANDONED;
 pub use install::CAPTURE_OPEN_FAILED;
 pub use install::CAPTURE_OPEN_RUNTIME_UNAVAILABLE;
 pub use install::CAPTURE_OPEN_THREAD_UNAVAILABLE;
-pub use install::CAPTURE_STILL_SHUTTING_DOWN;
 pub use install::CaptureState;
 pub use install::LhcCaptureSlot;
 pub use install::LhcStepIndex;
