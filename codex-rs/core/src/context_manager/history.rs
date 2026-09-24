@@ -239,9 +239,6 @@ impl ContextManager {
     }
 
     pub(crate) fn guardian_history_checkpoint(&self) -> Option<GuardianHistoryCheckpoint> {
-        if self.guardian_review_mode == GuardianContextMode::ThreadOwned {
-            return None;
-        }
         self.review_history
             .as_ref()
             .map(|history| GuardianHistoryCheckpoint(history.items().cloned().collect()))
@@ -318,10 +315,25 @@ impl ContextManager {
                 )
             });
         }
-        if self.guardian_review_mode == GuardianContextMode::ThreadOwned
-            || (self.guardian_context_mode == GuardianContextMode::Legacy && checkpoint.is_none())
-        {
-            self.review_history = None;
+        if self.guardian_review_mode == GuardianContextMode::ThreadOwned {
+            if let Some(checkpoint) = checkpoint {
+                let generation = self
+                    .review_history
+                    .as_ref()
+                    .map_or(self.history_version, TranscriptHistory::generation)
+                    .saturating_add(1);
+                let mut history = TranscriptHistory::new(generation);
+                history.reset(checkpoint.0.iter());
+                self.review_history = Some(history);
+            }
+            // LHC install captures no native Compaction item. Keep the live
+            // independent transcript so Guardian does not walk reconstructed
+            // parent history.
+            return;
+        }
+        if self.guardian_context_mode == GuardianContextMode::Legacy && checkpoint.is_none() {
+            // Keep a snapshot taken by replace_compacted (LHC rewrite has no
+            // native Compaction item). Resume with no checkpoint leaves None.
             return;
         }
         let generation = self
@@ -590,10 +602,37 @@ impl ContextManager {
                 == GuardianContextMode::ThreadOwned;
         if promoted {
             self.guardian_review_mode = GuardianContextMode::ThreadOwned;
-            self.review_history = None;
+            if codex_history::CompactionCheckpoint::latest(&items).is_some() {
+                // Native compact: Guardian walks the parent Compaction item + tail.
+                self.review_history = None;
+            } else if self.review_history.is_none() {
+                // LHC rewrite has no Compaction item. Snapshot the pre-fold
+                // conversation so review_items() keeps call/result order.
+                let mut retained = TranscriptHistory::new(self.history_version.saturating_add(1));
+                for item in self.raw_items().filter(|item| {
+                    !matches!(item, ResponseItem::Message { role, content, .. }
+                        if role == "user" && is_contextual_user_message_content(content))
+                }) {
+                    retained.record(item);
+                }
+                self.review_history = Some(retained);
+            }
             self.user_message_revision = self.user_message_revision.saturating_add(/*rhs*/ 1);
         }
         if self.guardian_review_mode == GuardianContextMode::Legacy && self.review_history.is_none()
+        {
+            let mut retained = TranscriptHistory::new(self.history_version.saturating_add(1));
+            for item in self.raw_items().filter(|item| {
+                !matches!(item, ResponseItem::Message { role, content, .. }
+                    if role == "user" && is_contextual_user_message_content(content))
+            }) {
+                retained.record(item);
+            }
+            self.review_history = Some(retained);
+        }
+        if self.guardian_review_mode == GuardianContextMode::ThreadOwned
+            && self.review_history.is_none()
+            && codex_history::CompactionCheckpoint::latest(&items).is_none()
         {
             let mut retained = TranscriptHistory::new(self.history_version.saturating_add(1));
             for item in self.raw_items().filter(|item| {

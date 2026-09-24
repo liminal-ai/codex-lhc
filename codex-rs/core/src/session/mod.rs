@@ -4101,11 +4101,12 @@ impl Session {
                     reviewer_compaction_hash: None,
                 },
             );
-            // Same restore resume uses from CompactedItem so live Guardian v2
-            // snapshots match the rewritten rollout after an LHC fold.
+            // Prefer the post-fold independent transcript snapshot. The
+            // pre-fold capture is None for ThreadOwned and would wipe it.
+            let live_guardian_history = state.history.guardian_history_checkpoint();
             state.history.restore_review_context(
                 retained_context.as_ref(),
-                guardian_history.as_ref(),
+                live_guardian_history.as_ref().or(guardian_history.as_ref()),
                 /*reviewer_compaction_hash*/ None,
             );
             if let Some(world_state) = world_state_baseline {

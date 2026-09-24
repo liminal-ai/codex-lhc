@@ -1304,7 +1304,7 @@ index 0000000000..85034166e5
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index a4b4ba0032..e635f08ef1 100644
+index a4b4ba0032..d80cc8ef50 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -338,8 +338,10 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
@@ -1438,7 +1438,7 @@ index a4b4ba0032..e635f08ef1 100644
          }
  
          let mut rollout_items = vec![RolloutItem::Compacted(compacted_item)];
-@@ -4029,10 +4075,94 @@ impl Session {
+@@ -4029,10 +4075,95 @@ impl Session {
          }
      }
  
@@ -1468,11 +1468,12 @@ index a4b4ba0032..e635f08ef1 100644
 +                    reviewer_compaction_hash: None,
 +                },
 +            );
-+            // Same restore resume uses from CompactedItem so live Guardian v2
-+            // snapshots match the rewritten rollout after an LHC fold.
++            // Prefer the post-fold independent transcript snapshot. The
++            // pre-fold capture is None for ThreadOwned and would wipe it.
++            let live_guardian_history = state.history.guardian_history_checkpoint();
 +            state.history.restore_review_context(
 +                retained_context.as_ref(),
-+                guardian_history.as_ref(),
++                live_guardian_history.as_ref().or(guardian_history.as_ref()),
 +                /*reviewer_compaction_hash*/ None,
 +            );
 +            if let Some(world_state) = world_state_baseline {
@@ -1533,7 +1534,7 @@ index a4b4ba0032..e635f08ef1 100644
      pub(crate) fn features(&self) -> ManagedFeatures {
          self.features.clone()
      }
-@@ -4072,7 +4202,42 @@ impl Session {
+@@ -4072,7 +4203,42 @@ impl Session {
      }
  
      #[tracing::instrument(level = "trace", skip_all, fields(item_count = items.len()))]
@@ -1577,7 +1578,7 @@ index a4b4ba0032..e635f08ef1 100644
          for item in items {
              self.send_event(
                  turn_context,
-@@ -4404,6 +4569,32 @@ impl Session {
+@@ -4404,6 +4570,32 @@ impl Session {
          state.advance_auto_compact_window()
      }
  
@@ -1610,7 +1611,7 @@ index a4b4ba0032..e635f08ef1 100644
      pub(crate) async fn request_new_context_window(&self) {
          let mut state = self.state.lock().await;
          state.request_new_context_window();
-@@ -4758,11 +4949,12 @@ impl Session {
+@@ -4758,11 +4950,12 @@ impl Session {
          model_info: &ModelInfo,
          response_item: ResponseItem,
      ) {
@@ -1625,7 +1626,7 @@ index a4b4ba0032..e635f08ef1 100644
          )
          .await;
  
-@@ -4809,11 +5001,13 @@ impl Session {
+@@ -4809,11 +5002,13 @@ impl Session {
              &prepared_items,
              &user_image_content_indices,
          );
@@ -1639,7 +1640,7 @@ index a4b4ba0032..e635f08ef1 100644
          )
          .await;
          user_message_item.client_id = client_id;
-@@ -5015,3 +5209,14 @@ mod elicitation_holders_tests;
+@@ -5015,3 +5210,14 @@ mod elicitation_holders_tests;
  
  #[cfg(test)]
  pub(crate) mod tests;

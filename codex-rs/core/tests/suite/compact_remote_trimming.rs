@@ -87,6 +87,7 @@ async fn remote_compact_v2_token_estimate_ignores_message_bookkeeping_and_json_e
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is remote v2 /responses compact trimming tool_search_output; Op::Compact under LHC never hits /v1/responses compact"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_compact_v2_trims_tool_search_output_to_empty_tools_array() -> Result<()> {
     skip_if_no_network!(Ok(()));

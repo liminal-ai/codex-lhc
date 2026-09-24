@@ -3084,6 +3084,7 @@ async fn pre_sampling_compact_falls_back_after_previous_model_stream_retries_are
     );
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: owned assertion is native pre-sampling compact on an unknown previous model (3 /responses including compact); LHC never issues that compact request"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider() {
     skip_if_no_network!();

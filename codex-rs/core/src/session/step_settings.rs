@@ -213,8 +213,10 @@ impl ModelInfoOverrides {
             tool_output_token_limit: self.tool_output_token_limit,
             base_instructions: self.base_instructions.clone(),
             personality,
-            // The models manager already owns its catalog.
-            model_catalog: None,
+            // Operator/test catalog must survive turn-context re-resolve.
+            // Upstream 0.156.1 zeros this ("manager already owns catalog");
+            // dropping it lets the bundled 370k LHC overlay lift a 20k fixture.
+            model_catalog: self.model_catalog.clone(),
         }
     }
 }

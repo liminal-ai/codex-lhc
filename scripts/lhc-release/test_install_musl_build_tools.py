@@ -75,6 +75,14 @@ class InstallMuslBuildToolsTests(unittest.TestCase):
                 libcap = tool_root / "libcap-2.75/prefix/lib/libcap.a"
                 libcap.parent.mkdir(parents=True)
                 libcap.touch()
+                # 0.156.1 compiles OpenSSL with the musl CC. Pre-seed the
+                # completed prefix so the unit test's fake compiler is not
+                # asked to build the real library.
+                openssl_complete = (
+                    tool_root / "openssl-3.6.4" / "prefix" / ".complete"
+                )
+                openssl_complete.parent.mkdir(parents=True)
+                openssl_complete.touch()
 
                 env = {
                     **os.environ,

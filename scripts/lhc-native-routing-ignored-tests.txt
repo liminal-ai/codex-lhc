@@ -1,5 +1,5 @@
 # Reviewed native-routing ignore allowlist (LIM-142).
-# count: 86
+# count: 87
 #
 # Tests that assert upstream TokenBudget / remote / local compact routing.
 # Under Codex-LHC those routes are never taken; the ignore is the reviewed exclusion.
@@ -27,11 +27,12 @@ codex-rs/core/tests/suite/compact.rs::manual_compact_records_durable_and_local_t
 codex-rs/core/tests/suite/compact.rs::manual_compact_retries_after_context_window_error
 codex-rs/core/tests/suite/compact.rs::manual_compact_twice_preserves_latest_user_messages
 codex-rs/core/tests/suite/compact.rs::manual_compact_uses_custom_prompt
-codex-rs/core/tests/suite/compact.rs::manual_compaction_keeps_the_creation_time_global_instructions
+codex-rs/core/tests/suite/compact.rs::manual_compaction_refreshes_global_instructions_for_next_turn
 codex-rs/core/tests/suite/compact.rs::manual_pre_compact_block_decision_does_not_block_compaction
-codex-rs/core/tests/suite/compact.rs::mid_turn_compaction_keeps_the_creation_time_global_instructions
+codex-rs/core/tests/suite/compact.rs::mid_turn_compaction_uses_refreshed_global_instructions
 codex-rs/core/tests/suite/compact.rs::multiple_auto_compact_per_task_runs_after_token_limit_hit
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_after_previous_model_invalid_request_on_downshift
+codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_after_previous_model_stream_retries_are_exhausted
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_from_retired_previous_model_after_rename
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_falls_back_when_previous_model_is_not_found
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_keeps_unknown_previous_model_for_api_key_auth_and_custom_provider
@@ -43,7 +44,7 @@ codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_skips_missing_comp_ha
 codex-rs/core/tests/suite/compact.rs::pre_sampling_compact_skips_when_either_comp_hash_is_missing
 codex-rs/core/tests/suite/compact.rs::previous_model_compaction_resolves_selected_settings
 codex-rs/core/tests/suite/compact.rs::reasoning_effort_override_remote_v2_compaction_resets_pinned_effort
-codex-rs/core/tests/suite/compact.rs::remote_v2_compaction_keeps_creation_time_instructions_after_same_path_mutation
+codex-rs/core/tests/suite/compact.rs::remote_v2_compaction_refreshes_instructions_and_preserves_them_on_cold_resume
 codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_manual_compact_without_previous_user_messages
 codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_mid_turn_continuation_compaction
 codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction_context_window_exceeded
@@ -51,6 +52,7 @@ codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction
 codex-rs/core/tests/suite/compact.rs::snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
 codex-rs/core/tests/suite/compact.rs::summarize_context_three_requests_and_instructions
 codex-rs/core/tests/suite/compact_remote.rs::active_realtime_refreshes_changed_start_instructions_only_after_compaction
+codex-rs/core/tests/suite/compact_remote_trimming.rs::remote_compact_v2_token_estimate_ignores_message_bookkeeping_and_json_escaping
 codex-rs/core/tests/suite/compact_remote_trimming.rs::remote_compact_v2_trim_estimate_uses_session_base_instructions
 codex-rs/core/tests/suite/compact_remote_trimming.rs::remote_compact_v2_trims_tool_search_output_to_empty_tools_array
 codex-rs/core/tests/suite/compact_remote.rs::amazon_bedrock_automatic_compaction_uses_v2_responses_endpoint
@@ -65,7 +67,6 @@ codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v2_sends_tu
 codex-rs/core/tests/suite/compact_remote.rs::remote_mid_turn_compact_v2_sends_turn_state_over_websocket
 codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_after_second_compaction_preserves_history
 codex-rs/core/tests/suite/compact_resume_fork.rs::compact_resume_and_fork_preserve_model_history_view
-codex-rs/core/tests/suite/compact_resume_fork.rs::snapshot_rollback_past_compaction_replays_append_only_history
 codex-rs/core/tests/suite/guardian_history.rs::guardian_history_uses_deltas_between_eviction_batches
 codex-rs/core/tests/suite/current_time_reminder.rs::current_time_reminder_is_refreshed_after_compaction
 codex-rs/core/tests/suite/hooks.rs::compact_session_start_hook_records_additional_context_for_next_turn
