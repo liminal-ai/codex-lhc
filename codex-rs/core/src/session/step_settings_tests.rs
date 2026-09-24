@@ -507,11 +507,7 @@ async fn step_overrides_preserve_configured_catalog_windows() {
     );
 
     let resolved = settings
-        .resolve_model_info(
-            &models_manager,
-            &overrides,
-            /*personality_enabled*/ false,
-        )
+        .resolve_model_info(&models_manager, &overrides)
         .await;
     assert_eq!(resolved.context_window, Some(20_000));
     assert_eq!(resolved.max_context_window, Some(20_000));

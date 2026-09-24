@@ -428,6 +428,7 @@ async fn lhc_band_shape_eval_dry_run_installs_and_dumps() {
                 window_ids,
                 compaction_response_id: None,
                 compaction_model_hash: None,
+                reviewer_compaction_hash: None,
             },
         )
         .await;
@@ -552,12 +553,14 @@ async fn lhc_band_shape_eval_live() {
         "lhc-band-shape-eval".to_string(),
         config.model_verbosity,
         /*content_item_kinds_enabled*/ false,
+        /*reasoning_effort_override_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         config.http_client_factory(),
+        config.workspace_routing_context(),
     );
 
     let (session, _tc) = make_session_and_context().await;
@@ -573,6 +576,7 @@ async fn lhc_band_shape_eval_live() {
                 window_ids,
                 compaction_response_id: None,
                 compaction_model_hash: None,
+                reviewer_compaction_hash: None,
             },
         )
         .await;
@@ -778,6 +782,7 @@ async fn replace_compacted_history_clears_prefill_for_threshold_untrip() {
                 window_ids,
                 compaction_response_id: None,
                 compaction_model_hash: None,
+                reviewer_compaction_hash: None,
             },
         )
         .await;

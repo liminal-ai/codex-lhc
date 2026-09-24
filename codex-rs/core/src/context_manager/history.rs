@@ -491,6 +491,12 @@ impl ContextManager {
         self.items.iter().map(|envelope| &envelope.item)
     }
 
+    /// Owned copy of [`Self::raw_items`] for compact-install assertions.
+    #[cfg(test)]
+    pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
+        self.raw_items().cloned().collect()
+    }
+
     /// Returns annotated history items without cloning their response payloads.
     pub(crate) fn annotated_items(&self) -> &[ResponseItemEnvelope] {
         &self.items

@@ -208,7 +208,7 @@ impl GuardianV2Extension {
             context_mode,
             &guardian_config,
             input.conversation_history.as_ref(),
-            &sampler,
+            |hash| sampler.supports_parent_compaction(hash),
             parent_model
                 .as_ref()
                 .and_then(|model| model.comp_hash.as_deref()),

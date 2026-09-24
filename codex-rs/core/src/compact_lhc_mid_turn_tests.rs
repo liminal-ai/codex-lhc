@@ -180,7 +180,7 @@ pub(super) async fn inject_response_usage(
 ) {
     let usage = sample_usage(input_tokens);
     session
-        .record_token_usage_info(tc, Some(&usage))
+        .record_token_usage_info(tc, tc.initial_settings.as_ref(), Some(&usage))
         .await
         .expect("record token usage");
 }
@@ -1172,7 +1172,7 @@ async fn mid_turn_uses_response_scoped_usage_and_attempt_id() {
     // Pollute session aggregate with a different later snapshot via the
     // production record path (session.state is private to the session module).
     session
-        .record_token_usage_info(&tc, Some(&sample_usage(99_999)))
+        .record_token_usage_info(&tc, tc.initial_settings.as_ref(), Some(&sample_usage(99_999)))
         .await
         .expect("pollute aggregate");
     // Response-scoped usage is much smaller — arm must prefer it.
@@ -1363,12 +1363,16 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
         "test_originator".to_string(),
         /*model_verbosity*/ None,
         /*content_item_kinds_enabled*/ false,
+        /*reasoning_effort_override_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        codex_model_provider::WorkspaceRoutingContext::new(
+            "https://chatgpt.com/backend-api".into(),
+        ),
     )
     .new_session()
 }

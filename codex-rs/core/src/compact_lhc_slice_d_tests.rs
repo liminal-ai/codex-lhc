@@ -31,6 +31,7 @@ use codex_lhc_host::read_materialize_surfaces;
 use codex_lhc_host::wait_for_handle;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::SessionMeta;
@@ -585,7 +586,7 @@ async fn slice_d_display_consumers_on_rebuilt_file() {
         ..TokenUsage::default()
     };
     session
-        .record_token_usage_info(&tc, Some(&usage1))
+        .record_token_usage_info(&tc, tc.initial_settings.as_ref(), Some(&usage1))
         .await
         .expect("token usage 1");
 
@@ -597,7 +598,7 @@ async fn slice_d_display_consumers_on_rebuilt_file() {
         ..TokenUsage::default()
     };
     session
-        .record_token_usage_info(&tc, Some(&usage2))
+        .record_token_usage_info(&tc, tc.initial_settings.as_ref(), Some(&usage2))
         .await
         .expect("token usage 2");
     handle.flush().await;
@@ -1067,6 +1068,7 @@ async fn slice_d_f2_interrupt_rewrite_preserves_host_uuid_on_resume() {
             thread_id: sess.thread_id,
             turn_id: host_turn.into(),
             item: TurnItem::CommandExecution(CommandExecutionItem {
+                model_context: None,
                 id: exec_id.into(),
                 plugin_id: None,
                 script_path: None,
@@ -1840,7 +1842,9 @@ async fn slice_d_unrepresentable_unpaired_output_refuses_before_install() {
                         text: "see attachment".to_string(),
                     },
                     codex_protocol::models::FunctionCallOutputContentItem::InputImage {
-                        image_url: "https://example.invalid/a.png".to_string(),
+                        image: ImageReference::Inline {
+                            image_url: "https://example.invalid/a.png".to_string(),
+                        },
                         detail: None,
                     },
                 ]),

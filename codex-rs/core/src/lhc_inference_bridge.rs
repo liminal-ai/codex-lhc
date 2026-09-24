@@ -717,12 +717,16 @@ mod tests {
             "test_originator".to_string(),
             /*model_verbosity*/ None,
             /*content_item_kinds_enabled*/ false,
+            /*reasoning_effort_override_enabled*/ false,
             /*enable_request_compression*/ false,
             /*include_timing_metrics*/ false,
             /*beta_features_header*/ None,
             /*concurrent_reasoning_summaries_enabled*/ false,
             /*attestation_provider*/ None,
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            codex_model_provider::WorkspaceRoutingContext::new(
+                "https://chatgpt.com/backend-api".into(),
+            ),
         );
 
         let target = resolve_lhc_derivation_target(&session)

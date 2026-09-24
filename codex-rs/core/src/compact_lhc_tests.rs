@@ -13,6 +13,7 @@ use codex_lhc_host::install_with_root;
 use codex_lhc_host::wait_for_handle;
 use codex_protocol::error::CodexErrorDetails;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ImageReference;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
@@ -381,7 +382,9 @@ fn law1_structural_eq_includes_phase_and_media() {
         content: vec![
             ContentItem::InputText { text: "see".into() },
             ContentItem::InputImage {
-                image_url: "data:image/png;base64,abc".into(),
+                image: ImageReference::Inline {
+                    image_url: "data:image/png;base64,abc".into(),
+                },
                 detail: None,
             },
         ],
@@ -930,12 +933,16 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
         "test_originator".to_string(),
         /*model_verbosity*/ None,
         /*content_item_kinds_enabled*/ false,
+        /*reasoning_effort_override_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        codex_model_provider::WorkspaceRoutingContext::new(
+            "https://chatgpt.com/backend-api".into(),
+        ),
     )
     .new_session()
 }
@@ -1134,12 +1141,16 @@ async fn j1_production_without_override_fails_open_not_deterministic() {
             "test_originator".to_string(),
             /*model_verbosity*/ None,
             /*content_item_kinds_enabled*/ false,
+            /*reasoning_effort_override_enabled*/ false,
             /*enable_request_compression*/ false,
             /*include_timing_metrics*/ false,
             /*beta_features_header*/ None,
             /*concurrent_reasoning_summaries_enabled*/ false,
             /*attestation_provider*/ None,
             HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+            codex_model_provider::WorkspaceRoutingContext::new(
+                "https://chatgpt.com/backend-api".into(),
+            ),
         )
     };
     // Deliberately NO derivation callbacks seeded: J1 asserts production never

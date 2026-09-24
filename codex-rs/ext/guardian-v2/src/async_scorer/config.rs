@@ -164,7 +164,7 @@ impl GuardianV2Config {
         Ok(resolved)
     }
 
-    fn from_overrides(configured: GuardianV2ConfigToml) -> Result<Self, String> {
+    pub(super) fn from_overrides(configured: GuardianV2ConfigToml) -> Result<Self, String> {
         // Existing custom and model-owned prompts retain their original calibration
         // unless their owner explicitly supplies a matching threshold.
         let review_threshold = configured.review_threshold.unwrap_or_else(|| {

@@ -232,11 +232,9 @@ async fn e2e_core_id_assignment_is_restart_stable() {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }];
-    let (prepared, _) = session.prepare_conversation_items_for_history(
-        &turn_context,
-        turn_context.model_info(),
-        &items,
-    );
+    let (prepared, _) = session
+        .prepare_conversation_items_for_history(&turn_context, turn_context.model_info(), &items)
+        .await;
     let prepared = prepared.into_owned();
     let id_str = prepared[0]
         .id()
@@ -629,7 +627,7 @@ async fn e2e_rollout_reconstruction_does_not_re_ingest_into_capture() {
     // The production entry itself — the same call `InitialHistory::Resumed`
     // and `InitialHistory::Forked` make in `Session::new`.
     let _ = session
-        .apply_rollout_reconstruction(&turn_context, &rollout_items)
+        .apply_rollout_reconstruction(&Arc::new(turn_context), &rollout_items)
         .await;
 
     // Reconstruction is synchronous into state; give any stray async capture
@@ -740,7 +738,11 @@ async fn e2e_v5_host_facts_complete_and_provider_usage() {
         codex_rollout_budget_units: None,
     };
     session
-        .record_token_usage_info(&turn_context, Some(&per_call))
+        .record_token_usage_info(
+            &turn_context,
+            turn_context.initial_settings.as_ref(),
+            Some(&per_call),
+        )
         .await
         .expect("record token usage");
 

@@ -753,11 +753,10 @@ pub(crate) async fn run_turn(
                     {
                         return Ok(None);
                     }
-                    // Token-budget resets do not summarize, so preserve their existing rollover
-                    // policy. Keep summarizing compaction in this task to serialize history updates.
+                    // Opt-in post-turn compact uses the same strict LHC auto ladder as
+                    // PreTurn. Native TokenBudget / compact.rs arms are unreachable.
                     let config = &turn_context.config;
                     if config.model_post_turn_compact_threshold_percent > 0
-                        && !config.features.enabled(Feature::TokenBudget)
                         && super::context_window::context_window_token_status(
                             sess.as_ref(),
                             turn_context.as_ref(),

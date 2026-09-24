@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_extension_api::ConversationHistorySnapshot;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadStartInput;
 use codex_features::Feature;
@@ -171,12 +172,16 @@ fn inert_model_client_session() -> crate::client::ModelClientSession {
         "test_originator".to_string(),
         /*model_verbosity*/ None,
         /*content_item_kinds_enabled*/ false,
+        /*reasoning_effort_override_enabled*/ false,
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        codex_model_provider::WorkspaceRoutingContext::new(
+            "https://chatgpt.com/backend-api".into(),
+        ),
     )
     .new_session()
 }
@@ -230,6 +235,10 @@ fn strict_dispatch_sites_have_no_native_compaction_fallback() {
         auto.matches("run_strict_lhc_compact").count(),
         1,
         "run_auto_compact must have exactly one compaction dispatch"
+    );
+    assert!(
+        auto.contains("CompactionPhase::PostTurn"),
+        "turn.rs must keep the post-turn trigger on the LHC auto ladder"
     );
 
     let arm = source_file("src/compact_lhc.rs");
@@ -442,6 +451,63 @@ async fn run_auto_compact_is_strict_lhc_only() {
             Some(codex_hooks::SessionStartSource::Compact)
         ),
         "auto ladder install must queue Compact session-start"
+    );
+}
+
+/// Upstream post-turn compact is opt-in on the same LHC auto ladder. Native
+/// compact.rs PostTurn / TokenBudget arms must not run on an LHC thread.
+#[tokio::test]
+async fn run_auto_compact_post_turn_is_strict_lhc_only() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let (mut session, tc) = make_session_and_context().await;
+    install_lhc_and_enable(&mut session, root).await;
+    let slot = session
+        .services
+        .thread_extension_data
+        .get::<LhcCaptureSlot>()
+        .expect("slot");
+    let handle = wait_for_handle(&slot, Duration::from_secs(30))
+        .await
+        .expect("handle");
+    seed_conversation_bandable(&session, &tc, 80).await;
+    handle.flush().await;
+    install_deterministic_test_override(&session);
+    while session.take_pending_session_start_source().await.is_some() {}
+
+    let sess = Arc::new(session);
+    let step = crate::session::step_context::StepContext::for_test(Arc::new(tc));
+    let mut client = inert_model_client_session();
+    let result = run_auto_compact(
+        &sess,
+        step,
+        /*fallback*/ None,
+        &mut client,
+        InitialContextInjection::DoNotInject,
+        CompactionReason::ContextLimit,
+        CompactionPhase::PostTurn,
+        /*mid_turn*/ None,
+        &CancellationToken::new(),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "post-turn auto ladder must complete via LHC: {result:?}"
+    );
+    assert!(
+        matches!(
+            sess.take_pending_session_start_source().await,
+            Some(codex_hooks::SessionStartSource::Compact)
+        ),
+        "post-turn LHC install must queue Compact session-start"
+    );
+    let history = sess.clone_history().await;
+    assert!(
+        ConversationHistorySnapshot::latest_compaction(
+            history.conversation_history_snapshot().as_ref(),
+        )
+        .is_none(),
+        "LHC post-turn fold must not install a native Compaction checkpoint"
     );
 }
 

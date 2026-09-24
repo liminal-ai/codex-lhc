@@ -149,8 +149,8 @@ pub(super) async fn install_lhc_compact_rewrite(
         turn_context: reference_context_item
             .clone()
             .or_else(|| Some(turn_context.to_turn_context_item())),
-        guardian_history,
-        retained_context,
+        guardian_history: guardian_history.clone(),
+        retained_context: retained_context.clone(),
         latest_token_usage_record,
         // Live identity from the same label sources capture uses
         // (config.model / config.model_provider_id), so same-identity replay
@@ -579,6 +579,8 @@ pub(super) async fn install_lhc_compact_rewrite(
         reference_context_item,
         world_state_baseline,
         Some(durable_message),
+        guardian_history,
+        retained_context,
     )
     .await;
     // Commit the planned window only with successful replacement.

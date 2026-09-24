@@ -2,6 +2,7 @@
 
 use super::*;
 use codex_core::TurnInputRequest;
+use codex_features::Feature;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -121,5 +122,22 @@ async fn terminal_turn_clears_extension_owned_denials() -> anyhow::Result<()> {
         None
     );
     streaming.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn reviewer_config_zeros_post_turn_and_disables_native_compact() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut parent = core_test_support::load_default_config_for_test(&home).await;
+    parent.model_post_turn_compact_threshold_percent = 80;
+    let _ = parent.features.enable(Feature::TokenBudget);
+    let _ = parent.features.enable(Feature::LhcCapture);
+    let reviewer = reviewer_config::build_reviewer_config(&parent)?;
+    assert_eq!(reviewer.model_post_turn_compact_threshold_percent, 0);
+    assert!(!reviewer.features.enabled(Feature::TokenBudget));
+    assert!(
+        reviewer.features.enabled(Feature::LhcCapture),
+        "parent LHC capture stays inherited so reviewer window-full compact uses LHC"
+    );
     Ok(())
 }

@@ -14,6 +14,8 @@ pub(crate) fn build_reviewer_config(parent_config: &Config) -> anyhow::Result<Co
     config.model_provider.request_max_retries = Some(1);
     config.model_provider.stream_max_retries = Some(1);
     // Approvals wait for TurnComplete; post-turn compaction must not delay it.
+    // Parent LHC capture stays inherited so a window-full reviewer compact uses
+    // the host's strict LHC arm (LIM-142), never TokenBudget / compact.rs.
     config.model_post_turn_compact_threshold_percent = 0;
     config.include_skill_instructions = false;
     config.memories.use_memories = false;

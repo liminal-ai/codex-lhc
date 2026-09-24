@@ -338,8 +338,10 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_git_utils::get_git_repo_root;
 use codex_history::CodexHarnessMetadata;
 use codex_history::CompactedItem;
+use codex_history::GuardianHistoryCheckpoint;
 use codex_history::InitialHistory;
 use codex_history::ResponseItemEnvelope;
+use codex_history::RetainedContext;
 use codex_mcp::McpConfig;
 use codex_mcp::effective_mcp_servers;
 use codex_otel::SessionTelemetry;
@@ -4085,6 +4087,8 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         durable_message: Option<String>,
+        guardian_history: Option<GuardianHistoryCheckpoint>,
+        retained_context: Option<RetainedContext>,
     ) {
         let items = Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned();
         let items = items.into_iter().map(Into::into).collect();
@@ -4096,6 +4100,13 @@ impl Session {
                 HistoryReplacement::Compaction {
                     reviewer_compaction_hash: None,
                 },
+            );
+            // Same restore resume uses from CompactedItem so live Guardian v2
+            // snapshots match the rewritten rollout after an LHC fold.
+            state.history.restore_review_context(
+                retained_context.as_ref(),
+                guardian_history.as_ref(),
+                /*reviewer_compaction_hash*/ None,
             );
             if let Some(world_state) = world_state_baseline {
                 let snapshot = world_state.snapshot();

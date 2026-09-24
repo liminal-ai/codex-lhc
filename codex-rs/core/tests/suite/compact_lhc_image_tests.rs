@@ -1,6 +1,7 @@
 //! Image-bearing native tool output through a real MidTurn provider loop.
 use super::*;
 use base64::Engine;
+use codex_protocol::models::ImageReference;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn view_image_payload_survives_mid_turn_compaction() -> Result<()> {
@@ -184,7 +185,9 @@ async fn pasted_image_uses_placeholder_when_its_part_is_compressed_across_resume
     test.codex
         .start_or_steer_turn(TurnInputRequest::user_input(vec![
             UserInput::Image {
-                image_url: image_url.into(),
+                image: ImageReference::Inline {
+                    image_url: image_url.into(),
+                },
                 detail: Some(codex_protocol::models::ImageDetail::Original),
             },
             UserInput::Text {

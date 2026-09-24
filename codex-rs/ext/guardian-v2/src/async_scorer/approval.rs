@@ -157,7 +157,7 @@ async fn cached_evidence(
             context_mode,
             config,
             history.as_ref(),
-            &sampler,
+            |hash| sampler.supports_parent_compaction(hash),
             /*legacy_model_hash*/ None,
         )
         .is_err()

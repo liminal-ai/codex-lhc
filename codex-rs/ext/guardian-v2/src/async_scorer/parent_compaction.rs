@@ -7,7 +7,6 @@ use codex_extension_api::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
 use super::config::GuardianV2Config;
-use super::sampler::LunaSampler;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum ParentCompactionError {
@@ -17,6 +16,7 @@ pub(super) enum ParentCompactionError {
     Unusable,
 }
 
+#[derive(Debug, PartialEq)]
 pub(super) struct ParentCompaction {
     pub(super) item: Option<ResponseItem>,
     pub(super) model_hash: Option<String>,
@@ -26,9 +26,13 @@ pub(super) fn select_parent_compaction(
     mode: GuardianContextMode,
     config: &GuardianV2Config,
     history: &dyn ConversationHistorySnapshot,
-    sampler: &LunaSampler,
+    supports_parent_compaction: impl Fn(Option<&str>) -> bool,
     legacy_model_hash: Option<&str>,
 ) -> Result<ParentCompaction, ParentCompactionError> {
+    // LHC rewrite installs bands + tail and never emits native Compaction /
+    // ContextCompaction items. Missing checkpoint is a valid omit: ThreadOwned
+    // keeps parent history as evidence, and Luna samples without encrypted carry.
+    // RequiresSync only when a native checkpoint exists and cannot be reused.
     let checkpoint = history.latest_compaction();
     let model_hash = match mode {
         GuardianContextMode::Legacy => legacy_model_hash,
@@ -36,7 +40,7 @@ pub(super) fn select_parent_compaction(
     };
     if mode == GuardianContextMode::ThreadOwned
         && checkpoint.is_some()
-        && (!config.reuse_parent_compaction || !sampler.supports_parent_compaction(model_hash))
+        && (!config.reuse_parent_compaction || !supports_parent_compaction(model_hash))
     {
         return Err(ParentCompactionError::RequiresSync);
     }
@@ -52,7 +56,7 @@ pub(super) fn select_parent_compaction(
     // Legacy has raw history, so it can omit an incompatible checkpoint. Validate its size
     // before omission, preserving the previous failure behavior for oversized items.
     let item = item.filter(|_| {
-        mode == GuardianContextMode::ThreadOwned || sampler.supports_parent_compaction(model_hash)
+        mode == GuardianContextMode::ThreadOwned || supports_parent_compaction(model_hash)
     });
     Ok(ParentCompaction {
         item,
