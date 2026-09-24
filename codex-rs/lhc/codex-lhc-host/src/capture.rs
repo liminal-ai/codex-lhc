@@ -955,12 +955,11 @@ fn finish_capture_runtime(
     terminated: &watch::Sender<bool>,
     remaining: std::time::Duration,
 ) {
-    // Release the live-path reservation before SQLite hand-back so a successor
-    // is not blocked if hand-back is skipped or still waiting. `terminated`
-    // stays false until hand-back returns: that is when this OS thread can no
-    // longer claim, and tests that wait on it can observe the handed-back row.
-    unregister_live_capture(path, terminated);
+    // Keep admission through hand-back (including skip) so a successor cannot
+    // note a claim on this path until this runtime has isolated what it owns.
+    // Hand-back's wait is already reserved inside the worker-return deadline.
     crate::handback::on_thread_unload_within(root, thread_id, remaining);
+    unregister_live_capture(path, terminated);
     let _ = terminated.send_replace(true);
 }
 

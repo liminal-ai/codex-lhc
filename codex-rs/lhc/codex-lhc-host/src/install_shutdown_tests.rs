@@ -526,6 +526,94 @@ async fn former_owner_drop_does_not_take_resumed_thread_claim() {
 }
 
 #[tokio::test]
+async fn racing_successor_keeps_its_claim_until_predecessor_returns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "race-hb";
+    let predecessor = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("predecessor");
+    predecessor.persist(
+        &message("user", "predecessor claim prompt", "user-pred"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    predecessor.persist(
+        &message("assistant", "predecessor claim reply", "assistant-pred"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    predecessor.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "predecessor must hold a claim before shutdown"
+    );
+
+    let wait_pred = predecessor.clone();
+    let successor_fut = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    );
+    tokio::pin!(successor_fut);
+    let shutting = tokio::spawn(async move { predecessor.shutdown().await });
+    let successor = tokio::select! {
+        result = &mut successor_fut => {
+            assert!(
+                wait_pred.is_terminated(),
+                "successor must not open before the predecessor returns"
+            );
+            result
+        }
+        ok = wait_pred.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND) => {
+            assert!(
+                ok,
+                "predecessor must return within the worker-return bound"
+            );
+            tokio::time::timeout(Duration::from_secs(2), successor_fut)
+                .await
+                .expect("successor must open once the predecessor returns")
+        }
+    };
+    shutting.await.expect("predecessor shutdown");
+    let successor = successor.expect("successor capture");
+    successor.persist(
+        &message("user", "successor claim prompt", "user-succ"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    successor.persist(
+        &message("assistant", "successor claim reply", "assistant-succ"),
+        RawItemProvenance::ModelOutput,
+        /*step_index*/ None,
+    );
+    successor.flush().await;
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "successor must hold its own claim after opening"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        claimed_work_item_count(&path) > 0,
+        "predecessor hand-back must not requeue the successor's claim"
+    );
+    let wait_succ = successor.clone();
+    successor.shutdown().await;
+    assert!(
+        wait_succ
+            .wait_terminated_bounded(Duration::from_secs(8))
+            .await
+    );
+}
+
+#[tokio::test]
 async fn cancelled_spawn_capture_releases_path_slot() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();

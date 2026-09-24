@@ -13,7 +13,8 @@ use tracing::warn;
 use crate::gating::lhc_root;
 use crate::session::thread_file_path;
 
-/// SDK `release_held_claims_for` waits up to 2s (`PRAGMA busy_timeout = 2000`).
+/// Per-statement SQLite wait in `release_held_claims_for` (`PRAGMA busy_timeout
+/// = 2000` in `claim_fence.rs`). Not a total bound on the hand-back call.
 pub(crate) const HANDBACK_BOUND: Duration = Duration::from_secs(2);
 
 /// Hand back claims held on one thread database. Call from that thread's
@@ -22,9 +23,9 @@ pub fn on_thread_unload(root: Option<&Path>, thread_id: &str) {
     on_thread_unload_within(root, thread_id, HANDBACK_BOUND);
 }
 
-/// Like [`on_thread_unload`], but skip SQLite if `remaining` cannot cover the
-/// SDK's 2s busy wait. Lease expiry is the fallback; the caller still releases
-/// the live-path reservation.
+/// Like [`on_thread_unload`], but skip SQLite if `remaining` cannot cover one
+/// per-statement busy wait. Lease expiry is the fallback. The caller keeps the
+/// live-path reservation until this returns.
 pub(crate) fn on_thread_unload_within(root: Option<&Path>, thread_id: &str, remaining: Duration) {
     if remaining < HANDBACK_BOUND {
         warn!(
