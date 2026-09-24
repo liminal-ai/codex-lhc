@@ -64,7 +64,8 @@ const SHUTDOWN_ENQUEUE_CLEANUP_BOUND: std::time::Duration = std::time::Duration:
 /// so a write finishes or errors instead of being dropped mid-SQLite.
 pub(crate) const CAPTURE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Retiring worker return bound: [`CAPTURE_WRITE_BOUND`] + [`crate::session::CLOSE_SETTLE_BOUND`].
+/// Absolute worker-return deadline. Persist, close-settle, and claim hand-back
+/// all charge this one clock; the live-path reservation is released by then.
 pub(crate) const CAPTURE_WORKER_RETURN_BOUND: std::time::Duration =
     std::time::Duration::from_secs(10);
 
@@ -197,17 +198,17 @@ struct CaptureShutdownControl {
 
 impl CaptureShutdownControl {
     fn persist_bound(&self) -> std::time::Duration {
-        let deadline = *self
-            .deadline
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(deadline) = deadline else {
+        if !self.has_deadline() {
             return CAPTURE_WRITE_BOUND;
-        };
-        deadline
-            .saturating_duration_since(tokio::time::Instant::now())
-            .saturating_sub(crate::session::CLOSE_SETTLE_BOUND)
-            .min(CAPTURE_WRITE_BOUND)
+        }
+        self.remaining_after_handback().min(CAPTURE_WRITE_BOUND)
+    }
+
+    fn has_deadline(&self) -> bool {
+        self.deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
     fn remaining(&self) -> std::time::Duration {
@@ -219,6 +220,11 @@ impl CaptureShutdownControl {
             Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
             None => crate::session::CLOSE_SETTLE_BOUND,
         }
+    }
+
+    fn remaining_after_handback(&self) -> std::time::Duration {
+        self.remaining()
+            .saturating_sub(crate::handback::HANDBACK_BOUND)
     }
 }
 
@@ -947,9 +953,14 @@ fn finish_capture_runtime(
     thread_id: &str,
     path: &str,
     terminated: &watch::Sender<bool>,
+    remaining: std::time::Duration,
 ) {
-    crate::handback::on_thread_unload(root, thread_id);
+    // Release the live-path reservation before SQLite hand-back so a successor
+    // is not blocked if hand-back is skipped or still waiting. `terminated`
+    // stays false until hand-back returns: that is when this OS thread can no
+    // longer claim, and tests that wait on it can observe the handed-back row.
     unregister_live_capture(path, terminated);
+    crate::handback::on_thread_unload_within(root, thread_id, remaining);
     let _ = terminated.send_replace(true);
 }
 
@@ -1025,6 +1036,7 @@ pub(crate) async fn spawn_capture_with_admission(
     let finish_thread = thread_id.to_string();
     let finish_path = db_path.clone();
     let finish_terminated = terminated.clone();
+    let shutdown_for_finish = Arc::clone(&shutdown);
     std::thread::Builder::new()
         .name(format!("lhc-capture-{thread_id}"))
         .spawn(move || {
@@ -1034,6 +1046,7 @@ pub(crate) async fn spawn_capture_with_admission(
                     &finish_thread,
                     &finish_path,
                     &finish_terminated,
+                    shutdown_for_finish.remaining(),
                 );
             };
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -1081,7 +1094,13 @@ pub(crate) async fn spawn_capture_with_admission(
         })
         .map_err(|err| {
             error!(?err, "LHC: failed to spawn capture thread");
-            finish_capture_runtime(root.as_deref(), thread_id, &db_path, &terminated);
+            finish_capture_runtime(
+                root.as_deref(),
+                thread_id,
+                &db_path,
+                &terminated,
+                crate::handback::HANDBACK_BOUND,
+            );
             err
         })
         .ok()?;
@@ -1377,7 +1396,7 @@ async fn handle_worker_cmd(
             {
                 return true;
             }
-            let event = map_turn_end(&thread_id, &turn_id, &reason, &facts);
+            let event = map_turn_end(thread_id, &turn_id, &reason, &facts);
             if let Err(err) = submit_mapped(session, &[event], shutdown).await {
                 durability.failed = true;
                 warn!(thread_id = %thread_id, %err, "LHC: turn_end failed");
@@ -1420,7 +1439,7 @@ async fn handle_worker_cmd(
                     Some(api.unwrap_or_else(|| ModelIdentity::RESPONSES_API.to_string()));
             }
             let events = map_model_or_thinking_change(
-                &thread_id,
+                thread_id,
                 &previous_model,
                 &new_model,
                 &previous_level,
@@ -1459,7 +1478,7 @@ async fn handle_worker_cmd(
             *live_identity = identity;
         }
         CaptureCmd::RuntimeNote { text, key_suffix } => {
-            let event = map_runtime_note(&thread_id, &text, &key_suffix);
+            let event = map_runtime_note(thread_id, &text, &key_suffix);
             if let Err(err) = submit_mapped(session, &[event], shutdown).await {
                 durability.failed = true;
                 warn!(thread_id = %thread_id, %err, "LHC: degraded note failed");
@@ -1498,11 +1517,19 @@ async fn handle_worker_cmd(
             // the handle: this await runs inside the worker loop, so an
             // unbounded settle-wait on a thread that can never settle would
             // wedge the loop and starve every command behind it, including
-            // `Shutdown`. Timing out reports unsettled and the caller fails
-            // open; it is never licence to drain inline.
-            let settled = tokio::time::timeout(timeout, session.drain_settled())
-                .await
-                .is_ok();
+            // `Shutdown`. Shutdown aborts the wait so retirement can proceed.
+            // Timing out reports unsettled and the caller fails open; it is
+            // never licence to drain inline.
+            let settled = tokio::select! {
+                biased;
+                _ = shutdown_rx.wait_for(|done| *done) => {
+                    *shutting_down = true;
+                    false
+                }
+                settled = tokio::time::timeout(timeout, session.drain_settled()) => {
+                    settled.is_ok()
+                }
+            };
             let _ = ack.send(settled);
         }
         #[cfg(any(test, feature = "test-util"))]
@@ -1599,7 +1626,7 @@ async fn finish_worker(
         };
         let _ = ack.send(result);
     }
-    close_capture_session(session, derivation, shutdown.remaining()).await;
+    close_capture_session(session, derivation, shutdown.remaining_after_handback()).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1815,7 +1842,12 @@ async fn close_capture_session(
 ) {
     derivation.cancel();
     if derivation.is_seeded() && !settle.is_zero() {
-        let _ = tokio::time::timeout(settle, session.close()).await;
+        // drain_settled can still enter a sync SQLite busy wait; catch that
+        // panic so reservation release in `finish_capture_runtime` still runs.
+        let _ = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+            tokio::time::timeout(settle, session.close()),
+        ))
+        .await;
     }
 }
 
@@ -1824,20 +1856,25 @@ async fn submit_mapped(
     events: &[MappedEvent],
     shutdown: &CaptureShutdownControl,
 ) -> Result<lhc::intake_stream::BatchResult, String> {
-    submit_mapped_within(session, events, shutdown.persist_bound()).await
-}
-
-async fn submit_mapped_within(
-    session: &mut LhcSession,
-    events: &[MappedEvent],
-    bound: std::time::Duration,
-) -> Result<lhc::intake_stream::BatchResult, String> {
+    let bound = shutdown.persist_bound();
     if bound.is_zero() {
         return Err("LHC persist deadline already passed".into());
     }
+    // open_database uses a fixed 5s busy_timeout. A cooperative future timeout
+    // cannot preempt that wait, so do not start a write whose SQLite wait
+    // would overrun the remaining shutdown budget.
+    if shutdown.has_deadline() && bound < CAPTURE_WRITE_BOUND {
+        return Err("LHC persist remaining is below SQLite busy_timeout".into());
+    }
     let inputs: Vec<_> = events.iter().map(|e| e.input.clone()).collect();
-    match tokio::time::timeout(bound, session.submit_events(&inputs)).await {
-        Ok(result) => result,
-        Err(_) => Err("LHC persist timed out".into()),
+    match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tokio::time::timeout(
+        bound,
+        session.submit_events(&inputs),
+    )))
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err("LHC persist timed out".into()),
+        Err(_) => Err("LHC persist panicked (database locked)".into()),
     }
 }

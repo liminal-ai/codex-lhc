@@ -798,6 +798,145 @@ async fn shutdown_returns_within_bound_when_active_flush_is_blocked() {
     db.exec("ROLLBACK");
 }
 
+#[cfg(target_os = "linux")]
+fn capture_os_thread_alive(thread_id: &str) -> bool {
+    let mut comm = format!("lhc-capture-{thread_id}");
+    comm.truncate(15);
+    std::fs::read_dir("/proc/self/task")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            std::fs::read_to_string(entry.path().join("comm"))
+                .ok()
+                .is_some_and(|name| name.trim() == comm)
+        })
+}
+
+#[tokio::test]
+async fn shutdown_releases_reservation_within_bound_when_flush_and_handback_are_blocked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let thread_id = "cf";
+    let handle = spawn_capture(
+        thread_id,
+        None,
+        Some(root.to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("capture");
+    handle.persist(
+        &message("user", "hold a real derivation claim", "user-claim"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+    let path = crate::session::thread_file_path(root, thread_id);
+    assert!(
+        wait_for_claimed_work_item(&path, Duration::from_secs(2)).await,
+        "seeded hanging inference must hold a claim"
+    );
+    let db = match lhc::shared_tech::storage::open_database(path.to_str().expect("utf-8")) {
+        lhc::shared_tech::errors::OpResult::Ok { value } => value,
+        lhc::shared_tech::errors::OpResult::Err { error } => panic!("{}", error.reason),
+    };
+    db.exec("BEGIN EXCLUSIVE");
+    for index in 0..3 {
+        handle.persist(
+            &message(
+                "assistant",
+                &format!("flush output {index}"),
+                &format!("asst-cf-{index}"),
+            ),
+            RawItemProvenance::ModelOutput,
+            /*step_index*/ None,
+        );
+    }
+    handle.flush_async();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let wait = handle.clone();
+    let started = Instant::now();
+    let result = handle
+        .shutdown_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+        .await;
+    assert_eq!(
+        result,
+        CaptureShutdownResult::Failed(CaptureShutdownFailure::PersistenceFailed)
+    );
+    assert!(
+        wait.wait_terminated_bounded(crate::capture::CAPTURE_WORKER_RETURN_BOUND)
+            .await,
+        "reservation must be released by the worker-return bound"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        while capture_os_thread_alive(thread_id)
+            && started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !capture_os_thread_alive(thread_id),
+            "capture OS thread must be gone by the bound; elapsed {:?}",
+            started.elapsed()
+        );
+    }
+    assert!(
+        started.elapsed() <= crate::capture::CAPTURE_WORKER_RETURN_BOUND,
+        "capture thread and reservation outlived the bound; elapsed {:?}",
+        started.elapsed()
+    );
+    db.exec("ROLLBACK");
+    let successor = tokio::time::timeout(
+        Duration::from_secs(2),
+        spawn_capture(
+            thread_id,
+            None,
+            Some(root.to_path_buf()),
+            LateBoundCallbacks::seeded(lhc_inference_callbacks(false).expect("callbacks")),
+        ),
+    )
+    .await
+    .expect("successor must not wait on a leaked reservation");
+    let successor = successor.expect("successor must open after reservation release");
+    successor.shutdown().await;
+}
+
+#[tokio::test]
+async fn drain_settled_aborts_when_shutdown_is_requested() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let handle = spawn_capture(
+        "ds",
+        None,
+        Some(dir.path().to_path_buf()),
+        LateBoundCallbacks::seeded(pending_inference_callbacks()),
+    )
+    .await
+    .expect("capture");
+    handle.persist(
+        &message("user", "pending drain", "user-drain"),
+        RawItemProvenance::UserPrompt,
+        /*step_index*/ None,
+    );
+    handle.flush().await;
+    let wait = handle.clone();
+    let draining = tokio::spawn(async move { wait.drain_settled(Duration::from_secs(120)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = Instant::now();
+    handle.shutdown().await;
+    let settled = tokio::time::timeout(Duration::from_secs(2), draining)
+        .await
+        .expect("DrainSettled must not ignore shutdown")
+        .expect("drain task");
+    assert!(!settled, "shutdown must abort DrainSettled as unsettled");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "DrainSettled ignored shutdown; elapsed {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn dropping_last_handle_releases_admission_for_a_successor() {
     let dir = tempfile::tempdir().expect("tempdir");
