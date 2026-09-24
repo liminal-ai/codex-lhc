@@ -10,6 +10,7 @@ use std::path::PathBuf;
 /// Root directory for LHC registry + thread SQLite files.
 ///
 /// Override with `CODEX_LHC_ROOT` (tests). Default: `~/.codex/lhc`.
+/// `CODEX_LHC_HOLD_OPEN` leaves capture in Opening without creating a database.
 pub fn lhc_root() -> PathBuf {
     if let Ok(root) = std::env::var("CODEX_LHC_ROOT") {
         let trimmed = root.trim();

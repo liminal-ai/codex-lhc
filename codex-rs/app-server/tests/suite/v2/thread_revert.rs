@@ -811,11 +811,75 @@ async fn thread_revert_refuses_when_lhc_db_exists_even_if_capture_is_disabled() 
     Ok(())
 }
 
+#[tokio::test]
+async fn thread_revert_refuses_while_lhc_capture_is_opening_without_a_database() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let lhc_root = TempDir::new()?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_env_overrides(&[
+            (
+                "CODEX_LHC_ROOT",
+                Some(lhc_root.path().to_str().expect("utf-8")),
+            ),
+            ("CODEX_LHC_HOLD_OPEN", Some("1")),
+        ])
+        .build()
+        .await?;
+    initialize_experimental(&mut mcp).await?;
+
+    let ThreadStartResponse { thread, .. } = mcp
+        .start_thread(ThreadStartParams {
+            history_mode: Some(ThreadHistoryMode::Paginated),
+            ..Default::default()
+        })
+        .await?;
+    let first = mcp
+        .start_turn_and_wait_for_completion(TurnStartParams {
+            thread_id: thread.id.clone(),
+            input: vec![UserInput::Text {
+                text: "first".to_string(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let db_path = codex_lhc_host::thread_file_path(lhc_root.path(), &thread.id);
+    assert!(
+        !db_path.is_file(),
+        "Opening capture must not have created {} yet",
+        db_path.display()
+    );
+
+    let before = capture_history_snapshot(&mut mcp, &thread.id, lhc_root.path()).await?;
+    assert!(
+        before.lhc_digest.is_none(),
+        "Opening capture must not have an LHC database digest"
+    );
+    refuse_revert_and_assert_unchanged(
+        &mut mcp,
+        &thread.id,
+        &first.turn.id,
+        lhc_root.path(),
+        &before,
+    )
+    .await?;
+    assert!(
+        !db_path.is_file(),
+        "refused rewind must not create {}",
+        db_path.display()
+    );
+    Ok(())
+}
+
 struct HistorySnapshot {
     rollout_path: PathBuf,
     native: Vec<u8>,
     lhc_db_path: PathBuf,
     lhc_turn_ids: Vec<String>,
+    lhc_digest: Option<String>,
 }
 
 async fn capture_history_snapshot(
@@ -827,13 +891,21 @@ async fn capture_history_snapshot(
     let native = std::fs::read(&rollout_path)
         .with_context(|| format!("read native history {}", rollout_path.display()))?;
     let lhc_db_path = codex_lhc_host::thread_file_path(lhc_root, thread_id);
-    let lhc_turn_ids = codex_lhc_host::live_turn_ids(&lhc_db_path)
-        .map_err(|err| anyhow::anyhow!("read LHC turns at {}: {err}", lhc_db_path.display()))?;
+    let (lhc_turn_ids, lhc_digest) = if lhc_db_path.is_file() {
+        let ids = codex_lhc_host::live_turn_ids(&lhc_db_path)
+            .map_err(|err| anyhow::anyhow!("read LHC turns at {}: {err}", lhc_db_path.display()))?;
+        let digest = codex_lhc_host::lhc_database_digest(&lhc_db_path)
+            .map_err(|err| anyhow::anyhow!("digest LHC DB at {}: {err}", lhc_db_path.display()))?;
+        (ids, Some(digest))
+    } else {
+        (Vec::new(), None)
+    };
     Ok(HistorySnapshot {
         rollout_path,
         native,
         lhc_db_path,
         lhc_turn_ids,
+        lhc_digest,
     })
 }
 
@@ -877,6 +949,10 @@ async fn refuse_revert_and_assert_unchanged(
     assert_eq!(
         after.lhc_turn_ids, before.lhc_turn_ids,
         "captured LHC turns must be unchanged"
+    );
+    assert_eq!(
+        after.lhc_digest, before.lhc_digest,
+        "LHC database content digest must be unchanged"
     );
     Ok(())
 }
@@ -933,7 +1009,11 @@ async fn wait_for_stable_captured_turns(path: &Path, expected: usize) -> Result<
             Err(err) => anyhow::bail!("failed to read LHC turns at {}: {err}", path.display()),
         }
     }
-    Ok(last)
+    anyhow::bail!(
+        "LHC turns at {} did not stabilize before timeout (last {} turns)",
+        path.display(),
+        last.len()
+    )
 }
 
 async fn turn_ids_from_cursor(

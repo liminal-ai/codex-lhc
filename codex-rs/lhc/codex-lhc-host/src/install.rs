@@ -1413,7 +1413,7 @@ impl<C: Send + Sync + 'static> ThreadLifecycleContributor<C> for LhcExtension<C>
             let model = (self.model_label)(input.config);
             let provider = (self.provider_label)(input.config);
             let identity = ModelIdentity::new(provider, model, ModelIdentity::RESPONSES_API);
-            if self.hold_open {
+            if self.hold_open || std::env::var_os("CODEX_LHC_HOLD_OPEN").is_some() {
                 debug!(thread_id = %thread_id, "LHC: capture slot held Opening (test)");
                 return;
             }
