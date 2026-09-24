@@ -1054,7 +1054,7 @@ fn decode_unpaired_field(field: &str) -> Option<Option<String>> {
         return Some(None);
     }
     let value = field.strip_prefix('s')?;
-    Some(Some(crate::materialize::decode_percent(value)))
+    Some(Some(crate::idempotency::decode_percent(value)))
 }
 
 /// Build the fork-owned synthetic id for an unpaired `FunctionCallOutput`.
@@ -1145,6 +1145,22 @@ mod tests {
 
     fn tracker() -> OccurrenceTracker {
         OccurrenceTracker::new()
+    }
+
+    #[test]
+    fn unpaired_output_id_round_trips_non_ascii_name_and_namespace() {
+        let name = Some("café");
+        let namespace = Some("naïve:prod");
+        let id = unpaired_output_call_id(/*exact*/ true, name, namespace, "deadbeef");
+        assert_eq!(
+            parse_unpaired_output_call_id(&id),
+            Some(UnpairedOutputIdentity {
+                exact: true,
+                name: name.map(str::to_string),
+                namespace: namespace.map(str::to_string),
+            }),
+            "mapping decoder callsite must invert encode_thread_id: {id}"
+        );
     }
 
     #[test]

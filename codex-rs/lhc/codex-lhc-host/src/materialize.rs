@@ -1931,44 +1931,8 @@ fn parse_host_id_from_key(key: &str) -> Option<String> {
     let after_tid = rest.split_once(':')?.1;
     let after_id = after_tid.strip_prefix("id:")?;
     let iid = after_id.split(':').next()?;
-    let decoded = decode_percent(iid);
+    let decoded = crate::idempotency::decode_percent(iid);
     sanitize_id(&decoded)
-}
-
-pub(crate) fn decode_percent(encoded: &str) -> String {
-    let mut out = String::with_capacity(encoded.len());
-    let bytes = encoded.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&encoded[i + 1..i + 3], 16)
-        {
-            // UTF-8 safe: collect contiguous percent-decoded bytes.
-            let mut raw = vec![v];
-            i += 3;
-            while i + 2 < bytes.len() && bytes[i] == b'%' {
-                if let Ok(b) = u8::from_str_radix(&encoded[i + 1..i + 3], 16) {
-                    raw.push(b);
-                    i += 3;
-                } else {
-                    break;
-                }
-            }
-            match String::from_utf8(raw) {
-                Ok(s) => out.push_str(&s),
-                Err(e) => {
-                    for b in e.into_bytes() {
-                        out.push(b as char);
-                    }
-                }
-            }
-            continue;
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
 }
 
 // ── carry-forwards ────────────────────────────────────────────────────────

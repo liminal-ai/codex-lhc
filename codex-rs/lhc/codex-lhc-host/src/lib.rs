@@ -186,6 +186,7 @@ pub use gating::lhc_root;
 pub use handback::on_process_shutdown;
 pub use handback::on_thread_unload;
 pub use idempotency::OccurrenceTracker;
+pub use idempotency::decode_percent;
 pub use idempotency::encode_thread_id;
 pub use idempotency::item_digest;
 pub use idempotency::item_event_key;

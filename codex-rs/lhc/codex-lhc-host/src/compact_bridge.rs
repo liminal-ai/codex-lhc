@@ -351,27 +351,7 @@ fn parse_host_id_from_archive_key(key: &str) -> Option<String> {
     if iid.is_empty() {
         return None;
     }
-    Some(decode_thread_id(iid))
-}
-
-fn decode_thread_id(encoded: &str) -> String {
-    // Inverse of encode_thread_id: %3A → :, %25 → %
-    let mut out = String::with_capacity(encoded.len());
-    let bytes = encoded.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hex = &encoded[i + 1..i + 3];
-            if let Ok(v) = u8::from_str_radix(hex, 16) {
-                out.push(v as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i] as char);
-        i += 1;
-    }
-    out
+    Some(crate::idempotency::decode_percent(iid))
 }
 
 /// Collect host item ids present in the archive (identity, not text — F1a).
@@ -1686,6 +1666,25 @@ mod tests {
         );
         assert_eq!(content_identity_digest(&a), content_identity_digest(&b));
         assert_ne!(item_stable_id(&a), item_stable_id(&b));
+    }
+
+    #[test]
+    fn archive_key_round_trips_non_ascii_ids() {
+        let id = "msg_é";
+        let item = user("same text", id);
+        let key = crate::idempotency::item_event_key(
+            "t",
+            Some(id),
+            &item_digest(&item),
+            0,
+            "user_prompt",
+            None,
+        );
+        assert_eq!(
+            parse_host_id_from_archive_key(&key).as_deref(),
+            Some(id),
+            "archive decoder callsite must invert encode_thread_id: {key}"
+        );
     }
 
     #[tokio::test]

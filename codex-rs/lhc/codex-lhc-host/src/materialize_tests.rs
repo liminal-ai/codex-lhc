@@ -2976,6 +2976,17 @@ fn parse_host_id_from_key_recovers_real_ids() {
 }
 
 #[test]
+fn parse_host_id_from_key_round_trips_non_ascii_ids() {
+    let id = "msg_é";
+    let key = crate::idempotency::item_event_key("t", Some(id), "deadbeef", 0, "user_prompt", None);
+    assert_eq!(
+        parse_host_id_from_key(&key),
+        Some(id.into()),
+        "materialize decoder callsite must invert encode_thread_id: {key}"
+    );
+}
+
+#[test]
 fn user_tail_recovers_host_id_from_idempotency_key() {
     let view = SessionThreadView {
         thread_id: "t".into(),
@@ -3020,6 +3031,52 @@ fn user_tail_recovers_host_id_from_idempotency_key() {
         user,
         Some(Some(ResponseItemId::from_server("msg_overlap".into()))),
         "verbatim user tail must keep the captured host id: {tail:?}"
+    );
+}
+
+#[test]
+fn user_tail_round_trips_non_ascii_host_id() {
+    let id = "msg_é";
+    let key = crate::idempotency::item_event_key("t", Some(id), "deadbeef", 0, "user_prompt", None);
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("band"),
+            user_tail_with_key("m1", "read the file", Some(&key)),
+        ],
+    };
+    let messages = [msg(
+        "m1",
+        "turn-1",
+        MessageKind::UserPrompt,
+        10,
+        "read the file",
+        None,
+    )];
+    let turns = [turn(
+        "turn-1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        Some("2026-07-01T12:00:00.000Z"),
+        Some("2026-07-01T12:00:10.000Z"),
+    )];
+    let items = materialize(view, &messages, &turns, &[], None);
+    let tail = tail_response_items(&items);
+    let user = tail.iter().find_map(|item| match item {
+        ResponseItem::Message {
+            role, id, content, ..
+        } if role == "user" => content.iter().find_map(|part| match part {
+            ContentItem::InputText { text } if text == "read the file" => Some(id.clone()),
+            _ => None,
+        }),
+        _ => None,
+    });
+    assert_eq!(
+        user,
+        Some(Some(ResponseItemId::from_server(id.into()))),
+        "emit_tail decoder callsite must keep legacy Unicode ids: {tail:?}"
     );
 }
 

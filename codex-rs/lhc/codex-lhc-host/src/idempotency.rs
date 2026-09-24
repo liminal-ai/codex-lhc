@@ -106,6 +106,38 @@ pub fn encode_thread_id(thread_id: &str) -> String {
     thread_id.replace('%', "%25").replace(':', "%3A")
 }
 
+/// Inverse of [`encode_thread_id`]: percent-decode to bytes, then UTF-8.
+///
+/// Unescaped octets are copied as bytes, not as `char`s, so a legacy id like
+/// `msg_é` round-trips instead of becoming `msg_Ã©`.
+pub fn decode_percent(encoded: &str) -> String {
+    let hex = |b: u8| -> Option<u8> {
+        Some(match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        })
+    };
+    let bytes = encoded.as_bytes();
+    let mut raw = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            raw.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        raw.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(raw)
+        .unwrap_or_else(|err| String::from_utf8_lossy(err.as_bytes()).into_owned())
+}
+
 /// SHA-256 hex digest of the canonical JSON encoding of `item`.
 pub fn item_digest(item: &ResponseItem) -> String {
     match serde_json::to_vec(item) {
@@ -269,6 +301,22 @@ mod tests {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }
+    }
+
+    #[test]
+    fn decode_percent_is_the_utf8_inverse_of_encode_thread_id() {
+        for id in ["msg_é", "msg_é:legacy", "100%é", "café:naïve%id"] {
+            assert_eq!(
+                decode_percent(&encode_thread_id(id)),
+                id,
+                "encoder/decoder must round-trip {id:?}"
+            );
+        }
+        assert_eq!(
+            decode_percent("msg_é"),
+            "msg_é",
+            "unescaped UTF-8 must not be copied byte-as-char"
+        );
     }
 
     #[test]
