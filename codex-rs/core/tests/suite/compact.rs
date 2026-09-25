@@ -4407,7 +4407,6 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     );
 }
 
-#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -4574,6 +4573,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
     Ok(())
 }
 
+#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_request_shape_mid_turn_continuation_compaction() {
     skip_if_no_network!();
