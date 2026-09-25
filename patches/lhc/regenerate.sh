@@ -45,7 +45,8 @@ regen 0002-raw-item-contributor.patch \
 
 regen 0003-feature-flag.patch \
   codex-rs/features/src/lib.rs \
-  codex-rs/core/config.schema.json
+  codex-rs/core/config.schema.json \
+  codex-rs/cli/tests/daemon_startup.rs
 
 regen 0004-session-raw-item-hook.patch \
   codex-rs/core/src/session/mod.rs \
@@ -181,7 +182,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/state/src/migrations.rs \
   codex-rs/state/src/migrations_tests.rs \
   codex-rs/state/src/sqlite.rs \
-  codex-rs/state/thread_history_migrations/0007_rollout_generation_id.sql \
+  codex-rs/state/thread_history_migrations/0008_rollout_generation_id.sql \
   codex-rs/thread-store/Cargo.toml \
   codex-rs/thread-store/src/live_thread.rs \
   codex-rs/thread-store/src/local/mod.rs \

@@ -60,6 +60,7 @@ fn sample_items(tag: &str) -> Vec<RolloutItem> {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
     ]
 }
@@ -351,6 +352,7 @@ fn history_from_materialized_is_bands_plus_native_tail() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::ResponseItem(tail.clone().into()),
     ];
@@ -415,6 +417,7 @@ fn dual_format_history_picks_newest_compacted_only() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::ResponseItem(after1.into()),
         RolloutItem::Compacted(CompactedItem {
@@ -430,6 +433,7 @@ fn dual_format_history_picks_newest_compacted_only() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::ResponseItem(after2.clone().into()),
     ];
@@ -473,6 +477,7 @@ fn fl4_model_context_estimate_like_for_like() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
     ];
     let baseline = model_context_token_estimate_from_rollout_items(&items);
@@ -533,6 +538,7 @@ fn mutation_history_extract_drops_tail_without_boundary_split() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
     ];
     let history = history_from_materialized_items(&items);

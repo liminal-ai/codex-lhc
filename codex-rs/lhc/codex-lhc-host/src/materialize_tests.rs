@@ -366,6 +366,7 @@ fn materialize_full(
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -510,6 +511,7 @@ fn boundary_record_field_completeness_pinned() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         })]),
         Some("Compacted.replacement_history is empty")
     );
@@ -527,6 +529,7 @@ fn boundary_record_field_completeness_pinned() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         })]),
         Some("Compacted.replacement_history is None")
     );
@@ -544,6 +547,7 @@ fn boundary_record_field_completeness_pinned() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         })]),
         Some("Compacted.window_number is None")
     );
@@ -2393,6 +2397,7 @@ fn m12_realistic_prior_generation_carry_forward_and_drops() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::EventMsg(EventMsg::TokenCount(TokenCountEvent {
             info: Some(TokenUsageInfo {
@@ -2596,6 +2601,7 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         guardian_history: Some(guardian.clone()),
         retained_context: Some(retained.clone()),
         latest_token_usage_record: Some(usage.clone()),
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -2624,6 +2630,7 @@ fn compacted_carries_guardian_retained_and_token_usage_and_survive_rematerialize
         guardian_history: carry.guardian_history,
         retained_context: carry.retained_context,
         latest_token_usage_record: carry.latest_token_usage_record,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -2792,6 +2799,7 @@ fn rewrite_preserves_host_uuid_on_aborted_turn_from_turn_end_key() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -3139,6 +3147,7 @@ fn identity_match_reemits_encrypted_content() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: Some(identity),
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -3206,6 +3215,7 @@ fn identity_mismatch_suppresses_encrypted_content() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: Some(live),
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -3263,6 +3273,7 @@ fn signature_only_thinking_emits_when_identity_matches() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: Some(identity),
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -3552,6 +3563,7 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -3594,6 +3606,7 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,

@@ -174,6 +174,8 @@ pub(super) async fn attach_rollout(session: &mut Session) -> std::path::PathBuf 
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -266,6 +268,7 @@ fn compacted(
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })
 }
 
@@ -396,6 +399,7 @@ async fn slice_d_regenerate_and_resume_drill() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -1372,6 +1376,7 @@ async fn slice_d_l2_crash_injection_full_stack() {
         guardian_history: None,
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,
@@ -1601,6 +1606,7 @@ async fn slice_d_l2_empty_edge_cases() {
             guardian_history: None,
             retained_context: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
             live_identity: None,
             current_host_turn_id: None,
             current_lhc_turn_id: None,

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_analytics::TurnAnalyticsMetadata;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ThreadIdleCause;
 use codex_extension_api::TurnStartPhase;
@@ -17,6 +18,8 @@ impl Session {
         token_usage_at_turn_start: Option<&TokenUsage>,
         phase: TurnStartPhase,
     ) {
+        let metadata: Arc<dyn TurnAnalyticsMetadata> = turn_context.turn_metadata_state.clone();
+        turn_context.extension_data.insert(metadata);
         let collaboration_mode = turn_context.collaboration_mode();
         // LHC-HOOK: pass host turn start time into turn lifecycle (schema v5).
         let started_at = turn_context.turn_timing_state.started_at_unix_secs().await;

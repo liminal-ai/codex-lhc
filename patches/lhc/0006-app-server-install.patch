@@ -1,5 +1,5 @@
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history.rs b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
-index 6a2ad271f0..d329dbd014 100644
+index 90df776957..184f0c961f 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history.rs
 @@ -4503,6 +4503,7 @@ mod tests {
@@ -11,7 +11,7 @@ index 6a2ad271f0..d329dbd014 100644
                  window_number: None,
                  first_window_id: None,
 diff --git a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
-index e976735ea3..2097d8757f 100644
+index 5a67d157d3..f13372ff17 100644
 --- a/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/thread_history_projection_tests.rs
 @@ -210,6 +210,7 @@ fn ignores_legacy_abort_without_turn_id_and_context_only_records() {
@@ -23,7 +23,7 @@ index e976735ea3..2097d8757f 100644
          window_number: None,
          first_window_id: None,
 diff --git a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
-index 09732cfb43..d719547a51 100644
+index a1376843a0..43af69288f 100644
 --- a/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 +++ b/codex-rs/app-server-protocol/src/protocol/v2/thread.rs
 @@ -1254,6 +1254,9 @@ pub struct ThreadBackgroundTerminalsTerminateResponse {
@@ -37,10 +37,10 @@ index 09732cfb43..d719547a51 100644
  ///
  /// This only changes persisted conversation history. It does not revert local file changes.
 diff --git a/codex-rs/app-server/src/extensions.rs b/codex-rs/app-server/src/extensions.rs
-index 34adaff2f2..efd62bf111 100644
+index c2d6d6d0a2..70a98e6b26 100644
 --- a/codex-rs/app-server/src/extensions.rs
 +++ b/codex-rs/app-server/src/extensions.rs
-@@ -121,6 +121,28 @@ pub(crate) fn thread_extensions(
+@@ -118,6 +118,28 @@ pub(crate) fn thread_extensions(
                  .enabled(codex_features::Feature::SkillSearch),
          },
      );
@@ -69,7 +69,7 @@ index 34adaff2f2..efd62bf111 100644
      Arc::new(builder.build())
  }
  
-@@ -312,6 +334,132 @@ mod tests {
+@@ -309,6 +331,132 @@ mod tests {
  
      use super::*;
  
@@ -203,10 +203,10 @@ index 34adaff2f2..efd62bf111 100644
      async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
          let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
 diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
-index 20e44d3253..a699f55f57 100644
+index 1fb7b51f17..8bed57efb6 100644
 --- a/codex-rs/app-server/src/in_process.rs
 +++ b/codex-rs/app-server/src/in_process.rs
-@@ -877,7 +877,202 @@ mod tests {
+@@ -885,7 +885,202 @@ mod tests {
          start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
      }
  
@@ -409,7 +409,7 @@ index 20e44d3253..a699f55f57 100644
      async fn in_process_start_initializes_and_handles_typed_v2_request() {
          let client = start_test_client(SessionSource::Cli).await;
          let response = client
-@@ -899,6 +1094,7 @@ mod tests {
+@@ -907,6 +1102,7 @@ mod tests {
      }
  
      #[tokio::test]
@@ -417,7 +417,7 @@ index 20e44d3253..a699f55f57 100644
      async fn in_process_start_uses_requested_session_source_for_thread_start() {
          for (requested_source, expected_source) in [
              (SessionSource::Cli, ApiSessionSource::Cli),
-@@ -927,6 +1123,7 @@ mod tests {
+@@ -935,6 +1131,7 @@ mod tests {
      }
  
      #[tokio::test]
@@ -426,10 +426,10 @@ index 20e44d3253..a699f55f57 100644
          let client =
              start_test_client_with_capacity(SessionSource::Cli, /*channel_capacity*/ 0).await;
 diff --git a/codex-rs/app-server/src/lib.rs b/codex-rs/app-server/src/lib.rs
-index fc11b838a0..921c725324 100644
+index fc0fb1d9d0..c43d8ff864 100644
 --- a/codex-rs/app-server/src/lib.rs
 +++ b/codex-rs/app-server/src/lib.rs
-@@ -1312,6 +1312,7 @@ pub async fn run_main_with_transport_options(
+@@ -1315,6 +1315,7 @@ pub async fn run_main_with_transport_options(
                  connection_cleanup_tasks.drain().await;
                  processor.drain_background_tasks().await;
                  processor.shutdown_threads().await;
@@ -438,7 +438,7 @@ index fc11b838a0..921c725324 100644
                  connection_cleanup_tasks.abort();
              }
 diff --git a/codex-rs/app-server/tests/suite/v2/guardian_v2.rs b/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
-index f8feea4a33..bdfb42bd40 100644
+index d8926e825a..953d150498 100644
 --- a/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
 +++ b/codex-rs/app-server/tests/suite/v2/guardian_v2.rs
 @@ -403,8 +403,6 @@ async fn parent_response(
@@ -460,7 +460,7 @@ index f8feea4a33..bdfb42bd40 100644
          && request
              .pointer("/client_metadata/x-codex-parent-thread-id")
 diff --git a/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs b/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
-index 7128381526..7d0a5100d6 100644
+index 560d9628db..191b6d0781 100644
 --- a/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
 +++ b/codex-rs/app-server/tests/suite/v2/guardian_v2_history_tests.rs
 @@ -206,8 +206,6 @@ async fn guardians_retain_evidence_after_compaction_and_resume(
@@ -482,10 +482,10 @@ index 7128381526..7d0a5100d6 100644
                              let mut requests = parent_requests.lock().expect("request log lock");
                              let step = requests.len();
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_resume.rs b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
-index 1904431cc7..0757af6a13 100644
+index c6ea68f725..d1cc13c882 100644
 --- a/codex-rs/app-server/tests/suite/v2/thread_resume.rs
 +++ b/codex-rs/app-server/tests/suite/v2/thread_resume.rs
-@@ -199,6 +199,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() ->
+@@ -194,6 +194,7 @@ async fn thread_resume_paginated_model_context_preserves_original_metadata() ->
              replacement_history: Some(Vec::new()),
              retained_context: None,
              guardian_history: None,
@@ -494,7 +494,7 @@ index 1904431cc7..0757af6a13 100644
              window_number: Some(1),
              first_window_id: None,
 diff --git a/codex-rs/app-server/tests/suite/v2/thread_revert.rs b/codex-rs/app-server/tests/suite/v2/thread_revert.rs
-index a8a9cc8a49..714d6362b7 100644
+index 4b74e297f1..af11f5f10d 100644
 --- a/codex-rs/app-server/tests/suite/v2/thread_revert.rs
 +++ b/codex-rs/app-server/tests/suite/v2/thread_revert.rs
 @@ -1,3 +1,4 @@

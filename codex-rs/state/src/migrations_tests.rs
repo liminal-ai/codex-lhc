@@ -6,6 +6,7 @@ use sqlx::migrate::Migration;
 use sqlx::migrate::Migrator;
 use std::borrow::Cow;
 
+use super::ROLLOUT_GENERATION_ID_MIGRATION_VERSION;
 use super::STATE_MIGRATOR;
 use super::THREAD_HISTORY_MIGRATOR;
 use super::repair_legacy_recency_migration_version;
@@ -31,6 +32,123 @@ fn migrator_through(version: i64) -> Migrator {
         create_schemas: STATE_MIGRATOR.create_schemas.clone(),
         no_tx: STATE_MIGRATOR.no_tx,
     }
+}
+
+#[tokio::test]
+async fn guardian_metadata_cleanup_preserves_custom_names_and_titles() {
+    let sqlite_home = crate::runtime::test_support::unique_temp_dir();
+    tokio::fs::create_dir_all(&sqlite_home)
+        .await
+        .expect("sqlite home should be created");
+    let _cleanup = scopeguard::guard(sqlite_home.clone(), |sqlite_home| {
+        let _ = std::fs::remove_dir_all(sqlite_home);
+    });
+    let sqlite = crate::SqliteConfig::new_for_testing(sqlite_home.as_path().abs());
+    let pool = sqlite
+        .open_read_write_pool(&sqlite.state_db_path())
+        .await
+        .expect("sqlite database should open");
+    migrator_through(/*version*/ 56)
+        .run(&pool)
+        .await
+        .expect("pre-cleanup migrations should apply");
+
+    sqlx::query(
+        r#"
+INSERT INTO threads (
+    id, rollout_path, created_at, updated_at, source, model_provider, cwd,
+    title, name, preview, sandbox_policy, approval_mode, first_user_message
+) VALUES
+    ('derived', '/tmp/guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     ' large guardian prompt ', NULL, 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('empty', '/tmp/empty-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     ' ', ' ', 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('worker', '/tmp/worker.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"worker"}}', 'openai', '/tmp',
+     'worker title', 'worker name', 'worker preview',
+     'read-only', 'on-request', 'worker first message'),
+    ('custom-title', '/tmp/named-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     'Named Guardian review', NULL, 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt'),
+    ('custom-name', '/tmp/explicitly-named-guardian.jsonl', 1700000000, 1700000100,
+     '{"subagent":{"other":"guardian"}}', 'openai', '/tmp',
+     'large guardian prompt', 'Explicit Guardian name', 'large guardian prompt',
+     'read-only', 'on-request', 'large guardian prompt')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy metadata rows should insert");
+
+    STATE_MIGRATOR
+        .run(&pool)
+        .await
+        .expect("guardian metadata cleanup should apply");
+
+    let rows =
+        sqlx::query("SELECT id, title, name, preview, first_user_message FROM threads ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .expect("cleaned metadata rows should load");
+    let actual = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<&str, _>("id"),
+                row.get::<&str, _>("title"),
+                row.get::<Option<&str>, _>("name"),
+                row.get::<&str, _>("preview"),
+                row.get::<&str, _>("first_user_message"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![
+            (
+                "custom-name",
+                "Guardian review",
+                Some("Explicit Guardian name"),
+                "Approval review",
+                ""
+            ),
+            (
+                "custom-title",
+                "Named Guardian review",
+                Some("Named Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "derived",
+                "Guardian review",
+                Some("Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "empty",
+                "Guardian review",
+                Some("Guardian review"),
+                "Approval review",
+                ""
+            ),
+            (
+                "worker",
+                "worker title",
+                Some("worker name"),
+                "worker preview",
+                "worker first message"
+            ),
+        ]
+    );
+
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -547,6 +665,13 @@ async fn realtime_items_preserve_older_thread_history_writers() {
             ("older-writer-item".to_string(), "turn-1".to_string()),
         ]
     );
+    let lifecycle_timestamps = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+        "SELECT started_at_ms, completed_at_ms FROM thread_items ORDER BY rollout_ordinal",
+    )
+    .fetch_all(&older_pool)
+    .await
+    .expect("old rows and older writers leave lifecycle timestamps unknown");
+    assert_eq!(lifecycle_timestamps, vec![(None, None), (None, None)]);
     sqlx::query("DELETE FROM thread_history_projection_state WHERE thread_id = ?")
         .bind("thread-1")
         .execute(&older_pool)
@@ -620,6 +745,17 @@ async fn rollout_generation_id_migration_preserves_existing_projection_frontiers
 
 #[tokio::test]
 async fn repairs_rollout_generation_migration_that_was_applied_as_version_5() {
+    repairs_rollout_generation_migration_applied_as(5).await;
+}
+
+/// 0.155.1 and 0.156.1 shipped the generation-ID migration as version 7, which
+/// upstream's own version 7 now occupies.
+#[tokio::test]
+async fn repairs_rollout_generation_migration_that_was_applied_as_version_7() {
+    repairs_rollout_generation_migration_applied_as(7).await;
+}
+
+async fn repairs_rollout_generation_migration_applied_as(legacy_version: i64) {
     let sqlite_home = crate::runtime::test_support::unique_temp_dir();
     tokio::fs::create_dir_all(&sqlite_home)
         .await
@@ -633,7 +769,7 @@ async fn repairs_rollout_generation_migration_that_was_applied_as_version_5() {
             THREAD_HISTORY_MIGRATOR
                 .migrations
                 .iter()
-                .filter(|migration| migration.version < 5)
+                .filter(|migration| migration.version < legacy_version)
                 .cloned()
                 .collect(),
         ),
@@ -654,16 +790,16 @@ async fn repairs_rollout_generation_migration_that_was_applied_as_version_5() {
     let generation_migration = THREAD_HISTORY_MIGRATOR
         .migrations
         .iter()
-        .find(|migration| migration.version == 7)
+        .find(|migration| migration.version == ROLLOUT_GENERATION_ID_MIGRATION_VERSION)
         .expect("rollout generation ID migration should exist");
     let mut legacy_migrations = THREAD_HISTORY_MIGRATOR
         .migrations
         .iter()
-        .filter(|migration| migration.version < 5)
+        .filter(|migration| migration.version < legacy_version)
         .cloned()
         .collect::<Vec<_>>();
     legacy_migrations.push(Migration::new(
-        5,
+        legacy_version,
         generation_migration.description.clone(),
         generation_migration.migration_type,
         generation_migration.sql.clone(),
@@ -672,7 +808,7 @@ async fn repairs_rollout_generation_migration_that_was_applied_as_version_5() {
     Migrator::with_migrations(legacy_migrations)
         .run(&pool)
         .await
-        .expect("legacy generation-ID migration should apply as version 5");
+        .expect("legacy generation-ID migration should apply under the legacy version");
     sqlx::query(
         "INSERT INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id) VALUES ('thread-1', 123, 7, X'00')",
     )
@@ -709,6 +845,16 @@ async fn repairs_rollout_generation_migration_that_was_applied_as_version_5() {
         .map(|migration| (migration.version, migration.checksum.to_vec()))
         .collect::<Vec<_>>();
     assert_eq!(applied, expected);
+    repair_legacy_rollout_generation_migration_version(&pool, &THREAD_HISTORY_MIGRATOR)
+        .await
+        .expect("a repaired history is left alone");
+    let columns =
+        sqlx::query_scalar::<_, String>("SELECT name FROM pragma_table_info('thread_items')")
+            .fetch_all(&pool)
+            .await
+            .expect("thread_items columns should load");
+    assert!(columns.iter().any(|c| c == "started_at_ms"));
+    assert!(columns.iter().any(|c| c == "completed_at_ms"));
     let projection = sqlx::query_as::<_, (i64, i64, Option<Vec<u8>>)>(
         "SELECT next_rollout_byte_offset, next_rollout_ordinal, rollout_generation_id FROM thread_history_projection_state WHERE thread_id = 'thread-1'",
     )

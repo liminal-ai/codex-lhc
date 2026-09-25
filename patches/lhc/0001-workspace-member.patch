@@ -1,5 +1,5 @@
 diff --git a/codex-rs/Cargo.toml b/codex-rs/Cargo.toml
-index 1feba3c7fb..ee804ff247 100644
+index 624c166e5f..632ee6f0c0 100644
 --- a/codex-rs/Cargo.toml
 +++ b/codex-rs/Cargo.toml
 @@ -78,6 +78,8 @@ members = [
@@ -72,10 +72,10 @@ index 74721c8b8d..64e3a95540 100644
  ## Installation and update cases
  
 diff --git a/codex-rs/app-server-daemon/src/lib.rs b/codex-rs/app-server-daemon/src/lib.rs
-index fbeff0988e..1b2a8de7e9 100644
+index 755a0ebd82..ddf687ca97 100644
 --- a/codex-rs/app-server-daemon/src/lib.rs
 +++ b/codex-rs/app-server-daemon/src/lib.rs
-@@ -34,6 +34,8 @@ use codex_utils_home_dir::find_codex_home;
+@@ -35,6 +35,8 @@ use codex_utils_home_dir::find_codex_home;
  use managed_install::managed_codex_bin;
  #[cfg(any(unix, windows))]
  use managed_install::managed_codex_version;
@@ -84,7 +84,7 @@ index fbeff0988e..1b2a8de7e9 100644
  use serde::Serialize;
  use settings::DaemonSettings;
  use settings::MAX_SHUTDOWN_GRACE_SECONDS;
-@@ -933,9 +935,21 @@ impl Daemon {
+@@ -938,9 +940,21 @@ impl Daemon {
              return Ok(());
          }
  
@@ -107,7 +107,7 @@ index fbeff0988e..1b2a8de7e9 100644
          ))
      }
  
-@@ -1142,8 +1156,9 @@ mod tests {
+@@ -1147,8 +1161,9 @@ mod tests {
  
      #[test]
      fn restart_decision_preserves_forced_refreshes() {
@@ -118,7 +118,7 @@ index fbeff0988e..1b2a8de7e9 100644
          };
  
          assert_eq!(
-@@ -1151,14 +1166,18 @@ mod tests {
+@@ -1156,14 +1171,18 @@ mod tests {
                  restart_decision(
                      RestartMode::IfVersionChanged,
                      Some(&current_info),
@@ -266,7 +266,7 @@ index 8f55126878..43b29ebdd7 100644
  pub(crate) async fn run(
      http_client_factory: HttpClientFactory,
 diff --git a/codex-rs/app-server-daemon/src/update_loop_tests.rs b/codex-rs/app-server-daemon/src/update_loop_tests.rs
-index 198cbcea4b..feaef391d3 100644
+index 1602c080a4..160e188745 100644
 --- a/codex-rs/app-server-daemon/src/update_loop_tests.rs
 +++ b/codex-rs/app-server-daemon/src/update_loop_tests.rs
 @@ -49,6 +49,16 @@ async fn installer_fetch_rejects_non_success_status() {

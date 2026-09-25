@@ -1,8 +1,21 @@
+diff --git a/codex-rs/cli/tests/daemon_startup.rs b/codex-rs/cli/tests/daemon_startup.rs
+index 395ff6efc1..47203c52d2 100644
+--- a/codex-rs/cli/tests/daemon_startup.rs
++++ b/codex-rs/cli/tests/daemon_startup.rs
+@@ -76,7 +76,7 @@ async fn daemon_startup(command: &str) -> Result<()> {
+     fs::write(
+         home.path().join("config.toml"),
+         format!(
+-            "model = \"gpt-5.6-terra\"\n\
++            "model = \"gpt-5.6-terra\"\nfeatures.daemon_auto_start = true\n\
+          features.bedrock_setup_wizard = true\ncli_auth_credentials_store = \"file\"\n\
+          suppress_unstable_features_warning = true\nanalytics.enabled = false\n\
+          windows.sandbox = \"unelevated\"\n\
 diff --git a/codex-rs/core/config.schema.json b/codex-rs/core/config.schema.json
-index 9dffbb207f..6292c3184d 100644
+index c5302f17d8..f95cfba1b4 100644
 --- a/codex-rs/core/config.schema.json
 +++ b/codex-rs/core/config.schema.json
-@@ -875,6 +875,9 @@
+@@ -894,6 +894,9 @@
              "js_repl_tools_only": {
                "type": "boolean"
              },
@@ -12,7 +25,7 @@ index 9dffbb207f..6292c3184d 100644
              "local_thread_store_compression": {
                "type": "boolean"
              },
-@@ -2130,9 +2133,81 @@
+@@ -2162,9 +2165,81 @@
        ],
        "description": "One action binding value in config.\n\nThis accepts either:\n\n1. A single key or chord string (`\"ctrl-a\"` or `\"ctrl-x ctrl-s\"`). 2. A list of alternative bindings (`[\"ctrl-a\", \"ctrl-x ctrl-s\"]`).\n\nAn empty list explicitly unbinds the action in that scope. Because an explicit empty list is still a configured value, runtime resolution must not fall through to global or built-in defaults for that action."
      },
@@ -94,7 +107,7 @@ index 9dffbb207f..6292c3184d 100644
      "MarketplaceConfig": {
        "additionalProperties": false,
        "properties": {
-@@ -6752,6 +6827,9 @@
+@@ -6793,6 +6868,9 @@
          "js_repl_tools_only": {
            "type": "boolean"
          },
@@ -104,7 +117,7 @@ index 9dffbb207f..6292c3184d 100644
          "local_thread_store_compression": {
            "type": "boolean"
          },
-@@ -7112,6 +7190,22 @@
+@@ -7156,6 +7234,22 @@
        "description": "System instructions.",
        "type": "string"
      },
@@ -128,10 +141,10 @@ index 9dffbb207f..6292c3184d 100644
        "allOf": [
          {
 diff --git a/codex-rs/features/src/lib.rs b/codex-rs/features/src/lib.rs
-index 30318ae47b..9efdda735d 100644
+index 5ea619d0ab..8c59341ebd 100644
 --- a/codex-rs/features/src/lib.rs
 +++ b/codex-rs/features/src/lib.rs
-@@ -366,6 +366,9 @@ pub enum Feature {
+@@ -367,6 +367,9 @@ pub enum Feature {
      PreventIdleSleep,
      /// Removed compatibility key, still advertised to the Responses API.
      RemoteCompactionV2,
@@ -141,7 +154,19 @@ index 30318ae47b..9efdda735d 100644
      /// Include retained images in the remote compaction context budget.
      CompactionImageBudget,
      /// Retain client-authored developer messages across compacted context windows.
-@@ -1819,6 +1822,19 @@ pub const FEATURES: &[FeatureSpec] = &[
+@@ -941,7 +944,10 @@ pub const FEATURES: &[FeatureSpec] = &[
+         id: Feature::DaemonAutoStart,
+         key: "daemon_auto_start",
+         stage: Stage::Stable,
+-        default_enabled: true,
++        // codex-lhc: fork default OFF (Lee, 2026-09-25). Upstream 75ec81c862
++        // defaults the shared background server on; the fork keeps interactive
++        // sessions in-process until the daemon path is qualified with LHC.
++        default_enabled: false,
+     },
+     FeatureSpec {
+         id: Feature::TranscriptV2,
+@@ -1824,6 +1830,19 @@ pub const FEATURES: &[FeatureSpec] = &[
          stage: Stage::Removed,
          default_enabled: false,
      },

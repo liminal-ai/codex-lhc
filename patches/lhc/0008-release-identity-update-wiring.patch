@@ -11,10 +11,10 @@ index a0223e9d72..c8ac9ec2c1 100644
      "workspace_root_test_launcher.sh.tpl",
  ])
 diff --git a/codex-rs/cli/src/doctor/output.rs b/codex-rs/cli/src/doctor/output.rs
-index bef6dc7772..cb9dbd2107 100644
+index a6142503de..c58743ec1b 100644
 --- a/codex-rs/cli/src/doctor/output.rs
 +++ b/codex-rs/cli/src/doctor/output.rs
-@@ -529,7 +529,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
+@@ -534,7 +534,7 @@ fn find_check<'a>(report: &'a DoctorReport, category: &str) -> Option<&'a Doctor
          .find(|check| check.category == category)
  }
  
@@ -23,7 +23,7 @@ index bef6dc7772..cb9dbd2107 100644
      let status = detail::detail_value(check, "latest version status")?;
      if !status.contains("newer version is available") {
          return None;
-@@ -538,7 +538,7 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
+@@ -543,7 +543,7 @@ fn update_note(check: &DoctorCheck, report: &DoctorReport) -> Option<DoctorNote>
          .or_else(|| detail::detail_value(check, "cached latest version"))
          .unwrap_or_else(|| "newer version".to_string());
      let dismissed = detail::detail_value(check, "dismissed version");
@@ -32,7 +32,7 @@ index bef6dc7772..cb9dbd2107 100644
      if let Some(dismissed) = dismissed
          && !detail::is_falsy(&dismissed)
      {
-@@ -1713,7 +1713,10 @@ Run codex doctor without --summary for detailed diagnostics.
+@@ -1755,7 +1755,10 @@ Run codex doctor without --summary for detailed diagnostics.
          let rendered = render_human_report(&report, summary_no_color_unicode_options());
  
          assert!(rendered.contains("Notes\n   ↑ updates"));
@@ -220,10 +220,10 @@ index fbad7d91ce..b96396ff67 100644
      }
  }
 diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
-index 2d9e7ed7f5..44a1ee7064 100644
+index be141103c3..d29ed05d1b 100644
 --- a/codex-rs/cli/src/main.rs
 +++ b/codex-rs/cli/src/main.rs
-@@ -142,6 +142,10 @@ struct MultitoolCli {
+@@ -135,6 +135,10 @@ struct MultitoolCli {
      #[clap(flatten)]
      interactive: TuiCli,
  
@@ -234,7 +234,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
      #[clap(subcommand)]
      subcommand: Option<Subcommand>,
  }
-@@ -909,7 +913,10 @@ fn handle_app_exit(
+@@ -751,7 +755,10 @@ fn handle_app_exit(
          | ExitReason::ThreadRemoved => false,
      };
  
@@ -246,7 +246,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
      if !matches!(update_action, Some(UpdateAction::Daemon(_))) {
          let color_enabled = supports_color::on(Stream::Stdout).is_some();
          for line in exit_info.format_exit_messages(color_enabled) {
-@@ -953,7 +960,10 @@ fn run_update_action(
+@@ -795,7 +802,10 @@ fn run_update_action(
          #[cfg(windows)]
          {
              let (cmd, args) = action.command_args();
@@ -258,7 +258,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
                  // These args contain PowerShell metacharacters, so do not let
                  // PATHEXT select a batch shim for this action.
                  "powershell.exe"
-@@ -1022,8 +1032,19 @@ fn run_update_command() -> anyhow::Result<()> {
+@@ -864,8 +874,19 @@ fn run_update_command() -> anyhow::Result<()> {
      #[cfg(not(debug_assertions))]
      {
          let Some(action) = codex_tui::get_update_action() else {
@@ -279,7 +279,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
              );
          };
          run_update_action(action, /*cli_executable*/ None)
-@@ -1187,8 +1208,13 @@ async fn cli_main(
+@@ -1029,8 +1050,13 @@ async fn cli_main(
          feature_toggles,
          remote,
          mut interactive,
@@ -293,7 +293,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
      // Retain the launch target through TUI exit, even if a launcher changes selection.
      let daemon_cli_executable = arg0_paths
          .codex_self_exe
-@@ -3296,6 +3322,7 @@ mod tests {
+@@ -2859,6 +2885,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -301,7 +301,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
          } = cli;
          interactive
              .shared
-@@ -3333,6 +3360,7 @@ mod tests {
+@@ -2896,6 +2923,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -309,7 +309,7 @@ index 2d9e7ed7f5..44a1ee7064 100644
          } = cli;
          interactive
              .shared
-@@ -3377,6 +3405,7 @@ mod tests {
+@@ -2940,6 +2968,7 @@ mod tests {
              subcommand,
              feature_toggles: _,
              remote: _,
@@ -454,7 +454,7 @@ index 39b023805b..f2417680cc 100644
          }
      }
 diff --git a/codex-rs/tui/src/app/tests/realtime_requests.rs b/codex-rs/tui/src/app/tests/realtime_requests.rs
-index 79e257eab1..07974d548c 100644
+index af57f9a22b..68de9e0422 100644
 --- a/codex-rs/tui/src/app/tests/realtime_requests.rs
 +++ b/codex-rs/tui/src/app/tests/realtime_requests.rs
 @@ -7,6 +7,7 @@ use crate::app::tests::session_lifecycle_requests::start_recording_realtime_spee
@@ -473,12 +473,18 @@ index 79e257eab1..07974d548c 100644
  
  fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
      let cwd = cwd.display().to_string();
-@@ -27,7 +29,38 @@ fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
+@@ -27,12 +29,43 @@ fn normalize_voice_snapshot_directory(rendered: &str, cwd: &Path) -> String {
          "{placeholder}{}",
          " ".repeat(cwd.len().saturating_sub(placeholder.len()))
      );
--    rendered.replace(&cwd, &padded_placeholder)
-+    let with_cwd = rendered.replace(&cwd, &padded_placeholder);
+-    rendered
++    let with_cwd = rendered
+         .replace(&cwd, &padded_placeholder)
+         .lines()
+         .map(str::trim_end)
+         .collect::<Vec<_>>()
+-        .join("\n")
++        .join("\n");
 +    let needle = format!("(v{CODEX_CLI_VERSION})");
 +    let had_trailing_newline = with_cwd.ends_with('\n');
 +    let mut normalized = with_cwd
@@ -528,7 +534,7 @@ index c177895a1b..9768e7e672 100644
  use codex_mcp::qualified_mcp_tool_name_prefix;
  use codex_otel::RuntimeMetricsSummary;
 diff --git a/codex-rs/tui/src/history_cell/notices.rs b/codex-rs/tui/src/history_cell/notices.rs
-index a786340378..8fe88e92c7 100644
+index c5fa224172..f8496669d5 100644
 --- a/codex-rs/tui/src/history_cell/notices.rs
 +++ b/codex-rs/tui/src/history_cell/notices.rs
 @@ -30,35 +30,39 @@ impl HistoryCell for UpdateAvailableHistoryCell {
@@ -728,10 +734,10 @@ index 1a2df82a9d..7dfcbe551b 100644
 +│ https://github.com/liminal-ai/codex-lhc/releases/latest │
 +╰─────────────────────────────────────────────────────────╯
 diff --git a/codex-rs/tui/src/history_cell/tests.rs b/codex-rs/tui/src/history_cell/tests.rs
-index 0062cd5b2c..9589ee4c17 100644
+index 5ce4b76560..311f0a5a38 100644
 --- a/codex-rs/tui/src/history_cell/tests.rs
 +++ b/codex-rs/tui/src/history_cell/tests.rs
-@@ -1355,6 +1355,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
+@@ -1357,6 +1357,26 @@ fn standalone_unix_update_available_history_cell_snapshot() {
      insta::assert_snapshot!(rendered);
  }
  
@@ -759,10 +765,10 @@ index 0062cd5b2c..9589ee4c17 100644
  fn standalone_windows_update_available_history_cell_snapshot() {
      let cell =
 diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
-index 8c75176aa3..4cb4a4dcb5 100644
+index bb65053072..36207ef362 100644
 --- a/codex-rs/tui/src/status/tests.rs
 +++ b/codex-rs/tui/src/status/tests.rs
-@@ -20,6 +20,7 @@ use crate::test_support::PathBufExt;
+@@ -21,6 +21,7 @@ use crate::test_support::PathBufExt;
  use crate::test_support::test_path_buf;
  use crate::token_usage::TokenUsage;
  use crate::token_usage::TokenUsageInfo;
@@ -770,7 +776,7 @@ index 8c75176aa3..4cb4a4dcb5 100644
  use app_test_support::ChatGptAuthFixture;
  use app_test_support::write_chatgpt_auth;
  use app_test_support::write_models_cache;
-@@ -184,6 +185,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
+@@ -185,6 +186,30 @@ fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
          .collect()
  }
  
@@ -801,7 +807,7 @@ index 8c75176aa3..4cb4a4dcb5 100644
  fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
      let frame_width = lines
          .iter()
-@@ -192,7 +217,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+@@ -193,7 +218,7 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
      lines
          .into_iter()
          .map(|line| {
@@ -810,7 +816,7 @@ index 8c75176aa3..4cb4a4dcb5 100644
                  (frame_width, line.find("Directory: "), line.rfind('│'))
              {
                  let prefix = &line[..dir_pos + "Directory: ".len()];
-@@ -211,7 +236,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
+@@ -212,7 +237,8 @@ fn sanitize_directory(lines: Vec<String>) -> Vec<String> {
                  rebuilt
              } else {
                  line

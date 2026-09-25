@@ -986,6 +986,7 @@ fn band_body_replacement_history_byte_equal() {
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
     let mut history = ContextManager::new();
     history.replace(
@@ -1060,6 +1061,7 @@ fn shape_risk_consumers_see_band_replacement() {
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     };
     let mut resume = ContextManager::new();
     resume.replace(
@@ -1762,6 +1764,7 @@ async fn c1_resume_after_compact_no_reingest_and_durable_provenance_survives() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         },
     )];
     s2.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -1875,6 +1878,7 @@ async fn c1_fork_full_history_after_compact_inherits_coherent_body() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         },
     )];
     child.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -2230,6 +2234,8 @@ async fn attach_rollout_for_slice_c(session: &mut Session) -> std::path::PathBuf
     let live_thread = LiveThread::create(
         Arc::clone(&session.services.thread_store),
         CreateThreadParams {
+            creator_user_id: None,
+            creator_account_id: None,
             session_id: session.session_id(),
             thread_id: session.thread_id,
             extra_config: None,
@@ -3551,6 +3557,7 @@ fn grafted_pair_survives_patch_materialized_history_ids() {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::ResponseItem(reconstructed_call.into()),
         RolloutItem::ResponseItem(reconstructed_out.into()),
@@ -3597,6 +3604,7 @@ fn empty_install_history_keeps_prior_body() {
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })];
     assert!(
         codex_lhc_host::history_from_materialized_items(&items).is_empty(),
@@ -3672,6 +3680,7 @@ fn degraded_drops_keep_rollout_and_installed_body_identical() {
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     })];
     rollout.extend(
         tail.iter()

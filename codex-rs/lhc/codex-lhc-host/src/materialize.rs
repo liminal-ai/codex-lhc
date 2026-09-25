@@ -62,6 +62,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 use codex_history::CompactedItem;
+use codex_history::CompactionResumeMetadata;
 use codex_history::GuardianHistoryCheckpoint;
 use codex_history::RetainedContext;
 use codex_history::RolloutItem;
@@ -176,6 +177,9 @@ pub struct MaterializeInput<'a> {
     pub retained_context: Option<RetainedContext>,
     /// Latest token-usage record at compact time, for resume without a long scan.
     pub latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Resume contract (0.157.0): lets cold replay select the LHC fold as its
+    /// input checkpoint instead of only its history base.
+    pub resume_metadata: Option<CompactionResumeMetadata>,
     /// When set and matching the stored assistant provider/model/api, reverse
     /// maps restore `encrypted_content` from the thinking signature.
     pub live_identity: Option<ModelIdentity>,
@@ -192,6 +196,9 @@ pub struct PriorCompactCarry {
     pub guardian_history: Option<GuardianHistoryCheckpoint>,
     pub retained_context: Option<RetainedContext>,
     pub latest_token_usage_record: Option<TokenUsageRecord>,
+    /// Resume contract (0.157.0): lets cold replay select the LHC fold as its
+    /// input checkpoint instead of only its history base.
+    pub resume_metadata: Option<CompactionResumeMetadata>,
     pub turn_context: Option<TurnContextItem>,
 }
 
@@ -220,6 +227,7 @@ pub fn prior_compact_carry(prior: &[RolloutItem]) -> PriorCompactCarry {
         guardian_history: compacted.guardian_history.clone(),
         retained_context: compacted.retained_context.clone(),
         latest_token_usage_record: compacted.latest_token_usage_record.clone(),
+        resume_metadata: compacted.resume_metadata.clone(),
         turn_context,
     }
 }
@@ -292,6 +300,7 @@ pub fn materialize_rollout(input: &MaterializeInput<'_>) -> MaterializeResult {
         retained_context: input.retained_context.clone(),
         compaction_response_id: None,
         latest_token_usage_record: input.latest_token_usage_record.clone(),
+        resume_metadata: input.resume_metadata.clone(),
     };
     debug_assert!(
         compacted

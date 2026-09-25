@@ -124,6 +124,7 @@ pub(super) async fn install_lhc_compact_rewrite(
     let guardian_history = history.lhc_fold_guardian_checkpoint();
     let retained_context = Some(history.retained_context().clone());
     let latest_token_usage_record = sess.latest_token_usage_record().await;
+    let resume_metadata = Some(sess.compaction_resume_metadata().await);
 
     // Provisional boundary message (host ids filled after history extract).
     let provisional_message = marker.to_durable_writeback_record();
@@ -152,6 +153,7 @@ pub(super) async fn install_lhc_compact_rewrite(
         guardian_history: guardian_history.clone(),
         retained_context: retained_context.clone(),
         latest_token_usage_record,
+        resume_metadata,
         // Live identity from the same label sources capture uses
         // (config.model / config.model_provider_id), so same-identity replay
         // actually re-emits encrypted reasoning (R2 host gate).

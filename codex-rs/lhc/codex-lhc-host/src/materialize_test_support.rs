@@ -165,6 +165,7 @@ pub fn materialize_guardian_tool_fold(
         guardian_history: Some(guardian),
         retained_context: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
         live_identity: None,
         current_host_turn_id: None,
         current_lhc_turn_id: None,

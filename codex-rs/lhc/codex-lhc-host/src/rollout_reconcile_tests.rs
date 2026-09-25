@@ -84,6 +84,7 @@ fn single_boundary_items(compact_point: i64) -> Vec<RolloutItem> {
             retained_context: None,
             compaction_response_id: None,
             latest_token_usage_record: None,
+            resume_metadata: None,
         }),
         RolloutItem::ResponseItem(user("tail", "u2").into()),
     ]
@@ -104,6 +105,7 @@ fn dual_compacted_polluted() -> Vec<RolloutItem> {
         retained_context: None,
         compaction_response_id: None,
         latest_token_usage_record: None,
+        resume_metadata: None,
     }));
     items
 }

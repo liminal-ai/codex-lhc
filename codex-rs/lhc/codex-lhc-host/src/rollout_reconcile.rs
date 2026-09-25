@@ -1265,6 +1265,7 @@ pub async fn materialize_thread_rollout_items(
         guardian_history: carry.guardian_history,
         retained_context: carry.retained_context,
         latest_token_usage_record: carry.latest_token_usage_record,
+        resume_metadata: carry.resume_metadata,
         live_identity,
         current_host_turn_id: None,
         current_lhc_turn_id: None,

@@ -1,15 +1,16 @@
 use std::borrow::Cow;
 
-use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
+use sqlx_sqlite::SqlitePool;
 
-pub(crate) static STATE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-pub(crate) static LOGS_MIGRATOR: Migrator = sqlx::migrate!("./logs_migrations");
-pub(crate) static GOALS_MIGRATOR: Migrator = sqlx::migrate!("./goals_migrations");
-pub(crate) static MEMORIES_MIGRATOR: Migrator = sqlx::migrate!("./memory_migrations");
-pub(crate) static QUEUE_MIGRATOR: Migrator = sqlx::migrate!("./queue_migrations");
+pub(crate) static STATE_MIGRATOR: Migrator = sqlx_macros::migrate!("./migrations");
+pub(crate) static LOGS_MIGRATOR: Migrator = sqlx_macros::migrate!("./logs_migrations");
+pub(crate) static GOALS_MIGRATOR: Migrator = sqlx_macros::migrate!("./goals_migrations");
+pub(crate) static MEMORIES_MIGRATOR: Migrator = sqlx_macros::migrate!("./memory_migrations");
+pub(crate) static QUEUE_MIGRATOR: Migrator = sqlx_macros::migrate!("./queue_migrations");
 /// Includes projection frontiers and their durable rollout generation identities.
-pub(crate) static THREAD_HISTORY_MIGRATOR: Migrator = sqlx::migrate!("./thread_history_migrations");
+pub(crate) static THREAD_HISTORY_MIGRATOR: Migrator =
+    sqlx_macros::migrate!("./thread_history_migrations");
 
 /// Allow an older Codex binary to open a database that has already been
 /// migrated by a newer binary running in parallel.
@@ -118,10 +119,13 @@ WHERE version = ?
 }
 
 /// The fork's rollout generation identity migration first shipped as thread
-/// history version 5; upstream later added its own versions 5 and 6, so the
-/// fork migration now lives at version 7. Relabel a legacy version-5 row that
-/// carries the generation-ID checksum as version 7 so upstream's 5 and 6 apply
-/// beneath it instead of failing the checksum comparison.
+/// history version 5, then as version 7 (0.155.1 and 0.156.1); upstream now owns
+/// versions 5, 6 and 7, so the fork migration lives at version 8. Relabel a row
+/// that carries the generation-ID checksum under any other version as version 8
+/// so upstream's own versions apply beneath it instead of failing the checksum
+/// comparison.
+pub(crate) const ROLLOUT_GENERATION_ID_MIGRATION_VERSION: i64 = 8;
+
 pub(crate) async fn repair_legacy_rollout_generation_migration_version(
     pool: &SqlitePool,
     migrator: &Migrator,
@@ -129,7 +133,7 @@ pub(crate) async fn repair_legacy_rollout_generation_migration_version(
     let Some(generation_migration) = migrator
         .migrations
         .iter()
-        .find(|migration| migration.version == 7)
+        .find(|migration| migration.version == ROLLOUT_GENERATION_ID_MIGRATION_VERSION)
     else {
         return Ok(());
     };
@@ -147,14 +151,14 @@ pub(crate) async fn repair_legacy_rollout_generation_migration_version(
         r#"
 SELECT 1
 FROM _sqlx_migrations
-WHERE version = ?
+WHERE version <> ?
   AND checksum = ?
   AND NOT EXISTS (
       SELECT 1 FROM _sqlx_migrations WHERE version = ?
   )
         "#,
     )
-    .bind(5_i64)
+    .bind(generation_migration.version)
     .bind(generation_migration.checksum.as_ref())
     .bind(generation_migration.version)
     .fetch_optional(pool)
@@ -168,7 +172,7 @@ WHERE version = ?
         r#"
 UPDATE _sqlx_migrations
 SET version = ?, description = ?
-WHERE version = ?
+WHERE version <> ?
   AND checksum = ?
   AND NOT EXISTS (
       SELECT 1 FROM _sqlx_migrations WHERE version = ?
@@ -177,7 +181,7 @@ WHERE version = ?
     )
     .bind(generation_migration.version)
     .bind(generation_migration.description.as_ref())
-    .bind(5_i64)
+    .bind(generation_migration.version)
     .bind(generation_migration.checksum.as_ref())
     .bind(generation_migration.version)
     .execute(pool)
