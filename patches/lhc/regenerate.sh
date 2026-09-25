@@ -121,6 +121,7 @@ regen 0007-lhc-compact-arm.patch \
   codex-rs/core/src/session/guardian_replay_seam_tests.rs \
   codex-rs/core/src/session/rollout_reconstruction.rs \
   codex-rs/core/src/session/rollout_reconstruction_tests.rs \
+  codex-rs/core/src/tools/executed_tool_calls/mcp_attribution_tests.rs \
   codex-rs/history/src/rollout_payload.rs \
   codex-rs/history/src/tests.rs \
   codex-rs/rollout/src/metadata_tests.rs \

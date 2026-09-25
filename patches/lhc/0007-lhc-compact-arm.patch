@@ -9721,10 +9721,10 @@ index 0000000000..d5a30374ff
 +}
 diff --git a/codex-rs/core/src/compact_lhc_slice_d_tests.rs b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
 new file mode 100644
-index 0000000000..74f0368baf
+index 0000000000..2ddf708008
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_slice_d_tests.rs
-@@ -0,0 +1,1939 @@
+@@ -0,0 +1,1941 @@
 +//! Slice D certification — regenerate-and-resume drill, dual-format resume,
 +//! display consumers against rebuilt files, and the layer-2 deterministic matrix.
 +//!
@@ -9901,6 +9901,8 @@ index 0000000000..74f0368baf
 +    let live_thread = LiveThread::create(
 +        Arc::clone(&session.services.thread_store),
 +        CreateThreadParams {
++            creator_user_id: None,
++            creator_account_id: None,
 +            session_id: session.session_id(),
 +            thread_id: session.thread_id,
 +            extra_config: None,
@@ -12215,10 +12217,10 @@ index 0000000000..902ef91166
 +}
 diff --git a/codex-rs/core/src/compact_lhc_tests.rs b/codex-rs/core/src/compact_lhc_tests.rs
 new file mode 100644
-index 0000000000..4634a269cc
+index 0000000000..0bbd93d1b5
 --- /dev/null
 +++ b/codex-rs/core/src/compact_lhc_tests.rs
-@@ -0,0 +1,3706 @@
+@@ -0,0 +1,3715 @@
 +//! Tests for the LHC compact arm (Chunk 2b fix round 1).
 +//! Rule zero: production paths + structural equality. No include_str.
 +
@@ -13207,6 +13209,7 @@ index 0000000000..4634a269cc
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
++        resume_metadata: None,
 +    };
 +    let mut history = ContextManager::new();
 +    history.replace(
@@ -13281,6 +13284,7 @@ index 0000000000..4634a269cc
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
++        resume_metadata: None,
 +    };
 +    let mut resume = ContextManager::new();
 +    resume.replace(
@@ -13983,6 +13987,7 @@ index 0000000000..4634a269cc
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
++            resume_metadata: None,
 +        },
 +    )];
 +    s2.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -14096,6 +14101,7 @@ index 0000000000..4634a269cc
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
++            resume_metadata: None,
 +        },
 +    )];
 +    child.seed_last_lhc_durable_from_rollout(&rollout).await;
@@ -14451,6 +14457,8 @@ index 0000000000..4634a269cc
 +    let live_thread = LiveThread::create(
 +        Arc::clone(&session.services.thread_store),
 +        CreateThreadParams {
++            creator_user_id: None,
++            creator_account_id: None,
 +            session_id: session.session_id(),
 +            thread_id: session.thread_id,
 +            extra_config: None,
@@ -15772,6 +15780,7 @@ index 0000000000..4634a269cc
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
++            resume_metadata: None,
 +        }),
 +        RolloutItem::ResponseItem(reconstructed_call.into()),
 +        RolloutItem::ResponseItem(reconstructed_out.into()),
@@ -15818,6 +15827,7 @@ index 0000000000..4634a269cc
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
++        resume_metadata: None,
 +    })];
 +    assert!(
 +        codex_lhc_host::history_from_materialized_items(&items).is_empty(),
@@ -15893,6 +15903,7 @@ index 0000000000..4634a269cc
 +        retained_context: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
++        resume_metadata: None,
 +    })];
 +    rollout.extend(
 +        tail.iter()
@@ -19002,7 +19013,7 @@ index 473cd17bc7..fe85eaf512 100644
          let reference_context_item = match reference_context_item {
              TurnReferenceContextItem::NeverSet | TurnReferenceContextItem::Cleared => None,
 diff --git a/codex-rs/core/src/session/rollout_reconstruction_tests.rs b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
-index e69c0fb585..3ddb6fffb5 100644
+index e69c0fb585..c00dc56224 100644
 --- a/codex-rs/core/src/session/rollout_reconstruction_tests.rs
 +++ b/codex-rs/core/src/session/rollout_reconstruction_tests.rs
 @@ -11,6 +11,7 @@ use codex_history::InitialHistory;
@@ -19145,7 +19156,7 @@ index e69c0fb585..3ddb6fffb5 100644
              mcp_resource_origins: None,
              window_number: None,
              first_window_id: None,
-@@ -2602,3 +2624,324 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
+@@ -2602,3 +2624,325 @@ async fn record_initial_history_resumed_replaced_incomplete_compacted_turn_clear
      );
      assert!(session.reference_context_item().await.is_none());
  }
@@ -19169,6 +19180,7 @@ index e69c0fb585..3ddb6fffb5 100644
 +        window_id: None,
 +        compaction_response_id: None,
 +        latest_token_usage_record: None,
++        resume_metadata: None,
 +    }
 +}
 +
@@ -20926,6 +20938,18 @@ index df153259e6..ca16c0d3ae 100644
  fn stored_thread_to_initial_history(
      stored_thread: StoredThread,
      rollout_path: Option<PathBuf>,
+diff --git a/codex-rs/core/src/tools/executed_tool_calls/mcp_attribution_tests.rs b/codex-rs/core/src/tools/executed_tool_calls/mcp_attribution_tests.rs
+index 8d90927ddc..996526b67a 100644
+--- a/codex-rs/core/src/tools/executed_tool_calls/mcp_attribution_tests.rs
++++ b/codex-rs/core/src/tools/executed_tool_calls/mcp_attribution_tests.rs
+@@ -68,6 +68,7 @@ fn restores_cumulative_item_and_compaction_checkpoints() {
+             message: "summary".to_string(),
+             replacement_history: Some(vec![envelope(Some(cumulative.clone()))]),
+             guardian_history: None,
++            guardian_covered_suffix_items: None,
+             retained_context: None,
+             mcp_resource_origins: None,
+             window_number: None,
 diff --git a/codex-rs/core/tests/common/responses.rs b/codex-rs/core/tests/common/responses.rs
 index 408a6234b3..90bba59a32 100644
 --- a/codex-rs/core/tests/common/responses.rs
@@ -27035,7 +27059,7 @@ index bd57728462..6fd254bbe3 100644
              mcp_resource_origins: item.mcp_resource_origins.map(Cow::into_owned),
              window_number,
 diff --git a/codex-rs/history/src/tests.rs b/codex-rs/history/src/tests.rs
-index 96733b2041..d42e4c06f1 100644
+index 96733b2041..b66901bb72 100644
 --- a/codex-rs/history/src/tests.rs
 +++ b/codex-rs/history/src/tests.rs
 @@ -449,6 +449,7 @@ fn compacted_replacement_history_stores_metadata_in_an_aligned_sidecar() -> Resu
@@ -27046,7 +27070,15 @@ index 96733b2041..d42e4c06f1 100644
          mcp_resource_origins: None,
          window_number: None,
          first_window_id: None,
-@@ -589,6 +590,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() ->
+@@ -506,6 +507,7 @@ fn compacted_resume_metadata_presence_round_trips_empty_values() -> Result<()> {
+         replacement_history: None,
+         retained_context: None,
+         guardian_history: None,
++        guardian_covered_suffix_items: None,
+         mcp_resource_origins: None,
+         window_number: None,
+         first_window_id: None,
+@@ -589,6 +591,7 @@ fn compacted_metadata_remains_compatible_with_legacy_response_item_readers() ->
          replacement_history: Some(vec![envelope]),
          retained_context: None,
          guardian_history: Some(checkpoint.clone()),
@@ -27054,7 +27086,7 @@ index 96733b2041..d42e4c06f1 100644
          mcp_resource_origins: Some(McpResourceOriginCheckpoint::default()),
          window_number: None,
          first_window_id: None,
-@@ -802,6 +804,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
+@@ -802,6 +805,7 @@ fn compacted_item_serializes_window_number_and_id() -> Result<()> {
          replacement_history: None,
          retained_context: None,
          guardian_history: None,
@@ -27062,7 +27094,7 @@ index 96733b2041..d42e4c06f1 100644
          mcp_resource_origins: None,
          window_number: Some(3),
          first_window_id: Some("019b3f6e-0000-7000-8000-000000000001".to_string()),
-@@ -842,6 +845,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
+@@ -842,6 +846,7 @@ fn compacted_item_migrates_legacy_numeric_window_id() -> Result<()> {
              replacement_history: None,
              retained_context: None,
              guardian_history: None,
@@ -27828,14 +27860,17 @@ index efbb76cc09..07f1b0617b 100644
  #[path = "migrations_tests.rs"]
  mod tests;
 diff --git a/codex-rs/state/src/migrations_tests.rs b/codex-rs/state/src/migrations_tests.rs
-index f80ecc8f83..753b1dad57 100644
+index f80ecc8f83..a68cbd280e 100644
 --- a/codex-rs/state/src/migrations_tests.rs
 +++ b/codex-rs/state/src/migrations_tests.rs
-@@ -9,6 +9,8 @@ use std::borrow::Cow;
+@@ -6,9 +6,11 @@ use sqlx::migrate::Migration;
+ use sqlx::migrate::Migrator;
+ use std::borrow::Cow;
+ 
++use super::ROLLOUT_GENERATION_ID_MIGRATION_VERSION;
  use super::STATE_MIGRATOR;
  use super::THREAD_HISTORY_MIGRATOR;
  use super::repair_legacy_recency_migration_version;
-+use super::ROLLOUT_GENERATION_ID_MIGRATION_VERSION;
 +use super::repair_legacy_rollout_generation_migration_version;
  use crate::PINNED_THREAD_SECTION_ID;
  use crate::PINNED_THREAD_SECTION_NAME;

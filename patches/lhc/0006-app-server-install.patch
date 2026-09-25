@@ -203,10 +203,10 @@ index c2d6d6d0a2..70a98e6b26 100644
      async fn app_server_event_sink_uses_listener_fifo_for_goal_updates_warnings_and_clears() {
          let (outgoing_tx, _outgoing_rx) = mpsc::channel(4);
 diff --git a/codex-rs/app-server/src/in_process.rs b/codex-rs/app-server/src/in_process.rs
-index 1fb7b51f17..8bed57efb6 100644
+index 1fb7b51f17..6c91db720f 100644
 --- a/codex-rs/app-server/src/in_process.rs
 +++ b/codex-rs/app-server/src/in_process.rs
-@@ -885,7 +885,202 @@ mod tests {
+@@ -885,7 +885,203 @@ mod tests {
          start_test_client_with_capacity(session_source, DEFAULT_IN_PROCESS_CHANNEL_CAPACITY).await
      }
  
@@ -305,6 +305,7 @@ index 1fb7b51f17..8bed57efb6 100644
 +            state_db: Some(state_db),
 +            environment_manager: Arc::new(EnvironmentManager::default_for_tests()),
 +            config_warnings: Vec::new(),
++            embedded_network_policy: Default::default(),
 +            session_source,
 +            enable_codex_api_key_env: false,
 +            initialize: InitializeParams {
@@ -409,7 +410,7 @@ index 1fb7b51f17..8bed57efb6 100644
      async fn in_process_start_initializes_and_handles_typed_v2_request() {
          let client = start_test_client(SessionSource::Cli).await;
          let response = client
-@@ -907,6 +1102,7 @@ mod tests {
+@@ -907,6 +1103,7 @@ mod tests {
      }
  
      #[tokio::test]
@@ -417,7 +418,7 @@ index 1fb7b51f17..8bed57efb6 100644
      async fn in_process_start_uses_requested_session_source_for_thread_start() {
          for (requested_source, expected_source) in [
              (SessionSource::Cli, ApiSessionSource::Cli),
-@@ -935,6 +1131,7 @@ mod tests {
+@@ -935,6 +1132,7 @@ mod tests {
      }
  
      #[tokio::test]

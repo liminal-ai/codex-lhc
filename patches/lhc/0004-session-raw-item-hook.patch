@@ -41,10 +41,10 @@ index d66602b205..bbd9311eb9 100644
      }
 diff --git a/codex-rs/core/src/session/lhc_capture_e2e_tests.rs b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
 new file mode 100644
-index 0000000000..178abea0d2
+index 0000000000..a237a3c25f
 --- /dev/null
 +++ b/codex-rs/core/src/session/lhc_capture_e2e_tests.rs
-@@ -0,0 +1,1260 @@
+@@ -0,0 +1,1262 @@
 +//! End-to-end LHC capture through the real `Session` recording seam (F11/F14).
 +//!
 +//! These tests fail when the raw-item contributor invocation is deleted from
@@ -1103,6 +1103,7 @@ index 0000000000..178abea0d2
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
++            resume_metadata: None,
 +        }),
 +        RolloutItem::ResponseItem(user("after-c1").into()),
 +        RolloutItem::ResponseItem(assistant("reply-c1").into()),
@@ -1119,6 +1120,7 @@ index 0000000000..178abea0d2
 +            retained_context: None,
 +            compaction_response_id: None,
 +            latest_token_usage_record: None,
++            resume_metadata: None,
 +        }),
 +        RolloutItem::ResponseItem(user("after-c2").into()),
 +        RolloutItem::ResponseItem(assistant("reply-c2").into()),
@@ -1306,7 +1308,7 @@ index 0000000000..178abea0d2
 +    }
 +}
 diff --git a/codex-rs/core/src/session/mod.rs b/codex-rs/core/src/session/mod.rs
-index b977bb16f6..3b4bf7ae51 100644
+index b977bb16f6..91733dee4b 100644
 --- a/codex-rs/core/src/session/mod.rs
 +++ b/codex-rs/core/src/session/mod.rs
 @@ -237,6 +237,7 @@ mod inject;
@@ -1327,12 +1329,11 @@ index b977bb16f6..3b4bf7ae51 100644
  mod rollout_reconstruction_tests;
  
  use crate::exec_policy::ExecPolicyUpdateError;
-@@ -329,10 +333,12 @@ use codex_core_plugins::RecommendedPluginCandidatesInput;
- use codex_git_utils::get_git_repo_root;
+@@ -330,9 +334,11 @@ use codex_git_utils::get_git_repo_root;
  use codex_history::CodexHarnessMetadata;
  use codex_history::CompactedItem;
-+use codex_history::GuardianHistoryCheckpoint;
  use codex_history::CompactionResumeMetadata;
++use codex_history::GuardianHistoryCheckpoint;
  use codex_history::InitialHistory;
  pub(crate) use codex_history::PreviousTurnSettings;
  use codex_history::ResponseItemEnvelope;
