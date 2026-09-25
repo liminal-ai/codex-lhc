@@ -709,11 +709,18 @@ fn emit_tail(
                 });
                 // Verbatim tail copies keep the captured host id so Guardian
                 // identity overlap can suppress them on restart.
-                let id_hint = u.source_messages.iter().find_map(|s| {
-                    s.idempotency_key
-                        .as_deref()
-                        .and_then(parse_host_id_from_key)
-                });
+                // Only a `msg` id belongs on a rebuilt user Message. A runtime
+                // note may come from another variant (a subagent result is an
+                // AgentMessage, `amsg_`), and the provider rejects that id here.
+                let id_hint = u
+                    .source_messages
+                    .iter()
+                    .find_map(|s| {
+                        s.idempotency_key
+                            .as_deref()
+                            .and_then(parse_host_id_from_key)
+                    })
+                    .filter(|id| host_id_kind_prefix(id) == Some("msg"));
                 if is_runtime_note {
                     let text = u
                         .source_messages

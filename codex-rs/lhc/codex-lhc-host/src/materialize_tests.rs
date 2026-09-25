@@ -3604,3 +3604,58 @@ fn prior_generation_realtime_rows_are_carried_forward_in_order() {
         "repeated rewrites do not duplicate carried realtime rows"
     );
 }
+
+/// A subagent reply is captured as an `AgentMessage` (`amsg_` id) and
+/// flattened to a runtime note. The rebuilt tail item is an ordinary user
+/// `Message`, whose Responses API prefix is `msg`; it must not carry the
+/// `amsg_` id, or the provider rejects every later request on the thread.
+#[test]
+fn runtime_note_tail_drops_host_id_of_another_variant() {
+    let note =
+        "agent_message author=/root/independent_review recipient=/root parts=[]\nreview body";
+    let host_id = "amsg_01a0d67b-94e0-7fa2-85c9-d77877fd01d9";
+    let key =
+        crate::idempotency::item_event_key("t", Some(host_id), "deadbeef", 0, "runtime_note", None);
+    let view = SessionThreadView {
+        thread_id: "t".into(),
+        entries: vec![
+            band_entry("band"),
+            user_tail_with_key("m1", note, Some(&key)),
+        ],
+    };
+    let messages = [msg(
+        "m1",
+        "turn-1",
+        MessageKind::RuntimeNote,
+        10,
+        note,
+        None,
+    )];
+    let turns = [turn(
+        "turn-1",
+        1,
+        &["m1"],
+        Some(TurnOutcome::Completed),
+        None,
+        Some("2026-07-01T12:00:00.000Z"),
+        Some("2026-07-01T12:00:10.000Z"),
+    )];
+    let items = materialize(view, &messages, &turns, &[], None);
+    let tail = tail_response_items(&items);
+    let user = tail
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::Message {
+                role, id, content, ..
+            } if role == "user" => content.iter().find_map(|part| match part {
+                ContentItem::InputText { text } if text == note => Some(id.clone()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("runtime note tail item present");
+    assert_eq!(
+        user, None,
+        "rebuilt user Message must not carry {host_id}: {tail:?}"
+    );
+}
