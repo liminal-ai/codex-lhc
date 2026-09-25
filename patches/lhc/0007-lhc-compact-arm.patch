@@ -21773,7 +21773,7 @@ index 67c77fb907..d1db6e68c2 100644
          for request in &guardian_requests {
              assert!(!request.has_content_kinds(&["token_budget.context_window"]));
 diff --git a/codex-rs/core/tests/suite/compact.rs b/codex-rs/core/tests/suite/compact.rs
-index 76d8354a32..6efcca62b7 100644
+index 76d8354a32..c7a9c22e88 100644
 --- a/codex-rs/core/tests/suite/compact.rs
 +++ b/codex-rs/core/tests/suite/compact.rs
 @@ -515,6 +515,7 @@ fn format_history_snapshot(
@@ -22016,7 +22016,15 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
      skip_if_no_network!(Ok(()));
-@@ -4641,6 +4671,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
+@@ -4544,6 +4574,7 @@ async fn paginated_compaction_cold_resume_from_bounded_suffix() -> Result<()> {
+     Ok(())
+ }
+ 
++#[ignore = "codex-lhc LIM-142 strict-lhc-routing: native compact/remote path not taken under LHC"]
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
+     skip_if_no_network!();
+@@ -4641,6 +4672,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
      );
  }
  
@@ -22024,7 +22032,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn auto_compact_clamps_config_limit_to_context_window() {
      skip_if_no_network!();
-@@ -4701,6 +4732,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
+@@ -4701,6 +4733,7 @@ async fn auto_compact_clamps_config_limit_to_context_window() {
      );
  }
  
@@ -22032,7 +22040,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
      skip_if_no_network!();
-@@ -4770,6 +4802,7 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
+@@ -4770,6 +4803,7 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
      );
  }
  
@@ -22040,7 +22048,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
      skip_if_no_network!();
-@@ -4873,6 +4906,7 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
+@@ -4873,6 +4907,7 @@ async fn auto_compact_body_after_prefix_counts_growth_after_compaction() {
      );
  }
  
@@ -22048,7 +22056,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
      skip_if_no_network!();
-@@ -4935,6 +4969,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
+@@ -4935,6 +4970,7 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
  #[test_case::test_case(false; "counts_encrypted_reasoning_before_last_user")]
  #[test_case::test_case(true; "compacts_after_reasoning_header_clears")]
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22056,7 +22064,7 @@ index 76d8354a32..6efcca62b7 100644
  async fn auto_compact_accounts_for_encrypted_reasoning(first_response_includes_reasoning: bool) {
      skip_if_no_network!();
  
-@@ -5038,6 +5073,7 @@ async fn auto_compact_accounts_for_encrypted_reasoning(first_response_includes_r
+@@ -5038,6 +5074,7 @@ async fn auto_compact_accounts_for_encrypted_reasoning(first_response_includes_r
  
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  // TODO(ccunningham): Update once pre-turn compaction includes incoming user input.
@@ -22064,7 +22072,7 @@ index 76d8354a32..6efcca62b7 100644
  async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_message() {
      skip_if_no_network!();
  
-@@ -5154,6 +5190,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
+@@ -5154,6 +5191,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  // TODO(ccunningham): Update once pre-turn compaction context-overflow handling includes incoming
  // user input and emits richer oversized-input messaging.
@@ -22072,7 +22080,7 @@ index 76d8354a32..6efcca62b7 100644
  async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch() {
      skip_if_no_network!();
  
-@@ -5257,6 +5294,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
+@@ -5257,6 +5295,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
      );
  }
  
@@ -22080,7 +22088,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
      skip_if_no_network!();
-@@ -5339,6 +5377,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
+@@ -5339,6 +5378,7 @@ async fn snapshot_request_shape_pre_turn_compaction_context_window_exceeded() {
      );
  }
  
@@ -22088,7 +22096,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn snapshot_request_shape_manual_compact_without_previous_user_messages() {
      skip_if_no_network!();
-@@ -5398,6 +5437,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages()
+@@ -5398,6 +5438,7 @@ async fn snapshot_request_shape_manual_compact_without_previous_user_messages()
      );
  }
  
@@ -22096,7 +22104,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn manual_compaction_refreshes_global_instructions_for_next_turn() -> Result<()> {
      // Set up an initial turn, a manual compaction response, and a post-compaction turn.
-@@ -5477,6 +5517,7 @@ async fn manual_compaction_refreshes_global_instructions_for_next_turn() -> Resu
+@@ -5477,6 +5518,7 @@ async fn manual_compaction_refreshes_global_instructions_for_next_turn() -> Resu
      Ok(())
  }
  
@@ -22104,7 +22112,7 @@ index 76d8354a32..6efcca62b7 100644
  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
  async fn mid_turn_compaction_uses_refreshed_global_instructions() -> Result<()> {
      // Set up a turn that crosses the auto-compaction limit and a post-compaction response.
-@@ -5549,6 +5590,7 @@ async fn mid_turn_compaction_uses_refreshed_global_instructions() -> Result<()>
+@@ -5549,6 +5591,7 @@ async fn mid_turn_compaction_uses_refreshed_global_instructions() -> Result<()>
      Ok(())
  }
  
