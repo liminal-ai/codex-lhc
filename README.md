@@ -40,30 +40,31 @@
 > install `codex-lhc` and leaves any stock `codex` command alone.
 > Official Codex installers and `openai/codex` releases do **not** include LHC.
 >
-> ### What changes in v0.156.1
+> ### What changes in v0.157.0
 >
-> This update brings the fork to Codex 0.156.1.
+> This update brings the fork to Codex 0.157.0 (GPT-6 Sol and Luna in the
+> catalog, a network policy for sandboxed commands and MCP servers, fullscreen
+> transcript by default).
 >
-> - **Custom context windows stick.** A set model context window is kept when
->   a turn is rebuilt, instead of falling back to the default catalog window.
-> - **Guardian after compaction.** Later conversation stays in order after a
->   compact: new work is not dropped, and overlapping user messages are not
->   duplicated.
-> - **Unfinished summary work is handed back** when a thread is closed or
->   Codex exits, so the next session on that thread can continue from it.
-> - **Rewind is refused** on LHC threads, with the message
->   `Rewinding is not yet supported.`
+> - **Background server stays off.** Upstream now starts a shared background
+>   app-server by default; this fork keeps Codex in-process. Opt in with
+>   `features.daemon_auto_start = true`.
+> - **Guardian keeps its thread context** across an LHC compaction and a
+>   reopen, on upstream's new history reconstruction.
+> - **Cold reopen after an LHC compaction** resumes from the LHC fold instead
+>   of replaying the whole rollout.
 >
 > **Known limitation:** threads rewound under 0.155.1 or earlier can surface
 > rewound turns via retrieval and after compaction.
 >
-> **Upgrade impact:** LHC thread schema remains 13. Opening a schema-12 (or
-> older) thread still migrates it in place. Releases v0.150.2 and earlier
-> cannot reopen migrated threads. See [upgrade details](lhc-docs/INSTALL.md#upgrade-and-compatibility).
+> **Upgrade impact:** LHC thread schema remains 13. Codex's thread-history
+> database migrates one way on first open; rolling back to v0.156.1 needs a
+> backup of `thread_history_1.sqlite` taken before that. Releases v0.150.2 and
+> earlier cannot reopen migrated LHC threads. See [upgrade details](lhc-docs/INSTALL.md#upgrade-and-compatibility).
 >
 > Upstream's optional experimental context-management mode remains incompatible
 > with LHC and is rejected at startup. Normal LHC use does not require it.
-> [Release notes](lhc-release/notes/v0.156.1.md) describe the remaining changes.
+> [Release notes](lhc-release/notes/v0.157.0.md) describe the remaining changes.
 >
 > Everything below is upstream's README. Its install commands install stock
 > Codex, not Codex + LHC.
