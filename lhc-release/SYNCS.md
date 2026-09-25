@@ -7,6 +7,7 @@ production knobs.
 ## Records
 
 2026-09-24 rust-v0.156.1 BASE=b412ff32c4 notes: release 0.156.1; local Linux candidate 0.156.1-local.1. No push.
+2026-09-25 rust-v0.156.1 BASE=b412ff32c4 candidate=da9e8c6c88fd32282b9887d46e1f155a90082a55 notes: released v0.156.1 (candidate run 36094985977, promote run 36104370044, tag at da9e8c6c88); fix d2bb3f2bf2 keeps only msg-prefixed host ids on rebuilt user messages (subagent reply after compaction, reproduced on 4745976fca run 36069745127); live-qualified on the exact Linux x86_64 artifact; cutover on lee-box same day.
 
 2026-09-19 rust-v0.155.1 BASE=be2951ea34 candidate=dc30d2bfd969e587b0c74a422a6a5c9379cbf903 conflicts=37-merge-tree (0.155.1 retarget Cargo.toml-version-only) notes: release 0.155.1; F2 proven-binding turn ids (unproven stay synthetic+warn; no migration); untagged morning def59737 burn-in does not carry; tagged artifact gets own fold/resume/F2 TUI/Guardian qualification. No cutover.
 
