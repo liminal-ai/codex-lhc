@@ -40,7 +40,21 @@
 > install `codex-lhc` and leaves any stock `codex` command alone.
 > Official Codex installers and `openai/codex` releases do **not** include LHC.
 >
-> ### What changes in v0.157.0
+> ### What changes in v0.157.0-lhc.1
+>
+> A fix release on the same Codex 0.157.0 and the same LHC core as v0.157.0.
+> `codex --version` still reports `codex-cli 0.157.0`; `codex --lhc-version`
+> reports `0.157.0-lhc.1`. No stored data changes shape; going back to v0.157.0
+> is a version switch.
+>
+> - **Compaction no longer stops on a reply with no text.** A thread whose
+>   model reply was empty failed every later compaction, and the turn with it
+>   (`LHC compact failed: … mapper produced zero events`). Such items hold
+>   nothing the LHC archive could keep; they are now logged and skipped, and
+>   the compaction continues. History items of a type the archive cannot
+>   represent are treated the same way.
+>
+> ### What changed in v0.157.0
 >
 > This update brings the fork to Codex 0.157.0 (GPT-6 Sol and Luna in the
 > catalog, a network policy for sandboxed commands and MCP servers, fullscreen
@@ -64,7 +78,8 @@
 >
 > Upstream's optional experimental context-management mode remains incompatible
 > with LHC and is rejected at startup. Normal LHC use does not require it.
-> [Release notes](lhc-release/notes/v0.157.0.md) describe the remaining changes.
+> [Release notes](lhc-release/notes/v0.157.0-lhc.1.md) describe this release; the
+> [v0.157.0 notes](lhc-release/notes/v0.157.0.md) describe the upstream move.
 >
 > Everything below is upstream's README. Its install commands install stock
 > Codex, not Codex + LHC.

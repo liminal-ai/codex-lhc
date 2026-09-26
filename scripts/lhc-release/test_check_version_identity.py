@@ -10,7 +10,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/lhc-release/check_version_identity.py"
-UPSTREAM_VERSION = (ROOT / "lhc-release/VERSION").read_text(encoding="utf-8").strip()
+CHECKED_IN_RELEASE = (ROOT / "lhc-release/VERSION").read_text(encoding="utf-8").strip()
+# The checked-in release is X.Y.Z (an upstream base) or X.Y.Z-lhc.N (a fork fix
+# release on that base); the fixtures below need the bare base.
+UPSTREAM_VERSION = CHECKED_IN_RELEASE.split("-lhc.", 1)[0]
 FORK_RELEASE = f"{UPSTREAM_VERSION}-lhc.1"
 WORKSPACE_CLI = "version.workspace = true"
 
@@ -39,11 +42,11 @@ def run_check(version: str, root: Path = ROOT) -> subprocess.CompletedProcess[st
 
 
 class VersionIdentityTests(unittest.TestCase):
-    def test_repository_accepts_checked_in_bare_release(self) -> None:
-        result = run_check(UPSTREAM_VERSION)
+    def test_repository_accepts_checked_in_release(self) -> None:
+        result = run_check(CHECKED_IN_RELEASE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            f"aligned at {UPSTREAM_VERSION} (upstream base {UPSTREAM_VERSION})",
+            f"aligned at {CHECKED_IN_RELEASE} (upstream base {UPSTREAM_VERSION})",
             result.stdout,
         )
 
