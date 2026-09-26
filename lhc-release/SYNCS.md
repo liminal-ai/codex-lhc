@@ -18,3 +18,5 @@ production knobs.
 2026-09-25 rust-v0.157.0 BASE=00c972ed5d candidate=3487fd369c9ae9b1824f710e7840f4afc0d70e2d notes: released v0.157.0 (candidate run 36148327496, promote run 36165953062, tag at 3487fd369c); fork main fast-forwarded to 3487fd369c; live-qualified on the exact linux-x86_64 artifact (subagent, two compactions, Guardian-reviewed approvals, kill, reopen, exec resume) and migration/rollback rehearsed on a copy of the 0.156.1 home; Lee waived the separate release test.
 
 2026-09-26 rust-v0.157.0 BASE=00c972ed5d notes: release identity 0.157.0-lhc.1 cut on wrenn/codex-lhc-0.157.0-lhc.1; fix 0371504ce2 (compact import warns and skips zero-event and unrepresentable items; Chester's stop of 2026-09-25); candidate pending. No push yet.
+
+2026-09-26 rust-v0.157.1 BASE=36650394c5b38c2990ccf2a3457165ca3e9d9726 conflicts=1 (Cargo.toml workspace version) notes: merged peeled 36650394c5 onto the unreleased 0.157.0-lhc.1 tree (8b6a686c2c) at ea33ea5c77; release 0.157.1 supersedes 0.157.0-lhc.1 (candidate run 36219930180 built, never published; its notes file removed) and carries fix 0371504ce2; branch codex-lhc/0.157.1; candidate pending.
