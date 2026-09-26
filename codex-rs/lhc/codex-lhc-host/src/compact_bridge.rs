@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 
+use codex_extension_api::RawItemProvenance;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use lhc::intake_stream::EventRecord;
@@ -42,11 +43,13 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::idempotency::OccurrenceTracker;
 use crate::idempotency::item_digest;
 use crate::idempotency::item_stable_id;
 use crate::inference::lhc_inference_callbacks;
 use crate::mapping::ACTOR_SYSTEM;
 use crate::mapping::HARNESS;
+use crate::mapping::map_item;
 use crate::projections::compact_marker_key_prefix;
 use crate::projections::ensure_legacy_occurrence;
 use crate::projections::host_items_missing_from_archive_indexed;
@@ -495,7 +498,10 @@ fn is_coverage_candidate(item: &ResponseItem) -> bool {
     matches!(classify_coverage(item), CoverageClass::Required)
 }
 
-/// Hard-failure reason when host history carries an unrepresentable item type.
+/// Reason text when host history carries an unrepresentable item type. Since
+/// 0.157.1 this is detected and warned about, never a stop: such items map to
+/// no event, so the archive cannot hold them and compact proceeds without them
+/// (docs/compact-gating-triage/codex/rulings.md: detect + warn + continue).
 pub fn unrepresentable_host_items_gap(host_items: &[ResponseItem]) -> Option<String> {
     let bad: Vec<&'static str> = host_items
         .iter()
@@ -769,18 +775,23 @@ pub fn host_history_coverage_gap_with_provenance(
 /// Callers must pass the output of [`host_items_missing_from_archive`] — never the
 /// full post-compact body.
 ///
-/// If a required candidate maps to zero events, this is a hard failure (never a
-/// silent skip) so tool/reasoning pairing cannot be dropped without notice.
+/// Items the mapper emits nothing for — an unrepresentable type, or a required
+/// candidate that maps to zero events (an assistant message with empty text,
+/// reasoning without content) — are warned about and skipped: they carry no
+/// provider content the archive could hold, so compact continues on the
+/// archive as it stands (rulings.md: detect + warn + continue). Until 0.157.1
+/// both cases were hard failures that stranded the turn (Chester, 2026-09-25).
+/// Returns the number of items imported.
 pub async fn import_host_items_into_archive(
     session: &mut LhcSession,
     host_items: &[ResponseItem],
 ) -> Result<usize, String> {
-    use crate::idempotency::OccurrenceTracker;
-    use crate::mapping::map_item;
-    use codex_extension_api::RawItemProvenance;
-
     if let Some(reason) = unrepresentable_host_items_gap(host_items) {
-        return Err(reason);
+        warn!(
+            thread_id = %session.thread_id,
+            %reason,
+            "LHC import: unrepresentable host item(s) skipped; compact continues without them"
+        );
     }
 
     let mut tracker = OccurrenceTracker::new();
@@ -792,35 +803,53 @@ pub async fn import_host_items_into_archive(
         ensure_legacy_occurrence(session, &mut tracker, item)
             .await
             .map_err(|err| err.to_string())?;
-        let provenance = match item {
-            ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
-            ResponseItem::Message { role, .. } if role == "assistant" => {
-                RawItemProvenance::ModelOutput
-            }
-            ResponseItem::Reasoning { .. }
-            | ResponseItem::FunctionCall { .. }
-            | ResponseItem::FunctionCallOutput { .. }
-            | ResponseItem::LocalShellCall { .. }
-            | ResponseItem::CustomToolCall { .. }
-            | ResponseItem::CustomToolCallOutput { .. }
-            | ResponseItem::ToolSearchCall { .. }
-            | ResponseItem::ToolSearchOutput { .. }
-            | ResponseItem::WebSearchCall { .. }
-            | ResponseItem::ImageGenerationCall { .. } => RawItemProvenance::ModelOutput,
-            _ => RawItemProvenance::HostContext,
-        };
-        let mapped = map_item(&session.thread_id, item, provenance, &mut tracker, None);
+        let mapped = map_item(
+            &session.thread_id,
+            item,
+            import_provenance(item),
+            &mut tracker,
+            None,
+        );
         if mapped.is_empty() {
-            return Err(format!(
-                "cannot safely import host {} into archive (mapper produced zero events)",
-                host_item_kind_name(item)
-            ));
+            warn!(
+                thread_id = %session.thread_id,
+                kind = host_item_kind_name(item),
+                "LHC import: host item maps to zero events; skipped, compact continues without it"
+            );
+            continue;
         }
         let inputs: Vec<_> = mapped.into_iter().map(|m| m.input).collect();
         session.submit_events(&inputs).await?;
         n += 1;
     }
     Ok(n)
+}
+
+/// Provenance an imported host item is archived under.
+fn import_provenance(item: &ResponseItem) -> RawItemProvenance {
+    match item {
+        ResponseItem::Message { role, .. } if role == "user" => RawItemProvenance::UserPrompt,
+        ResponseItem::Message { role, .. } if role == "assistant" => RawItemProvenance::ModelOutput,
+        ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCall { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::LocalShellCall { .. }
+        | ResponseItem::CustomToolCall { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchCall { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { .. }
+        | ResponseItem::ImageGenerationCall { .. } => RawItemProvenance::ModelOutput,
+        _ => RawItemProvenance::HostContext,
+    }
+}
+
+/// True when the mapper emits no event for `item` (empty-text message,
+/// reasoning without content, unrepresentable type). Such an item holds
+/// nothing the archive could contain, so it is never "missing" from it.
+pub fn maps_to_zero_events(thread_id: &str, item: &ResponseItem) -> bool {
+    let mut scratch = OccurrenceTracker::new();
+    map_item(thread_id, item, import_provenance(item), &mut scratch, None).is_empty()
 }
 
 /// Tip identity of the archive for marker keying (F5).
@@ -936,10 +965,15 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
 
     check_cancel(cancel.as_deref())?;
 
-    // Unrepresentable provider-adjacent types hard-fail (never silent omit).
+    // Unrepresentable provider-adjacent types: detected and warned, never a
+    // stop (rulings.md). They map to no event, so the archive cannot hold them;
+    // the coverage check below leaves them out and import skips them.
     if let Some(reason) = unrepresentable_host_items_gap(host_items) {
-        session.close().await;
-        return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(reason));
+        warn!(
+            thread_id,
+            %reason,
+            "LHC compact: unrepresentable host item(s) ignored; compact continues on the archive's content"
+        );
     }
 
     // Import only identity-missing *native* items; never the served body (H1).
@@ -964,6 +998,12 @@ pub async fn produce_lhc_compact_with_provenance_and_percentages(
             let still = host_items_missing_from_archive_indexed(&session, host_items, &derived)
                 .await
                 .map_err(LhcCompactUnavailable::OpenFailed)?;
+            // Items the mapper emits nothing for were skipped by import on
+            // purpose: they hold no provider content, so they are not a gap.
+            let still: Vec<&ResponseItem> = still
+                .iter()
+                .filter(|item| !maps_to_zero_events(thread_id, item))
+                .collect();
             if !still.is_empty() {
                 session.close().await;
                 return Err(LhcCompactUnavailable::ArchiveDoesNotCoverHost(format!(
@@ -2131,5 +2171,71 @@ mod tests {
         );
         assert!(matches!(missing[0], ResponseItem::FunctionCall { .. }));
         assert!(matches!(missing[1], ResponseItem::Reasoning { .. }));
+    }
+
+    /// 0.157.1: an assistant message with empty text maps to zero events. The
+    /// import used to hard-fail ("mapper produced zero events") and the turn
+    /// died with it (Chester, 2026-09-25). Now it warns, skips the item, and
+    /// compact proceeds on the archive's content.
+    #[tokio::test]
+    async fn empty_assistant_message_is_skipped_and_compact_proceeds() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-empty-assistant-1";
+        let mut host = seed_thread(root, tid).await;
+        let before = list_archive(root, tid).await.len();
+        host.push(assistant("", "empty-reply"));
+        let result =
+            produce_lhc_compact_deterministic(tid, Some(root), &host, /*import*/ true)
+                .await
+                .expect("an empty assistant message must not stop compact");
+        assert!(!result.body.is_empty());
+        assert_eq!(
+            list_archive(root, tid).await.len(),
+            before,
+            "nothing importable: the archive is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_skips_zero_event_items_and_counts_only_imported() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-import-zero-events";
+        let _ = seed_thread(root, tid).await;
+        let (mut session, _) = LhcSession::open_with_inference(
+            tid,
+            None,
+            Some(root),
+            lhc_inference_callbacks(false).unwrap(),
+        )
+        .await
+        .expect("open");
+        let n = import_host_items_into_archive(
+            &mut session,
+            &[
+                assistant("", "e1"),
+                user("late real prompt", "u9"),
+                ResponseItem::Other,
+            ],
+        )
+        .await
+        .expect("zero-event and unrepresentable items must not fail the import");
+        assert_eq!(n, 1, "only the item with content is imported");
+        session.close().await;
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_other_item_is_skipped_not_refused() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let tid = "compact-other-item-1";
+        let mut host = seed_thread(root, tid).await;
+        host.push(ResponseItem::Other);
+        let result =
+            produce_lhc_compact_deterministic(tid, Some(root), &host, /*import*/ true)
+                .await
+                .expect("an unrepresentable item must not stop compact");
+        assert!(!result.body.is_empty());
     }
 }
