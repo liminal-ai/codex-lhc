@@ -1,5 +1,11 @@
-> **This is a maintained fork of
-> [`openai/codex`](https://github.com/openai/codex).**
+> **This is a fork of [`openai/codex`](https://github.com/openai/codex). It is
+> no longer maintained: v0.157.1 is its final release.**
+>
+> The fork will not track new Codex releases, and reported problems will not be
+> fixed. v0.157.1 keeps working as released, and its installers remain
+> available below. For current Codex, use the official
+> [`openai/codex`](https://github.com/openai/codex) releases. LHC development
+> continues in the [LHC project](https://github.com/liminal-ai/long-horizon-context).
 >
 > **Codex + LHC** keeps the full transcript of a session and serves
 > **long-horizon views** with a fidelity ramp: recent work verbatim, older work
@@ -21,7 +27,7 @@
 > - [**LHC project**](https://github.com/liminal-ai/long-horizon-context) — the
 >   shared engine and design.
 >
-> Install the latest fork release on Linux or macOS:
+> Install the final fork release (v0.157.1) on Linux or macOS:
 >
 > ```sh
 > curl -fsSLO https://github.com/liminal-ai/codex-lhc/releases/latest/download/install.sh

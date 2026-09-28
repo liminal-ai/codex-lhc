@@ -1,8 +1,11 @@
 # codex-lhc — what this fork is
 
-**Codex + LHC** is a maintained fork of
+**Codex + LHC** is a fork of
 [`openai/codex`](https://github.com/openai/codex) that integrates Long Horizon
 Context (LHC).
+
+This fork is no longer maintained. v0.157.1 is its final release: it will not
+track new Codex releases, and reported problems will not be fixed.
 
 It keeps the transcript captured by the host adapter and serves **long-horizon
 views**. Capture and reconstruction have documented limits, including some
@@ -301,6 +304,8 @@ different here."
 ---
 
 ## Status
+
+Maintenance ended with v0.157.1, the final release; the rest of this section describes that release.
 
 Keep `features.context_management.experimental_mode` and
 `features.token_budget.enabled` disabled with LHC. Their inherited notes/reset
